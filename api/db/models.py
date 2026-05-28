@@ -1296,3 +1296,27 @@ class KnowledgeBaseChunkModel(Base):
             postgresql_ops={"embedding": "vector_cosine_ops"},
         ),
     )
+
+
+class VoiceLibraryModel(Base):
+    __tablename__ = "voice_library"
+
+    id = Column(Integer, primary_key=True, index=True)
+    uuid = Column(String, unique=True, index=True, nullable=False, default=lambda: str(uuid.uuid4()))
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    organization_id = Column(Integer, ForeignKey("organizations.id"), nullable=False)
+    name = Column(String(255), nullable=False)
+    description = Column(Text, nullable=True)
+    provider = Column(String(50), nullable=False)  # dograh_clone | elevenlabs | system
+    provider_voice_id = Column(String(255), nullable=True)
+    language = Column(String(50), nullable=True)
+    accent = Column(String(100), nullable=True)
+    gender = Column(String(20), nullable=True)
+    age = Column(String(20), nullable=True)
+    use_case = Column(String(50), nullable=True)
+    is_public = Column(Boolean, nullable=False, default=False)
+    status = Column(String(20), nullable=False, default="pending")
+    audio_preview_url = Column(Text, nullable=True)
+    labels = Column(JSON, nullable=False, default=dict)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
