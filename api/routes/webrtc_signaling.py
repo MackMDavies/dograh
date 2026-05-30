@@ -391,16 +391,36 @@ class SignalingManager:
                 self._peer_connections.pop(webrtc_connection.pc_id, None)
 
             # Start pipeline in background
-            asyncio.create_task(
-                run_pipeline_smallwebrtc(
-                    pc,
-                    workflow_id,
-                    workflow_run_id,
-                    user.id,
-                    call_context_vars,
-                    user_provider_id=str(user.provider_id),
-                )
-            )
+            async def _run_pipeline_with_error_reporting():
+                try:
+                    await run_pipeline_smallwebrtc(
+                        pc,
+                        workflow_id,
+                        workflow_run_id,
+                        user.id,
+                        call_context_vars,
+                        user_provider_id=str(user.provider_id),
+                    )
+                except Exception as e:
+                    error_msg = getattr(e, "detail", None) or str(e)
+                    logger.error(f"Pipeline failed for run {workflow_run_id}: {error_msg}")
+                    sender = get_ws_sender(workflow_run_id)
+                    if sender:
+                        try:
+                            await sender(
+                                {
+                                    "type": "rtf-pipeline-error",
+                                    "payload": {
+                                        "error": error_msg,
+                                        "fatal": True,
+                                        "processor": "pipeline",
+                                    },
+                                }
+                            )
+                        except Exception:
+                            pass
+
+            asyncio.create_task(_run_pipeline_with_error_reporting())
 
             # Get answer after initialization
             answer = pc.get_answer()

@@ -67,14 +67,14 @@ export function ManualTextChatPanel({
     }
 
     return (
-        <div className="flex min-h-0 flex-1 flex-col">
+        <div className="flex h-full min-h-0 flex-1 flex-col">
             {disabledReason ? (
                 <div className="pb-3">
                     <DisabledNotice reason={disabledReason} />
                 </div>
             ) : null}
 
-            <div className="flex min-h-0 flex-1 flex-col">
+            <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
                 {creatingSession && !session ? (
                     <div className="space-y-3 py-1">
                         <Skeleton className="ml-auto h-9 w-2/3 rounded-2xl" />

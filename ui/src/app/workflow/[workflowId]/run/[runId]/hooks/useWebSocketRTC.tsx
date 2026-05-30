@@ -4,7 +4,6 @@ import { client } from "@/client/client.gen";
 import { getTurnCredentialsApiV1TurnCredentialsGet, validateUserConfigurationsApiV1UserConfigurationsUserValidateGet, validateWorkflowApiV1WorkflowWorkflowIdValidatePost } from "@/client/sdk.gen";
 import { TurnCredentialsResponse } from "@/client/types.gen";
 import { WorkflowValidationError } from "@/components/flow/types";
-import type { ConversationNodeTransitionItem, RealtimeFeedbackMessage as FeedbackMessage } from "@/components/workflow/conversation";
 import { useAppConfig } from "@/context/AppConfigContext";
 import logger from '@/lib/logger';
 
@@ -16,10 +15,29 @@ interface UseWebSocketRTCProps {
     workflowRunId: number;
     accessToken: string | null;
     initialContextVariables?: Record<string, string> | null;
-    onNodeTransition?: (transition: ConversationNodeTransitionItem) => void;
 }
 
-export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initialContextVariables, onNodeTransition }: UseWebSocketRTCProps) => {
+export interface FeedbackMessage {
+    id: string;
+    type: 'user-transcription' | 'bot-text' | 'function-call' | 'node-transition' | 'ttfb-metric' | 'pipeline-error' | 'interrupt-warning';
+    text: string;
+    final?: boolean;
+    timestamp: string;
+    functionName?: string;
+    status?: 'running' | 'completed';
+    // Node transition fields
+    nodeName?: string;
+    previousNode?: string;
+    allowInterrupt?: boolean;
+    // TTFB metric fields
+    ttfbSeconds?: number;
+    processor?: string;
+    model?: string;
+    // Pipeline error fields
+    fatal?: boolean;
+}
+
+export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initialContextVariables }: UseWebSocketRTCProps) => {
     const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'failed'>('idle');
     const [connectionActive, setConnectionActive] = useState(false);
     const [isCompleted, setIsCompleted] = useState(false);
@@ -54,11 +72,6 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
     const pcRef = useRef<RTCPeerConnection | null>(null);
     const wsRef = useRef<WebSocket | null>(null);
     const timeStartRef = useRef<number | null>(null);
-    const onNodeTransitionRef = useRef(onNodeTransition);
-
-    useEffect(() => {
-        onNodeTransitionRef.current = onNodeTransition;
-    }, [onNodeTransition]);
 
     // Generate a cryptographically secure unique ID
     const generateSecureId = () => {
@@ -366,22 +379,18 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                         }
 
                         case 'rtf-function-call-start': {
-                            const { function_name, tool_call_id, arguments: toolArguments } = message.payload;
+                            const { function_name, tool_call_id } = message.payload;
                             setFeedbackMessages(prev => {
                                 // Check if we already have this function call
-                                const existingId = tool_call_id
-                                    ? `func-${tool_call_id}`
-                                    : `func-${Date.now()}`;
+                                const existingId = `func-${tool_call_id}`;
                                 if (prev.some(msg => msg.id === existingId)) {
                                     return prev;
                                 }
                                 return [...prev, {
                                     id: existingId,
                                     type: 'function-call',
-                                    text: function_name ?? 'tool',
-                                    functionName: function_name ?? 'tool',
-                                    toolCallId: tool_call_id,
-                                    arguments: toolArguments,
+                                    text: function_name,
+                                    functionName: function_name,
                                     status: 'running',
                                     timestamp: new Date().toISOString(),
                                 }];
@@ -393,44 +402,24 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                             const { tool_call_id, result } = message.payload;
                             setFeedbackMessages(prev => prev.map(msg =>
                                 msg.id === `func-${tool_call_id}`
-                                    ? { ...msg, status: 'completed' as const, text: result || msg.text, result }
+                                    ? { ...msg, status: 'completed' as const, text: result || msg.text }
                                     : msg
                             ));
                             break;
                         }
 
                         case 'rtf-node-transition': {
-                            const {
-                                node_id,
-                                node_name,
-                                previous_node_id,
-                                previous_node_name,
-                                allow_interrupt,
-                            } = message.payload;
+                            const { node_name, previous_node_name, allow_interrupt } = message.payload;
                             currentAllowInterruptRef.current = allow_interrupt;
-                            const transitionTimestamp = new Date().toISOString();
-                            const transition: ConversationNodeTransitionItem = {
-                                kind: 'node-transition',
-                                id: `node-${Date.now()}`,
-                                timestamp: transitionTimestamp,
-                                nodeId: node_id,
-                                nodeName: node_name ?? 'Node',
-                                previousNodeId: previous_node_id,
-                                previousNodeName: previous_node_name,
-                                allowInterrupt: allow_interrupt,
-                            };
                             setFeedbackMessages(prev => [...prev, {
-                                id: transition.id,
+                                id: `node-${Date.now()}`,
                                 type: 'node-transition',
-                                text: transition.nodeName,
-                                nodeId: transition.nodeId,
-                                nodeName: transition.nodeName,
-                                previousNodeId: transition.previousNodeId,
+                                text: node_name,
+                                nodeName: node_name,
                                 previousNode: previous_node_name,
                                 allowInterrupt: allow_interrupt,
-                                timestamp: transitionTimestamp,
+                                timestamp: new Date().toISOString(),
                             }]);
-                            onNodeTransitionRef.current?.(transition);
                             break;
                         }
 

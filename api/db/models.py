@@ -1118,6 +1118,11 @@ class KnowledgeBaseDocumentModel(Base):
         onupdate=lambda: datetime.now(UTC),
     )
 
+    # Global flag: document is available to all agents in the org when True
+    is_global = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+
     # Soft delete
     is_active = Column(Boolean, default=True, nullable=False)
     archived_at = Column(DateTime(timezone=True), nullable=True)
@@ -1130,6 +1135,11 @@ class KnowledgeBaseDocumentModel(Base):
         back_populates="document",
         cascade="all, delete-orphan",
     )
+    workflow_assignments = relationship(
+        "WorkflowDocumentAssignmentModel",
+        back_populates="document",
+        cascade="all, delete-orphan",
+    )
 
     # Indexes and constraints
     __table_args__ = (
@@ -1137,6 +1147,48 @@ class KnowledgeBaseDocumentModel(Base):
         Index("ix_kb_documents_uuid", "document_uuid"),
         Index("ix_kb_documents_status", "processing_status"),
         Index("ix_kb_documents_created_at", "created_at"),
+        Index("ix_kb_documents_is_global", "organization_id", "is_global"),
+    )
+
+
+class WorkflowDocumentAssignmentModel(Base):
+    """Many-to-many assignment of KB documents to specific workflows (agents).
+
+    Documents with is_global=True are available to all workflows without an
+    explicit assignment. This table tracks per-agent assignments for non-global docs.
+    """
+
+    __tablename__ = "workflow_document_assignments"
+
+    id = Column(Integer, primary_key=True, index=True)
+
+    workflow_id = Column(
+        Integer,
+        ForeignKey("workflows.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    document_id = Column(
+        Integer,
+        ForeignKey("knowledge_base_documents.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id = Column(
+        Integer,
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    # Relationships
+    workflow = relationship("WorkflowModel")
+    document = relationship("KnowledgeBaseDocumentModel", back_populates="workflow_assignments")
+    organization = relationship("OrganizationModel")
+
+    __table_args__ = (
+        UniqueConstraint("workflow_id", "document_id", name="uq_workflow_document_assignment"),
+        Index("ix_wda_workflow_id", "workflow_id"),
+        Index("ix_wda_document_id", "document_id"),
+        Index("ix_wda_organization_id", "organization_id"),
     )
 
 
@@ -1320,3 +1372,93 @@ class VoiceLibraryModel(Base):
     labels = Column(JSON, nullable=False, default=dict)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+class OrgProviderConnectionModel(Base):
+    """Stores an API connection (provider + key) at the organization level.
+
+    One row per provider per service type per org. Admins connect providers here;
+    workflow execution falls back to these when a user has no personal config.
+    """
+
+    __tablename__ = "org_provider_connections"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    service_type = Column(String(20), nullable=False)  # llm | tts | stt | embeddings | realtime
+    provider = Column(String(50), nullable=False)      # openai | google | anthropic | …
+    display_name = Column(String(100), nullable=True)  # optional admin label
+    api_key = Column(Text, nullable=True)              # stored as plain text (same as existing UserConfigurationModel)
+    extra_config = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
+    is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
+    created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+    organization = relationship("OrganizationModel")
+    created_by_user = relationship("UserModel")
+    available_models = relationship(
+        "OrgAvailableModelModel",
+        back_populates="connection",
+        cascade="all, delete-orphan",
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "service_type", "provider",
+            name="uq_org_provider_service",
+        ),
+        Index("ix_org_provider_connections_org", "organization_id"),
+        Index("ix_org_provider_connections_service_type", "service_type"),
+    )
+
+
+class OrgAvailableModelModel(Base):
+    """A model ID from a connected provider, with a client-visibility flag.
+
+    Populated automatically when a provider is connected (seeded from the
+    registry's model list). Admins toggle `is_client_available` to control
+    what clients see.
+    """
+
+    __tablename__ = "org_available_models"
+
+    id = Column(Integer, primary_key=True, index=True)
+    connection_id = Column(
+        Integer,
+        ForeignKey("org_provider_connections.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    service_type = Column(String(20), nullable=False)
+    model_id = Column(String(200), nullable=False)
+    display_name = Column(String(200), nullable=True)
+    is_client_available = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    is_default = Column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+
+    connection = relationship("OrgProviderConnectionModel", back_populates="available_models")
+    organization = relationship("OrganizationModel")
+
+    __table_args__ = (
+        UniqueConstraint("connection_id", "model_id", name="uq_connection_model"),
+        Index("ix_org_available_models_org_service", "organization_id", "service_type"),
+        Index(
+            "ix_org_available_models_client",
+            "organization_id",
+            "service_type",
+            "is_client_available",
+        ),
+    )

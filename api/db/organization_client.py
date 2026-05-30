@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from typing import Optional
 
+from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.future import select
 
@@ -8,6 +9,7 @@ from api.db.base_client import BaseDBClient
 from api.db.models import (
     APIKeyModel,
     OrganizationModel,
+    WorkflowModel,
     organization_users_association,
 )
 from api.utils.api_key import generate_api_key
@@ -112,3 +114,22 @@ class OrganizationClient(BaseDBClient):
 
             await session.execute(stmt)
             await session.commit()
+
+    async def get_all_organizations(self) -> list[dict]:
+        """Get all organizations for superuser listing."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(
+                    OrganizationModel.id,
+                    OrganizationModel.provider_id,
+                    func.count(WorkflowModel.id).label("workflow_count"),
+                )
+                .outerjoin(WorkflowModel, WorkflowModel.organization_id == OrganizationModel.id)
+                .group_by(OrganizationModel.id, OrganizationModel.provider_id)
+                .order_by(OrganizationModel.id)
+            )
+            rows = result.all()
+            return [
+                {"id": row.id, "provider_id": row.provider_id, "workflow_count": row.workflow_count}
+                for row in rows
+            ]

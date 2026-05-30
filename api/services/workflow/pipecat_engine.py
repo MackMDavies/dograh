@@ -157,6 +157,16 @@ class PipecatEngine:
             )
         return self._organization_id
 
+    async def _get_workflow_id(self) -> Optional[int]:
+        """Get and cache the workflow ID from workflow run."""
+        if not hasattr(self, "_workflow_id"):
+            self._workflow_id: Optional[int] = (
+                await db_client.get_workflow_id_by_workflow_run_id(
+                    self._workflow_run_id
+                )
+            )
+        return self._workflow_id
+
     def _get_otel_context(self):
         """Extract the OTel Context from the task's TracingContext.
 
@@ -517,9 +527,25 @@ class PipecatEngine:
                 mcp_tool_filters=getattr(node, "mcp_tool_filters", None),
             )
 
-        # Register knowledge base retrieval handler if node has documents
-        if node.document_uuids:
-            await self._register_knowledge_base_function(node.document_uuids)
+        # Register knowledge base retrieval handler.
+        # Merge per-node document_uuids with workflow-level assignments (assigned + global).
+        kb_doc_uuids = list(node.document_uuids or [])
+        workflow_id = await self._get_workflow_id()
+        organization_id = await self._get_organization_id()
+        if workflow_id and organization_id:
+            workflow_uuids = await db_client.get_document_uuids_for_workflow(
+                workflow_id=workflow_id,
+                organization_id=organization_id,
+            )
+            # Deduplicate: workflow-level takes precedence, node-level added on top
+            seen = set(workflow_uuids)
+            for uid in kb_doc_uuids:
+                if uid not in seen:
+                    workflow_uuids.append(uid)
+                    seen.add(uid)
+            kb_doc_uuids = workflow_uuids
+        if kb_doc_uuids:
+            await self._register_knowledge_base_function(kb_doc_uuids)
 
         # Compose prompt and functions via the context composer module
         system_prompt = compose_system_prompt_for_node(

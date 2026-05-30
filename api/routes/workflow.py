@@ -900,6 +900,33 @@ async def move_workflow_to_folder(
     )
 
 
+@router.delete(
+    "/{workflow_id}",
+    **sdk_expose(
+        method="delete_workflow",
+        description="Permanently delete a workflow and all its run history.",
+    ),
+)
+async def delete_workflow(
+    workflow_id: int,
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Permanently delete a workflow, its definitions, and its run history."""
+    try:
+        await db_client.delete_workflow_hard(
+            workflow_id=workflow_id,
+            organization_id=user.selected_organization_id,
+        )
+        return {"message": "Workflow deleted successfully"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error deleting workflow {workflow_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @router.put(
     "/{workflow_id}",
     **sdk_expose(
@@ -979,17 +1006,32 @@ async def update_workflow(
             )
             user_config = await db_client.get_user_configurations(user.id)
             try:
+                from api.services.configuration.org_provider_resolver import (
+                    enrich_overrides_with_org_api_keys,
+                )
                 enriched_overrides = enrich_overrides_with_api_keys(
                     workflow_configurations["model_overrides"],
                     user_config,
                 )
+                # Second pass: fill any still-missing API keys from org connections
+                enriched_overrides = await enrich_overrides_with_org_api_keys(
+                    enriched_overrides, user.selected_organization_id
+                )
                 effective = resolve_effective_config(user_config, enriched_overrides)
-                await UserConfigurationValidator().validate(
+                # Only validate services that are explicitly overridden — the
+                # full config may lack TTS/STT if the user hasn't configured them
+                # globally, and that must not block saving an LLM-only override.
+                overridden_services = {
+                    k for k in enriched_overrides
+                    if k in {"llm", "stt", "tts", "embeddings", "realtime"}
+                }
+                await UserConfigurationValidator().validate_partial(
                     effective,
+                    services=overridden_services,
                     organization_id=user.selected_organization_id,
                     created_by=user.provider_id,
                 )
-            except ValueError as e:
+            except (ValueError, ValidationError) as e:
                 raise HTTPException(status_code=422, detail=str(e))
             workflow_configurations = {
                 **workflow_configurations,
@@ -1036,14 +1078,19 @@ async def update_workflow(
             workflow_def = draft.workflow_json
             workflow_configs = draft.workflow_configurations
             template_vars = draft.template_context_variables
+            published = None
         else:
-            published = workflow.released_definition
-            workflow_def = published.workflow_json
-            workflow_configs = published.workflow_configurations
-            template_vars = published.template_context_variables
+            # update_workflow only eagerly loads current_definition — re-fetch to get released_definition
+            full_workflow = await db_client.get_workflow(
+                workflow_id, organization_id=user.selected_organization_id
+            )
+            published = full_workflow.released_definition if full_workflow else None
+            workflow_def = published.workflow_json if published else {}
+            workflow_configs = published.workflow_configurations if published else {}
+            template_vars = published.template_context_variables if published else {}
 
         # Include version info from the active definition (draft or published)
-        active_def = draft or workflow.released_definition
+        active_def = draft or published
         return {
             "id": workflow.id,
             "name": workflow.name,

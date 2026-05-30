@@ -168,22 +168,15 @@ export default function CustomEdge(props: CustomEdgeProps) {
             (e.source === target && e.target === source)
     );
 
-    // 2) if there are two, sort by id and pick an index
+    // 2) if there are two parallel edges, stagger their label positions
     let offsetX = 0;
     let offsetY = 0;
     if (parallel.length > 1) {
         const sorted = parallel.slice().sort((a, b) => a.id.localeCompare(b.id));
         const idx = sorted.findIndex((e) => e.id === id);
-
-        // first edge (idx 0) moves right & down;
-        // second edge (idx 1) moves left & up
-        if (idx === 0) {
-            offsetX = 100;
-            offsetY = 0;
-        } else {
-            offsetX = 0;
-            offsetY = -50;
-        }
+        // Stagger labels symmetrically around the midpoint
+        offsetX = idx === 0 ? -40 : 40;
+        offsetY = 0;
     }
 
     // Check if this is a self-loop (source and target are the same node)
@@ -209,7 +202,7 @@ export default function CustomEdge(props: CustomEdgeProps) {
     } else {
         // Use smoothstep path for orthogonal/elbow edges
         // borderRadius: 8 gives slightly rounded corners for a clean look
-        // offset: 20 provides spacing before the first bend
+        // offset: 40 ensures bends start well clear of node handles
         const [path, lx, ly] = getSmoothStepPath({
             sourceX,
             sourceY,
@@ -218,11 +211,14 @@ export default function CustomEdge(props: CustomEdgeProps) {
             targetY,
             targetPosition,
             borderRadius: 8,
-            offset: 20,
+            offset: 40,
         });
         edgePath = path;
-        labelX = lx;
-        labelY = ly;
+        // Float the label above the edge midpoint so it doesn't overlap node bodies.
+        // For primarily-horizontal edges push the label up; for primarily-vertical push right.
+        const isHorizontal = Math.abs(targetX - sourceX) > Math.abs(targetY - sourceY);
+        labelX = lx + (isHorizontal ? 0 : 18);
+        labelY = ly + (isHorizontal ? -18 : 0);
     }
 
     // Update connected nodes when edge is selected or hovered

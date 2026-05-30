@@ -47,6 +47,8 @@ from pipecat.services.openai.stt import (
 from pipecat.services.openai.tts import OpenAITTSService, OpenAITTSSettings
 from pipecat.services.openrouter.llm import OpenRouterLLMService, OpenRouterLLMSettings
 from pipecat.services.rime.tts import RimeTTSService, RimeTTSSettings
+from pipecat.services.xai.stt import XAISTTService, XAISTTSettings
+from pipecat.services.xai.tts import XAITTSService, XAIWebsocketTTSSettings
 from pipecat.services.sarvam.stt import SarvamSTTService, SarvamSTTSettings
 from pipecat.services.sarvam.tts import SarvamTTSService, SarvamTTSSettings
 from pipecat.services.speaches.llm import SpeachesLLMService, SpeachesLLMSettings
@@ -243,6 +245,21 @@ def create_stt_service(
                 language=language,
                 operating_point=operating_point,
                 additional_vocab=additional_vocab,
+            ),
+            sample_rate=audio_config.transport_in_sample_rate,
+        )
+    elif user_config.stt.provider == ServiceProviders.XAI.value:
+        language = getattr(user_config.stt, "language", None) or "en"
+        try:
+            lang_enum = Language(language)
+        except ValueError:
+            lang_enum = Language.EN
+        return XAISTTService(
+            api_key=user_config.stt.api_key,
+            settings=XAISTTSettings(
+                language=lang_enum,
+                interim_results=True,
+                endpointing=100,
             ),
             sample_rate=audio_config.transport_in_sample_rate,
         )
@@ -492,6 +509,20 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
         )
+    elif user_config.tts.provider == ServiceProviders.XAI.value:
+        voice = getattr(user_config.tts, "voice", None) or "eve"
+        language_code = getattr(user_config.tts, "language", None) or "en"
+        try:
+            lang_enum = Language(language_code)
+        except ValueError:
+            lang_enum = Language.EN
+        return XAITTSService(
+            api_key=user_config.tts.api_key,
+            settings=XAIWebsocketTTSSettings(voice=voice, language=lang_enum),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
     else:
         raise HTTPException(
             status_code=400, detail=f"Invalid TTS provider {user_config.tts.provider}"
@@ -541,6 +572,14 @@ def create_llm_service_from_provider(
         return GroqLLMService(
             api_key=api_key,
             settings=GroqLLMSettings(model=model, temperature=0.1),
+        )
+    elif provider == ServiceProviders.XAI.value:
+        xai_base_url = base_url or "https://api.x.ai/v1"
+        _validate_runtime_service_url(xai_base_url, "base_url")
+        return OpenAILLMService(
+            api_key=api_key,
+            base_url=xai_base_url,
+            settings=OpenAILLMSettings(model=model, temperature=0.1),
         )
     elif provider == ServiceProviders.OPENROUTER.value:
         kwargs = {}
@@ -743,6 +782,8 @@ def create_llm_service(user_config):
         kwargs["base_url"] = user_config.llm.base_url
     elif provider == ServiceProviders.AZURE.value:
         kwargs["endpoint"] = user_config.llm.endpoint
+    elif provider == ServiceProviders.XAI.value:
+        kwargs["base_url"] = user_config.llm.base_url
     elif provider == ServiceProviders.SPEACHES.value:
         kwargs["base_url"] = user_config.llm.base_url
     elif provider == ServiceProviders.AWS_BEDROCK.value:

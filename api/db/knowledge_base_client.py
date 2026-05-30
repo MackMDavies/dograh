@@ -5,11 +5,16 @@ from pathlib import Path
 from typing import List, Optional
 
 from loguru import logger
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import selectinload
 
 from api.db.base_client import BaseDBClient
-from api.db.models import KnowledgeBaseChunkModel, KnowledgeBaseDocumentModel
+from api.db.models import (
+    KnowledgeBaseChunkModel,
+    KnowledgeBaseDocumentModel,
+    WorkflowDocumentAssignmentModel,
+    WorkflowModel,
+)
 
 
 class KnowledgeBaseClient(BaseDBClient):
@@ -511,6 +516,176 @@ class KnowledgeBaseClient(BaseDBClient):
                 f"Deleted document {document_uuid} for organization {organization_id}"
             )
             return True
+
+    async def set_document_global(
+        self,
+        document_uuid: str,
+        organization_id: int,
+        is_global: bool,
+    ) -> Optional[KnowledgeBaseDocumentModel]:
+        """Toggle a document's global flag."""
+        async with self.async_session() as session:
+            query = select(KnowledgeBaseDocumentModel).where(
+                KnowledgeBaseDocumentModel.document_uuid == document_uuid,
+                KnowledgeBaseDocumentModel.organization_id == organization_id,
+                KnowledgeBaseDocumentModel.is_active == True,
+            )
+            result = await session.execute(query)
+            document = result.scalar_one_or_none()
+            if not document:
+                return None
+            document.is_global = is_global
+            await session.commit()
+            await session.refresh(document)
+            logger.info(f"Set document {document_uuid} is_global={is_global}")
+            return document
+
+    async def assign_document_to_workflow(
+        self,
+        document_uuid: str,
+        workflow_id: int,
+        organization_id: int,
+    ) -> bool:
+        """Assign a document to a workflow. Returns True if newly created, False if already existed."""
+        async with self.async_session() as session:
+            # Verify document belongs to this org
+            doc_query = select(KnowledgeBaseDocumentModel).where(
+                KnowledgeBaseDocumentModel.document_uuid == document_uuid,
+                KnowledgeBaseDocumentModel.organization_id == organization_id,
+                KnowledgeBaseDocumentModel.is_active == True,
+            )
+            doc_result = await session.execute(doc_query)
+            document = doc_result.scalar_one_or_none()
+            if not document:
+                return False
+
+            # Check if assignment already exists
+            existing_query = select(WorkflowDocumentAssignmentModel).where(
+                WorkflowDocumentAssignmentModel.workflow_id == workflow_id,
+                WorkflowDocumentAssignmentModel.document_id == document.id,
+            )
+            existing_result = await session.execute(existing_query)
+            if existing_result.scalar_one_or_none():
+                return False  # Already assigned
+
+            assignment = WorkflowDocumentAssignmentModel(
+                workflow_id=workflow_id,
+                document_id=document.id,
+                organization_id=organization_id,
+            )
+            session.add(assignment)
+            await session.commit()
+            logger.info(f"Assigned document {document_uuid} to workflow {workflow_id}")
+            return True
+
+    async def unassign_document_from_workflow(
+        self,
+        document_uuid: str,
+        workflow_id: int,
+        organization_id: int,
+    ) -> bool:
+        """Remove a document assignment from a workflow. Returns True if removed."""
+        async with self.async_session() as session:
+            doc_query = select(KnowledgeBaseDocumentModel).where(
+                KnowledgeBaseDocumentModel.document_uuid == document_uuid,
+                KnowledgeBaseDocumentModel.organization_id == organization_id,
+            )
+            doc_result = await session.execute(doc_query)
+            document = doc_result.scalar_one_or_none()
+            if not document:
+                return False
+
+            assignment_query = select(WorkflowDocumentAssignmentModel).where(
+                WorkflowDocumentAssignmentModel.workflow_id == workflow_id,
+                WorkflowDocumentAssignmentModel.document_id == document.id,
+            )
+            assignment_result = await session.execute(assignment_query)
+            assignment = assignment_result.scalar_one_or_none()
+            if not assignment:
+                return False
+
+            await session.delete(assignment)
+            await session.commit()
+            logger.info(f"Unassigned document {document_uuid} from workflow {workflow_id}")
+            return True
+
+    async def get_documents_for_workflow(
+        self,
+        workflow_id: int,
+        organization_id: int,
+    ) -> List[KnowledgeBaseDocumentModel]:
+        """Get all documents available to a workflow: assigned + global."""
+        async with self.async_session() as session:
+            # Documents directly assigned to this workflow
+            assigned_subquery = (
+                select(WorkflowDocumentAssignmentModel.document_id)
+                .where(WorkflowDocumentAssignmentModel.workflow_id == workflow_id)
+            ).scalar_subquery()
+
+            query = (
+                select(KnowledgeBaseDocumentModel)
+                .where(
+                    KnowledgeBaseDocumentModel.organization_id == organization_id,
+                    KnowledgeBaseDocumentModel.is_active == True,
+                    or_(
+                        KnowledgeBaseDocumentModel.is_global == True,
+                        KnowledgeBaseDocumentModel.id.in_(assigned_subquery),
+                    ),
+                )
+                .order_by(KnowledgeBaseDocumentModel.created_at.desc())
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def get_document_uuids_for_workflow(
+        self,
+        workflow_id: int,
+        organization_id: int,
+    ) -> List[str]:
+        """Return UUIDs of all completed documents available to a workflow."""
+        docs = await self.get_documents_for_workflow(workflow_id, organization_id)
+        return [
+            d.document_uuid
+            for d in docs
+            if d.processing_status == "completed"
+        ]
+
+    async def get_workflow_assignments_for_document(
+        self,
+        document_uuid: str,
+        organization_id: int,
+    ) -> List[dict]:
+        """Return a list of {workflow_id, workflow_uuid, workflow_name} dicts for a document."""
+        async with self.async_session() as session:
+            doc_query = select(KnowledgeBaseDocumentModel.id).where(
+                KnowledgeBaseDocumentModel.document_uuid == document_uuid,
+                KnowledgeBaseDocumentModel.organization_id == organization_id,
+            )
+            doc_result = await session.execute(doc_query)
+            document_id = doc_result.scalar_one_or_none()
+            if not document_id:
+                return []
+
+            query = (
+                select(
+                    WorkflowDocumentAssignmentModel.workflow_id,
+                    WorkflowDocumentAssignmentModel.created_at,
+                    WorkflowModel.workflow_uuid,
+                    WorkflowModel.name,
+                )
+                .join(WorkflowModel, WorkflowModel.id == WorkflowDocumentAssignmentModel.workflow_id)
+                .where(WorkflowDocumentAssignmentModel.document_id == document_id)
+            )
+            result = await session.execute(query)
+            return [
+                {
+                    "workflow_id": row.workflow_id,
+                    "workflow_uuid": row.workflow_uuid,
+                    "workflow_name": row.name,
+                    "created_at": row.created_at,
+                }
+                for row in result.all()
+            ]
 
     @staticmethod
     def compute_file_hash(file_path: str) -> str:

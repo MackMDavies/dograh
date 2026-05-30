@@ -16,6 +16,8 @@ from api.schemas.knowledge_base import (
     DocumentUploadRequestSchema,
     DocumentUploadResponseSchema,
     ProcessDocumentRequestSchema,
+    SetDocumentGlobalRequestSchema,
+    WorkflowDocumentListResponseSchema,
 )
 from api.sdk_expose import sdk_expose
 from api.services.auth.depends import get_user
@@ -241,6 +243,7 @@ async def list_documents(
                 organization_id=doc.organization_id,
                 created_by=doc.created_by,
                 is_active=doc.is_active,
+                is_global=doc.is_global,
             )
             for doc in documents
         ]
@@ -300,6 +303,7 @@ async def get_document(
             organization_id=document.organization_id,
             created_by=document.created_by,
             is_active=document.is_active,
+            is_global=document.is_global,
         )
 
     except HTTPException:
@@ -307,6 +311,59 @@ async def get_document(
     except Exception as exc:
         logger.error(f"Error getting document: {exc}")
         raise HTTPException(status_code=500, detail="Failed to get document") from exc
+
+
+@router.patch(
+    "/documents/{document_uuid}/global",
+    response_model=DocumentResponseSchema,
+    summary="Set or unset a document as global",
+)
+async def set_document_global(
+    document_uuid: str,
+    request: SetDocumentGlobalRequestSchema,
+    user=Depends(get_user),
+):
+    """Toggle whether a document is available to all agents in the organization.
+
+    Global documents are automatically available to every agent without explicit
+    assignment. Non-global documents must be assigned to specific agents.
+    """
+    try:
+        document = await db_client.set_document_global(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+            is_global=request.is_global,
+        )
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        return DocumentResponseSchema(
+            id=document.id,
+            document_uuid=document.document_uuid,
+            filename=document.filename,
+            file_size_bytes=document.file_size_bytes,
+            file_hash=document.file_hash,
+            mime_type=document.mime_type,
+            processing_status=document.processing_status,
+            processing_error=document.processing_error,
+            total_chunks=document.total_chunks,
+            retrieval_mode=document.retrieval_mode,
+            custom_metadata=document.custom_metadata,
+            docling_metadata=document.docling_metadata,
+            source_url=document.source_url,
+            created_at=document.created_at,
+            updated_at=document.updated_at,
+            organization_id=document.organization_id,
+            created_by=document.created_by,
+            is_active=document.is_active,
+            is_global=document.is_global,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error setting document global: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to update document") from exc
 
 
 @router.delete(
@@ -429,3 +486,178 @@ async def search_chunks(
     except Exception as exc:
         logger.error(f"Error searching chunks: {exc}")
         raise HTTPException(status_code=500, detail="Failed to search chunks") from exc
+
+
+@router.get(
+    "/documents/{document_uuid}/assignments",
+    summary="List workflows this document is assigned to",
+)
+async def get_document_assignments(
+    document_uuid: str,
+    user=Depends(get_user),
+):
+    """Return all workflows that have this document explicitly assigned."""
+    try:
+        assignments = await db_client.get_workflow_assignments_for_document(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+        )
+        return {"assignments": assignments}
+    except Exception as exc:
+        logger.error(f"Error getting document assignments: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Failed to get document assignments"
+        ) from exc
+
+
+# ─── Per-agent workflow assignment endpoints ───────────────────────────────────
+
+
+async def _resolve_workflow_id(workflow_uuid: str, organization_id: int) -> int:
+    """Resolve workflow_uuid to workflow_id, verifying org ownership."""
+    workflow = await db_client.get_workflow_by_uuid(workflow_uuid, organization_id)
+    if not workflow:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    return workflow.id
+
+
+@router.get(
+    "/workflows/{workflow_uuid}/documents",
+    response_model=WorkflowDocumentListResponseSchema,
+    summary="List documents available to a workflow",
+)
+async def list_workflow_documents(
+    workflow_uuid: str,
+    user=Depends(get_user),
+):
+    """List all documents available to a specific agent (assigned + global).
+
+    Returns documents that are either explicitly assigned to this workflow
+    or marked as global (available to all agents in the organization).
+    """
+    try:
+        workflow_id = await _resolve_workflow_id(
+            workflow_uuid, user.selected_organization_id
+        )
+        docs = await db_client.get_documents_for_workflow(
+            workflow_id=workflow_id,
+            organization_id=user.selected_organization_id,
+        )
+        document_list = [
+            DocumentResponseSchema(
+                id=doc.id,
+                document_uuid=doc.document_uuid,
+                filename=doc.filename,
+                file_size_bytes=doc.file_size_bytes,
+                file_hash=doc.file_hash,
+                mime_type=doc.mime_type,
+                processing_status=doc.processing_status,
+                processing_error=doc.processing_error,
+                total_chunks=doc.total_chunks,
+                retrieval_mode=doc.retrieval_mode,
+                custom_metadata=doc.custom_metadata,
+                docling_metadata=doc.docling_metadata,
+                source_url=doc.source_url,
+                created_at=doc.created_at,
+                updated_at=doc.updated_at,
+                organization_id=doc.organization_id,
+                created_by=doc.created_by,
+                is_active=doc.is_active,
+                is_global=doc.is_global,
+            )
+            for doc in docs
+        ]
+        return WorkflowDocumentListResponseSchema(
+            documents=document_list, total=len(document_list)
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error listing workflow documents: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Failed to list workflow documents"
+        ) from exc
+
+
+@router.post(
+    "/workflows/{workflow_uuid}/documents/{document_uuid}",
+    summary="Assign a document to a workflow",
+)
+async def assign_document_to_workflow(
+    workflow_uuid: str,
+    document_uuid: str,
+    user=Depends(get_user),
+):
+    """Assign a knowledge base document to a specific agent.
+
+    The document will be available to this agent during calls. Documents can
+    also be marked as global to make them available to all agents.
+    """
+    try:
+        workflow_id = await _resolve_workflow_id(
+            workflow_uuid, user.selected_organization_id
+        )
+        created = await db_client.assign_document_to_workflow(
+            document_uuid=document_uuid,
+            workflow_id=workflow_id,
+            organization_id=user.selected_organization_id,
+        )
+        if not created:
+            # Either document not found or already assigned — both are OK
+            return {"success": True, "message": "Document assignment confirmed"}
+
+        logger.info(
+            f"Assigned document {document_uuid} to workflow {workflow_uuid}, "
+            f"user {user.id}, org {user.selected_organization_id}"
+        )
+        return {"success": True, "message": "Document assigned to agent"}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error assigning document to workflow: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Failed to assign document"
+        ) from exc
+
+
+@router.delete(
+    "/workflows/{workflow_uuid}/documents/{document_uuid}",
+    summary="Unassign a document from a workflow",
+)
+async def unassign_document_from_workflow(
+    workflow_uuid: str,
+    document_uuid: str,
+    user=Depends(get_user),
+):
+    """Remove a document assignment from a specific agent.
+
+    Note: global documents will still be available to all agents even after
+    unassignment. Use PATCH /documents/{uuid}/global to change the global flag.
+    """
+    try:
+        workflow_id = await _resolve_workflow_id(
+            workflow_uuid, user.selected_organization_id
+        )
+        removed = await db_client.unassign_document_from_workflow(
+            document_uuid=document_uuid,
+            workflow_id=workflow_id,
+            organization_id=user.selected_organization_id,
+        )
+        if not removed:
+            raise HTTPException(status_code=404, detail="Assignment not found")
+
+        logger.info(
+            f"Unassigned document {document_uuid} from workflow {workflow_uuid}, "
+            f"user {user.id}, org {user.selected_organization_id}"
+        )
+        return {"success": True, "message": "Document unassigned from agent"}
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error unassigning document from workflow: {exc}")
+        raise HTTPException(
+            status_code=500, detail="Failed to unassign document"
+        ) from exc

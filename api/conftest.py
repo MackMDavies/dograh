@@ -191,7 +191,7 @@ async def run_migrations(database_url: str):
     import asyncio
 
     def _run_upgrade():
-        command.upgrade(alembic_cfg, "head")
+        command.upgrade(alembic_cfg, "heads")
 
     try:
         await asyncio.get_event_loop().run_in_executor(None, _run_upgrade)

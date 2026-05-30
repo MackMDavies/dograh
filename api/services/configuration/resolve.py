@@ -28,7 +28,12 @@ def _build_section_from_override(service_type: ServiceType, override: dict):
     config_cls = registry.get(provider)
     if config_cls is None:
         return None
-    return config_cls(**override)
+    try:
+        return config_cls(**override)
+    except Exception:
+        # Construction can fail when api_key is absent; return None so that
+        # validate_partial can surface a clear "API key is missing" message.
+        return None
 
 
 _SECRET_FIELDS = ("api_key", "credentials", "aws_access_key", "aws_secret_key")

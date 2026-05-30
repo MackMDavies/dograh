@@ -201,9 +201,20 @@ async def run_pipeline_telephony(
     run_configs = (
         (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
     )
-    user_config = resolve_effective_config(
-        user_config, run_configs.get("model_overrides")
+    from api.services.configuration.org_provider_resolver import (
+        enrich_overrides_with_org_api_keys,
+        resolve_org_provider_config,
     )
+    if workflow and workflow.organization_id:
+        user_config = await resolve_org_provider_config(
+            workflow.organization_id, user_config
+        )
+    raw_overrides = run_configs.get("model_overrides")
+    if raw_overrides and workflow and workflow.organization_id:
+        raw_overrides = await enrich_overrides_with_org_api_keys(
+            raw_overrides, workflow.organization_id
+        )
+    user_config = resolve_effective_config(user_config, raw_overrides)
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     spec = telephony_registry.get(provider_name)
@@ -279,9 +290,20 @@ async def run_pipeline_smallwebrtc(
     run_configs = (
         (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
     )
-    user_config = resolve_effective_config(
-        user_config, run_configs.get("model_overrides")
+    from api.services.configuration.org_provider_resolver import (
+        enrich_overrides_with_org_api_keys,
+        resolve_org_provider_config,
     )
+    if workflow and workflow.organization_id:
+        user_config = await resolve_org_provider_config(
+            workflow.organization_id, user_config
+        )
+    raw_overrides = run_configs.get("model_overrides")
+    if raw_overrides and workflow and workflow.organization_id:
+        raw_overrides = await enrich_overrides_with_org_api_keys(
+            raw_overrides, workflow.organization_id
+        )
+    user_config = resolve_effective_config(user_config, raw_overrides)
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     transport = await create_webrtc_transport(
@@ -381,16 +403,64 @@ async def _run_pipeline(
     # when the caller already resolved it).
     if resolved_user_config is None:
         from api.services.configuration.resolve import resolve_effective_config
+        from api.services.configuration.org_provider_resolver import (
+            enrich_overrides_with_org_api_keys,
+            resolve_org_provider_config,
+        )
 
         user_config = await db_client.get_user_configurations(user_id)
-        user_config = resolve_effective_config(
-            user_config, run_configs.get("model_overrides")
-        )
+        org_id = workflow.organization_id if workflow else None
+        if org_id:
+            user_config = await resolve_org_provider_config(org_id, user_config)
+        raw_overrides = run_configs.get("model_overrides")
+        if raw_overrides and org_id:
+            raw_overrides = await enrich_overrides_with_org_api_keys(raw_overrides, org_id)
+        user_config = resolve_effective_config(user_config, raw_overrides)
     else:
         user_config = resolved_user_config
 
+    # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
+    if user_config.tts is not None:
+        tts_override = run_configs.get("model_overrides", {}).get("tts", {})
+        voice_uuid = tts_override.get("voice_uuid")
+        if voice_uuid and workflow:
+            from api.services.configuration.org_provider_resolver import resolve_voice_for_tts
+            resolved_voice = await resolve_voice_for_tts(voice_uuid, workflow.organization_id)
+            if resolved_voice:
+                user_config = user_config.model_copy(deep=True)
+                user_config.tts = user_config.tts.model_copy(
+                    update={"voice": resolved_voice}
+                )
+                logger.debug(
+                    f"[run {workflow_run_id}] Resolved voice_uuid={voice_uuid} "
+                    f"→ voice={resolved_voice}"
+                )
+
     # Detect realtime mode (speech-to-speech services like OpenAI Realtime, Gemini Live)
     is_realtime = user_config.is_realtime and user_config.realtime is not None
+
+    # Guard: providers must be configured before we try to build services
+    if is_realtime:
+        if user_config.realtime is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No realtime provider configured. Connect a provider in AI Models.",
+            )
+        if user_config.llm is None:
+            raise HTTPException(
+                status_code=400,
+                detail="No LLM configured. Connect a provider in AI Models.",
+            )
+    else:
+        missing = [s for s in ("llm", "stt", "tts") if getattr(user_config, s) is None]
+        if missing:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Missing AI provider configuration for: {', '.join(missing).upper()}. "
+                    "Go to AI Models to connect providers, then select them in Workflow Settings."
+                ),
+            )
 
     # Create services based on user configuration
     if is_realtime:

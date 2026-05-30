@@ -480,7 +480,7 @@ function RenderWorkflow({
 
     return (
         <WorkflowProvider value={workflowContextValue}>
-            <div className="flex flex-col h-screen min-w-fit">
+            <div className="flex h-screen w-full flex-col overflow-hidden">
                 {/* New Workflow Editor Header */}
                 <WorkflowEditorHeader
                     workflowName={workflowName}

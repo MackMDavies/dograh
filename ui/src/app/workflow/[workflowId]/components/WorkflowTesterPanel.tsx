@@ -148,7 +148,7 @@ export function WorkflowTesterPanel({
             <Tabs
                 value={activeMode}
                 onValueChange={(value) => setActiveMode(value as "audio" | "text")}
-                className="min-h-0 flex-1 gap-0"
+                className="flex min-h-0 flex-1 flex-col gap-0"
             >
                 <div className="border-b border-border/70 px-4 py-3">
                     <div className="flex items-center gap-3">

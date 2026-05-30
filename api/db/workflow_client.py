@@ -2,12 +2,12 @@ from datetime import UTC, datetime
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import func, update
+from sqlalchemy import delete, func, update
 from sqlalchemy.future import select
 from sqlalchemy.orm import load_only, selectinload
 
 from api.db.base_client import BaseDBClient
-from api.db.models import WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
+from api.db.models import CampaignModel, OrganizationModel, UserModel, WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
 
 
 class WorkflowClient(BaseDBClient):
@@ -385,6 +385,70 @@ class WorkflowClient(BaseDBClient):
 
             result = await session.execute(query)
             return result.scalars().all()
+
+    async def get_all_workflows_for_superuser(
+        self, organization_id: int | None = None, status: str | None = None
+    ) -> list[dict]:
+        """Get all workflows across all organizations for superuser listing.
+
+        Joins with organization and user tables to include owner info.
+        Optionally filter by organization_id and/or status.
+        """
+        async with self.async_session() as session:
+            query = (
+                select(
+                    WorkflowModel.id,
+                    WorkflowModel.name,
+                    WorkflowModel.status,
+                    WorkflowModel.created_at,
+                    WorkflowModel.folder_id,
+                    WorkflowModel.workflow_uuid,
+                    WorkflowModel.organization_id,
+                    func.count(WorkflowRunModel.id).label("total_runs"),
+                )
+                .outerjoin(WorkflowRunModel, WorkflowRunModel.workflow_id == WorkflowModel.id)
+                .outerjoin(UserModel, WorkflowModel.user_id == UserModel.id)
+                .outerjoin(OrganizationModel, WorkflowModel.organization_id == OrganizationModel.id)
+                .group_by(
+                    WorkflowModel.id,
+                    WorkflowModel.name,
+                    WorkflowModel.status,
+                    WorkflowModel.created_at,
+                    WorkflowModel.folder_id,
+                    WorkflowModel.workflow_uuid,
+                    WorkflowModel.organization_id,
+                    UserModel.email,
+                    OrganizationModel.provider_id,
+                )
+            )
+
+            if organization_id is not None:
+                query = query.where(WorkflowModel.organization_id == organization_id)
+
+            if status:
+                statuses = [s.strip() for s in status.split(",")]
+                if len(statuses) > 1:
+                    query = query.where(WorkflowModel.status.in_(statuses))
+                else:
+                    query = query.where(WorkflowModel.status == statuses[0])
+
+            query = query.order_by(WorkflowModel.created_at.desc())
+            result = await session.execute(query)
+            rows = result.all()
+
+            return [
+                {
+                    "id": row.id,
+                    "name": row.name,
+                    "status": row.status,
+                    "created_at": row.created_at,
+                    "folder_id": row.folder_id,
+                    "workflow_uuid": row.workflow_uuid,
+                    "organization_id": row.organization_id,
+                    "total_runs": row.total_runs or 0,
+                }
+                for row in rows
+            ]
 
     async def get_workflow_counts(self, organization_id: int = None) -> dict[str, int]:
         """Get workflow counts by status.
@@ -793,6 +857,63 @@ class WorkflowClient(BaseDBClient):
                 counts[workflow_id] = run_count
 
             return counts
+
+    async def delete_workflow_hard(
+        self, workflow_id: int, organization_id: int
+    ) -> None:
+        """Permanently delete a workflow, all its definitions, and all run history.
+
+        Raises ValueError if the workflow doesn't exist or doesn't belong to the org.
+        Raises RuntimeError if campaigns reference this workflow.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(WorkflowModel).where(
+                    WorkflowModel.id == workflow_id,
+                    WorkflowModel.organization_id == organization_id,
+                )
+            )
+            workflow = result.scalars().first()
+            if workflow is None:
+                raise ValueError(f"Workflow {workflow_id} not found")
+
+            campaign_result = await session.execute(
+                select(func.count(CampaignModel.id)).where(
+                    CampaignModel.workflow_id == workflow_id
+                )
+            )
+            campaign_count = campaign_result.scalar() or 0
+            if campaign_count > 0:
+                raise RuntimeError(
+                    f"Cannot delete — this agent is used by {campaign_count} campaign(s). "
+                    "Remove it from those campaigns first."
+                )
+
+            # Break the circular FK: workflows.released_definition_id → workflow_definitions.id
+            await session.execute(
+                update(WorkflowModel)
+                .where(WorkflowModel.id == workflow_id)
+                .values(released_definition_id=None)
+            )
+
+            # Delete runs (DB-level CASCADE handles child rows like text_sessions)
+            await session.execute(
+                delete(WorkflowRunModel).where(WorkflowRunModel.workflow_id == workflow_id)
+            )
+
+            # Delete all definitions for this workflow
+            await session.execute(
+                delete(WorkflowDefinitionModel).where(
+                    WorkflowDefinitionModel.workflow_id == workflow_id
+                )
+            )
+
+            # Finally delete the workflow itself
+            await session.execute(
+                delete(WorkflowModel).where(WorkflowModel.id == workflow_id)
+            )
+
+            await session.commit()
 
     async def add_call_disposition_code(
         self, workflow_id: int, disposition_code: str

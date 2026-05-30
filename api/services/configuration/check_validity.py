@@ -50,6 +50,7 @@ class UserConfigurationValidator:
             ServiceProviders.SPEACHES.value: self._check_speaches_api_key,
             ServiceProviders.GOOGLE_VERTEX.value: self._check_google_vertex_llm_api_key,
             ServiceProviders.OPENAI_REALTIME.value: self._check_openai_api_key,
+            ServiceProviders.XAI.value: self._check_xai_api_key,
             ServiceProviders.GROK_REALTIME.value: self._check_grok_realtime_api_key,
             ServiceProviders.ULTRAVOX_REALTIME.value: self._check_ultravox_realtime_api_key,
             ServiceProviders.GOOGLE_REALTIME.value: self._check_google_api_key,
@@ -87,6 +88,44 @@ class UserConfigurationValidator:
                 self._validate_service(
                     configuration.realtime, "realtime", required=True
                 )
+            )
+
+        if status_list:
+            raise ValueError(status_list)
+
+        return {"status": [{"model": "all", "message": "ok"}]}
+
+    async def validate_partial(
+        self,
+        configuration: UserConfiguration,
+        services: set[str],
+        organization_id: Optional[int] = None,
+        created_by: Optional[str] = None,
+    ) -> APIKeyStatusResponse:
+        """Validate only the services present in the given set.
+
+        Used when saving workflow-level model_overrides so that unconfigured
+        services (TTS, STT) don't block saving an LLM-only override.
+        """
+        self._auth_context: AuthContext = {
+            "organization_id": organization_id,
+            "created_by": created_by,
+        }
+        status_list = []
+
+        if "llm" in services:
+            status_list.extend(self._validate_service(configuration.llm, "llm"))
+        if "stt" in services:
+            status_list.extend(self._validate_service(configuration.stt, "stt"))
+        if "tts" in services:
+            status_list.extend(self._validate_service(configuration.tts, "tts"))
+        if "embeddings" in services:
+            status_list.extend(
+                self._validate_service(configuration.embeddings, "embeddings", required=False)
+            )
+        if "realtime" in services and configuration.is_realtime:
+            status_list.extend(
+                self._validate_service(configuration.realtime, "realtime", required=True)
             )
 
         if status_list:
@@ -333,6 +372,9 @@ class UserConfigurationValidator:
         return True
 
     def _check_openrouter_api_key(self, model: str, api_key: str) -> bool:
+        return True
+
+    def _check_xai_api_key(self, model: str, api_key: str) -> bool:
         return True
 
     def _check_grok_realtime_api_key(self, model: str, api_key: str) -> bool:

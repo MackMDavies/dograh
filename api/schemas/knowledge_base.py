@@ -56,6 +56,7 @@ class DocumentResponseSchema(BaseModel):
     organization_id: int
     created_by: int
     is_active: bool
+    is_global: bool = False
 
 
 class DocumentListResponseSchema(BaseModel):
@@ -100,3 +101,26 @@ class ChunkSearchResponseSchema(BaseModel):
     chunks: List[ChunkResponseSchema]
     query: str
     total_results: int
+
+
+class SetDocumentGlobalRequestSchema(BaseModel):
+    """Request to set/unset a document's global flag."""
+
+    is_global: bool
+
+
+class WorkflowDocumentAssignmentResponseSchema(BaseModel):
+    """Response for a single workflow-document assignment."""
+
+    workflow_id: int
+    workflow_uuid: str
+    workflow_name: str
+    document_uuid: str
+    created_at: datetime
+
+
+class WorkflowDocumentListResponseSchema(BaseModel):
+    """Response for listing documents assigned to a workflow."""
+
+    documents: List[DocumentResponseSchema]
+    total: int

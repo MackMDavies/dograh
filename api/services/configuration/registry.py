@@ -43,6 +43,7 @@ class ServiceProviders(str, Enum):
     OPENAI = "openai"
     DEEPGRAM = "deepgram"
     GROQ = "groq"
+    XAI = "xai"
     OPENROUTER = "openrouter"
     CARTESIA = "cartesia"
     # NEUPHONIC = "neuphonic"
@@ -72,6 +73,7 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.OPENAI,
         ServiceProviders.DEEPGRAM,
         ServiceProviders.GROQ,
+        ServiceProviders.XAI,
         ServiceProviders.OPENROUTER,
         ServiceProviders.ELEVENLABS,
         ServiceProviders.GOOGLE,
@@ -209,6 +211,11 @@ def provider_model_config(
 OPENAI_PROVIDER_MODEL_CONFIG = provider_model_config("OpenAI")
 GOOGLE_PROVIDER_MODEL_CONFIG = provider_model_config("Google")
 GROQ_PROVIDER_MODEL_CONFIG = provider_model_config("Groq")
+XAI_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "xAI",
+    description="xAI's Grok models via the OpenAI-compatible API at api.x.ai.",
+    provider_docs_url="https://docs.x.ai/docs",
+)
 OPENROUTER_PROVIDER_MODEL_CONFIG = provider_model_config("Open Router")
 AZURE_OPENAI_PROVIDER_MODEL_CONFIG = provider_model_config("Azure OpenAI")
 DOGRAH_PROVIDER_MODEL_CONFIG = provider_model_config("Dograh")
@@ -260,6 +267,16 @@ GROQ_MODELS = [
     "llama-3.1-8b-instant",
     "openai/gpt-oss-120b",
 ]
+
+XAI_MODELS = [
+    "grok-3",
+    "grok-3-mini",
+    "grok-3-fast",
+    "grok-3-mini-fast",
+    "grok-2-1212",
+    "grok-2-vision-1212",
+]
+
 OPENROUTER_MODELS = [
     "openai/gpt-4.1",
     "openai/gpt-4.1-mini",
@@ -349,6 +366,21 @@ class GroqLLMService(BaseLLMConfiguration):
         default="llama-3.3-70b-versatile",
         description="Groq-hosted model identifier.",
         json_schema_extra={"examples": GROQ_MODELS, "allow_custom_input": True},
+    )
+
+
+@register_llm
+class XAILLMConfiguration(BaseLLMConfiguration):
+    model_config = XAI_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.XAI] = ServiceProviders.XAI
+    model: str = Field(
+        default="grok-3",
+        description="xAI Grok model identifier.",
+        json_schema_extra={"examples": XAI_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.x.ai/v1",
+        description="Override only if proxying through a custom gateway.",
     )
 
 
@@ -654,6 +686,7 @@ LLMConfig = Annotated[
         OpenAILLMService,
         GoogleVertexLLMConfiguration,
         GroqLLMService,
+        XAILLMConfiguration,
         OpenRouterLLMConfiguration,
         GoogleLLMService,
         AzureLLMService,
@@ -993,6 +1026,25 @@ class MiniMaxTTSConfiguration(BaseTTSConfiguration):
     )
 
 
+XAI_TTS_VOICES = ["eve", "ara", "rex", "sal", "leo"]
+
+
+@register_tts
+class XAITTSConfiguration(BaseTTSConfiguration):
+    model_config = XAI_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.XAI] = ServiceProviders.XAI
+    model: str = Field(
+        default="grok-voice-latest",
+        description="xAI TTS model.",
+        json_schema_extra={"examples": ["grok-voice-latest"]},
+    )
+    voice: str = Field(
+        default="eve",
+        description="xAI voice ID.",
+        json_schema_extra={"examples": XAI_TTS_VOICES},
+    )
+
+
 TTSConfig = Annotated[
     Union[
         DeepgramTTSConfiguration,
@@ -1006,6 +1058,7 @@ TTSConfig = Annotated[
         RimeTTSConfiguration,
         SpeachesTTSConfiguration,
         MiniMaxTTSConfiguration,
+        XAITTSConfiguration,
     ],
     Field(discriminator="provider"),
 ]
@@ -1227,6 +1280,30 @@ class GladiaSTTConfiguration(BaseSTTConfiguration):
     )
 
 
+XAI_STT_MODELS = ["xai-speech-v1"]
+
+XAI_STT_LANGUAGES = [
+    "ar", "cs", "da", "de", "el", "en", "es", "fa", "fi", "fr", "hi", "hu", "id",
+    "it", "ja", "ko", "mk", "ms", "nl", "pl", "pt", "ro", "ru", "sv", "th", "tr", "vi",
+]
+
+
+@register_stt
+class XAISTTConfiguration(BaseSTTConfiguration):
+    model_config = XAI_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.XAI] = ServiceProviders.XAI
+    model: str = Field(
+        default="xai-speech-v1",
+        description="xAI speech-to-text service.",
+        json_schema_extra={"examples": XAI_STT_MODELS},
+    )
+    language: str = Field(
+        default="en",
+        description="BCP-47 language code for transcription (e.g. 'en', 'es', 'fr').",
+        json_schema_extra={"examples": XAI_STT_LANGUAGES},
+    )
+
+
 STTConfig = Annotated[
     Union[
         DeepgramSTTConfiguration,
@@ -1239,6 +1316,7 @@ STTConfig = Annotated[
         SpeachesSTTConfiguration,
         AssemblyAISTTConfiguration,
         GladiaSTTConfiguration,
+        XAISTTConfiguration,
     ],
     Field(discriminator="provider"),
 ]

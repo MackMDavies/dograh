@@ -408,9 +408,17 @@ async def execute_text_chat_pending_turn(
     run_configs = run_definition.workflow_configurations or {}
 
     user_config = await db_client.get_user_configurations(workflow_run.workflow.user.id)
-    user_config = resolve_effective_config(
-        user_config, run_configs.get("model_overrides")
+    from api.services.configuration.org_provider_resolver import (
+        enrich_overrides_with_org_api_keys,
+        resolve_org_provider_config,
     )
+    org_id = workflow.organization_id
+    if org_id:
+        user_config = await resolve_org_provider_config(org_id, user_config)
+    raw_overrides = run_configs.get("model_overrides")
+    if raw_overrides and org_id:
+        raw_overrides = await enrich_overrides_with_org_api_keys(raw_overrides, org_id)
+    user_config = resolve_effective_config(user_config, raw_overrides)
     if user_config.llm is None:
         raise ValueError("Text chat requires an LLM configuration")
 

@@ -5,7 +5,7 @@ from fastapi import Header, HTTPException, Query, WebSocket
 from loguru import logger
 from pydantic import ValidationError
 
-from api.constants import AUTH_PROVIDER, DOGRAH_MPS_SECRET_KEY, MPS_API_URL
+from api.constants import AUTH_PROVIDER, DOGRAH_MPS_SECRET_KEY, MPS_API_URL, SUPABASE_ANON_KEY, SUPABASE_URL
 from api.db import db_client
 from api.db.models import UserModel
 from api.enums import PostHogEvent
@@ -31,6 +31,12 @@ async def get_user(
     # ------------------------------------------------------------------
     if AUTH_PROVIDER == "local":
         return await _handle_oss_auth(authorization)
+
+    # ------------------------------------------------------------------
+    # Check if we're using Supabase auth
+    # ------------------------------------------------------------------
+    if AUTH_PROVIDER == "supabase":
+        return await _handle_supabase_auth(authorization)
 
     # ------------------------------------------------------------------
     # 1. Validate and fetch the authenticated Stack user
@@ -127,6 +133,82 @@ async def get_user(
         )
 
     return user_model
+
+
+async def _handle_supabase_auth(authorization: str | None) -> UserModel:
+    """
+    Handle authentication for Supabase-backed deployments.
+    Validates the Supabase access token via the Supabase /auth/v1/user endpoint,
+    then get-or-creates a local user and organization keyed by the Supabase user UUID.
+    """
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Authorization header required")
+
+    token = (
+        authorization.replace("Bearer ", "")
+        if authorization.startswith("Bearer ")
+        else authorization
+    )
+
+    if not token:
+        raise HTTPException(status_code=401, detail="Invalid authorization token")
+
+    if not SUPABASE_URL or not SUPABASE_ANON_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="SUPABASE_URL and SUPABASE_ANON_KEY must be set when AUTH_PROVIDER=supabase",
+        )
+
+    # Verify the token with Supabase
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/auth/v1/user",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "apikey": SUPABASE_ANON_KEY,
+                },
+                timeout=10.0,
+            )
+    except httpx.RequestError as e:
+        logger.error(f"Supabase auth request failed: {e}")
+        raise HTTPException(status_code=503, detail="Auth service unavailable")
+
+    if response.status_code != 200:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+    supabase_user = response.json()
+    supabase_user_id: str = supabase_user.get("id", "")
+    if not supabase_user_id:
+        raise HTTPException(status_code=401, detail="Unable to identify user")
+
+    # Get or create local user record keyed by Supabase UUID
+    try:
+        user, was_created = await db_client.get_or_create_user_by_provider_id(supabase_user_id)
+
+        # Sync email if available
+        email = supabase_user.get("email")
+        if email and user.email != email:
+            await db_client.update_user_email(user.id, email)
+            user.email = email
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create user: {e}")
+
+    # Get or create an organization for this user
+    try:
+        org_provider_id = f"supabase_org_{supabase_user_id}"
+        org, org_was_created = await db_client.get_or_create_organization_by_provider_id(
+            org_provider_id=org_provider_id, user_id=user.id
+        )
+
+        if user.selected_organization_id != org.id:
+            await db_client.add_user_to_organization(user.id, org.id)
+            await db_client.update_user_selected_organization(user.id, org.id)
+            user.selected_organization_id = org.id
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to map user to organization: {e}")
+
+    return user
 
 
 async def _handle_oss_auth(authorization: str | None) -> UserModel:

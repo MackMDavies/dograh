@@ -56,6 +56,40 @@ class SuperuserWorkflowRunsListResponse(BaseModel):
     total_pages: int
 
 
+class SuperuserWorkflowItem(BaseModel):
+    id: int
+    name: str
+    status: str
+    created_at: datetime
+    folder_id: Optional[int]
+    workflow_uuid: Optional[str]
+    organization_id: Optional[int]
+    total_runs: int
+
+
+@router.get("/workflows", response_model=List[SuperuserWorkflowItem])
+async def list_all_workflows(
+    organization_id: Optional[int] = Query(None),
+    status: Optional[str] = Query(None, description="Comma-separated: active,archived"),
+    user: UserModel = Depends(get_superuser),
+) -> List[SuperuserWorkflowItem]:
+    """List all workflows across all organizations. Superuser only."""
+    workflows = await db_client.get_all_workflows_for_superuser(
+        organization_id=organization_id,
+        status=status,
+    )
+    return [SuperuserWorkflowItem(**w) for w in workflows]
+
+
+@router.get("/organizations", response_model=List[dict])
+async def list_organizations(
+    user: UserModel = Depends(get_superuser),
+) -> List[dict]:
+    """List all organizations. Superuser only."""
+    orgs = await db_client.get_all_organizations()
+    return orgs
+
+
 @router.post("/impersonate")
 async def impersonate(
     request: ImpersonateRequest, user: UserModel = Depends(get_superuser)
