@@ -148,34 +148,58 @@ class ProviderConnectionClient(BaseDBClient):
         display_name: Optional[str] = None,
     ) -> OrgProviderConnectionModel:
         async with self.async_session() as session:
-            conn = OrgProviderConnectionModel(
-                organization_id=organization_id,
-                created_by=created_by,
-                service_type=service_type,
-                provider=provider,
-                api_key=api_key,
-                extra_config=extra_config,
-                display_name=display_name,
-            )
-            session.add(conn)
-            await session.flush()  # get conn.id before inserting models
-
-            # Seed available models from PROVIDER_MODELS
-            model_ids = PROVIDER_MODELS.get(service_type, {}).get(provider, [])
-            for i, model_id in enumerate(model_ids):
-                model = OrgAvailableModelModel(
-                    connection_id=conn.id,
-                    organization_id=organization_id,
-                    service_type=service_type,
-                    model_id=model_id,
-                    is_client_available=True,
-                    is_default=(i == 0),  # first model is default
+            # Upsert: if a connection for this (org, service_type, provider) already
+            # exists (even inactive), update it rather than failing with a unique
+            # constraint violation.
+            existing = await session.execute(
+                select(OrgProviderConnectionModel).where(
+                    OrgProviderConnectionModel.organization_id == organization_id,
+                    OrgProviderConnectionModel.service_type == service_type,
+                    OrgProviderConnectionModel.provider == provider,
                 )
-                session.add(model)
+            )
+            conn = existing.scalar_one_or_none()
+
+            if conn is not None:
+                # Re-activate and update credentials
+                if api_key is not None:
+                    conn.api_key = api_key
+                if extra_config:
+                    conn.extra_config = extra_config
+                if display_name is not None:
+                    conn.display_name = display_name
+                conn.is_active = True
+                logger.info(f"Updated existing provider connection {provider}/{service_type} for org {organization_id}")
+            else:
+                conn = OrgProviderConnectionModel(
+                    organization_id=organization_id,
+                    created_by=created_by,
+                    service_type=service_type,
+                    provider=provider,
+                    api_key=api_key,
+                    extra_config=extra_config,
+                    display_name=display_name,
+                )
+                session.add(conn)
+                await session.flush()  # get conn.id before inserting models
+
+                # Seed available models from PROVIDER_MODELS (new connections only)
+                model_ids = PROVIDER_MODELS.get(service_type, {}).get(provider, [])
+                for i, model_id in enumerate(model_ids):
+                    model = OrgAvailableModelModel(
+                        connection_id=conn.id,
+                        organization_id=organization_id,
+                        service_type=service_type,
+                        model_id=model_id,
+                        is_client_available=True,
+                        is_default=(i == 0),
+                    )
+                    session.add(model)
+
+                logger.info(f"Created provider connection {provider}/{service_type} for org {organization_id}")
 
             await session.commit()
             await session.refresh(conn)
-            logger.info(f"Created provider connection {provider}/{service_type} for org {organization_id}")
             return conn
 
     async def update_connection(
