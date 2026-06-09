@@ -491,6 +491,40 @@ class CampaignClient(BaseDBClient):
                 await session.rollback()
                 raise
 
+    async def increment_campaign_processed_rows(self, campaign_id: int) -> None:
+        """Atomically increment processed_rows by 1."""
+        async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET processed_rows = processed_rows + 1, updated_at = :now "
+                    "WHERE id = :campaign_id"
+                ),
+                {"campaign_id": campaign_id, "now": datetime.now(UTC)},
+            )
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
+    async def increment_campaign_failed_rows(self, campaign_id: int) -> None:
+        """Atomically increment failed_rows by 1."""
+        async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET failed_rows = failed_rows + 1, updated_at = :now "
+                    "WHERE id = :campaign_id"
+                ),
+                {"campaign_id": campaign_id, "now": datetime.now(UTC)},
+            )
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
     async def increment_campaign_metadata_counter(
         self, campaign_id: int, key: str
     ) -> int:

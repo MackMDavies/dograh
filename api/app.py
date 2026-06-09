@@ -30,6 +30,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from loguru import logger
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from api.constants import REDIS_URL
 from api.mcp_server import mcp
@@ -116,6 +117,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Trust X-Forwarded-Proto/X-Forwarded-For from the reverse proxy so that
+# Twilio webhook signature validation uses the correct public HTTPS URL.
+app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="*")
 
 api_router = APIRouter()
 

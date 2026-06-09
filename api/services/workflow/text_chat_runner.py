@@ -45,6 +45,7 @@ from api.services.pipecat.tracing_config import (
     build_remote_parent_context,
     get_trace_url,
 )
+from api.services.gen_ai import resolve_embeddings_config
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
 from api.services.workflow.workflow_graph import WorkflowGraph
@@ -467,13 +468,10 @@ async def execute_text_chat_pending_turn(
             }
         )
 
-    embeddings_api_key = None
-    embeddings_model = None
-    embeddings_base_url = None
-    if user_config.embeddings:
-        embeddings_api_key = user_config.embeddings.api_key
-        embeddings_model = user_config.embeddings.model
-        embeddings_base_url = getattr(user_config.embeddings, "base_url", None)
+    embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
+        organization_id=workflow.organization_id,
+        user_config=user_config,
+    )
 
     has_recordings = await db_client.has_active_recordings(workflow.organization_id)
     context_compaction_enabled = (workflow.workflow_configurations or {}).get(

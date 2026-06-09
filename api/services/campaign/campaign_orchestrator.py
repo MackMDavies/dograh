@@ -636,7 +636,14 @@ class CampaignOrchestrator:
         total = fresh.total_rows or 0
         dispatched = (fresh.processed_rows or 0) + (fresh.failed_rows or 0)
 
-        if total > 0 and dispatched >= total:
+        # Use queued-run counts as ground truth: if no pending work exists and
+        # all queued_runs are either processed or failed, complete immediately
+        # rather than relying solely on the row counters (which may lag).
+        non_terminal_count = await db_client.get_queued_runs_count(
+            campaign_id=campaign_id, states=["queued", "in_processing"]
+        )
+
+        if total > 0 and (dispatched >= total or non_terminal_count == 0):
             logger.info(
                 f"campaign_id: {campaign_id} - All {total} rows dispatched "
                 f"({fresh.processed_rows} processed, {fresh.failed_rows} failed) — completing immediately"
@@ -662,11 +669,16 @@ class CampaignOrchestrator:
                 )
                 return
 
-            # Determine final state: failed if every dispatched row failed
+            # Refresh counters so the final state uses accurate data
+            fresh = await db_client.get_campaign_by_id(campaign_id)
+            if fresh:
+                campaign = fresh
+
+            # Determine final state: failed if no calls succeeded at all
             total = campaign.total_rows or 0
             failed = campaign.failed_rows or 0
             processed = campaign.processed_rows or 0
-            final_state = "failed" if total > 0 and failed >= total and processed == 0 else "completed"
+            final_state = "failed" if total > 0 and processed == 0 else "completed"
 
             await db_client.update_campaign(
                 campaign_id=campaign_id,

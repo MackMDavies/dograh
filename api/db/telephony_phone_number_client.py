@@ -75,6 +75,20 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             )
             return [row[0] for row in result.all()]
 
+    async def list_phone_numbers_for_workflows(
+        self, workflow_ids: List[int]
+    ) -> List[TelephonyPhoneNumberModel]:
+        """Return all phone numbers whose inbound_workflow_id is in workflow_ids."""
+        if not workflow_ids:
+            return []
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(TelephonyPhoneNumberModel).where(
+                    TelephonyPhoneNumberModel.inbound_workflow_id.in_(workflow_ids)
+                )
+            )
+            return list(result.scalars().all())
+
     async def get_phone_number(
         self, phone_number_id: int
     ) -> Optional[TelephonyPhoneNumberModel]:

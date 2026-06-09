@@ -622,26 +622,19 @@ async def search_chunks(
     """
 
     try:
-        # Import here to avoid circular dependency
-        from api.services.gen_ai import OpenAIEmbeddingService
+        from api.services.gen_ai import OpenAIEmbeddingService, resolve_embeddings_config
 
-        # Try to get user's embeddings configuration
         user_config = await db_client.get_user_configurations(user.id)
-        embeddings_api_key = None
-        embeddings_model = None
+        embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
+            organization_id=user.selected_organization_id,
+            user_config=user_config,
+        )
 
-        if user_config.embeddings:
-            embeddings_api_key = user_config.embeddings.api_key
-            embeddings_model = user_config.embeddings.model
-
-        # Initialize embedding service with user config or fallback to env
         embedding_service = OpenAIEmbeddingService(
             db_client=db_client,
             api_key=embeddings_api_key,
             model_id=embeddings_model or "text-embedding-3-small",
-            base_url=getattr(user_config.embeddings, "base_url", None)
-            if user_config.embeddings
-            else None,
+            base_url=embeddings_base_url,
         )
 
         # Perform search

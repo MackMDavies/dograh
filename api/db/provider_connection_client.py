@@ -262,6 +262,36 @@ async def _fetch_live_models(provider: str, service_type: str, api_key: Optional
 
 class ProviderConnectionClient(BaseDBClient):
 
+    async def get_default_embedding_model_connection(
+        self, organization_id: int
+    ) -> Optional[tuple]:
+        """Return (api_key, model_id, base_url) for the org's default embedding model, or None."""
+        async with self.async_session() as session:
+            model_result = await session.execute(
+                select(OrgAvailableModelModel).where(
+                    OrgAvailableModelModel.organization_id == organization_id,
+                    OrgAvailableModelModel.service_type == "embeddings",
+                    OrgAvailableModelModel.is_default == True,
+                )
+            )
+            model = model_result.scalar_one_or_none()
+            if not model:
+                return None
+            conn_result = await session.execute(
+                select(OrgProviderConnectionModel).where(
+                    OrgProviderConnectionModel.id == model.connection_id,
+                    OrgProviderConnectionModel.is_active == True,
+                )
+            )
+            conn = conn_result.scalar_one_or_none()
+            if conn and conn.api_key:
+                return (
+                    conn.api_key,
+                    model.model_id,
+                    (conn.extra_config or {}).get("base_url"),
+                )
+            return None
+
     async def list_connections(
         self,
         organization_id: int,

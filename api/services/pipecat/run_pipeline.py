@@ -39,6 +39,7 @@ from api.services.pipecat.recording_audio_cache import (
     create_recording_audio_fetcher,
     warm_recording_cache,
 )
+from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
 from api.services.pipecat.service_factory import (
     create_llm_service,
@@ -576,14 +577,10 @@ async def _run_pipeline(
 
     node_transition_callback = send_node_transition
 
-    # Extract embeddings configuration from user config
-    embeddings_api_key = None
-    embeddings_model = None
-    embeddings_base_url = None
-    if user_config and user_config.embeddings:
-        embeddings_api_key = user_config.embeddings.api_key
-        embeddings_model = user_config.embeddings.model
-        embeddings_base_url = getattr(user_config.embeddings, "base_url", None)
+    embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
+        organization_id=workflow.organization_id,
+        user_config=user_config,
+    )
 
     # Check if the workflow has any active recordings so the engine can
     # include recording response mode instructions in all node prompts.

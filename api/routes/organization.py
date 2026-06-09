@@ -463,7 +463,7 @@ async def create_phone_number(
         raise HTTPException(status_code=400, detail="No organization selected")
     cfg = await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
 
-    if request.inbound_workflow_id is not None:
+    if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(
             request.inbound_workflow_id, user.selected_organization_id
         )
@@ -569,7 +569,7 @@ async def update_phone_number(
     if not existing:
         raise HTTPException(status_code=404, detail="Phone number not found")
 
-    if request.inbound_workflow_id is not None:
+    if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(
             request.inbound_workflow_id, user.selected_organization_id
         )

@@ -136,10 +136,8 @@ class CampaignCallDispatcher:
                 processed_count += 1
                 processed_run_ids.add(queued_run.id)
 
-                # Update campaign processed count
-                await db_client.update_campaign(
-                    campaign_id=campaign_id, processed_rows=campaign.processed_rows + 1
-                )
+                # Atomically increment processed_rows (avoids stale-read race)
+                await db_client.increment_campaign_processed_rows(campaign_id)
 
             except asyncio.CancelledError:
                 logger.warning(
@@ -182,12 +180,24 @@ class CampaignCallDispatcher:
             except Exception as e:
                 logger.warning(f"Error processing queued run {queued_run.id}: {e}")
 
-                # Mark the queued run as failed to prevent infinite retry loops
+                # Mark the queued run as failed and count it against the campaign
                 try:
                     await db_client.update_queued_run(
                         queued_run_id=queued_run.id,
                         state="failed",
                         processed_at=datetime.now(UTC),
+                    )
+                    await db_client.increment_campaign_failed_rows(campaign_id)
+                    await db_client.append_campaign_log(
+                        campaign_id=campaign_id,
+                        level="warning",
+                        event="call_dispatch_failed",
+                        message=f"Failed to dispatch call for queued run {queued_run.id}: {e}",
+                        details={
+                            "queued_run_id": queued_run.id,
+                            "error": str(e),
+                            "phone_number": queued_run.context_variables.get("phone_number"),
+                        },
                     )
                     logger.info(
                         f"Marked queued run {queued_run.id} as failed due to error: {e}"
@@ -401,6 +411,24 @@ class CampaignCallDispatcher:
                     "telephony_status_callbacks": telephony_callback_logs,
                 },
             )
+
+            # Emit a campaign-level log so the operator can see why the call failed
+            try:
+                await db_client.append_campaign_log(
+                    campaign_id=campaign.id,
+                    level="error",
+                    event="call_initiation_failed",
+                    message=f"Telephony provider rejected call to {phone_number}: {e}",
+                    details={
+                        "workflow_run_id": workflow_run.id,
+                        "phone_number": phone_number,
+                        "from_number": from_number,
+                        "provider": provider.PROVIDER_NAME,
+                        "error": str(e),
+                    },
+                )
+            except Exception:
+                pass  # log failure must not mask the original error
 
             # Record call initiation failure in circuit breaker
             await circuit_breaker.record_and_evaluate(

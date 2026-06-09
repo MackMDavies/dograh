@@ -19,17 +19,14 @@ from api.enums import CallType, PostHogEvent, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.sdk_expose import sdk_expose
 from api.services.auth.depends import get_user
-from api.services.configuration.check_validity import UserConfigurationValidator
 from api.services.configuration.masking import (
     mask_workflow_configurations,
     mask_workflow_definition,
     merge_workflow_api_keys,
 )
 from api.services.configuration.merge import merge_workflow_configuration_secrets
-from api.services.configuration.resolve import (
-    enrich_overrides_with_api_keys,
-    resolve_effective_config,
-)
+from api.services.configuration.org_provider_resolver import enrich_overrides_with_org_api_keys
+from api.services.configuration.resolve import enrich_overrides_with_api_keys
 from api.services.mps_service_key_client import mps_service_key_client
 from api.services.posthog_client import capture_event
 from api.services.reports import generate_workflow_report_csv
@@ -196,6 +193,12 @@ class WorkflowResponse(BaseModel):
     organization_id: int | None = None
 
 
+class WorkflowListPhoneNumber(BaseModel):
+    id: int
+    address: str
+    address_normalized: str
+
+
 class WorkflowListResponse(BaseModel):
     """Lightweight response for workflow listings (excludes large fields)."""
 
@@ -206,6 +209,7 @@ class WorkflowListResponse(BaseModel):
     total_runs: int
     folder_id: int | None = None
     workflow_uuid: str | None = None
+    phone_numbers: List[WorkflowListPhoneNumber] = []
 
 
 class MoveWorkflowToFolderRequest(BaseModel):
@@ -603,6 +607,11 @@ async def get_workflows(
     workflow_ids = [workflow.id for workflow in workflows]
     run_counts = await db_client.get_workflow_run_counts(workflow_ids)
 
+    phone_numbers = await db_client.list_phone_numbers_for_workflows(workflow_ids)
+    phone_map: dict[int, list] = {}
+    for pn in phone_numbers:
+        phone_map.setdefault(pn.inbound_workflow_id, []).append(pn)
+
     return [
         WorkflowListResponse(
             id=workflow.id,
@@ -612,6 +621,14 @@ async def get_workflows(
             total_runs=run_counts.get(workflow.id, 0),
             folder_id=workflow.folder_id,
             workflow_uuid=workflow.workflow_uuid,
+            phone_numbers=[
+                WorkflowListPhoneNumber(
+                    id=pn.id,
+                    address=pn.address,
+                    address_normalized=pn.address_normalized,
+                )
+                for pn in phone_map.get(workflow.id, [])
+            ],
         )
         for workflow in workflows
     ]
@@ -1039,10 +1056,9 @@ async def update_workflow(
                     existing_def,
                 )
 
-        # Validate model_overrides: resolve onto global config, then
-        # run the same validator used by the user-configurations endpoint.
-        # Also stamp the current global API key into the override so the override
-        # remains functional if the global config later switches to a different provider.
+        # Stamp the current API key into the override so the workflow keeps working
+        # if the global provider config later changes.  No live key validation here —
+        # validation belongs at the AI-models settings endpoint, not at save time.
         workflow_configurations = request.workflow_configurations
         if workflow_configurations and workflow_configurations.get("model_overrides"):
             existing_workflow = await db_client.get_workflow(
@@ -1056,41 +1072,24 @@ async def update_workflow(
             existing_configs = (
                 existing_draft.workflow_configurations
                 if existing_draft
-                else existing_workflow.released_definition.workflow_configurations
+                else (
+                    existing_workflow.released_definition.workflow_configurations
+                    if existing_workflow.released_definition
+                    else None
+                )
             )
             workflow_configurations = merge_workflow_configuration_secrets(
                 workflow_configurations,
                 existing_configs,
             )
             user_config = await db_client.get_user_configurations(user.id)
-            try:
-                from api.services.configuration.org_provider_resolver import (
-                    enrich_overrides_with_org_api_keys,
-                )
-                enriched_overrides = enrich_overrides_with_api_keys(
-                    workflow_configurations["model_overrides"],
-                    user_config,
-                )
-                # Second pass: fill any still-missing API keys from org connections
-                enriched_overrides = await enrich_overrides_with_org_api_keys(
-                    enriched_overrides, effective_org_id
-                )
-                effective = resolve_effective_config(user_config, enriched_overrides)
-                # Only validate services that are explicitly overridden — the
-                # full config may lack TTS/STT if the user hasn't configured them
-                # globally, and that must not block saving an LLM-only override.
-                overridden_services = {
-                    k for k in enriched_overrides
-                    if k in {"llm", "stt", "tts", "embeddings", "realtime"}
-                }
-                await UserConfigurationValidator().validate_partial(
-                    effective,
-                    services=overridden_services,
-                    organization_id=effective_org_id,
-                    created_by=user.provider_id,
-                )
-            except (ValueError, ValidationError) as e:
-                raise HTTPException(status_code=422, detail=str(e))
+            enriched_overrides = enrich_overrides_with_api_keys(
+                workflow_configurations["model_overrides"],
+                user_config,
+            )
+            enriched_overrides = await enrich_overrides_with_org_api_keys(
+                enriched_overrides, effective_org_id
+            )
             workflow_configurations = {
                 **workflow_configurations,
                 "model_overrides": enriched_overrides,

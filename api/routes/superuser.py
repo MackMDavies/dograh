@@ -56,6 +56,12 @@ class SuperuserWorkflowRunsListResponse(BaseModel):
     total_pages: int
 
 
+class SuperuserWorkflowPhoneNumber(BaseModel):
+    id: int
+    address: str
+    address_normalized: str
+
+
 class SuperuserWorkflowItem(BaseModel):
     id: int
     name: str
@@ -65,6 +71,7 @@ class SuperuserWorkflowItem(BaseModel):
     workflow_uuid: Optional[str]
     organization_id: Optional[int]
     total_runs: int
+    phone_numbers: List[SuperuserWorkflowPhoneNumber] = []
 
 
 @router.get("/workflows", response_model=List[SuperuserWorkflowItem])
@@ -78,7 +85,26 @@ async def list_all_workflows(
         organization_id=organization_id,
         status=status,
     )
-    return [SuperuserWorkflowItem(**w) for w in workflows]
+    workflow_ids = [w["id"] for w in workflows]
+    phone_numbers = await db_client.list_phone_numbers_for_workflows(workflow_ids)
+    phone_map: dict[int, list] = {}
+    for pn in phone_numbers:
+        phone_map.setdefault(pn.inbound_workflow_id, []).append(pn)
+
+    return [
+        SuperuserWorkflowItem(
+            **w,
+            phone_numbers=[
+                SuperuserWorkflowPhoneNumber(
+                    id=pn.id,
+                    address=pn.address,
+                    address_normalized=pn.address_normalized,
+                )
+                for pn in phone_map.get(w["id"], [])
+            ],
+        )
+        for w in workflows
+    ]
 
 
 class SuperuserCampaignItem(BaseModel):

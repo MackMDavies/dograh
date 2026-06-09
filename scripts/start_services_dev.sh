@@ -156,7 +156,7 @@ rm -f "$RUN_DIR/uvicorn.port" "$RUN_DIR/uvicorn_new.port" "$RUN_DIR/uvicorn_old.
 ### 5) Run migrations
 ###############################################################################
 
-alembic -c "$BASE_DIR/api/alembic.ini" upgrade head
+alembic -c "$BASE_DIR/api/alembic.ini" upgrade heads
 
 ###############################################################################
 ### 6) Prepare logs

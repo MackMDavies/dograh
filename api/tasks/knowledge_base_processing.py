@@ -15,7 +15,7 @@ from loguru import logger
 
 from api.db import db_client
 from api.db.models import KnowledgeBaseChunkModel
-from api.services.gen_ai import OpenAIEmbeddingService
+from api.services.gen_ai import OpenAIEmbeddingService, resolve_embeddings_config
 from api.services.mps_service_key_client import mps_service_key_client
 from api.services.storage import storage_fs
 
@@ -229,42 +229,12 @@ async def process_knowledge_base_document(
 
             mps_chunks = mps_response.get("chunks", [])
 
-        # Chunked mode: fetch embedding config — user config first, org connections as fallback.
-        embeddings_api_key = None
-        embeddings_model = None
-        embeddings_base_url = None
-
-        if document.created_by:
-            user_config = await db_client.get_user_configurations(document.created_by)
-            if user_config.embeddings:
-                embeddings_api_key = user_config.embeddings.api_key
-                embeddings_model = user_config.embeddings.model
-                embeddings_base_url = getattr(user_config.embeddings, "base_url", None)
-                logger.info(f"Using user embeddings config: model={embeddings_model}")
-
-        if not embeddings_api_key:
-            # Fall back to the org-level embedding provider connection.
-            org_embed_conns = await db_client.list_connections(organization_id, "embeddings")
-            if org_embed_conns:
-                conn = next((c for c in org_embed_conns if c.api_key), None)
-                if conn:
-                    embeddings_api_key = conn.api_key
-                    embeddings_model = (conn.extra_config or {}).get("model") or embeddings_model
-                    embeddings_base_url = (conn.extra_config or {}).get("base_url") or embeddings_base_url
-                    logger.info(
-                        f"Using org embedding connection: provider={conn.provider} "
-                        f"model={embeddings_model}"
-                    )
-
-        if not embeddings_api_key:
-            # Last resort: check any org connection for OpenAI (shared key across services).
-            all_conns = await db_client.list_connections(organization_id)
-            openai_conn = next(
-                (c for c in all_conns if c.provider == "openai" and c.api_key), None
-            )
-            if openai_conn:
-                embeddings_api_key = openai_conn.api_key
-                logger.info("Using OpenAI LLM connection key for embeddings (shared key fallback)")
+        # Chunked mode: resolve embedding config via shared priority-ordered resolver.
+        user_config = await db_client.get_user_configurations(document.created_by) if document.created_by else None
+        embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
+            organization_id=organization_id,
+            user_config=user_config,
+        )
 
         if not embeddings_api_key:
             error_message = (
