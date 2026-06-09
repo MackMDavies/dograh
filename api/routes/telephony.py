@@ -84,6 +84,16 @@ async def initiate_call(
 
     user_configuration = await db_client.get_user_configurations(user.id)
 
+    # For superusers, resolve the workflow's actual org so org-scoped lookups work
+    # even when the workflow and telephony config belong to a different org.
+    if user.is_superuser:
+        _wf_ref = await db_client.get_workflow_by_id(request.workflow_id)
+        if not _wf_ref:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        effective_org_id = _wf_ref.organization_id
+    else:
+        effective_org_id = user.selected_organization_id
+
     # Resolve which telephony config to use: explicit request value, otherwise
     # the org's default outbound config.
     telephony_configuration_id = request.telephony_configuration_id
@@ -91,7 +101,7 @@ async def initiate_call(
     if telephony_configuration_id:
         try:
             provider = await get_telephony_provider_by_id(
-                telephony_configuration_id, user.selected_organization_id
+                telephony_configuration_id, effective_org_id
             )
         except ValueError:
             raise HTTPException(
@@ -99,14 +109,10 @@ async def initiate_call(
             )
     else:
         try:
-            provider = await get_default_telephony_provider(
-                user.selected_organization_id
-            )
+            provider = await get_default_telephony_provider(effective_org_id)
         except ValueError:
             raise HTTPException(status_code=400, detail="telephony_not_configured")
-        default_cfg = await db_client.get_default_telephony_configuration(
-            user.selected_organization_id
-        )
+        default_cfg = await db_client.get_default_telephony_configuration(effective_org_id)
         telephony_configuration_id = default_cfg.id if default_cfg else None
 
     # Validate provider is configured
@@ -126,7 +132,7 @@ async def initiate_call(
         )
 
     workflow = await db_client.get_workflow(
-        request.workflow_id, organization_id=user.selected_organization_id
+        request.workflow_id, organization_id=effective_org_id
     )
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
@@ -166,12 +172,12 @@ async def initiate_call(
                 "telephony_configuration_id": telephony_configuration_id,
             },
             use_draft=True,
-            organization_id=user.selected_organization_id,
+            organization_id=effective_org_id,
         )
         workflow_run_id = workflow_run.id
     else:
         workflow_run = await db_client.get_workflow_run(
-            workflow_run_id, organization_id=user.selected_organization_id
+            workflow_run_id, organization_id=effective_org_id
         )
         if not workflow_run:
             raise HTTPException(status_code=400, detail="Workflow run not found")
@@ -192,7 +198,7 @@ async def initiate_call(
         f"?workflow_id={workflow.id}"
         f"&user_id={execution_user_id}"
         f"&workflow_run_id={workflow_run_id}"
-        f"&organization_id={user.selected_organization_id}"
+        f"&organization_id={effective_org_id}"
     )
 
     keywords = {"workflow_id": workflow.id, "user_id": execution_user_id}

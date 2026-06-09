@@ -14,9 +14,16 @@ from pipecat.frames.frames import (
 from pipecat.metrics.metrics import (
     LLMTokenUsage,
     LLMUsageMetricsData,
-    STTUsageMetricsData,
     TTSUsageMetricsData,
 )
+
+try:
+    from pipecat.metrics.metrics import STTUsageMetricsData
+except ImportError:
+    from pipecat.metrics.metrics import MetricsData
+
+    class STTUsageMetricsData(MetricsData):  # type: ignore[no-redef]
+        value: float
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
 

@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from loguru import logger
-from sqlalchemy import or_, select
+from sqlalchemy import delete, or_, select
 from sqlalchemy.orm import selectinload
 
 from api.db.base_client import BaseDBClient
@@ -282,6 +282,37 @@ class KnowledgeBaseClient(BaseDBClient):
 
             logger.info(f"Updated document {document_id} status to {status}")
             return document
+
+    async def delete_document_chunks(self, document_id: int) -> int:
+        """Delete all chunks for a document (used before retrying processing).
+
+        Returns the number of rows deleted.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                delete(KnowledgeBaseChunkModel).where(
+                    KnowledgeBaseChunkModel.document_id == document_id
+                )
+            )
+            await session.commit()
+            deleted = result.rowcount
+            logger.info(f"Deleted {deleted} chunks for document {document_id}")
+            return deleted
+
+    async def reset_document_for_retry(self, document_id: int) -> None:
+        """Reset a failed document to 'pending' and clear the error message."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(KnowledgeBaseDocumentModel).where(
+                    KnowledgeBaseDocumentModel.id == document_id
+                )
+            )
+            document = result.scalar_one_or_none()
+            if document:
+                document.processing_status = "pending"
+                document.processing_error = None
+                document.total_chunks = 0
+                await session.commit()
 
     async def create_chunks_batch(
         self,

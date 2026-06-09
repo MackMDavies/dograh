@@ -1447,6 +1447,9 @@ class OrgAvailableModelModel(Base):
     is_default = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
+    cost_per_min_usd = Column(Float, nullable=True)
+    native_cost_display = Column(String(200), nullable=True)
+    our_price_per_min_usd = Column(Float, nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
 
     connection = relationship("OrgProviderConnectionModel", back_populates="available_models")

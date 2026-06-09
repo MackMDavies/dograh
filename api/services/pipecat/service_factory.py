@@ -292,7 +292,15 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
     elif user_config.tts.provider == ServiceProviders.OPENAI.value:
         return OpenAITTSService(
             api_key=user_config.tts.api_key,
-            settings=OpenAITTSSettings(model=user_config.tts.model),
+            # OpenAI TTS natively outputs 24kHz. Without this, the TTS service
+            # inherits the pipeline's 16kHz rate from StartFrame and mislabels
+            # 24kHz audio as 16kHz — causing the transport resampler to skip
+            # resampling and play audio at 0.667x speed (slow motion effect).
+            sample_rate=24000,
+            settings=OpenAITTSSettings(
+                model=user_config.tts.model,
+                voice=user_config.tts.voice,
+            ),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
@@ -510,7 +518,10 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             silence_time_s=1.0,
         )
     elif user_config.tts.provider == ServiceProviders.XAI.value:
-        voice = getattr(user_config.tts, "voice", None) or "eve"
+        _xai_tts_voice = getattr(user_config.tts, "voice", None) or ""
+        # "grok-voice-latest" is a model name, not a voice name; reject it
+        _VALID_XAI_TTS_VOICES = {"eve", "Ara", "Rex", "Sal", "Leo"}
+        voice = _xai_tts_voice if _xai_tts_voice in _VALID_XAI_TTS_VOICES else "eve"
         language_code = getattr(user_config.tts, "language", None) or "en"
         try:
             lang_enum = Language(language_code)
@@ -518,7 +529,9 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             lang_enum = Language.EN
         return XAITTSService(
             api_key=user_config.tts.api_key,
-            settings=XAIWebsocketTTSSettings(voice=voice, language=lang_enum),
+            settings=XAIWebsocketTTSSettings(
+                model=user_config.tts.model, voice=voice, language=lang_enum
+            ),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,

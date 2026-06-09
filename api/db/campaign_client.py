@@ -2,7 +2,7 @@ import json
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, text, update
+from sqlalchemy import delete, func, text, update
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
@@ -74,6 +74,18 @@ class CampaignClient(BaseDBClient):
             result = await session.execute(query)
             return list(result.scalars().all())
 
+    async def get_all_campaigns_for_superuser(
+        self,
+        organization_id: Optional[int] = None,
+    ) -> list[CampaignModel]:
+        """Get campaigns across all organizations (superuser only)."""
+        async with self.async_session() as session:
+            query = select(CampaignModel).order_by(CampaignModel.created_at.desc())
+            if organization_id is not None:
+                query = query.where(CampaignModel.organization_id == organization_id)
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
     async def get_latest_campaign(
         self,
         organization_id: int,
@@ -92,14 +104,14 @@ class CampaignClient(BaseDBClient):
     async def get_campaign(
         self,
         campaign_id: int,
-        organization_id: int,
+        organization_id: Optional[int],
     ) -> Optional[CampaignModel]:
         """Get single campaign by ID, ensuring organization access"""
         async with self.async_session() as session:
-            query = select(CampaignModel).where(
-                CampaignModel.id == campaign_id,
-                CampaignModel.organization_id == organization_id,
-            )
+            conditions = [CampaignModel.id == campaign_id]
+            if organization_id is not None:
+                conditions.append(CampaignModel.organization_id == organization_id)
+            query = select(CampaignModel).where(*conditions)
             result = await session.execute(query)
             return result.scalar_one_or_none()
 
@@ -324,6 +336,7 @@ class CampaignClient(BaseDBClient):
         include_voicemail: bool,
         include_no_answer: bool,
         include_busy: bool,
+        include_failed: bool = False,
     ) -> list[dict]:
         """Return root context_variables for subscribers whose LATEST
         workflow_run indicates the call should be redialed.
@@ -346,6 +359,10 @@ class CampaignClient(BaseDBClient):
             tag_clauses.append(
                 "(lr.gathered_context::jsonb -> 'call_tags') @> '[\"telephony_busy\"]'::jsonb"
             )
+        if include_failed:
+            tag_clauses.append(
+                "(lr.gathered_context::jsonb -> 'call_tags') @> '[\"telephony_failed\"]'::jsonb"
+            )
 
         if not tag_clauses:
             return []
@@ -354,6 +371,8 @@ class CampaignClient(BaseDBClient):
         # Retries create new queued_runs with suffixed source_uuids linked via
         # parent_queued_run_id, so group by the ROOT queued_run using a
         # recursive walk and pick the latest workflow_run across the tree.
+        # LEFT JOIN so contacts whose call never reached the AI pipeline
+        # (no workflow_run row) are still rediallable.
         sql = text(
             f"""
             WITH RECURSIVE run_tree AS (
@@ -379,9 +398,15 @@ class CampaignClient(BaseDBClient):
             )
             SELECT q0.source_uuid, q0.context_variables
             FROM queued_runs q0
-            JOIN latest_run_per_root lr ON lr.root_id = q0.id
+            LEFT JOIN latest_run_per_root lr ON lr.root_id = q0.id
             WHERE q0.campaign_id = :cid
-              AND ({tag_filter})
+              AND q0.parent_queued_run_id IS NULL
+              AND (
+                lr.root_id IS NULL
+                OR (lr.gathered_context::jsonb -> 'call_tags') IS NULL
+                OR (lr.gathered_context::jsonb -> 'call_tags') = '[]'::jsonb
+                OR ({tag_filter})
+              )
             """
         )
 
@@ -725,6 +750,95 @@ class CampaignClient(BaseDBClient):
             await session.refresh(queued_run)
             return queued_run
 
+    async def get_campaign_contacts_paginated(
+        self,
+        campaign_id: int,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[dict], int]:
+        """Return root-level queued contacts with their latest call outcome.
+
+        Each item includes the queued_run fields plus, if a workflow_run exists,
+        the outcome fields from that run (call_tags, duration, disposition, error).
+        """
+        from sqlalchemy import desc, literal_column, outerjoin, text
+
+        async with self.async_session() as session:
+            # Count root contacts
+            count_result = await session.execute(
+                select(func.count(QueuedRunModel.id)).where(
+                    QueuedRunModel.campaign_id == campaign_id,
+                    QueuedRunModel.parent_queued_run_id.is_(None),
+                )
+            )
+            total = count_result.scalar() or 0
+
+            # Fetch root contacts ordered by created_at desc
+            rows_result = await session.execute(
+                select(QueuedRunModel)
+                .where(
+                    QueuedRunModel.campaign_id == campaign_id,
+                    QueuedRunModel.parent_queued_run_id.is_(None),
+                )
+                .order_by(QueuedRunModel.created_at.asc())
+                .limit(limit)
+                .offset(offset)
+            )
+            queued_runs = list(rows_result.scalars().all())
+
+            if not queued_runs:
+                return [], total
+
+            # Fetch the latest workflow_run for each queued_run id
+            qr_ids = [qr.id for qr in queued_runs]
+            wr_result = await session.execute(
+                select(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.campaign_id == campaign_id,
+                    WorkflowRunModel.queued_run_id.in_(qr_ids),
+                )
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+            all_wrs = wr_result.scalars().all()
+            # Keep only the latest run per queued_run_id
+            latest_wr: dict[int, WorkflowRunModel] = {}
+            for wr in all_wrs:
+                if wr.queued_run_id not in latest_wr:
+                    latest_wr[wr.queued_run_id] = wr
+
+            contacts = []
+            for qr in queued_runs:
+                item: dict = {
+                    "id": qr.id,
+                    "source_uuid": qr.source_uuid,
+                    "context_variables": qr.context_variables or {},
+                    "state": qr.state,
+                    "created_at": qr.created_at.isoformat() if qr.created_at else None,
+                    "processed_at": qr.processed_at.isoformat() if qr.processed_at else None,
+                    "retry_count": qr.retry_count,
+                    "retry_reason": qr.retry_reason,
+                    "scheduled_for": qr.scheduled_for.isoformat() if qr.scheduled_for else None,
+                    "run": None,
+                }
+                wr = latest_wr.get(qr.id)
+                if wr:
+                    ctx = wr.gathered_context or {}
+                    ic = wr.initial_context or {}
+                    item["run"] = {
+                        "id": wr.id,
+                        "state": wr.state.value if hasattr(wr.state, "value") else wr.state,
+                        "is_completed": wr.is_completed,
+                        "call_tags": ctx.get("call_tags") or [],
+                        "disposition": ctx.get("mapped_call_disposition"),
+                        "error": ctx.get("error"),
+                        "duration": (wr.cost_info or {}).get("call_duration_seconds") or ctx.get("duration"),
+                        "phone_number": ic.get("phone_number") or ic.get("called_number"),
+                        "created_at": wr.created_at.isoformat() if wr.created_at else None,
+                    }
+                contacts.append(item)
+
+            return contacts, total
+
     async def get_queued_run_by_id(
         self, queued_run_id: int
     ) -> Optional[QueuedRunModel]:
@@ -856,3 +970,61 @@ class CampaignClient(BaseDBClient):
                 await session.refresh(run)
 
             return claimed_runs
+
+    async def delete_campaign(self, campaign_id: int, organization_id: int) -> bool:
+        """Hard-delete a campaign and its queued runs.
+
+        Only campaigns in non-active states (completed, failed, created) may be
+        deleted.  workflow_runs that reference this campaign are de-linked
+        (campaign_id set to NULL) rather than deleted so call history is preserved.
+
+        Returns True if the campaign was deleted, False if not found / wrong org.
+        """
+        async with self.async_session() as session:
+            campaign = await session.scalar(
+                select(CampaignModel).where(
+                    CampaignModel.id == campaign_id,
+                    CampaignModel.organization_id == organization_id,
+                )
+            )
+            if not campaign:
+                return False
+
+            if campaign.state in ("running", "syncing", "paused"):
+                raise ValueError(
+                    f"Cannot delete a campaign in '{campaign.state}' state. "
+                    "Stop or pause it first."
+                )
+
+            # Delink workflow_runs so we don't lose call history
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.campaign_id == campaign_id)
+                .values(campaign_id=None)
+            )
+
+            # Delete campaign (queued_runs cascade automatically via DB FK)
+            await session.execute(
+                delete(CampaignModel).where(CampaignModel.id == campaign_id)
+            )
+
+            try:
+                await session.commit()
+            except Exception as e:
+                await session.rollback()
+                raise e
+
+            return True
+
+    async def get_stuck_campaign_runs(
+        self, campaign_id: int, older_than: datetime
+    ) -> list[WorkflowRunModel]:
+        """Return workflow runs for a campaign that are still in-progress after the cutoff."""
+        async with self.async_session() as session:
+            query = select(WorkflowRunModel).where(
+                WorkflowRunModel.campaign_id == campaign_id,
+                WorkflowRunModel.is_completed.is_(False),
+                WorkflowRunModel.created_at < older_than,
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())

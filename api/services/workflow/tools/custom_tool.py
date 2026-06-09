@@ -70,6 +70,8 @@ def tool_to_function_schema(tool: Any) -> Dict[str, Any]:
     function_name = re.sub(r"[^a-z0-9_]", "_", tool.name.lower())
     # Remove consecutive underscores and trim
     function_name = re.sub(r"_+", "_", function_name).strip("_")
+    # OpenAI enforces a 64-character limit on function names
+    function_name = function_name[:64].rstrip("_")
 
     return {
         "type": "function",

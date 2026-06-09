@@ -124,3 +124,9 @@ class WorkflowDocumentListResponseSchema(BaseModel):
 
     documents: List[DocumentResponseSchema]
     total: int
+
+
+class UpdateDocumentContentSchema(BaseModel):
+    """Request to replace a text document's content and re-process it."""
+
+    text: str = Field(..., description="New text content for the document")

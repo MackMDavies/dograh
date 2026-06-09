@@ -62,3 +62,14 @@ class ElevenLabsCatalogVoiceSchema(BaseModel):
 class ElevenLabsImportRequestSchema(BaseModel):
     voice_ids: list[str]
     is_public: bool = True
+
+
+class GoogleTTSCatalogVoiceSchema(BaseModel):
+    name: str
+    gender: Optional[str] = None
+    language_codes: list[str] = []
+
+
+class GoogleTTSImportRequestSchema(BaseModel):
+    voice_names: list[str]
+    is_public: bool = True

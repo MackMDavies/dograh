@@ -33,15 +33,14 @@ class WorkflowRunClient(BaseDBClient):
         queued_run_id: int = None,
         use_draft: bool = False,
         organization_id: int | None = None,
+        bypass_user_check: bool = False,
     ) -> WorkflowRunModel:
         async with self.async_session() as session:
-            workflow_query = (
-                select(WorkflowModel)
-                .options(joinedload(WorkflowModel.user))
-                .where(
-                    WorkflowModel.id == workflow_id, WorkflowModel.user_id == user_id
-                )
+            workflow_query = select(WorkflowModel).options(joinedload(WorkflowModel.user)).where(
+                WorkflowModel.id == workflow_id
             )
+            if not bypass_user_check:
+                workflow_query = workflow_query.where(WorkflowModel.user_id == user_id)
             if organization_id is not None:
                 workflow_query = workflow_query.where(
                     WorkflowModel.organization_id == organization_id
@@ -238,7 +237,8 @@ class WorkflowRunClient(BaseDBClient):
             result = await session.execute(
                 select(WorkflowRunModel)
                 .options(
-                    joinedload(WorkflowRunModel.workflow).joinedload(WorkflowModel.user)
+                    joinedload(WorkflowRunModel.workflow).joinedload(WorkflowModel.user),
+                    selectinload(WorkflowRunModel.definition),
                 )
                 .where(WorkflowRunModel.id == run_id)
             )

@@ -231,11 +231,14 @@ async def _sync_inbound_for_phone_number(
 
 @router.get("/telephony-configs", response_model=TelephonyConfigurationListResponse)
 async def list_telephony_configurations(user: UserModel = Depends(get_user)):
-    """List the org's telephony configurations with phone-number counts."""
-    if not user.selected_organization_id:
+    """List telephony configurations. Superusers see all orgs; others see their own."""
+    if not user.selected_organization_id and not user.is_superuser:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    rows = await db_client.list_telephony_configurations(user.selected_organization_id)
+    if user.is_superuser:
+        rows = await db_client.list_all_telephony_configurations_superuser()
+    else:
+        rows = await db_client.list_telephony_configurations(user.selected_organization_id)
     items: List[TelephonyConfigurationListItem] = []
     for row in rows:
         numbers = await db_client.list_phone_numbers_for_config(row.id)
@@ -306,12 +309,15 @@ async def create_telephony_configuration(
 async def get_telephony_configuration_by_id(
     config_id: int, user: UserModel = Depends(get_user)
 ):
-    if not user.selected_organization_id:
+    if not user.selected_organization_id and not user.is_superuser:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    row = await db_client.get_telephony_configuration_for_org(
-        config_id, user.selected_organization_id
-    )
+    if user.is_superuser:
+        row = await db_client.get_telephony_configuration(config_id)
+    else:
+        row = await db_client.get_telephony_configuration_for_org(
+            config_id, user.selected_organization_id
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Telephony configuration not found")
     return _detail_response(row)
@@ -433,9 +439,10 @@ async def _ensure_workflow_belongs_to_org(workflow_id: int, organization_id: int
     response_model=PhoneNumberListResponse,
 )
 async def list_phone_numbers(config_id: int, user: UserModel = Depends(get_user)):
-    if not user.selected_organization_id:
-        raise HTTPException(status_code=400, detail="No organization selected")
-    await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    if not user.is_superuser:
+        if not user.selected_organization_id:
+            raise HTTPException(status_code=400, detail="No organization selected")
+        await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
 
     rows = await db_client.list_phone_numbers_with_workflow_name_for_config(config_id)
     return PhoneNumberListResponse(

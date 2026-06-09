@@ -624,6 +624,23 @@ async def delete_tool(
     return {"status": "archived", "tool_uuid": tool_uuid}
 
 
+@router.delete("/{tool_uuid}/permanent")
+async def permanently_delete_tool(
+    tool_uuid: str,
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Permanently delete a tool from the database (hard delete)."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected for the user")
+
+    deleted = await db_client.delete_tool_permanently(tool_uuid, user.selected_organization_id)
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Tool not found")
+
+    return {"status": "deleted", "tool_uuid": tool_uuid}
+
+
 @router.post("/{tool_uuid}/unarchive")
 async def unarchive_tool(
     tool_uuid: str,

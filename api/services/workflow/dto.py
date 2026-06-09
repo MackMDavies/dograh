@@ -1002,8 +1002,8 @@ class RFNodeDTO(_RFNodeBase):
 
 
 class EdgeDataDTO(BaseModel):
-    label: str = Field(..., min_length=1)
-    condition: str = Field(..., min_length=1)
+    label: str = Field(default="")
+    condition: str = Field(default="")
     transition_speech: Optional[str] = None
     transition_speech_type: Optional[str] = None  # 'text' or 'audio'
     transition_speech_recording_id: Optional[str] = None

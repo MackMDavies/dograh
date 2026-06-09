@@ -14,6 +14,8 @@ from api.db.models import UserModel
 from api.schemas.voice_library import (
     ElevenLabsCatalogVoiceSchema,
     ElevenLabsImportRequestSchema,
+    GoogleTTSCatalogVoiceSchema,
+    GoogleTTSImportRequestSchema,
     VoiceLibraryResponseSchema,
     VoiceLibraryUpdateSchema,
 )
@@ -24,6 +26,10 @@ from api.services.voice_library.elevenlabs_service import (
     fetch_elevenlabs_catalog,
     get_caller_elevenlabs_api_key,
     get_system_elevenlabs_api_key,
+)
+from api.services.voice_library.google_service import (
+    fetch_google_tts_voices,
+    synthesize_google_tts_preview,
 )
 
 _XAI_TTS_URL = "https://api.x.ai/v1/tts"
@@ -67,6 +73,32 @@ _PROVIDER_PREDEFINED_VOICES: dict[str, list[dict]] = {
         {"name": "Sal",  "voice_id": "sal",  "gender": "male"},
         {"name": "Leo",  "voice_id": "leo",  "gender": "male"},
     ],
+    "openai": [
+        {"name": "Alloy",   "voice_id": "alloy",   "gender": "neutral"},
+        {"name": "Ash",     "voice_id": "ash",     "gender": "male"},
+        {"name": "Ballad",  "voice_id": "ballad",  "gender": "male"},
+        {"name": "Coral",   "voice_id": "coral",   "gender": "female"},
+        {"name": "Echo",    "voice_id": "echo",    "gender": "male"},
+        {"name": "Fable",   "voice_id": "fable",   "gender": "male"},
+        {"name": "Nova",    "voice_id": "nova",    "gender": "female"},
+        {"name": "Onyx",    "voice_id": "onyx",    "gender": "male"},
+        {"name": "Sage",    "voice_id": "sage",    "gender": "female"},
+        {"name": "Shimmer", "voice_id": "shimmer", "gender": "female"},
+    ],
+    "deepgram": [
+        {"name": "Asteria", "voice_id": "aura-asteria-en", "gender": "female"},
+        {"name": "Luna",    "voice_id": "aura-luna-en",    "gender": "female"},
+        {"name": "Stella",  "voice_id": "aura-stella-en",  "gender": "female"},
+        {"name": "Athena",  "voice_id": "aura-athena-en",  "gender": "female"},
+        {"name": "Hera",    "voice_id": "aura-hera-en",    "gender": "female"},
+        {"name": "Orion",   "voice_id": "aura-orion-en",   "gender": "male"},
+        {"name": "Arcas",   "voice_id": "aura-arcas-en",   "gender": "male"},
+        {"name": "Perseus", "voice_id": "aura-perseus-en", "gender": "male"},
+        {"name": "Angus",   "voice_id": "aura-angus-en",   "gender": "male"},
+        {"name": "Orpheus", "voice_id": "aura-orpheus-en", "gender": "male"},
+        {"name": "Helios",  "voice_id": "aura-helios-en",  "gender": "male"},
+        {"name": "Zeus",    "voice_id": "aura-zeus-en",    "gender": "male"},
+    ],
 }
 
 
@@ -87,17 +119,47 @@ async def _fetch_xai_voices(api_key: str) -> list[dict]:
         return []
 
 
+async def _fetch_cartesia_voices(api_key: str) -> list[dict]:
+    """Fetch all available voices from Cartesia API."""
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.cartesia.ai/voices/",
+                headers={"X-API-Key": api_key, "Cartesia-Version": "2024-06-10"},
+            ) as resp:
+                if resp.status != 200:
+                    return []
+                data = await resp.json()
+                return data if isinstance(data, list) else data.get("voices", [])
+    except Exception as e:
+        logger.warning(f"Failed to fetch Cartesia voices: {e}")
+        return []
+
+
+def _get_google_credentials_json(conn) -> Optional[str]:
+    """Extract service-account JSON from a Google TTS connection.
+
+    Checks extra_config["credentials"] first, then falls back to api_key
+    for deployments that store the JSON blob there.
+    """
+    if conn.extra_config:
+        creds = conn.extra_config.get("credentials")
+        if creds:
+            return creds
+    return conn.api_key or None
+
+
 @router.post("/sync-providers")
 async def sync_provider_voices(user: UserModel = Depends(get_user)):
-    """Seed predefined voices for all active TTS provider connections that have known voice lists."""
+    """Sync all voices from connected TTS providers into the voice library."""
 
     org_id = user.selected_organization_id
     conns = await db_client.list_connections(organization_id=org_id, service_type="tts")
     created = 0
+    errors: dict[str, str] = {}
 
     for conn in conns:
         if conn.provider == "xai" and conn.api_key:
-            # Try to fetch voices dynamically from xAI API
             api_voices = await _fetch_xai_voices(conn.api_key)
             if api_voices:
                 for av in api_voices:
@@ -122,8 +184,102 @@ async def sync_provider_voices(user: UserModel = Depends(get_user)):
                     created += 1
                     logger.info(f"Synced xAI voice '{vid}' for org {org_id}")
                 continue  # skip hardcoded fallback if API succeeded
+            # falls through to hardcoded xAI list if API returned nothing
 
-        # Hardcoded fallback for all providers
+        elif conn.provider == "elevenlabs" and conn.api_key:
+            try:
+                catalog = await fetch_elevenlabs_catalog(conn.api_key)
+            except Exception as e:
+                logger.warning(f"Failed to fetch ElevenLabs catalog for org {org_id}: {e}")
+                errors["ElevenLabs"] = str(e)
+                continue
+            for el_voice in catalog:
+                vid = el_voice.get("voice_id", "")
+                if not vid:
+                    continue
+                existing = await db_client.get_voice_by_provider_id(vid, org_id)
+                if existing:
+                    continue
+                labels = el_voice.get("labels") or {}
+                await db_client.create_voice(
+                    user_id=user.id,
+                    organization_id=org_id,
+                    name=el_voice.get("name", vid),
+                    provider="elevenlabs",
+                    provider_voice_id=vid,
+                    is_public=True,
+                    status="ready",
+                    language=labels.get("language") or "en",
+                    accent=labels.get("accent"),
+                    gender=labels.get("gender"),
+                    age=labels.get("age"),
+                    use_case=labels.get("use_case"),
+                    audio_preview_url=el_voice.get("preview_url"),
+                    labels=labels,
+                )
+                created += 1
+                logger.info(f"Synced ElevenLabs voice '{vid}' for org {org_id}")
+            continue
+
+        elif conn.provider == "cartesia" and conn.api_key:
+            api_voices = await _fetch_cartesia_voices(conn.api_key)
+            if api_voices:
+                for cv in api_voices:
+                    vid = cv.get("id", "")
+                    if not vid:
+                        continue
+                    existing = await db_client.get_voice_by_provider_id(vid, org_id)
+                    if existing:
+                        continue
+                    await db_client.create_voice(
+                        user_id=user.id,
+                        organization_id=org_id,
+                        name=cv.get("name", vid),
+                        provider="cartesia",
+                        provider_voice_id=vid,
+                        is_public=True,
+                        status="ready",
+                        language=cv.get("language") or "en",
+                        labels={"provider": "cartesia"},
+                    )
+                    created += 1
+                    logger.info(f"Synced Cartesia voice '{vid}' for org {org_id}")
+                continue
+            # falls through to hardcoded fallback (none currently) if API failed
+
+        elif conn.provider == "google":
+            credentials_json = _get_google_credentials_json(conn)
+            try:
+                google_voices = await fetch_google_tts_voices(credentials_json)
+            except Exception as e:
+                logger.warning(f"Failed to fetch Google TTS voices for org {org_id}: {e}")
+                errors["Google TTS"] = str(e)
+                continue
+            for gv in google_voices:
+                vid = gv.get("name", "")
+                if not vid:
+                    continue
+                existing = await db_client.get_voice_by_provider_id(vid, org_id)
+                if existing:
+                    continue
+                lang_codes = gv.get("language_codes", [])
+                await db_client.create_voice(
+                    user_id=user.id,
+                    organization_id=org_id,
+                    name=vid,
+                    provider="google",
+                    provider_voice_id=vid,
+                    is_public=True,
+                    status="ready",
+                    language=lang_codes[0] if lang_codes else None,
+                    gender=gv.get("gender"),
+                    labels={"language_codes": lang_codes, "provider": "google"},
+                )
+                created += 1
+                logger.info(f"Synced Google TTS voice '{vid}' for org {org_id}")
+            continue
+
+        # Hardcoded fallback for providers with fixed voice lists (openai, deepgram, etc.)
         voice_defs = _PROVIDER_PREDEFINED_VOICES.get(conn.provider, [])
         for vdef in voice_defs:
             existing = await db_client.get_voice_by_provider_id(vdef["voice_id"], org_id)
@@ -144,7 +300,7 @@ async def sync_provider_voices(user: UserModel = Depends(get_user)):
             created += 1
             logger.info(f"Synced voice '{vdef['voice_id']}' ({conn.provider}) for org {org_id}")
 
-    return {"synced": created}
+    return {"synced": created, "errors": errors}
 
 
 @router.get("/elevenlabs/voices", response_model=list[ElevenLabsCatalogVoiceSchema])
@@ -214,6 +370,79 @@ async def import_elevenlabs_voices(
     return created
 
 
+@router.get("/google/voices", response_model=list[GoogleTTSCatalogVoiceSchema])
+async def get_google_tts_catalog(
+    language: Optional[str] = Query(None, description="Filter by BCP-47 language code"),
+    user: UserModel = Depends(get_user),
+) -> list[GoogleTTSCatalogVoiceSchema]:
+    """Fetch available Google Cloud TTS voices via the org's connected credentials."""
+    conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "google")
+    if not conn:
+        raise HTTPException(status_code=400, detail="No Google TTS connection configured for this organisation")
+    credentials_json = _get_google_credentials_json(conn)
+    try:
+        voices = await fetch_google_tts_voices(credentials_json)
+    except Exception as e:
+        logger.error(f"Google TTS catalog fetch failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch Google TTS voice catalog")
+    result = []
+    for v in voices:
+        lang_codes = v.get("language_codes", [])
+        if language and language not in lang_codes:
+            continue
+        result.append(
+            GoogleTTSCatalogVoiceSchema(
+                name=v["name"],
+                gender=v.get("gender"),
+                language_codes=lang_codes,
+            )
+        )
+    return result
+
+
+@router.post("/import/google", response_model=list[VoiceLibraryResponseSchema], status_code=201)
+async def import_google_tts_voices(
+    body: GoogleTTSImportRequestSchema,
+    user: UserModel = Depends(get_user),
+) -> list[VoiceLibraryResponseSchema]:
+    """Import selected Google Cloud TTS voices into the org's voice library."""
+    conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "google")
+    if not conn:
+        raise HTTPException(status_code=400, detail="No Google TTS connection configured")
+    credentials_json = _get_google_credentials_json(conn)
+    try:
+        catalog = await fetch_google_tts_voices(credentials_json)
+    except Exception as e:
+        logger.error(f"Google TTS catalog fetch failed during import: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch Google TTS catalog")
+
+    catalog_by_name = {v["name"]: v for v in catalog}
+    created = []
+    for voice_name in body.voice_names:
+        voice_data = catalog_by_name.get(voice_name)
+        if not voice_data:
+            continue
+        existing = await db_client.get_voice_by_provider_id(voice_name, user.selected_organization_id)
+        if existing:
+            logger.info(f"Google TTS voice {voice_name} already in library, skipping")
+            continue
+        lang_codes = voice_data.get("language_codes", [])
+        voice = await db_client.create_voice(
+            user_id=user.id,
+            organization_id=user.selected_organization_id,
+            name=voice_name,
+            provider="google",
+            provider_voice_id=voice_name,
+            is_public=body.is_public,
+            gender=voice_data.get("gender"),
+            language=lang_codes[0] if lang_codes else None,
+            labels={"language_codes": lang_codes, "provider": "google"},
+            status="ready",
+        )
+        created.append(_serialize(voice))
+    return created
+
+
 @router.post("/clone", response_model=VoiceLibraryResponseSchema, status_code=201)
 async def clone_voice(
     background_tasks: BackgroundTasks,
@@ -225,7 +454,7 @@ async def clone_voice(
     gender: Optional[str] = Form(None),
     age: Optional[str] = Form(None),
     use_case: Optional[str] = Form(None),
-    tts_provider: str = Form("elevenlabs"),
+    tts_provider: str = Form("auto"),
     file: UploadFile = File(...),
     user: UserModel = Depends(get_user),
 ) -> VoiceLibraryResponseSchema:
@@ -233,10 +462,23 @@ async def clone_voice(
     if len(audio_data) < 1000:
         raise HTTPException(status_code=400, detail="Audio file too small — minimum 1 second of audio required")
 
+    org_id = user.selected_organization_id
+
+    # Auto-detect best available cloning provider from org's TTS connections.
+    if tts_provider == "auto":
+        xai_conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
+        el_conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
+        if xai_conn and xai_conn.api_key:
+            tts_provider = "xai"
+        elif el_conn and el_conn.api_key:
+            tts_provider = "elevenlabs"
+        else:
+            tts_provider = "elevenlabs"  # will attempt system fallback in background
+
     provider = "xai" if tts_provider == "xai" else "dograh_clone"
     voice = await db_client.create_voice(
         user_id=user.id,
-        organization_id=user.selected_organization_id,
+        organization_id=org_id,
         name=name,
         description=description or None,
         provider=provider,
@@ -259,7 +501,7 @@ async def clone_voice(
             audio_data,
             filename,
             content_type,
-            user.selected_organization_id,
+            org_id,
         )
     else:
         background_tasks.add_task(
@@ -270,6 +512,7 @@ async def clone_voice(
             audio_data,
             filename,
             content_type,
+            org_id,
         )
     return _serialize(voice)
 
@@ -281,10 +524,15 @@ async def _process_clone_background(
     audio_data: bytes,
     filename: str,
     content_type: str,
+    org_id: int,
 ) -> None:
-    api_key = await get_system_elevenlabs_api_key()
+    # Prefer the org's own connected ElevenLabs key; fall back to system superuser key.
+    conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
+    api_key = conn.api_key if (conn and conn.api_key) else None
     if not api_key:
-        logger.error(f"No system EL API key — cannot clone voice {voice_uuid}")
+        api_key = await get_system_elevenlabs_api_key()
+    if not api_key:
+        logger.error(f"No ElevenLabs API key for org {org_id} — cannot clone voice {voice_uuid}")
         await db_client.update_voice_status(voice_uuid, "failed")
         return
     try:
@@ -352,50 +600,100 @@ async def generate_voice_preview(
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
 
-    # 2. Only xAI voices support HTTP preview generation
-    if voice.provider != "xai":
+    # 2. Validate provider supports preview generation
+    _PREVIEW_SUPPORTED = {"xai", "openai", "elevenlabs", "google"}
+    if voice.provider not in _PREVIEW_SUPPORTED:
         raise HTTPException(
             status_code=422,
             detail=f"Preview generation is not supported for provider '{voice.provider}'",
         )
 
-    # 3. Get the org's xAI TTS connection to retrieve the API key
+    # 3. Get the org's TTS connection for this provider
     conn = await db_client.get_connection_by_provider(org_id, "tts", voice.provider)
-    if not conn or not conn.api_key:
+    if not conn:
         raise HTTPException(
             status_code=400,
-            detail="No active xAI TTS connection found for this organisation",
+            detail=f"No active {voice.provider} TTS connection found for this organisation",
+        )
+    # Google TTS uses service-account credentials, not api_key
+    if voice.provider != "google" and not conn.api_key:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No active {voice.provider} TTS connection found for this organisation",
         )
 
-    # 4. Call xAI TTS API to generate the preview
+    # 4. Call provider TTS API to generate the preview
     sample_text = f"Hello, I'm {voice.name}. How can I help you today?"
-    payload = {
-        "text": sample_text,
-        "voice_id": voice.provider_voice_id,
-        "language": "en",
-        "output_format": {"codec": "mp3"},
-    }
-    headers = {
-        "Authorization": f"Bearer {conn.api_key}",
-        "Content-Type": "application/json",
-    }
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(_XAI_TTS_URL, json=payload, headers=headers) as resp:
-                if resp.status != 200:
-                    error_text = await resp.text()
-                    logger.error(f"xAI TTS API error {resp.status}: {error_text}")
-                    raise HTTPException(
-                        status_code=502,
-                        detail=f"xAI TTS API returned {resp.status}",
-                    )
-                audio_bytes = await resp.read()
+        if voice.provider == "xai":
+            payload = {
+                "text": sample_text,
+                "voice_id": voice.provider_voice_id,
+                "language": "en",
+                "output_format": {"codec": "mp3"},
+            }
+            async with aiohttp.ClientSession() as http:
+                async with http.post(
+                    _XAI_TTS_URL,
+                    json=payload,
+                    headers={"Authorization": f"Bearer {conn.api_key}", "Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"xAI TTS API error {resp.status}: {error_text}")
+                        raise HTTPException(status_code=502, detail=f"xAI TTS API returned {resp.status}")
+                    audio_bytes = await resp.read()
+
+        elif voice.provider == "openai":
+            async with aiohttp.ClientSession() as http:
+                async with http.post(
+                    "https://api.openai.com/v1/audio/speech",
+                    json={
+                        "model": "tts-1",
+                        "input": sample_text,
+                        "voice": voice.provider_voice_id or "alloy",
+                        "response_format": "mp3",
+                    },
+                    headers={"Authorization": f"Bearer {conn.api_key}", "Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"OpenAI TTS API error {resp.status}: {error_text}")
+                        raise HTTPException(status_code=502, detail=f"OpenAI TTS API returned {resp.status}")
+                    audio_bytes = await resp.read()
+
+        elif voice.provider == "elevenlabs":
+            async with aiohttp.ClientSession() as http:
+                async with http.post(
+                    f"https://api.elevenlabs.io/v1/text-to-speech/{voice.provider_voice_id}",
+                    json={"text": sample_text, "model_id": "eleven_monolingual_v1"},
+                    headers={"xi-api-key": conn.api_key, "Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"ElevenLabs TTS API error {resp.status}: {error_text}")
+                        raise HTTPException(status_code=502, detail=f"ElevenLabs TTS API returned {resp.status}")
+                    audio_bytes = await resp.read()
+
+        elif voice.provider == "google":
+            credentials_json = _get_google_credentials_json(conn)
+            language_code = voice.language or "en-US"
+            audio_bytes = await synthesize_google_tts_preview(
+                text=sample_text,
+                voice_name=voice.provider_voice_id or voice.name,
+                language_code=language_code,
+                credentials_json=credentials_json,
+            )
+
+        else:
+            raise HTTPException(status_code=422, detail="Unsupported provider")
+
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error(f"Error calling xAI TTS API for voice {voice_uuid}: {exc}")
-        raise HTTPException(status_code=502, detail="Failed to call xAI TTS API") from exc
+        logger.error(f"Error calling {voice.provider} TTS API for voice {voice_uuid}: {exc}")
+        raise HTTPException(status_code=502, detail=f"Failed to call {voice.provider} TTS API") from exc
 
     # 5. Upload audio to object storage via a temp file
     storage_key = f"voice-previews/{voice_uuid}/{uuid_lib.uuid4()}.mp3"

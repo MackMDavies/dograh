@@ -61,7 +61,7 @@ from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnal
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
-from pipecat.pipeline.base_task import PipelineTaskParams
+from pipecat.pipeline.task import PipelineTaskParams
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
@@ -263,8 +263,9 @@ async def run_pipeline_smallwebrtc(
     )
     set_current_run_id(workflow_run_id)
 
-    # Get workflow to extract all pipeline configurations
-    workflow = await db_client.get_workflow(workflow_id, user_id)
+    # Get workflow to extract all pipeline configurations — unscoped: access
+    # was already validated in the signaling WebSocket handler.
+    workflow = await db_client.get_workflow_by_id(workflow_id)
 
     # Set org context early so tasks created by the transport inherit it
     if workflow:
@@ -285,10 +286,12 @@ async def run_pipeline_smallwebrtc(
     # reuses these via kwargs so we don't fetch twice.
     from api.services.configuration.resolve import resolve_effective_config
 
-    workflow_run = await db_client.get_workflow_run(workflow_run_id, user_id)
+    workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
     user_config = await db_client.get_user_configurations(user_id)
     run_configs = (
-        (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
+        (workflow_run.definition.workflow_configurations or {})
+        if (workflow_run and workflow_run.definition)
+        else {}
     )
     from api.services.configuration.org_provider_resolver import (
         enrich_overrides_with_org_api_keys,
@@ -350,10 +353,10 @@ async def _run_pipeline(
             applied. Fetched and resolved here if None.
     """
     if workflow_run is None:
-        workflow_run = await db_client.get_workflow_run(workflow_run_id, user_id)
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
 
     # If the workflow run is already completed, we don't need to run it again
-    if workflow_run.is_completed:
+    if workflow_run is None or workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
     merged_call_context_vars = workflow_run.initial_context
@@ -362,13 +365,16 @@ async def _run_pipeline(
     if call_context_vars:
         merged_call_context_vars = {**merged_call_context_vars, **call_context_vars}
 
-    # Get workflow for metadata (name, organization_id, call_disposition_codes)
-    workflow = await db_client.get_workflow(workflow_id, user_id)
+    # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
+    # access is validated before the pipeline is invoked.
+    workflow = await db_client.get_workflow_by_id(workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
+    if run_definition is None:
+        raise HTTPException(status_code=400, detail="Workflow run has no definition — save and publish the workflow first")
     run_workflow_json = run_definition.workflow_json
     run_configs = run_definition.workflow_configurations or {}
 

@@ -21,14 +21,17 @@ class TelephonyConfigurationInUseError(Exception):
 
 class TelephonyConfigurationClient(BaseDBClient):
     async def list_telephony_configurations(
-        self, organization_id: int
+        self, organization_id: Optional[int]
     ) -> List[TelephonyConfigurationModel]:
         async with self.async_session() as session:
-            result = await session.execute(
-                select(TelephonyConfigurationModel)
-                .where(TelephonyConfigurationModel.organization_id == organization_id)
-                .order_by(TelephonyConfigurationModel.created_at)
+            query = select(TelephonyConfigurationModel).order_by(
+                TelephonyConfigurationModel.created_at
             )
+            if organization_id is not None:
+                query = query.where(
+                    TelephonyConfigurationModel.organization_id == organization_id
+                )
+            result = await session.execute(query)
             return list(result.scalars().all())
 
     async def get_telephony_configuration(
@@ -61,6 +64,19 @@ class TelephonyConfigurationClient(BaseDBClient):
                 )
             )
             return result.scalars().first()
+
+    async def list_all_telephony_configurations_superuser(
+        self,
+    ) -> List[TelephonyConfigurationModel]:
+        """Return all configs across every org. Superuser only."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(TelephonyConfigurationModel).order_by(
+                    TelephonyConfigurationModel.organization_id,
+                    TelephonyConfigurationModel.created_at,
+                )
+            )
+            return list(result.scalars().all())
 
     async def list_telephony_configurations_by_provider(
         self, organization_id: int, provider: str

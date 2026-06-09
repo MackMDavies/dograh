@@ -43,8 +43,8 @@ class CampaignOrchestrator:
     def __init__(self, redis_client: aioredis.Redis):
         self.redis = redis_client
         self.publisher = CampaignEventPublisher(redis_client)
-        self.completion_check_interval = 60  # 1 minute
-        self.completion_timeout = 3600  # 1 hour
+        self.completion_check_interval = 30  # 30 seconds
+        self.completion_timeout = 120  # 2 minutes
         self._processing_locks: Dict[int, datetime] = {}  # prevent duplicate scheduling
         self._last_activity: Dict[
             int, datetime
@@ -140,9 +140,14 @@ class CampaignOrchestrator:
                 self._clear_campaign_state(campaign_id)
                 return
 
-            # Immediately schedule next batch
-            await self._schedule_next_batch(campaign_id)
-            self._last_activity[campaign_id] = datetime.now(UTC)
+            # Schedule next batch or complete immediately if no work remains
+            has_work = await self._has_pending_work(campaign_id)
+            if has_work:
+                await self._schedule_next_batch(campaign_id)
+                self._last_activity[campaign_id] = datetime.now(UTC)
+            else:
+                # All queued work is dispatched — complete immediately if all rows accounted for
+                await self._try_complete_immediately(campaign)
 
         elif isinstance(event, BatchFailedEvent):
             # Clear the batch in progress flag
@@ -518,6 +523,9 @@ class CampaignOrchestrator:
                         await self._schedule_next_batch(campaign_id)
                         continue
 
+                # Recover stuck in-progress workflow runs before checking completion
+                await self._recover_stuck_runs(campaign_id)
+
                 # Check if campaign should be marked complete
                 if await self._should_mark_complete(campaign):
                     await self._complete_campaign(campaign)
@@ -525,6 +533,25 @@ class CampaignOrchestrator:
                 logger.error(
                     f"campaign_id: {campaign.id} - Completion check failed: {e}"
                 )
+
+    async def _recover_stuck_runs(self, campaign_id: int) -> None:
+        """Mark workflow runs that have been in_progress for > 15 min as failed."""
+        stuck_cutoff = datetime.now(UTC) - timedelta(minutes=15)
+        stuck = await db_client.get_stuck_campaign_runs(campaign_id, older_than=stuck_cutoff)
+        for run in stuck:
+            logger.warning(
+                f"campaign_id: {campaign_id} - Recovering stuck workflow run {run.id} "
+                f"(in_progress since {run.created_at})"
+            )
+            await db_client.update_workflow_run(
+                run_id=run.id,
+                is_completed=True,
+                state="completed",
+                gathered_context={"call_tags": ["not_connected", "telephony_failed", "stuck_run_recovered"]},
+            )
+            if run.campaign_id:
+                from api.services.campaign.campaign_call_dispatcher import campaign_call_dispatcher
+                await campaign_call_dispatcher.release_call_slot(run.id)
 
     async def _should_mark_complete(self, campaign: CampaignModel) -> bool:
         """Check if campaign has no activity for 1 hour."""
@@ -597,8 +624,34 @@ class CampaignOrchestrator:
 
         return False
 
+    async def _try_complete_immediately(self, campaign: CampaignModel):
+        """Complete a campaign immediately when all rows are dispatched and no work remains."""
+        campaign_id = campaign.id
+
+        # Refresh from DB to get latest counters
+        fresh = await db_client.get_campaign_by_id(campaign_id)
+        if not fresh or fresh.state != "running":
+            return
+
+        total = fresh.total_rows or 0
+        dispatched = (fresh.processed_rows or 0) + (fresh.failed_rows or 0)
+
+        if total > 0 and dispatched >= total:
+            logger.info(
+                f"campaign_id: {campaign_id} - All {total} rows dispatched "
+                f"({fresh.processed_rows} processed, {fresh.failed_rows} failed) — completing immediately"
+            )
+            await self._complete_campaign(fresh)
+        else:
+            # Not all rows accounted for yet — fall back to the periodic timeout
+            logger.info(
+                f"campaign_id: {campaign_id} - No pending work but only {dispatched}/{total} rows "
+                f"dispatched — waiting for activity timeout"
+            )
+            self._last_activity[campaign_id] = datetime.now(UTC)
+
     async def _complete_campaign(self, campaign: CampaignModel):
-        """Mark campaign as complete."""
+        """Mark campaign as complete or failed based on outcome."""
         campaign_id = campaign.id
 
         try:
@@ -609,14 +662,19 @@ class CampaignOrchestrator:
                 )
                 return
 
-            # Update campaign status
+            # Determine final state: failed if every dispatched row failed
+            total = campaign.total_rows or 0
+            failed = campaign.failed_rows or 0
+            processed = campaign.processed_rows or 0
+            final_state = "failed" if total > 0 and failed >= total and processed == 0 else "completed"
+
             await db_client.update_campaign(
                 campaign_id=campaign_id,
-                state="completed",
+                state=final_state,
                 completed_at=datetime.now(UTC),
             )
 
-            logger.info(f"campaign_id: {campaign_id} - Campaign marked as completed")
+            logger.info(f"campaign_id: {campaign_id} - Campaign marked as {final_state}")
 
             # Calculate duration if started_at is available
             duration = None
@@ -626,9 +684,9 @@ class CampaignOrchestrator:
             # Publish completion event
             await self.publisher.publish_campaign_completed(
                 campaign_id=campaign_id,
-                total_rows=campaign.total_rows or 0,
-                processed_rows=campaign.processed_rows,
-                failed_rows=campaign.failed_rows,
+                total_rows=total,
+                processed_rows=processed,
+                failed_rows=failed,
                 duration_seconds=duration,
             )
 

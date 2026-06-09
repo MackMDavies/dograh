@@ -126,6 +126,7 @@ services:
     image: ${REGISTRY:-dograhai}/dograh-api:latest
     volumes:
       - shared-tmp:/tmp
+      - ./api:/app/api:ro
     environment:
       # Core application config
       ENVIRONMENT: "${ENVIRONMENT:-local}"
@@ -174,6 +175,15 @@ services:
       FORCE_TURN_RELAY: "${FORCE_TURN_RELAY:-false}"
 
       OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set to a strong secret}"
+
+      # Auth provider — set to "supabase" to validate Supabase JWTs; defaults to Dograh's own OSS JWTs
+      AUTH_PROVIDER: "${AUTH_PROVIDER:-local}"
+      SUPABASE_URL: "${SUPABASE_URL:-}"
+      SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:-}"
+
+      # CORS / deployment
+      DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
+      CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"
 
       # Telemetry
       ENABLE_TELEMETRY: "${ENABLE_TELEMETRY:-true}"

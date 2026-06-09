@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import List, Optional
 
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 from sqlalchemy.orm import selectinload
 
 from api.db.base_client import BaseDBClient
@@ -235,6 +235,25 @@ class ToolClient(BaseDBClient):
                 logger.info(
                     f"Archived tool {tool_uuid} for organization {organization_id}"
                 )
+                return True
+            return False
+
+    async def delete_tool_permanently(self, tool_uuid: str, organization_id: int) -> bool:
+        """Hard delete a tool from the database.
+
+        Returns:
+            True if tool was deleted, False if not found
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                delete(ToolModel).where(
+                    ToolModel.tool_uuid == tool_uuid,
+                    ToolModel.organization_id == organization_id,
+                )
+            )
+            await session.commit()
+            if result.rowcount > 0:
+                logger.info(f"Permanently deleted tool {tool_uuid} for organization {organization_id}")
                 return True
             return False
 

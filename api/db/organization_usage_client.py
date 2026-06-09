@@ -239,25 +239,30 @@ class OrganizationUsageClient(BaseDBClient):
 
     async def get_usage_history(
         self,
-        organization_id: int,
+        organization_id: Optional[int],
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
         limit: int = 50,
         offset: int = 0,
         filters: Optional[list[dict]] = None,
     ) -> tuple[list[dict], int, float, int]:
-        """Get paginated workflow runs with usage for an organization."""
+        """Get paginated workflow runs with usage for an organization.
+
+        Pass organization_id=None to return runs across all organizations (superuser use).
+        """
         async with self.async_session() as session:
-            query = (
+            base_query = (
                 select(WorkflowRunModel)
                 .join(WorkflowModel, WorkflowRunModel.workflow_id == WorkflowModel.id)
                 .join(UserModel, WorkflowModel.user_id == UserModel.id)
-                .where(
-                    UserModel.selected_organization_id == organization_id,
-                    WorkflowRunModel.cost_info.isnot(None),
-                )
+                .where(WorkflowRunModel.cost_info.isnot(None))
                 .order_by(WorkflowRunModel.created_at.desc())
             )
+            if organization_id is not None:
+                base_query = base_query.where(
+                    UserModel.selected_organization_id == organization_id
+                )
+            query = base_query
 
             # Apply date filters if provided
             if start_date:
@@ -431,7 +436,7 @@ class OrganizationUsageClient(BaseDBClient):
 
     async def get_daily_usage_breakdown(
         self,
-        organization_id: int,
+        organization_id: Optional[int],
         start_date: datetime,
         end_date: datetime,
         price_per_second_usd: float,
@@ -469,6 +474,14 @@ class OrganizationUsageClient(BaseDBClient):
                 func.timezone(user_timezone, WorkflowRunModel.created_at), Date
             )
 
+            base_where = [
+                WorkflowRunModel.created_at >= start_date,
+                WorkflowRunModel.created_at <= end_date,
+                WorkflowRunModel.is_completed == True,
+            ]
+            if organization_id is not None:
+                base_where.append(UserModel.selected_organization_id == organization_id)
+
             daily_usage = await session.execute(
                 select(
                     date_expr.label("date"),
@@ -479,12 +492,7 @@ class OrganizationUsageClient(BaseDBClient):
                 )
                 .join(WorkflowModel, WorkflowModel.id == WorkflowRunModel.workflow_id)
                 .join(UserModel, UserModel.id == WorkflowModel.user_id)
-                .where(
-                    UserModel.selected_organization_id == organization_id,
-                    WorkflowRunModel.created_at >= start_date,
-                    WorkflowRunModel.created_at <= end_date,
-                    WorkflowRunModel.is_completed == True,
-                )
+                .where(*base_where)
                 .group_by(date_expr)
                 .order_by(date_expr.desc())
             )
@@ -549,6 +557,141 @@ class OrganizationUsageClient(BaseDBClient):
             await session.commit()
             await session.refresh(org)
             return org
+
+    async def get_usage_by_model(
+        self,
+        organization_id: Optional[int] = None,
+        days: int = 30,
+    ) -> dict:
+        """Aggregate usage_info across workflow runs, keyed by model.
+
+        Returns a dict keyed by "{processor}|||{model_id}" with per-model
+        usage counts and proportional cost estimates derived from cost_info.
+        """
+        from datetime import timedelta
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+        async with self.async_session() as session:
+            query = (
+                select(WorkflowRunModel.usage_info, WorkflowRunModel.cost_info)
+                .join(WorkflowModel, WorkflowModel.id == WorkflowRunModel.workflow_id)
+                .join(UserModel, UserModel.id == WorkflowModel.user_id)
+                .where(
+                    WorkflowRunModel.usage_info.isnot(None),
+                    WorkflowRunModel.created_at >= cutoff,
+                )
+            )
+            if organization_id is not None:
+                query = query.where(
+                    UserModel.selected_organization_id == organization_id
+                )
+
+            result = await session.execute(query)
+            rows = result.all()
+
+        stats: dict = {}
+
+        for usage_info, cost_info in rows:
+            if not usage_info:
+                continue
+
+            cb = {}
+            if cost_info and isinstance(cost_info, dict):
+                cb = cost_info.get("cost_breakdown") or {}
+
+            # LLM — value is a dict with token counts
+            llm_data = usage_info.get("llm") or {}
+            total_llm_tok = sum(
+                (v.get("total_tokens") or 0) if isinstance(v, dict) else 0
+                for v in llm_data.values()
+            )
+            llm_cost = float(cb.get("llm_cost") or 0)
+
+            for key, metrics in llm_data.items():
+                if not isinstance(metrics, dict):
+                    continue
+                s = stats.setdefault(key, {
+                    "service_type": "llm", "call_count": 0,
+                    "prompt_tokens": 0, "completion_tokens": 0,
+                    "total_tokens": 0, "cost_usd": 0.0,
+                })
+                s["call_count"] += 1
+                t = int(metrics.get("total_tokens") or 0)
+                s["prompt_tokens"] += int(metrics.get("prompt_tokens") or 0)
+                s["completion_tokens"] += int(metrics.get("completion_tokens") or 0)
+                s["total_tokens"] += t
+                if total_llm_tok > 0:
+                    s["cost_usd"] += llm_cost * (t / total_llm_tok)
+
+            # TTS — value is character count (int/float)
+            tts_data = usage_info.get("tts") or {}
+            total_tts = sum(
+                (v or 0) for v in tts_data.values() if isinstance(v, (int, float))
+            )
+            tts_cost = float(cb.get("tts_cost") or 0)
+
+            for key, chars in tts_data.items():
+                chars = chars or 0
+                s = stats.setdefault(key, {
+                    "service_type": "tts", "call_count": 0,
+                    "characters": 0, "cost_usd": 0.0,
+                })
+                s["call_count"] += 1
+                s["characters"] += int(chars)
+                if total_tts > 0:
+                    s["cost_usd"] += tts_cost * (chars / total_tts)
+
+            # STT — value is audio seconds (float)
+            stt_data = usage_info.get("stt") or {}
+            total_stt = sum(
+                (v or 0) for v in stt_data.values() if isinstance(v, (int, float))
+            )
+            stt_cost = float(cb.get("stt_cost") or 0)
+
+            for key, secs in stt_data.items():
+                secs = secs or 0
+                s = stats.setdefault(key, {
+                    "service_type": "stt", "call_count": 0,
+                    "audio_seconds": 0.0, "cost_usd": 0.0,
+                })
+                s["call_count"] += 1
+                s["audio_seconds"] += float(secs)
+                if total_stt > 0:
+                    s["cost_usd"] += stt_cost * (secs / total_stt)
+
+        # Normalise keys where the model part is empty (older calls where model
+        # was not passed to the service settings).  Map known processor class
+        # names back to the canonical model_id so they surface correctly on the
+        # frontend.
+        _PROCESSOR_MODEL_FALLBACK: dict[str, dict[str, str]] = {
+            "tts": {
+                "XAITTSService": "grok-voice-latest",
+                "XAIHttpTTSService": "grok-voice-latest",
+            },
+        }
+        normalised: dict = {}
+        for key, stat in stats.items():
+            parts = key.split("|||", 1)
+            if len(parts) == 2 and parts[1] == "":
+                processor, _ = parts
+                svc = stat.get("service_type", "")
+                fallback_model = _PROCESSOR_MODEL_FALLBACK.get(svc, {}).get(processor)
+                if fallback_model:
+                    new_key = f"{processor}|||{fallback_model}"
+                    if new_key in normalised:
+                        # merge into existing entry
+                        existing = normalised[new_key]
+                        existing["call_count"] += stat.get("call_count", 0)
+                        existing["cost_usd"] += stat.get("cost_usd", 0.0)
+                        existing["characters"] = existing.get("characters", 0) + stat.get("characters", 0)
+                        existing["total_tokens"] = existing.get("total_tokens", 0) + stat.get("total_tokens", 0)
+                        existing["audio_seconds"] = existing.get("audio_seconds", 0.0) + stat.get("audio_seconds", 0.0)
+                        continue
+                    key = new_key
+            normalised[key] = stat
+
+        return normalised
 
     def _calculate_current_period(
         self, org: OrganizationModel

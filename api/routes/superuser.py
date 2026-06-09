@@ -81,6 +81,55 @@ async def list_all_workflows(
     return [SuperuserWorkflowItem(**w) for w in workflows]
 
 
+class SuperuserCampaignItem(BaseModel):
+    id: int
+    name: str
+    state: str
+    organization_id: Optional[int]
+    workflow_id: int
+    workflow_name: Optional[str]
+    total_rows: Optional[int]
+    processed_rows: int
+    failed_rows: int
+    created_at: datetime
+    started_at: Optional[datetime]
+    completed_at: Optional[datetime]
+
+
+@router.get("/campaigns", response_model=List[SuperuserCampaignItem])
+async def list_all_campaigns(
+    organization_id: Optional[int] = Query(None),
+    user: UserModel = Depends(get_superuser),
+) -> List[SuperuserCampaignItem]:
+    """List campaigns across all organizations. Superuser only."""
+    campaigns = await db_client.get_all_campaigns_for_superuser(organization_id=organization_id)
+
+    # Resolve workflow names across all orgs
+    workflow_ids = list({c.workflow_id for c in campaigns})
+    workflow_map: dict[int, str] = {}
+    if workflow_ids:
+        workflows = await db_client.get_workflows_by_ids_superuser(workflow_ids)
+        workflow_map = {w["id"]: w["name"] for w in workflows}
+
+    return [
+        SuperuserCampaignItem(
+            id=c.id,
+            name=c.name,
+            state=c.state,
+            organization_id=c.organization_id,
+            workflow_id=c.workflow_id,
+            workflow_name=workflow_map.get(c.workflow_id),
+            total_rows=c.total_rows,
+            processed_rows=c.processed_rows,
+            failed_rows=c.failed_rows,
+            created_at=c.created_at,
+            started_at=c.started_at,
+            completed_at=c.completed_at,
+        )
+        for c in campaigns
+    ]
+
+
 @router.get("/organizations", response_model=List[dict])
 async def list_organizations(
     user: UserModel = Depends(get_superuser),

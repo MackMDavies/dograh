@@ -193,6 +193,7 @@ class WorkflowResponse(BaseModel):
     version_number: int | None = None
     version_status: str | None = None
     workflow_uuid: str | None = None
+    organization_id: int | None = None
 
 
 class WorkflowListResponse(BaseModel):
@@ -580,6 +581,7 @@ async def get_workflows(
     Returns a lightweight response with only essential fields for listing.
     Use GET /workflow/fetch/{workflow_id} to get full workflow details.
     """
+    org_id = None if user.is_superuser else user.selected_organization_id
     # Handle comma-separated status values
     if status and "," in status:
         # Split comma-separated values and fetch workflows for each status
@@ -587,14 +589,14 @@ async def get_workflows(
         all_workflows = []
         for status_value in status_list:
             workflows = await db_client.get_all_workflows_for_listing(
-                organization_id=user.selected_organization_id, status=status_value
+                organization_id=org_id, status=status_value
             )
             all_workflows.extend(workflows)
         workflows = all_workflows
     else:
         # Single status or no status filter
         workflows = await db_client.get_all_workflows_for_listing(
-            organization_id=user.selected_organization_id, status=status
+            organization_id=org_id, status=status
         )
 
     # Get run counts for all workflows in a single query
@@ -631,9 +633,12 @@ async def get_workflow(
     If a draft version exists, returns the draft content for editing.
     Otherwise returns the published version's content.
     """
-    workflow = await db_client.get_workflow(
-        workflow_id, organization_id=user.selected_organization_id
-    )
+    if user.is_superuser:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+    else:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=user.selected_organization_id
+        )
     if workflow is None:
         raise HTTPException(
             status_code=404, detail=f"Workflow with id {workflow_id} not found"
@@ -666,6 +671,7 @@ async def get_workflow(
         "version_number": active_def.version_number if active_def else None,
         "version_status": active_def.status if active_def else None,
         "workflow_uuid": workflow.workflow_uuid,
+        "organization_id": workflow.organization_id,
     }
 
 
@@ -681,9 +687,12 @@ async def get_workflow_versions(
     Pass `limit`/`offset` to page through long histories. With no `limit`,
     returns every version (legacy behavior).
     """
-    workflow = await db_client.get_workflow(
-        workflow_id, organization_id=user.selected_organization_id
-    )
+    if user.is_superuser:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+    else:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=user.selected_organization_id
+        )
     if workflow is None:
         raise HTTPException(
             status_code=404, detail=f"Workflow with id {workflow_id} not found"
@@ -721,9 +730,12 @@ async def publish_workflow(
     but a published version is what runtime executes — so this is the gate
     where the full DTO + graph + trigger-conflict checks must pass.
     """
-    workflow = await db_client.get_workflow(
-        workflow_id, organization_id=user.selected_organization_id
-    )
+    if user.is_superuser:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+    else:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=user.selected_organization_id
+        )
     if workflow is None:
         raise HTTPException(
             status_code=404, detail=f"Workflow with id {workflow_id} not found"
@@ -762,24 +774,60 @@ async def publish_workflow(
     }
 
 
+class CreateDraftRequest(BaseModel):
+    workflow_definition: dict | None = None
+    name: str | None = None
+
+
 @router.post("/{workflow_id}/create-draft")
 async def create_workflow_draft(
     workflow_id: int,
+    request: CreateDraftRequest,
     user: UserModel = Depends(get_user),
 ) -> WorkflowVersionResponse:
-    """Create a draft version from the current published version.
+    """Create or update a draft version, optionally saving a new workflow definition.
 
-    If a draft already exists, returns the existing draft.
+    If a draft already exists it is updated in place.
     """
-    workflow = await db_client.get_workflow(
-        workflow_id, organization_id=user.selected_organization_id
-    )
+    if user.is_superuser:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+        _effective_org_id = workflow.organization_id if workflow else user.selected_organization_id
+    else:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=user.selected_organization_id
+        )
+        _effective_org_id = user.selected_organization_id
     if workflow is None:
         raise HTTPException(
             status_code=404, detail=f"Workflow with id {workflow_id} not found"
         )
 
-    draft = await db_client.save_workflow_draft(workflow_id)
+    # Sanitize and enrich the incoming definition the same way PUT /workflow/{id} does
+    workflow_definition = sanitize_workflow_definition(request.workflow_definition)
+    workflow_definition = ensure_trigger_paths(workflow_definition)
+
+    if workflow_definition and workflow:
+        existing_draft = await db_client.get_draft_version(workflow_id)
+        existing_def = (
+            existing_draft.workflow_json
+            if existing_draft
+            else (workflow.released_definition.workflow_json if workflow.released_definition else None)
+        )
+        if existing_def:
+            workflow_definition = merge_workflow_api_keys(workflow_definition, existing_def)
+
+    # Update name if it changed
+    if request.name and workflow and workflow.name != request.name:
+        await db_client.update_workflow(
+            workflow_id=workflow_id,
+            name=request.name,
+            organization_id=_effective_org_id,
+        )
+
+    draft = await db_client.save_workflow_draft(
+        workflow_id,
+        workflow_definition=workflow_definition,
+    )
     return WorkflowVersionResponse(
         id=draft.id,
         version_number=draft.version_number,
@@ -953,6 +1001,16 @@ async def update_workflow(
         HTTPException: If the workflow is not found or if there's a database error
     """
     try:
+        # For superusers, resolve the workflow's actual org so org-scoped DB
+        # calls work even when the workflow belongs to a different org.
+        if user.is_superuser:
+            _ref = await db_client.get_workflow_by_id(workflow_id)
+            if _ref is None:
+                raise HTTPException(status_code=404, detail=f"Workflow with id {workflow_id} not found")
+            effective_org_id = _ref.organization_id
+        else:
+            effective_org_id = user.selected_organization_id
+
         # Strip UI runtime-only fields (invalid, validationMessage, etc.) from
         # node.data / edge.data before anything touches the DB — the UI sends
         # nodes wholesale from the React Flow store, which carries those.
@@ -966,7 +1024,7 @@ async def update_workflow(
             raise _trigger_path_validation_http_exception(trigger_path_issues)
         if workflow_definition:
             existing_workflow = await db_client.get_workflow(
-                workflow_id, organization_id=user.selected_organization_id
+                workflow_id, organization_id=effective_org_id
             )
             if existing_workflow:
                 # Merge against what the user was editing (draft or published)
@@ -988,7 +1046,7 @@ async def update_workflow(
         workflow_configurations = request.workflow_configurations
         if workflow_configurations and workflow_configurations.get("model_overrides"):
             existing_workflow = await db_client.get_workflow(
-                workflow_id, organization_id=user.selected_organization_id
+                workflow_id, organization_id=effective_org_id
             )
             if existing_workflow is None:
                 raise HTTPException(
@@ -1015,7 +1073,7 @@ async def update_workflow(
                 )
                 # Second pass: fill any still-missing API keys from org connections
                 enriched_overrides = await enrich_overrides_with_org_api_keys(
-                    enriched_overrides, user.selected_organization_id
+                    enriched_overrides, effective_org_id
                 )
                 effective = resolve_effective_config(user_config, enriched_overrides)
                 # Only validate services that are explicitly overridden — the
@@ -1028,7 +1086,7 @@ async def update_workflow(
                 await UserConfigurationValidator().validate_partial(
                     effective,
                     services=overridden_services,
-                    organization_id=user.selected_organization_id,
+                    organization_id=effective_org_id,
                     created_by=user.provider_id,
                 )
             except (ValueError, ValidationError) as e:
@@ -1060,7 +1118,7 @@ async def update_workflow(
             workflow_definition=workflow_definition,
             template_context_variables=request.template_context_variables,
             workflow_configurations=workflow_configurations,
-            organization_id=user.selected_organization_id,
+            organization_id=effective_org_id,
         )
 
         # Sync agent triggers if workflow definition was updated
@@ -1068,7 +1126,7 @@ async def update_workflow(
             trigger_paths = extract_trigger_paths(workflow_definition)
             await db_client.sync_triggers_for_workflow(
                 workflow_id=workflow.id,
-                organization_id=user.selected_organization_id,
+                organization_id=effective_org_id,
                 trigger_paths=trigger_paths,
             )
 
@@ -1082,7 +1140,7 @@ async def update_workflow(
         else:
             # update_workflow only eagerly loads current_definition — re-fetch to get released_definition
             full_workflow = await db_client.get_workflow(
-                workflow_id, organization_id=user.selected_organization_id
+                workflow_id, organization_id=effective_org_id
             )
             published = full_workflow.released_definition if full_workflow else None
             workflow_def = published.workflow_json if published else {}
@@ -1172,14 +1230,29 @@ async def create_workflow_run(
         request: The create workflow run request
         user: The user to create the workflow run for
     """
-    run = await db_client.create_workflow_run(
-        request.name,
-        workflow_id,
-        request.mode,
-        user.id,
-        use_draft=True,
-        organization_id=user.selected_organization_id,
-    )
+    if user.is_superuser:
+        _wf_ref = await db_client.get_workflow_by_id(workflow_id)
+        if not _wf_ref:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        effective_org_id = _wf_ref.organization_id
+        run = await db_client.create_workflow_run(
+            request.name,
+            workflow_id,
+            request.mode,
+            user.id,
+            use_draft=True,
+            organization_id=effective_org_id,
+            bypass_user_check=True,
+        )
+    else:
+        run = await db_client.create_workflow_run(
+            request.name,
+            workflow_id,
+            request.mode,
+            user.id,
+            use_draft=True,
+            organization_id=user.selected_organization_id,
+        )
     return {
         "id": run.id,
         "workflow_id": run.workflow_id,
@@ -1197,7 +1270,8 @@ async def get_workflow_run(
     workflow_id: int, run_id: int, user: UserModel = Depends(get_user)
 ) -> WorkflowRunResponseSchema:
     run = await db_client.get_workflow_run(
-        run_id, organization_id=user.selected_organization_id
+        run_id,
+        organization_id=None if user.is_superuser else user.selected_organization_id,
     )
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -1299,7 +1373,7 @@ async def get_workflow_runs(
 
     runs, total_count = await db_client.get_workflow_runs_by_workflow_id(
         workflow_id,
-        organization_id=user.selected_organization_id,
+        organization_id=None if user.is_superuser else user.selected_organization_id,
         limit=limit,
         offset=offset,
         filters=filter_criteria if filter_criteria else None,

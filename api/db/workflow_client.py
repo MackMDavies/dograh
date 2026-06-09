@@ -679,6 +679,20 @@ class WorkflowClient(BaseDBClient):
             )
             return result.scalars().all()
 
+    async def get_workflows_by_ids_superuser(
+        self, workflow_ids: list[int]
+    ) -> list[dict]:
+        """Get workflow id+name for a set of IDs, cross-org (superuser only)."""
+        if not workflow_ids:
+            return []
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(WorkflowModel.id, WorkflowModel.name).where(
+                    WorkflowModel.id.in_(workflow_ids)
+                )
+            )
+            return [{"id": row.id, "name": row.name} for row in result.all()]
+
     async def get_workflow_name(
         self, workflow_id: int, user_id: int = None, organization_id: int = None
     ) -> Optional[str]:

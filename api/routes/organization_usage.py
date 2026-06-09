@@ -95,13 +95,51 @@ class DailyUsageBreakdownResponse(BaseModel):
     currency: Optional[str] = None
 
 
+@router.get("/usage/by-model")
+async def get_usage_by_model(
+    days: int = Query(default=30, ge=1, le=365),
+    user: UserModel = Depends(get_user),
+) -> Dict[str, Any]:
+    """Return per-model usage aggregated from workflow run usage_info records."""
+    org_id = None if user.is_superuser else user.selected_organization_id
+    stats = await db_client.get_usage_by_model(organization_id=org_id, days=days)
+    return {"by_model": stats, "days": days}
+
+
 @router.get("/usage/current-period", response_model=CurrentUsageResponse)
 async def get_current_period_usage(user: UserModel = Depends(get_user)):
     """Get current billing period usage for the user's organization."""
-    if not user.selected_organization_id:
+    if not user.is_superuser and not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
     try:
+        if user.is_superuser:
+            # Aggregate total duration from all runs in the current calendar month
+            now = datetime.now()
+            period_start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            _, _, total_tokens, total_duration = await db_client.get_usage_history(
+                organization_id=None,
+                start_date=period_start,
+                limit=1,
+                offset=0,
+            )
+            # Re-query just for the count (get_usage_history returns total_count too)
+            _, total_count, _, _ = await db_client.get_usage_history(
+                organization_id=None,
+                start_date=period_start,
+                limit=1,
+                offset=0,
+            )
+            return {
+                "period_start": period_start.isoformat(),
+                "period_end": now.isoformat(),
+                "used_dograh_tokens": total_tokens,
+                "quota_dograh_tokens": 0,
+                "percentage_used": 0,
+                "next_refresh_date": now.replace(month=now.month % 12 + 1, day=1).date().isoformat() if now.month < 12 else now.replace(year=now.year + 1, month=1, day=1).date().isoformat(),
+                "quota_enabled": False,
+                "total_duration_seconds": total_duration,
+            }
         usage = await db_client.get_current_usage(user.selected_organization_id)
         return usage
     except Exception as e:
@@ -194,7 +232,7 @@ async def get_usage_history(
     user: UserModel = Depends(get_user),
 ):
     """Get paginated workflow runs with usage for the organization."""
-    if not user.selected_organization_id:
+    if not user.is_superuser and not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
     # Parse dates if provided
@@ -211,13 +249,15 @@ async def get_usage_history(
 
     try:
         offset = (page - 1) * limit
+        # Superusers see runs across all organizations
+        org_id_for_runs = None if user.is_superuser else user.selected_organization_id
         (
             runs,
             total_count,
             total_tokens,
             total_duration,
         ) = await db_client.get_usage_history(
-            user.selected_organization_id,
+            org_id_for_runs,
             start_date=start_dt,
             end_date=end_dt,
             limit=limit,
@@ -297,10 +337,25 @@ async def get_daily_usage_breakdown(
     user: UserModel = Depends(get_user),
 ):
     """Get daily usage breakdown for the last N days. Only available for organizations with pricing."""
-    if not user.selected_organization_id:
+    if not user.is_superuser and not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
     try:
+        end_date = datetime.now()
+        start_date = end_date - timedelta(days=days - 1)
+        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        if user.is_superuser:
+            # Aggregate across all orgs; use $0 price (no USD cost for superuser view)
+            breakdown = await db_client.get_daily_usage_breakdown(
+                None,
+                start_date,
+                end_date,
+                price_per_second_usd=0.0,
+                user_id=user.id,
+            )
+            return breakdown
+
         # Get organization to check if it has pricing
         org = await db_client.get_organization_by_id(user.selected_organization_id)
         if not org or org.price_per_second_usd is None:
@@ -309,12 +364,6 @@ async def get_daily_usage_breakdown(
                 detail="Daily breakdown is only available for organizations with pricing configured",
             )
 
-        # Calculate date range
-        end_date = datetime.now()
-        start_date = end_date - timedelta(days=days - 1)
-        start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        # Get daily breakdown
         breakdown = await db_client.get_daily_usage_breakdown(
             user.selected_organization_id,
             start_date,

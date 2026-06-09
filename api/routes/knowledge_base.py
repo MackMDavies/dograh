@@ -1,5 +1,7 @@
 """API routes for knowledge base operations."""
 
+import os
+import tempfile
 import uuid
 from typing import Annotated, Optional
 
@@ -17,6 +19,7 @@ from api.schemas.knowledge_base import (
     DocumentUploadResponseSchema,
     ProcessDocumentRequestSchema,
     SetDocumentGlobalRequestSchema,
+    UpdateDocumentContentSchema,
     WorkflowDocumentListResponseSchema,
 )
 from api.sdk_expose import sdk_expose
@@ -403,6 +406,200 @@ async def delete_document(
         raise HTTPException(
             status_code=500, detail="Failed to delete document"
         ) from exc
+
+
+@router.post(
+    "/documents/{document_uuid}/retry",
+    response_model=DocumentResponseSchema,
+    summary="Retry processing a failed document",
+)
+async def retry_document_processing(
+    document_uuid: str,
+    user=Depends(get_user),
+):
+    """Re-enqueue processing for a document that previously failed.
+
+    Only documents in 'failed' status can be retried. The document is reset
+    to 'pending' and its existing chunks (if any) are cleared before re-queuing.
+    """
+    try:
+        document = await db_client.get_document_by_uuid(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+        )
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        if document.processing_status != "failed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Document is '{document.processing_status}', not 'failed' — cannot retry.",
+            )
+
+        s3_key = (document.custom_metadata or {}).get("s3_key", "")
+        if not s3_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Document has no S3 key stored; cannot re-process.",
+            )
+
+        # Clear any stale chunks and reset status to pending.
+        await db_client.delete_document_chunks(document.id)
+        await db_client.reset_document_for_retry(document.id)
+
+        await enqueue_job(
+            FunctionNames.PROCESS_KNOWLEDGE_BASE_DOCUMENT,
+            document.id,
+            s3_key,
+            user.selected_organization_id,
+            str(user.provider_id),
+            128,
+            document.retrieval_mode or "chunked",
+        )
+
+        logger.info(
+            f"Retrying document {document_uuid} (id={document.id}), "
+            f"org {user.selected_organization_id}"
+        )
+
+        refreshed = await db_client.get_document_by_uuid(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+        )
+        return DocumentResponseSchema(
+            id=refreshed.id,
+            document_uuid=refreshed.document_uuid,
+            filename=refreshed.filename,
+            file_size_bytes=refreshed.file_size_bytes,
+            file_hash=refreshed.file_hash,
+            mime_type=refreshed.mime_type,
+            processing_status=refreshed.processing_status,
+            processing_error=refreshed.processing_error,
+            total_chunks=refreshed.total_chunks,
+            retrieval_mode=refreshed.retrieval_mode,
+            custom_metadata=refreshed.custom_metadata,
+            docling_metadata=refreshed.docling_metadata,
+            source_url=refreshed.source_url,
+            created_at=refreshed.created_at,
+            updated_at=refreshed.updated_at,
+            organization_id=refreshed.organization_id,
+            created_by=refreshed.created_by,
+            is_active=refreshed.is_active,
+            is_global=getattr(refreshed, "is_global", False),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error retrying document {document_uuid}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to retry document processing") from exc
+
+
+_EDITABLE_MIME_TYPES = frozenset({
+    "text/plain", "text/markdown", "text/x-markdown",
+    "text/csv", "application/json", "text/html",
+})
+
+
+@router.put(
+    "/documents/{document_uuid}/content",
+    response_model=DocumentResponseSchema,
+    summary="Replace text content and re-process",
+)
+async def update_document_content(
+    document_uuid: str,
+    request: UpdateDocumentContentSchema,
+    user=Depends(get_user),
+):
+    """Overwrite a text document's content in storage and re-trigger chunking/embedding.
+
+    Only text-based MIME types are supported (text/plain, text/markdown, text/csv,
+    application/json, text/html). Binary formats (PDF, DOCX, images) are rejected.
+    """
+    try:
+        document = await db_client.get_document_by_uuid(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+        )
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+
+        mime = (document.mime_type or "").split(";")[0].strip()
+        if mime and mime not in _EDITABLE_MIME_TYPES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Document type '{mime}' does not support inline editing.",
+            )
+
+        s3_key = (document.custom_metadata or {}).get("s3_key", "")
+        if not s3_key:
+            raise HTTPException(status_code=400, detail="Document has no S3 key stored.")
+
+        ext = os.path.splitext(document.filename)[1] or ".txt"
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", suffix=ext, delete=False, encoding="utf-8"
+            ) as fh:
+                fh.write(request.text)
+                temp_path = fh.name
+
+            success = await storage_fs.aupload_file(temp_path, s3_key)
+            if not success:
+                raise HTTPException(status_code=500, detail="Failed to write updated content to storage.")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                os.remove(temp_path)
+
+        await db_client.delete_document_chunks(document.id)
+        await db_client.reset_document_for_retry(document.id)
+
+        await enqueue_job(
+            FunctionNames.PROCESS_KNOWLEDGE_BASE_DOCUMENT,
+            document.id,
+            s3_key,
+            user.selected_organization_id,
+            str(user.provider_id),
+            128,
+            document.retrieval_mode or "chunked",
+        )
+
+        logger.info(
+            f"Updated content for document {document_uuid} (id={document.id}), "
+            f"org {user.selected_organization_id}"
+        )
+
+        refreshed = await db_client.get_document_by_uuid(
+            document_uuid=document_uuid,
+            organization_id=user.selected_organization_id,
+        )
+        return DocumentResponseSchema(
+            id=refreshed.id,
+            document_uuid=refreshed.document_uuid,
+            filename=refreshed.filename,
+            file_size_bytes=refreshed.file_size_bytes,
+            file_hash=refreshed.file_hash,
+            mime_type=refreshed.mime_type,
+            processing_status=refreshed.processing_status,
+            processing_error=refreshed.processing_error,
+            total_chunks=refreshed.total_chunks,
+            retrieval_mode=refreshed.retrieval_mode,
+            custom_metadata=refreshed.custom_metadata,
+            docling_metadata=refreshed.docling_metadata,
+            source_url=refreshed.source_url,
+            created_at=refreshed.created_at,
+            updated_at=refreshed.updated_at,
+            organization_id=refreshed.organization_id,
+            created_by=refreshed.created_by,
+            is_active=refreshed.is_active,
+            is_global=getattr(refreshed, "is_global", False),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.error(f"Error updating document content {document_uuid}: {exc}")
+        raise HTTPException(status_code=500, detail="Failed to update document content") from exc
 
 
 @router.post(

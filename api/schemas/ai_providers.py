@@ -44,7 +44,23 @@ class AvailableModelResponseSchema(BaseModel):
     display_name: Optional[str] = None
     is_client_available: bool
     is_default: bool
+    cost_per_min_usd: Optional[float] = None
+    native_cost_display: Optional[str] = None
+    our_price_per_min_usd: Optional[float] = None
 
 
 class SetModelClientAvailableSchema(BaseModel):
     is_client_available: bool
+
+
+class SetModelOurPriceSchema(BaseModel):
+    our_price_per_min_usd: Optional[float] = None
+
+
+class ApplyMarginSchema(BaseModel):
+    margin_percent: float
+    connection_id: Optional[int] = None
+
+
+class SetModelDisplayNameSchema(BaseModel):
+    display_name: Optional[str] = None

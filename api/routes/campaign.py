@@ -329,18 +329,18 @@ async def _get_campaign_stats(campaign_id: int) -> tuple[int, int]:
 
 
 async def _get_telephony_configuration_name(
-    config_id: Optional[int], organization_id: int
+    config_id: Optional[int], organization_id: Optional[int]
 ) -> Optional[str]:
-    """Resolve the display name for a campaign's telephony configuration.
-
-    Org-scoped lookup so a stale FK from another org (shouldn't happen, but
-    cheap to enforce) doesn't leak across tenants.
-    """
+    """Resolve the display name for a campaign's telephony configuration."""
     if config_id is None:
         return None
-    cfg = await db_client.get_telephony_configuration_for_org(
-        config_id, organization_id
-    )
+    if organization_id is None:
+        # Superuser — unscoped lookup
+        cfg = await db_client.get_telephony_configuration(config_id)
+    else:
+        cfg = await db_client.get_telephony_configuration_for_org(
+            config_id, organization_id
+        )
     return cfg.name if cfg else None
 
 
@@ -350,8 +350,11 @@ async def create_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Create a new campaign"""
-    # Verify workflow exists and belongs to organization
-    workflow_name = await db_client.get_workflow_name(request.workflow_id, user.id)
+    # Verify workflow exists — superusers can reference any org's workflow
+    if user.is_superuser:
+        workflow_name = await db_client.get_workflow_name(request.workflow_id)
+    else:
+        workflow_name = await db_client.get_workflow_name(request.workflow_id, user.id)
     if not workflow_name:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
@@ -364,8 +367,10 @@ async def create_campaign(
         raise HTTPException(status_code=400, detail=validation_result.error.message)
 
     # Validate template variables against source data columns
-    workflow = await db_client.get_workflow(
-        request.workflow_id, organization_id=user.selected_organization_id
+    workflow = await (
+        db_client.get_workflow_by_id(request.workflow_id)
+        if user.is_superuser
+        else db_client.get_workflow(request.workflow_id, organization_id=user.selected_organization_id)
     )
     if workflow:
         from api.services.workflow.dto import ReactFlowDTO
@@ -508,15 +513,20 @@ async def get_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Get campaign details"""
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
+    if user.is_superuser:
+        campaign = await db_client.get_campaign_by_id(campaign_id)
+    else:
+        campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    workflow_name = await db_client.get_workflow_name(campaign.workflow_id, user.id)
+    workflow_name = await db_client.get_workflow_name(
+        campaign.workflow_id, organization_id=campaign.organization_id
+    )
 
     executed, total = await _get_campaign_stats(campaign.id)
     cfg_name = await _get_telephony_configuration_name(
-        campaign.telephony_configuration_id, user.selected_organization_id
+        campaign.telephony_configuration_id, campaign.organization_id
     )
     return _build_campaign_response(
         campaign,
@@ -533,20 +543,20 @@ async def start_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Start campaign execution"""
-    # Block start if the org has no telephony configuration at all.
-    configs = await db_client.list_telephony_configurations(
-        user.selected_organization_id
-    )
+    org_id = None if user.is_superuser else user.selected_organization_id
+
+    # Load campaign first so we can check telephony against the campaign's org.
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Block start if the campaign's org has no telephony configuration.
+    configs = await db_client.list_telephony_configurations(campaign.organization_id)
     if not configs:
         raise HTTPException(
             status_code=401,
             detail="You must configure telephony first by going to APP_URL/configure-telephony",
         )
-
-    # Verify campaign exists and belongs to organization
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
 
     # Check Dograh quota before starting campaign (apply per-workflow
     # model_overrides so we evaluate the keys this campaign will use).
@@ -561,12 +571,14 @@ async def start_campaign(
         raise HTTPException(status_code=400, detail=str(e))
 
     # Get updated campaign
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    workflow_name = await db_client.get_workflow_name(campaign.workflow_id, user.id)
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    workflow_name = await db_client.get_workflow_name(
+        campaign.workflow_id, organization_id=campaign.organization_id
+    )
 
     executed, total = await _get_campaign_stats(campaign.id)
     cfg_name = await _get_telephony_configuration_name(
-        campaign.telephony_configuration_id, user.selected_organization_id
+        campaign.telephony_configuration_id, campaign.organization_id
     )
     return _build_campaign_response(
         campaign,
@@ -583,8 +595,9 @@ async def pause_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Pause campaign execution"""
+    org_id = None if user.is_superuser else user.selected_organization_id
     # Verify campaign exists and belongs to organization
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
+    campaign = await db_client.get_campaign(campaign_id, org_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
@@ -595,12 +608,14 @@ async def pause_campaign(
         raise HTTPException(status_code=400, detail=str(e))
 
     # Get updated campaign
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    workflow_name = await db_client.get_workflow_name(campaign.workflow_id, user.id)
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    workflow_name = await db_client.get_workflow_name(
+        campaign.workflow_id, organization_id=campaign.organization_id
+    )
 
     executed, total = await _get_campaign_stats(campaign.id)
     cfg_name = await _get_telephony_configuration_name(
-        campaign.telephony_configuration_id, user.selected_organization_id
+        campaign.telephony_configuration_id, campaign.organization_id
     )
     return _build_campaign_response(
         campaign,
@@ -618,7 +633,8 @@ async def update_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Update campaign settings (name, retry config, max concurrency, schedule)"""
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
@@ -665,12 +681,14 @@ async def update_campaign(
         await db_client.update_campaign(campaign_id=campaign_id, **update_kwargs)
 
     # Re-fetch to return updated data
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    workflow_name = await db_client.get_workflow_name(campaign.workflow_id, user.id)
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    workflow_name = await db_client.get_workflow_name(
+        campaign.workflow_id, organization_id=campaign.organization_id
+    )
 
     executed, total = await _get_campaign_stats(campaign.id)
     cfg_name = await _get_telephony_configuration_name(
-        campaign.telephony_configuration_id, user.selected_organization_id
+        campaign.telephony_configuration_id, campaign.organization_id
     )
     return _build_campaign_response(
         campaign,
@@ -721,10 +739,18 @@ async def get_campaign_runs(
                     status_code=403, detail=f"Invalid attribute '{attribute}'"
                 )
 
+    if user.is_superuser:
+        campaign_for_org = await db_client.get_campaign_by_id(campaign_id)
+        if not campaign_for_org:
+            raise HTTPException(status_code=404, detail="Campaign not found")
+        org_id_for_runs = campaign_for_org.organization_id
+    else:
+        org_id_for_runs = user.selected_organization_id
+
     try:
         runs, total_count = await db_client.get_campaign_runs_paginated(
             campaign_id,
-            user.selected_organization_id,
+            org_id_for_runs,
             limit=limit,
             offset=offset,
             filters=filter_criteria if filter_criteria else None,
@@ -745,6 +771,33 @@ async def get_campaign_runs(
     )
 
 
+@router.get("/{campaign_id}/contacts")
+async def get_campaign_contacts(
+    campaign_id: int,
+    page: int = 1,
+    limit: int = 50,
+    user: UserModel = Depends(get_user),
+):
+    """Return all queued contacts for a campaign with their latest call outcome."""
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    offset = (page - 1) * limit
+    contacts, total_count = await db_client.get_campaign_contacts_paginated(
+        campaign_id, limit=limit, offset=offset
+    )
+    total_pages = max(1, (total_count + limit - 1) // limit)
+    return {
+        "contacts": contacts,
+        "total_count": total_count,
+        "page": page,
+        "limit": limit,
+        "total_pages": total_pages,
+    }
+
+
 class RedialCampaignRequest(BaseModel):
     name: Optional[str] = Field(
         None, min_length=1, max_length=255, description="Name for the redial campaign"
@@ -752,16 +805,18 @@ class RedialCampaignRequest(BaseModel):
     retry_on_voicemail: bool = True
     retry_on_no_answer: bool = True
     retry_on_busy: bool = True
+    retry_on_failed: bool = False
     retry_config: Optional[RetryConfigRequest] = None
 
     @model_validator(mode="after")
     def validate_at_least_one_reason(self):
         if not (
             self.retry_on_voicemail or self.retry_on_no_answer or self.retry_on_busy
+            or self.retry_on_failed
         ):
             raise ValueError(
                 "At least one of retry_on_voicemail, retry_on_no_answer, "
-                "retry_on_busy must be true"
+                "retry_on_busy, retry_on_failed must be true"
             )
         return self
 
@@ -779,14 +834,15 @@ async def redial_campaign(
     from the parent's original initial contexts. A campaign can be redialed at
     most once.
     """
-    parent = await db_client.get_campaign(campaign_id, user.selected_organization_id)
+    org_id = None if user.is_superuser else user.selected_organization_id
+    parent = await db_client.get_campaign(campaign_id, org_id)
     if not parent:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    if parent.state != "completed":
+    if parent.state not in ("completed", "failed"):
         raise HTTPException(
             status_code=400,
-            detail=f"Only completed campaigns can be redialed (current state: {parent.state})",
+            detail=f"Only completed or failed campaigns can be redialed (current state: {parent.state})",
         )
 
     parent_meta = parent.orchestrator_metadata or {}
@@ -801,6 +857,7 @@ async def redial_campaign(
         include_voicemail=request.retry_on_voicemail,
         include_no_answer=request.retry_on_no_answer,
         include_busy=request.retry_on_busy,
+        include_failed=request.retry_on_failed,
     )
     if not candidates:
         raise HTTPException(
@@ -835,10 +892,12 @@ async def redial_campaign(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    workflow_name = await db_client.get_workflow_name(child.workflow_id, user.id)
+    workflow_name = await db_client.get_workflow_name(
+        child.workflow_id, organization_id=child.organization_id
+    )
     executed, total = await _get_campaign_stats(child.id)
     cfg_name = await _get_telephony_configuration_name(
-        child.telephony_configuration_id, user.selected_organization_id
+        child.telephony_configuration_id, child.organization_id
     )
     return _build_campaign_response(
         child,
@@ -855,20 +914,20 @@ async def resume_campaign(
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Resume a paused campaign"""
-    # Block resume if the org has no telephony configuration at all.
-    configs = await db_client.list_telephony_configurations(
-        user.selected_organization_id
-    )
+    org_id = None if user.is_superuser else user.selected_organization_id
+
+    # Load campaign first so we can check telephony against the campaign's org.
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Block resume if the campaign's org has no telephony configuration.
+    configs = await db_client.list_telephony_configurations(campaign.organization_id)
     if not configs:
         raise HTTPException(
             status_code=401,
             detail="You must configure telephony first by going to APP_URL/configure-telephony",
         )
-
-    # Verify campaign exists and belongs to organization
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
 
     # Check Dograh quota before resuming campaign (apply per-workflow
     # model_overrides so we evaluate the keys this campaign will use).
@@ -883,12 +942,14 @@ async def resume_campaign(
         raise HTTPException(status_code=400, detail=str(e))
 
     # Get updated campaign
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    workflow_name = await db_client.get_workflow_name(campaign.workflow_id, user.id)
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    workflow_name = await db_client.get_workflow_name(
+        campaign.workflow_id, organization_id=campaign.organization_id
+    )
 
     executed, total = await _get_campaign_stats(campaign.id)
     cfg_name = await _get_telephony_configuration_name(
-        campaign.telephony_configuration_id, user.selected_organization_id
+        campaign.telephony_configuration_id, campaign.organization_id
     )
     return _build_campaign_response(
         campaign,
@@ -997,3 +1058,30 @@ async def download_campaign_report(
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.delete("/{campaign_id}")
+async def delete_campaign(
+    campaign_id: int,
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Delete a campaign permanently.
+
+    Only campaigns in 'completed', 'failed', or 'created' state may be deleted.
+    Running or paused campaigns must be stopped first.
+    """
+    try:
+        if user.is_superuser:
+            _ref = await db_client.get_campaign_by_id(campaign_id)
+            if not _ref:
+                raise HTTPException(status_code=404, detail="Campaign not found")
+            deleted = await db_client.delete_campaign(campaign_id, _ref.organization_id)
+        else:
+            deleted = await db_client.delete_campaign(campaign_id, user.selected_organization_id)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    return {"status": "deleted", "campaign_id": campaign_id}

@@ -39,9 +39,10 @@ from api.routes.turn_credentials import (
     TURN_SECRET,
     generate_turn_credentials,
 )
-from api.services.auth.depends import get_user_ws
+from api.services.auth.depends import get_user, get_user_ws
 from api.services.pipecat.run_pipeline import run_pipeline_smallwebrtc
 from api.services.pipecat.ws_sender_registry import (
+    get_ws_sender,
     register_ws_sender,
     unregister_ws_sender,
 )
@@ -517,6 +518,25 @@ class SignalingManager:
 signaling_manager = SignalingManager()
 
 
+@router.get("/ice-servers")
+async def get_client_ice_servers(user: UserModel = Depends(get_user)):
+    """Return ICE server configuration (including time-limited TURN credentials) for the browser.
+
+    The browser must use the same TURN infrastructure as the server so relay
+    candidates in the answer SDP are reachable.
+    """
+    servers = get_ice_servers(user_id=str(user.id))
+    result = []
+    for s in servers:
+        entry: dict = {"urls": s.urls if isinstance(s.urls, list) else [s.urls]}
+        if s.username:
+            entry["username"] = s.username
+        if s.credential:
+            entry["credential"] = s.credential
+        result.append(entry)
+    return {"iceServers": result}
+
+
 @router.websocket("/signaling/{workflow_id}/{workflow_run_id}")
 async def signaling_websocket(
     websocket: WebSocket,
@@ -525,7 +545,10 @@ async def signaling_websocket(
     user: UserModel = Depends(get_user_ws),
 ):
     """WebSocket endpoint for WebRTC signaling with ICE trickling."""
-    workflow_run = await db_client.get_workflow_run(workflow_run_id, user.id)
+    if user.is_superuser:
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    else:
+        workflow_run = await db_client.get_workflow_run(workflow_run_id, user.id)
     if not workflow_run:
         logger.warning(f"workflow run {workflow_run_id} not found for user {user.id}")
         raise HTTPException(status_code=400, detail="Bad workflow_run_id")

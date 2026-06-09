@@ -98,8 +98,14 @@ class VoiceLibraryClient(BaseDBClient):
         status: Optional[str] = None,
     ) -> list[VoiceLibraryModel]:
         async with self.async_session() as session:
+            # Non-ready voices (pending/processing/failed) are always private to their
+            # creator — regardless of is_public or superuser status.
+            # Superusers see all ready voices across ALL orgs (no org filter).
             if is_superuser:
-                base_filter = VoiceLibraryModel.organization_id == organization_id
+                base_filter = or_(
+                    VoiceLibraryModel.status == "ready",
+                    VoiceLibraryModel.user_id == user_id,
+                )
             else:
                 base_filter = and_(
                     VoiceLibraryModel.organization_id == organization_id,

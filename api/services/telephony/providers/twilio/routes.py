@@ -32,28 +32,38 @@ async def handle_twiml_webhook(
     """
     Handle initial webhook from telephony provider.
     Returns provider-specific response (e.g., TwiML for Twilio).
+    Never returns a non-200 response — Twilio plays an error message if we do.
     """
+    _hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
 
-    workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
-    provider = await get_telephony_provider_for_run(workflow_run, organization_id)
-    callback_data = dict(await request.form())
+    try:
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+        if not workflow_run:
+            logger.error(f"[run {workflow_run_id}] Workflow run not found for TwiML webhook")
+            return HTMLResponse(content=_hangup, media_type="application/xml")
 
-    is_valid = await provider.verify_inbound_signature(
-        str(request.url),
-        callback_data,
-        dict(request.headers),
-    )
-    if not is_valid:
-        logger.warning(
-            f"[run {workflow_run_id}] Invalid Twilio signature on answer webhook"
+        provider = await get_telephony_provider_for_run(workflow_run, organization_id)
+        callback_data = dict(await request.form())
+
+        is_valid = await provider.verify_inbound_signature(
+            str(request.url),
+            callback_data,
+            dict(request.headers),
         )
-        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+        if not is_valid:
+            logger.warning(
+                f"[run {workflow_run_id}] Invalid Twilio signature on answer webhook"
+            )
+            return HTMLResponse(content=_hangup, media_type="application/xml")
 
-    response_content = await provider.get_webhook_response(
-        workflow_id, user_id, workflow_run_id
-    )
+        response_content = await provider.get_webhook_response(
+            workflow_id, user_id, workflow_run_id
+        )
+        return HTMLResponse(content=response_content, media_type="application/xml")
 
-    return HTMLResponse(content=response_content, media_type="application/xml")
+    except Exception as exc:
+        logger.error(f"[run {workflow_run_id}] TwiML webhook error: {exc}")
+        return HTMLResponse(content=_hangup, media_type="application/xml")
 
 
 @router.post("/twilio/status-callback/{workflow_run_id}")
