@@ -70,6 +70,16 @@ class VoiceLibraryClient(BaseDBClient):
             )
             return result.scalars().first()
 
+    async def get_voice_by_uuid_any_org(
+        self, voice_uuid: str
+    ) -> Optional[VoiceLibraryModel]:
+        """Look up a voice by UUID across all orgs. Used as a platform-level fallback."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(VoiceLibraryModel).where(VoiceLibraryModel.uuid == voice_uuid)
+            )
+            return result.scalars().first()
+
     async def get_voice_by_provider_id(
         self, provider_voice_id: str, organization_id: int
     ) -> Optional[VoiceLibraryModel]:

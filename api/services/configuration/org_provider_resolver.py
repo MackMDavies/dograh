@@ -45,6 +45,11 @@ async def resolve_org_provider_config(
 
         connections = await db_client.list_connections(organization_id, service_type_str)
         if not connections:
+            # Platform-level fallback: org has no connection for this service type,
+            # so search across all orgs (lowest id = platform/admin org first).
+            all_org_conns = await db_client.list_all_connections_superuser(service_type_str)
+            connections = all_org_conns
+        if not connections:
             continue
 
         # Use the first active connection (lowest id = oldest = implicit default)
@@ -76,9 +81,17 @@ async def resolve_org_provider_config(
                 "api_key": conn.api_key,
                 **(conn.extra_config or {}),
             }
-            # TTS: if voice is absent, fall back to model_id (works for Deepgram,
-            # OpenAI TTS; for ElevenLabs/Cartesia the caller must set voice separately)
-            if service_type_str == "tts" and "voice" not in config_dict:
+            # TTS: some providers use model_id as the voice/language specifier
+            # (e.g. Deepgram). ElevenLabs and Cartesia require a real voice ID
+            # that cannot be inferred from the model — skip the fallback for them
+            # so the schema default (a valid placeholder voice) is used instead.
+            # The caller must supply the real voice via voice_uuid resolution.
+            _voice_from_model_providers = {"deepgram", "sarvam", "camb", "rime"}
+            if (
+                service_type_str == "tts"
+                and "voice" not in config_dict
+                and conn.provider in _voice_from_model_providers
+            ):
                 config_dict["voice"] = default_model.model_id
 
             setattr(effective, section_key, config_cls(**config_dict))
@@ -117,16 +130,16 @@ async def enrich_overrides_with_org_api_keys(
         if not provider:
             continue
 
-        # Only look up org connection when api_key is missing — if it's already
-        # set we consider the override fully credentialled and skip the lookup.
-        if override.get("api_key"):
+        # Only look up org connection when credentials are missing. For standard
+        # providers this is api_key; for Google it is credentials (service-account JSON).
+        if override.get("api_key") or override.get("credentials"):
             continue
 
         conn = await db_client.get_connection_by_provider(
             organization_id, service_type_str, provider
         )
         if conn is None or not conn.api_key:
-            # Fallback: search all service types for the same provider.
+            # Fallback 1: search all service types for the same provider within the org.
             # Many providers (xAI, OpenAI, etc.) use one API key across all services,
             # so if the TTS connection lacks a key but the LLM connection has one, use it.
             all_conns = await db_client.list_connections(organization_id)
@@ -134,8 +147,20 @@ async def enrich_overrides_with_org_api_keys(
                 (c for c in all_conns if c.provider == provider and c.api_key),
                 conn,
             )
-            if conn is None:
-                continue
+
+        if conn is None or not conn.api_key:
+            # Fallback 2: platform-level — the org has no connection for this provider
+            # at all, so search across every org (e.g. admin org holds the keys).
+            # Use conn as the default so we keep the original connection's extra_config
+            # (e.g. Google service-account JSON stored in extra_config["credentials"]).
+            all_org_conns = await db_client.list_all_connections_superuser()
+            conn = next(
+                (c for c in all_org_conns if c.provider == provider and c.api_key),
+                conn,
+            )
+
+        if conn is None:
+            continue
 
         if conn.api_key:
             override["api_key"] = conn.api_key
@@ -149,13 +174,20 @@ async def enrich_overrides_with_org_api_keys(
 
 async def resolve_voice_for_tts(
     voice_uuid: str,
-    organization_id: int,
+    organization_id: int | None,
 ) -> str | None:
     """Resolve a voice library UUID to the provider_voice_id string used by the TTS API.
 
     Returns None if the entry is not found or has no provider_voice_id set.
+    Falls back to a cross-org lookup when the org-scoped search finds nothing
+    (e.g. voice is stored in the admin org but the call runs under a demo org).
     """
-    voice = await db_client.get_voice_by_uuid(voice_uuid, organization_id)
+    voice = None
+    if organization_id:
+        voice = await db_client.get_voice_by_uuid(voice_uuid, organization_id)
+    if voice is None:
+        # Platform-level fallback: search all orgs for this voice UUID.
+        voice = await db_client.get_voice_by_uuid_any_org(voice_uuid)
     if voice is None:
         return None
     return voice.provider_voice_id or None

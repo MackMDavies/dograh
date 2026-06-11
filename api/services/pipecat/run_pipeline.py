@@ -206,14 +206,17 @@ async def run_pipeline_telephony(
         enrich_overrides_with_org_api_keys,
         resolve_org_provider_config,
     )
-    if workflow and workflow.organization_id:
-        user_config = await resolve_org_provider_config(
-            workflow.organization_id, user_config
-        )
+    effective_org_id = workflow.organization_id if workflow else None
+    if not effective_org_id:
+        _user = await db_client.get_user_by_id(user_id)
+        if _user:
+            effective_org_id = _user.selected_organization_id
+    if effective_org_id:
+        user_config = await resolve_org_provider_config(effective_org_id, user_config)
     raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and workflow and workflow.organization_id:
+    if raw_overrides and effective_org_id:
         raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, workflow.organization_id
+            raw_overrides, effective_org_id
         )
     user_config = resolve_effective_config(user_config, raw_overrides)
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
@@ -298,14 +301,17 @@ async def run_pipeline_smallwebrtc(
         enrich_overrides_with_org_api_keys,
         resolve_org_provider_config,
     )
-    if workflow and workflow.organization_id:
-        user_config = await resolve_org_provider_config(
-            workflow.organization_id, user_config
-        )
+    effective_org_id = workflow.organization_id if workflow else None
+    if not effective_org_id:
+        _user = await db_client.get_user_by_id(user_id)
+        if _user:
+            effective_org_id = _user.selected_organization_id
+    if effective_org_id:
+        user_config = await resolve_org_provider_config(effective_org_id, user_config)
     raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and workflow and workflow.organization_id:
+    if raw_overrides and effective_org_id:
         raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, workflow.organization_id
+            raw_overrides, effective_org_id
         )
     user_config = resolve_effective_config(user_config, raw_overrides)
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
@@ -430,17 +436,28 @@ async def _run_pipeline(
     if user_config.tts is not None:
         tts_override = run_configs.get("model_overrides", {}).get("tts", {})
         voice_uuid = tts_override.get("voice_uuid")
-        if voice_uuid and workflow:
+        if voice_uuid:
             from api.services.configuration.org_provider_resolver import resolve_voice_for_tts
-            resolved_voice = await resolve_voice_for_tts(voice_uuid, workflow.organization_id)
+            # Use effective org: workflow org → user's selected org (same fallback as provider resolution)
+            _voice_org_id = workflow.organization_id if workflow else None
+            if not _voice_org_id:
+                _user = await db_client.get_user_by_id(user_id)
+                if _user:
+                    _voice_org_id = _user.selected_organization_id
+            resolved_voice = await resolve_voice_for_tts(voice_uuid, _voice_org_id)
+            logger.info(
+                f"[run {workflow_run_id}] Voice resolution: uuid={voice_uuid} "
+                f"org_id={_voice_org_id} → resolved={resolved_voice!r}"
+            )
             if resolved_voice:
                 user_config = user_config.model_copy(deep=True)
                 user_config.tts = user_config.tts.model_copy(
                     update={"voice": resolved_voice}
                 )
-                logger.debug(
-                    f"[run {workflow_run_id}] Resolved voice_uuid={voice_uuid} "
-                    f"→ voice={resolved_voice}"
+            else:
+                logger.warning(
+                    f"[run {workflow_run_id}] Voice UUID {voice_uuid!r} not found — "
+                    f"using default voice: {user_config.tts.voice!r}"
                 )
 
     # Detect realtime mode (speech-to-speech services like OpenAI Realtime, Gemini Live)

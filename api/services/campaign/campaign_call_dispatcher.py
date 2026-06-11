@@ -41,8 +41,17 @@ class CampaignCallDispatcher:
         )
 
         if campaign.telephony_configuration_id:
+            # Look up the config without org scope to get its actual organization_id.
+            # A superuser may have pinned a config that belongs to a different org
+            # than the campaign itself; we trust the config was validated at creation.
+            cfg_row = await db_client.get_telephony_configuration(
+                campaign.telephony_configuration_id
+            )
+            effective_org_id = (
+                cfg_row.organization_id if cfg_row else campaign.organization_id
+            )
             return await get_telephony_provider_by_id(
-                campaign.telephony_configuration_id, campaign.organization_id
+                campaign.telephony_configuration_id, effective_org_id
             )
         logger.warning(
             f"Campaign {campaign.id} has no telephony_configuration_id; "

@@ -1,27 +1,24 @@
 """ARQ background task for processing knowledge base documents.
 
-Document conversion and chunking live in the Model Proxy Service (MPS);
-this task downloads the file from S3, calls MPS, then handles the embedding
-and DB writes locally.
-
-Text-based files (plain text, markdown, CSV, JSON) bypass MPS entirely and
-are chunked locally for near-instant processing.
+All supported file types are processed locally — no external MPS dependency.
+Text files are chunked directly; PDFs and DOCX files have their text extracted
+with pypdf / python-docx before going through the same local chunker.
 """
 
 import os
 import tempfile
+from typing import Optional
 
 from loguru import logger
 
 from api.db import db_client
 from api.db.models import KnowledgeBaseChunkModel
 from api.services.gen_ai import OpenAIEmbeddingService, resolve_embeddings_config
-from api.services.mps_service_key_client import mps_service_key_client
 from api.services.storage import storage_fs
 
-MAX_FILE_SIZE_BYTES = 5 * 1024 * 1024
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10 MB
 
-# MIME types we can chunk locally without calling MPS
+# MIME types handled entirely locally (no MPS call)
 _TEXT_MIME_TYPES = frozenset({
     "text/plain",
     "text/markdown",
@@ -30,6 +27,30 @@ _TEXT_MIME_TYPES = frozenset({
     "application/json",
     "text/html",
 })
+
+_PDF_MIME = "application/pdf"
+_DOCX_MIME = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+
+
+def _extract_pdf_text(file_path: str) -> str:
+    """Extract plain text from a PDF using pypdf."""
+    from pypdf import PdfReader  # lazy import — only needed for PDFs
+
+    reader = PdfReader(file_path)
+    pages = []
+    for page in reader.pages:
+        text = page.extract_text() or ""
+        if text.strip():
+            pages.append(text)
+    return "\n\n".join(pages)
+
+
+def _extract_docx_text(file_path: str) -> str:
+    """Extract plain text from a DOCX file using python-docx."""
+    from docx import Document  # lazy import — only needed for DOCX
+
+    doc = Document(file_path)
+    return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
 
 
 def _chunk_text_locally(text: str, max_chars: int = 600) -> list[dict]:
@@ -93,17 +114,7 @@ async def process_knowledge_base_document(
     max_tokens: int = 128,
     retrieval_mode: str = "chunked",
 ):
-    """Process a knowledge base document via MPS: download, call MPS, embed, store.
-
-    Args:
-        ctx: ARQ context
-        document_id: Database ID of the document
-        s3_key: S3 key where the file is stored
-        organization_id: Organization ID
-        created_by_provider_id: Uploading user's provider ID (for OSS-mode auth to MPS)
-        max_tokens: Maximum number of tokens per chunk (default: 128)
-        retrieval_mode: "chunked" for vector search or "full_document" for full text
-    """
+    """Download a KB document from S3, extract its text locally, chunk, embed, and store."""
     logger.info(
         f"Processing knowledge base document: document_id={document_id}, "
         f"s3_key={s3_key}, org={organization_id}, mode={retrieval_mode}"
@@ -185,49 +196,51 @@ async def process_knowledge_base_document(
             mime_type=mime_type,
         )
 
-        # ── Fast path: text-based files skip MPS entirely ─────────────────────
-        is_text = (mime_type or "").split(";")[0].strip() in _TEXT_MIME_TYPES
-        if is_text:
-            logger.info(f"Text file detected (mime={mime_type}), using local chunker")
+        # ── Extract raw text from all supported file types ────────────────────
+        base_mime = (mime_type or "").split(";")[0].strip()
+        raw_text: Optional[str] = None
+
+        if base_mime in _TEXT_MIME_TYPES:
+            logger.info(f"Text file (mime={mime_type}), reading directly")
             with open(temp_file_path, encoding="utf-8", errors="replace") as fh:
                 raw_text = fh.read()
-
-            if retrieval_mode == "full_document":
-                await db_client.update_document_full_text(document_id, raw_text)
-                await db_client.update_document_status(
-                    document_id, "completed", total_chunks=0,
-                    docling_metadata={"source": "local_chunker"},
-                )
-                logger.info(f"full_document {document_id} stored ({len(raw_text)} chars)")
-                return
-
-            mps_chunks = _chunk_text_locally(raw_text, max_chars=max_tokens * 5)
-            docling_metadata: dict = {"source": "local_chunker"}
+        elif base_mime == _PDF_MIME:
+            logger.info(f"PDF detected, extracting text locally (doc={document_id})")
+            try:
+                raw_text = _extract_pdf_text(temp_file_path)
+            except Exception as exc:
+                raise RuntimeError(f"PDF text extraction failed: {exc}") from exc
+        elif base_mime == _DOCX_MIME:
+            logger.info(f"DOCX detected, extracting text locally (doc={document_id})")
+            try:
+                raw_text = _extract_docx_text(temp_file_path)
+            except Exception as exc:
+                raise RuntimeError(f"DOCX text extraction failed: {exc}") from exc
         else:
-            # ── Slow path: delegate parsing/chunking to MPS ───────────────────
-            logger.info(f"Delegating document processing to MPS (mode={retrieval_mode})")
-            mps_response = await mps_service_key_client.process_document(
-                file_path=temp_file_path,
-                filename=filename,
-                content_type=mime_type or "application/octet-stream",
-                retrieval_mode=retrieval_mode,
-                max_tokens=max_tokens,
-                organization_id=organization_id,
-                created_by=created_by_provider_id,
+            raise RuntimeError(
+                f"Unsupported file type '{mime_type}'. "
+                "Supported types: PDF, DOCX, TXT, Markdown, CSV, JSON."
             )
-            docling_metadata = mps_response.get("docling_metadata", {})
 
-            if retrieval_mode == "full_document":
-                full_text = mps_response.get("full_text") or ""
-                await db_client.update_document_full_text(document_id, full_text)
-                await db_client.update_document_status(
-                    document_id, "completed", total_chunks=0,
-                    docling_metadata=docling_metadata,
-                )
-                logger.info(f"full_document {document_id} ({len(full_text)} chars)")
-                return
+        if not raw_text or not raw_text.strip():
+            raise RuntimeError(
+                "No text could be extracted from the document. "
+                "The file may be empty, image-only, or password-protected."
+            )
 
-            mps_chunks = mps_response.get("chunks", [])
+        logger.info(f"Extracted {len(raw_text)} chars from document {document_id}")
+
+        if retrieval_mode == "full_document":
+            await db_client.update_document_full_text(document_id, raw_text)
+            await db_client.update_document_status(
+                document_id, "completed", total_chunks=0,
+                docling_metadata={"source": "local_extractor"},
+            )
+            logger.info(f"full_document {document_id} stored ({len(raw_text)} chars)")
+            return
+
+        mps_chunks = _chunk_text_locally(raw_text, max_chars=max_tokens * 5)
+        docling_metadata: dict = {"source": "local_extractor"}
 
         # Chunked mode: resolve embedding config via shared priority-ordered resolver.
         user_config = await db_client.get_user_configurations(document.created_by) if document.created_by else None
@@ -254,9 +267,8 @@ async def process_knowledge_base_document(
             base_url=embeddings_base_url,
         )
 
-        mps_chunks = mps_chunks  # already set above
         if not mps_chunks:
-            logger.warning(f"Document {document_id}: MPS returned zero chunks")
+            logger.warning(f"Document {document_id}: chunker returned zero chunks")
 
         chunk_records = []
         chunk_texts = []

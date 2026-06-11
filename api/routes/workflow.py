@@ -1087,8 +1087,11 @@ async def update_workflow(
                 workflow_configurations["model_overrides"],
                 user_config,
             )
+            # If the workflow has no org (superuser-created), fall back to the
+            # saving user's org so API keys can be embedded from org connections.
+            _enrich_org_id = effective_org_id or user.selected_organization_id
             enriched_overrides = await enrich_overrides_with_org_api_keys(
-                enriched_overrides, effective_org_id
+                enriched_overrides, _enrich_org_id
             )
             workflow_configurations = {
                 **workflow_configurations,

@@ -1,3 +1,4 @@
+import re
 from typing import TYPE_CHECKING
 
 import aiohttp
@@ -88,6 +89,9 @@ def create_stt_service(
         f"Creating STT service: provider={user_config.stt.provider}, model={user_config.stt.model}"
     )
     if user_config.stt.provider == ServiceProviders.DEEPGRAM.value:
+        logger.info(
+            f"Deepgram STT: model={user_config.stt.model!r} api_key_set={bool(user_config.stt.api_key)}"
+        )
         # Check if using Flux model (English-only, no language selection)
         if user_config.stt.model == "flux-general-en":
             return DeepgramFluxSTTService(
@@ -106,7 +110,6 @@ def create_stt_service(
         # Other models than flux
         # Use language from user config, defaulting to "multi" for multilingual support
         language = getattr(user_config.stt, "language", None) or "multi"
-        logger.debug(f"Using DeepGram Model - {user_config.stt.model}")
         return DeepgramSTTService(
             api_key=user_config.stt.api_key,
             settings=DeepgramSTTSettings(
@@ -128,6 +131,15 @@ def create_stt_service(
         language = getattr(user_config.stt, "language", None) or "en-US"
         location = getattr(user_config.stt, "location", None) or "global"
         credentials = getattr(user_config.stt, "credentials", None)
+        # Some deployments store the service-account JSON in api_key instead of credentials
+        if not credentials:
+            credentials = getattr(user_config.stt, "api_key", None) or None
+        logger.info(f"Google STT: model={user_config.stt.model!r} credentials_set={bool(credentials)}")
+        if not credentials:
+            raise ValueError(
+                "Google STT requires a service-account JSON credentials string. "
+                "Go to AI Models → Transcriber and paste your Google Cloud service-account JSON."
+            )
 
         settings_kwargs = {"model": user_config.stt.model}
         try:
@@ -282,6 +294,9 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
     # Create function call filter to prevent TTS from speaking function call tags
     xml_function_tag_filter = XMLFunctionTagFilter()
     if user_config.tts.provider == ServiceProviders.DEEPGRAM.value:
+        logger.info(
+            f"Deepgram TTS: voice={user_config.tts.voice!r} api_key_set={bool(user_config.tts.api_key)}"
+        )
         return DeepgramTTSService(
             api_key=user_config.tts.api_key,
             settings=DeepgramTTSSettings(voice=user_config.tts.voice),
@@ -312,6 +327,14 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         speed = getattr(user_config.tts, "speed", None)
         location = getattr(user_config.tts, "location", None) or None
         credentials = getattr(user_config.tts, "credentials", None)
+        # Some deployments store the service-account JSON in api_key instead of credentials
+        if not credentials:
+            credentials = getattr(user_config.tts, "api_key", None) or None
+        if not credentials:
+            raise ValueError(
+                "Google TTS requires a service-account JSON credentials string. "
+                "Go to AI Models → Voice Engine and paste your Google Cloud service-account JSON."
+            )
 
         settings_kwargs = {
             "model": model,
@@ -335,6 +358,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             voice_id = user_config.tts.voice.split(" - ")[1]
         except IndexError:
             voice_id = user_config.tts.voice
+        logger.info(f"ElevenLabs TTS: voice_id={voice_id!r} model={user_config.tts.model!r} api_key_set={bool(user_config.tts.api_key)!r}")
         # ElevenLabs TTS uses WebSocket. Users configure base_url with an HTTP
         # scheme (matching ElevenLabs documentation, e.g.
         # https://api.eu.residency.elevenlabs.io); rewrite it to the WS scheme.
@@ -574,6 +598,15 @@ def create_llm_service_from_provider(
                     model=model,
                     extra={"reasoning_effort": "minimal", "verbosity": "low"},
                 ),
+                **kwargs,
+            )
+        # o-series models (o1, o3, o4-mini, etc.) only accept temperature=1 (default).
+        # Detect by checking if the base model name starts with "o" + digit.
+        _base = model.split("/")[-1]
+        if re.match(r"^o\d", _base):
+            return OpenAILLMService(
+                api_key=api_key,
+                settings=OpenAILLMSettings(model=model),
                 **kwargs,
             )
         return OpenAILLMService(

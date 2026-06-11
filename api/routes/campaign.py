@@ -415,9 +415,12 @@ async def create_campaign(
     # working through the migration window.
     telephony_configuration_id = request.telephony_configuration_id
     if telephony_configuration_id:
-        cfg = await db_client.get_telephony_configuration_for_org(
-            telephony_configuration_id, user.selected_organization_id
-        )
+        if user.is_superuser:
+            cfg = await db_client.get_telephony_configuration(telephony_configuration_id)
+        else:
+            cfg = await db_client.get_telephony_configuration_for_org(
+                telephony_configuration_id, user.selected_organization_id
+            )
         if not cfg:
             raise HTTPException(
                 status_code=400, detail="telephony_configuration_not_found"
@@ -550,13 +553,17 @@ async def start_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Block start if the campaign's org has no telephony configuration.
-    configs = await db_client.list_telephony_configurations(campaign.organization_id)
-    if not configs:
-        raise HTTPException(
-            status_code=401,
-            detail="You must configure telephony first by going to APP_URL/configure-telephony",
-        )
+    # Block start if there is no usable telephony configuration.
+    # If the campaign already has a specific config pinned (validated at create
+    # time), that is sufficient — skip the org-level availability check which
+    # would fail when the config belongs to a different org (superuser case).
+    if not campaign.telephony_configuration_id:
+        configs = await db_client.list_telephony_configurations(campaign.organization_id)
+        if not configs:
+            raise HTTPException(
+                status_code=401,
+                detail="You must configure telephony first by going to APP_URL/configure-telephony",
+            )
 
     # Check Dograh quota before starting campaign (apply per-workflow
     # model_overrides so we evaluate the keys this campaign will use).
