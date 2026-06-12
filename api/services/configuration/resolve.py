@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 
 from api.schemas.user_configuration import UserConfiguration
+from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import (
     REGISTRY,
     ServiceType,
@@ -65,7 +66,8 @@ def enrich_overrides_with_api_keys(
         if getattr(global_section, "provider", None) != override_provider:
             continue
         for field in _SECRET_FIELDS:
-            if override.get(field):
+            existing_val = override.get(field)
+            if existing_val and not contains_masked_key(str(existing_val)):
                 continue
             if field == "api_key" and hasattr(global_section, "get_all_api_keys"):
                 all_keys = global_section.get_all_api_keys()

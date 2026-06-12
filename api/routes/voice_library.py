@@ -595,13 +595,19 @@ async def generate_voice_preview(
     """Generate an audio preview for a voice and store it in object storage."""
     org_id = user.selected_organization_id
 
-    # 1. Fetch the voice entry (org-scoped)
+    # 1. Fetch the voice entry — try org-scoped first, then fall back to any-org
+    # for superusers who see voices from all orgs in the library list.
     voice = await db_client.get_voice_by_uuid(voice_uuid, org_id)
+    if not voice and user.is_superuser:
+        voice = await db_client.get_voice_by_uuid_any_org(voice_uuid)
     if not voice:
         raise HTTPException(status_code=404, detail="Voice not found")
 
+    # Use the voice's own org to resolve the TTS connection.
+    voice_org_id = voice.organization_id or org_id
+
     # 2. Validate provider supports preview generation
-    _PREVIEW_SUPPORTED = {"xai", "openai", "elevenlabs", "google"}
+    _PREVIEW_SUPPORTED = {"xai", "openai", "elevenlabs", "google", "deepgram"}
     if voice.provider not in _PREVIEW_SUPPORTED:
         raise HTTPException(
             status_code=422,
@@ -609,7 +615,7 @@ async def generate_voice_preview(
         )
 
     # 3. Get the org's TTS connection for this provider
-    conn = await db_client.get_connection_by_provider(org_id, "tts", voice.provider)
+    conn = await db_client.get_connection_by_provider(voice_org_id, "tts", voice.provider)
     if not conn:
         raise HTTPException(
             status_code=400,
@@ -674,6 +680,20 @@ async def generate_voice_preview(
                         error_text = await resp.text()
                         logger.error(f"ElevenLabs TTS API error {resp.status}: {error_text}")
                         raise HTTPException(status_code=502, detail=f"ElevenLabs TTS API returned {resp.status}")
+                    audio_bytes = await resp.read()
+
+        elif voice.provider == "deepgram":
+            model = voice.provider_voice_id or "aura-2-luna-en"
+            async with aiohttp.ClientSession() as http:
+                async with http.post(
+                    f"https://api.deepgram.com/v1/speak?model={model}",
+                    json={"text": sample_text},
+                    headers={"Authorization": f"Token {conn.api_key}", "Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status != 200:
+                        error_text = await resp.text()
+                        logger.error(f"Deepgram TTS API error {resp.status}: {error_text}")
+                        raise HTTPException(status_code=502, detail=f"Deepgram TTS API returned {resp.status}")
                     audio_bytes = await resp.read()
 
         elif voice.provider == "google":

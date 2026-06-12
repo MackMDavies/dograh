@@ -203,6 +203,7 @@ async def run_pipeline_telephony(
         (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
     )
     from api.services.configuration.org_provider_resolver import (
+        enrich_config_from_org_connections,
         enrich_overrides_with_org_api_keys,
         resolve_org_provider_config,
     )
@@ -213,6 +214,7 @@ async def run_pipeline_telephony(
             effective_org_id = _user.selected_organization_id
     if effective_org_id:
         user_config = await resolve_org_provider_config(effective_org_id, user_config)
+        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
     raw_overrides = run_configs.get("model_overrides")
     if raw_overrides and effective_org_id:
         raw_overrides = await enrich_overrides_with_org_api_keys(
@@ -298,6 +300,7 @@ async def run_pipeline_smallwebrtc(
         else {}
     )
     from api.services.configuration.org_provider_resolver import (
+        enrich_config_from_org_connections,
         enrich_overrides_with_org_api_keys,
         resolve_org_provider_config,
     )
@@ -308,6 +311,7 @@ async def run_pipeline_smallwebrtc(
             effective_org_id = _user.selected_organization_id
     if effective_org_id:
         user_config = await resolve_org_provider_config(effective_org_id, user_config)
+        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
     raw_overrides = run_configs.get("model_overrides")
     if raw_overrides and effective_org_id:
         raw_overrides = await enrich_overrides_with_org_api_keys(
@@ -417,6 +421,7 @@ async def _run_pipeline(
     if resolved_user_config is None:
         from api.services.configuration.resolve import resolve_effective_config
         from api.services.configuration.org_provider_resolver import (
+            enrich_config_from_org_connections,
             enrich_overrides_with_org_api_keys,
             resolve_org_provider_config,
         )
@@ -425,6 +430,7 @@ async def _run_pipeline(
         org_id = workflow.organization_id if workflow else None
         if org_id:
             user_config = await resolve_org_provider_config(org_id, user_config)
+            user_config = await enrich_config_from_org_connections(org_id, user_config)
         raw_overrides = run_configs.get("model_overrides")
         if raw_overrides and org_id:
             raw_overrides = await enrich_overrides_with_org_api_keys(raw_overrides, org_id)

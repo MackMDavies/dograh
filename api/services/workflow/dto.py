@@ -567,7 +567,7 @@ class EndCallNodeData(
         "add_global_prompt": {"spec_exclude": True},
     },
 )
-class GlobalNodeData(BaseNodeData, _PromptedNodeDataMixin):
+class GlobalNodeData(BaseNodeData, _PromptedNodeDataMixin, _ExtractionNodeDataMixin, _ToolDocumentRefsMixin):
     pass
 
 

@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from loguru import logger
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -170,6 +171,8 @@ class UpdateCampaignRequest(BaseModel):
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
+    workflow_id: Optional[int] = None
+    telephony_configuration_id: Optional[int] = None
 
 
 class CampaignLogEntryResponse(BaseModel):
@@ -645,10 +648,18 @@ async def update_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    if campaign.state in ["completed", "failed"]:
+    # Running/syncing campaigns cannot have concurrency or schedule changed mid-flight,
+    # but name can always be updated regardless of state.
+    non_name_fields_requested = (
+        request.retry_config is not None
+        or request.max_concurrency is not None
+        or request.schedule_config is not None
+        or request.circuit_breaker is not None
+    )
+    if non_name_fields_requested and campaign.state in ["completed", "failed"]:
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot update a {campaign.state} campaign",
+            detail=f"Cannot update settings on a {campaign.state} campaign",
         )
 
     if request.max_concurrency is not None:
@@ -683,6 +694,33 @@ async def update_campaign(
 
     if metadata_changed:
         update_kwargs["orchestrator_metadata"] = metadata
+
+    if request.workflow_id is not None:
+        update_kwargs["workflow_id"] = request.workflow_id
+
+    if request.telephony_configuration_id is not None:
+        if user.is_superuser:
+            cfg = await db_client.get_telephony_configuration(
+                request.telephony_configuration_id
+            )
+        else:
+            cfg = await db_client.get_telephony_configuration_for_org(
+                request.telephony_configuration_id, user.selected_organization_id
+            )
+            if not cfg:
+                # Cross-org fallback for admin configs used by client orgs.
+                cfg = await db_client.get_telephony_configuration(
+                    request.telephony_configuration_id
+                )
+        if not cfg:
+            raise HTTPException(
+                status_code=400, detail="telephony_configuration_not_found"
+            )
+        update_kwargs["telephony_configuration_id"] = request.telephony_configuration_id
+        logger.info(
+            f"campaign {campaign_id}: setting telephony_configuration_id="
+            f"{request.telephony_configuration_id} (cfg={cfg.name!r})"
+        )
 
     if update_kwargs:
         await db_client.update_campaign(campaign_id=campaign_id, **update_kwargs)

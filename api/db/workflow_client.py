@@ -963,3 +963,40 @@ class WorkflowClient(BaseDBClient):
                     f"Failed to add disposition code '{disposition_code}' "
                     f"to workflow {workflow_id}: {e}"
                 )
+
+    async def get_tool_assignments_for_org(
+        self, organization_id: int
+    ) -> dict[str, list[dict]]:
+        """Return a map of tool_uuid -> list of {id, name, uuid} workflows that reference it.
+
+        Scans the globalNode.data.tool_uuids of every active workflow definition.
+        """
+        async with self.async_session() as session:
+            query = (
+                select(WorkflowModel)
+                .options(
+                    load_only(
+                        WorkflowModel.id,
+                        WorkflowModel.name,
+                        WorkflowModel.workflow_uuid,
+                        WorkflowModel.workflow_definition,
+                    )
+                )
+                .where(
+                    WorkflowModel.organization_id == organization_id,
+                    WorkflowModel.status == "active",
+                )
+            )
+            result = await session.execute(query)
+            workflows = result.scalars().all()
+
+        assignments: dict[str, list[dict]] = {}
+        for wf in workflows:
+            definition = wf.workflow_definition or {}
+            for node in definition.get("nodes", []):
+                if node.get("type") == "globalNode":
+                    for tool_uuid in (node.get("data") or {}).get("tool_uuids") or []:
+                        assignments.setdefault(tool_uuid, []).append(
+                            {"id": wf.id, "name": wf.name, "uuid": wf.workflow_uuid}
+                        )
+        return assignments

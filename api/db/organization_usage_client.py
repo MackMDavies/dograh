@@ -494,10 +494,10 @@ class OrganizationUsageClient(BaseDBClient):
                 .join(UserModel, UserModel.id == WorkflowModel.user_id)
                 .where(*base_where)
                 .group_by(date_expr)
-                .order_by(date_expr.desc())
+                .order_by(date_expr.asc())
             )
 
-            breakdown = []
+            raw_by_date: dict = {}
             total_minutes = 0
             total_cost_usd = 0
             total_dograh_tokens = 0
@@ -506,21 +506,34 @@ class OrganizationUsageClient(BaseDBClient):
                 seconds = row.total_seconds or 0
                 minutes = seconds / 60
                 cost_usd = seconds * price_per_second_usd
-                dograh_tokens = cost_usd * 100  # 1 cent = 1 token
+                dograh_tokens = cost_usd * 100
 
                 total_minutes += minutes
                 total_cost_usd += cost_usd
                 total_dograh_tokens += dograh_tokens
 
-                breakdown.append(
-                    {
-                        "date": row.date.isoformat(),
-                        "minutes": round(minutes, 1),
-                        "cost_usd": round(cost_usd, 2),
-                        "dograh_tokens": round(dograh_tokens, 0),
-                        "call_count": row.call_count,
-                    }
-                )
+                raw_by_date[row.date.isoformat()] = {
+                    "date": row.date.isoformat(),
+                    "minutes": round(minutes, 1),
+                    "cost_usd": round(cost_usd, 2),
+                    "dograh_tokens": round(dograh_tokens, 0),
+                    "call_count": row.call_count,
+                }
+
+            # Fill every day in the requested window with zeros if no calls occurred
+            breakdown = []
+            current_day = start_date.date()
+            end_day = end_date.date()
+            while current_day <= end_day:
+                date_str = current_day.isoformat()
+                breakdown.append(raw_by_date.get(date_str, {
+                    "date": date_str,
+                    "minutes": 0.0,
+                    "cost_usd": 0.0,
+                    "dograh_tokens": 0.0,
+                    "call_count": 0,
+                }))
+                current_day += timedelta(days=1)
 
             return {
                 "breakdown": breakdown,

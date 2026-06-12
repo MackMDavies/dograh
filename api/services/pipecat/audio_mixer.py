@@ -44,12 +44,15 @@ async def build_audio_out_mixer(
             )
         logger.warning("Custom ambient noise file unavailable, falling back to default")
 
+    file_path = APP_ROOT_DIR / "assets" / f"office-ambience-{audio_out_sample_rate}-mono.wav"
+    if not file_path.exists():
+        logger.warning(
+            f"Ambient noise file not found: {file_path}, falling back to SilenceAudioMixer"
+        )
+        return SilenceAudioMixer()
+
     return SoundfileMixer(
-        sound_files={
-            "office": APP_ROOT_DIR
-            / "assets"
-            / f"office-ambience-{audio_out_sample_rate}-mono.wav"
-        },
+        sound_files={"office": file_path},
         default_sound="office",
         volume=volume,
     )

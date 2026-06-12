@@ -549,6 +549,14 @@ class CampaignOrchestrator:
                 state="completed",
                 gathered_context={"call_tags": ["not_connected", "telephony_failed", "stuck_run_recovered"]},
             )
+            if run.queued_run_id:
+                try:
+                    await db_client.update_queued_run(run.queued_run_id, state="failed")
+                except Exception as e:
+                    logger.warning(
+                        f"campaign_id: {campaign_id} - Could not update queued_run "
+                        f"{run.queued_run_id} state to failed: {e}"
+                    )
             if run.campaign_id:
                 from api.services.campaign.campaign_call_dispatcher import campaign_call_dispatcher
                 await campaign_call_dispatcher.release_call_slot(run.id)

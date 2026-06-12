@@ -457,6 +457,16 @@ async def create_tool(
     return build_tool_response(tool)
 
 
+@router.get("/assignments")
+async def get_tool_assignments(
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Return a map of tool_uuid -> list of agents that reference it in their workflow definition."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    return await db_client.get_tool_assignments_for_org(user.selected_organization_id)
+
+
 @router.get("/{tool_uuid}")
 async def get_tool(
     tool_uuid: str,

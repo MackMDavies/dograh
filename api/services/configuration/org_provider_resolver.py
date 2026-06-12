@@ -1,9 +1,10 @@
 """Resolve org-level provider connections into pipeline config objects.
 
-Three public functions:
-  resolve_org_provider_config  – fills None sections in UserConfiguration from org defaults
+Four public functions:
+  resolve_org_provider_config       – fills None sections in UserConfiguration from org defaults
+  enrich_config_from_org_connections – fills missing secrets in already-set sections from org connections
   enrich_overrides_with_org_api_keys – stamps missing API keys into model_overrides from org connections
-  resolve_voice_for_tts        – resolves a voice library UUID → provider_voice_id string
+  resolve_voice_for_tts             – resolves a voice library UUID → provider_voice_id string
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ from loguru import logger
 
 from api.db import db_client
 from api.schemas.user_configuration import UserConfiguration
+from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import REGISTRY, ServiceType
 
 # Maps UserConfiguration field name → DB service_type string → ServiceType enum
@@ -107,6 +109,72 @@ async def resolve_org_provider_config(
 _SECRET_FIELDS = ("api_key", "credentials", "aws_access_key", "aws_secret_key")
 
 
+async def enrich_config_from_org_connections(
+    organization_id: int,
+    config: UserConfiguration,
+) -> UserConfiguration:
+    """Fill missing secret fields in already-set config sections from org connections.
+
+    resolve_org_provider_config only fills sections that are None.  This function
+    handles the complementary case: the section IS set (e.g. the user's global
+    config has Google STT selected) but a required secret field — like the
+    service-account JSON in extra_config["credentials"] — was never stored in the
+    user config and must be fetched from the org connection at runtime.
+    """
+    effective = config.model_copy(deep=True)
+
+    for section_key, service_type_str, _ in _SECTION_MAP:
+        section = getattr(effective, section_key)
+        if section is None:
+            continue
+
+        provider = getattr(section, "provider", None)
+        if not provider:
+            continue
+
+        # Check whether any secret field is absent or masked.
+        needs_enrichment = any(
+            not getattr(section, f, None) or contains_masked_key(str(getattr(section, f)))
+            for f in _SECRET_FIELDS
+            if hasattr(section, f)
+        )
+        if not needs_enrichment:
+            continue
+
+        conn = await db_client.get_connection_by_provider(
+            organization_id, service_type_str, provider
+        )
+        if conn is None:
+            all_conns = await db_client.list_connections(organization_id)
+            conn = next((c for c in all_conns if c.provider == provider), None)
+        if conn is None:
+            all_org_conns = await db_client.list_all_connections_superuser()
+            conn = next((c for c in all_org_conns if c.provider == provider), None)
+        if conn is None:
+            continue
+
+        updates = {}
+        if conn.api_key:
+            existing = getattr(section, "api_key", None)
+            if not existing or contains_masked_key(str(existing)):
+                updates["api_key"] = conn.api_key
+
+        for k, v in (conn.extra_config or {}).items():
+            if k in _SECRET_FIELDS:
+                existing = getattr(section, k, None)
+                if not existing or contains_masked_key(str(existing)):
+                    updates[k] = v
+
+        if updates:
+            logger.info(
+                f"enrich_config_from_org_connections: enriched {section_key}/{provider} "
+                f"fields={list(updates.keys())}"
+            )
+            setattr(effective, section_key, section.model_copy(update=updates))
+
+    return effective
+
+
 async def enrich_overrides_with_org_api_keys(
     model_overrides: dict | None,
     organization_id: int,
@@ -130,9 +198,15 @@ async def enrich_overrides_with_org_api_keys(
         if not provider:
             continue
 
-        # Only look up org connection when credentials are missing. For standard
-        # providers this is api_key; for Google it is credentials (service-account JSON).
-        if override.get("api_key") or override.get("credentials"):
+        # Only skip the org connection lookup when a real JSON-format credential is
+        # already present. A real api_key alone is not sufficient — service-account
+        # providers (e.g. Google STT) also need extra_config["credentials"] (JSON)
+        # which lives in the org connection and is fetched below.
+        api_key_val = override.get("api_key")
+        credentials_val = override.get("credentials")
+        has_real_api_key = api_key_val and not contains_masked_key(str(api_key_val))
+        has_real_credentials = credentials_val and not contains_masked_key(str(credentials_val))
+        if has_real_credentials:
             continue
 
         conn = await db_client.get_connection_by_provider(
@@ -166,8 +240,40 @@ async def enrich_overrides_with_org_api_keys(
             override["api_key"] = conn.api_key
 
         for k, v in (conn.extra_config or {}).items():
-            if k in _SECRET_FIELDS and not override.get(k):
+            existing_val = override.get(k)
+            if k in _SECRET_FIELDS and (not existing_val or contains_masked_key(str(existing_val))):
                 override[k] = v
+
+        # Cross-service-type credentials search: some providers (e.g. Google) store the
+        # service-account JSON in the STT connection but not the TTS connection. If
+        # credentials are still missing after the primary connection lookup, scan all
+        # connections for the same provider across every service type.
+        existing_creds = override.get("credentials")
+        if not existing_creds or contains_masked_key(str(existing_creds)):
+            all_conns = await db_client.list_connections(organization_id)
+            for c in all_conns:
+                if c.provider == provider:
+                    creds = (c.extra_config or {}).get("credentials")
+                    if creds and not contains_masked_key(str(creds)):
+                        override["credentials"] = creds
+                        logger.info(
+                            f"enrich_overrides: cross-service-type credentials found for "
+                            f"{section_key}/{provider} from connection id={c.id}"
+                        )
+                        break
+            else:
+                # Platform-level fallback: search all orgs for credentials.
+                all_org_conns = await db_client.list_all_connections_superuser()
+                for c in all_org_conns:
+                    if c.provider == provider:
+                        creds = (c.extra_config or {}).get("credentials")
+                        if creds and not contains_masked_key(str(creds)):
+                            override["credentials"] = creds
+                            logger.info(
+                                f"enrich_overrides: platform-level cross-service-type credentials "
+                                f"found for {section_key}/{provider} from connection id={c.id}"
+                            )
+                            break
 
     return result
 

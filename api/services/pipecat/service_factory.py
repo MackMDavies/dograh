@@ -6,6 +6,7 @@ from fastapi import HTTPException
 from loguru import logger
 
 from api.constants import MPS_API_URL
+from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import ServiceProviders
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
 from api.utils.url_security import validate_user_configured_service_url
@@ -31,7 +32,7 @@ from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSS
 from pipecat.services.gladia.stt import GladiaSTTService, GladiaSTTSettings
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
 from pipecat.services.google.stt import GoogleSTTService, GoogleSTTSettings
-from pipecat.services.google.tts import GoogleTTSService, GoogleTTSSettings
+from pipecat.services.google.tts import GoogleHttpTTSService, GoogleHttpTTSSettings, GoogleTTSService, GoogleTTSSettings
 from pipecat.services.google.vertex.llm import (
     GoogleVertexLLMService,
     GoogleVertexLLMSettings,
@@ -131,15 +132,36 @@ def create_stt_service(
         language = getattr(user_config.stt, "language", None) or "en-US"
         location = getattr(user_config.stt, "location", None) or "global"
         credentials = getattr(user_config.stt, "credentials", None)
-        # Some deployments store the service-account JSON in api_key instead of credentials
+        if credentials and contains_masked_key(str(credentials)):
+            credentials = None
+        # Some deployments store the service-account JSON in api_key instead of credentials.
+        # Only use this fallback when the value actually looks like JSON (starts with '{').
         if not credentials:
-            credentials = getattr(user_config.stt, "api_key", None) or None
-        logger.info(f"Google STT: model={user_config.stt.model!r} credentials_set={bool(credentials)}")
+            api_key_fallback = getattr(user_config.stt, "api_key", None) or None
+            if api_key_fallback and not contains_masked_key(str(api_key_fallback)):
+                if str(api_key_fallback).strip().startswith("{"):
+                    credentials = api_key_fallback
+        logger.info(
+            f"Google STT: model={user_config.stt.model!r} credentials_set={bool(credentials)} "
+            f"credentials_first_char={(str(credentials)[0] if credentials else 'N/A')!r}"
+        )
         if not credentials:
             raise ValueError(
                 "Google STT requires a service-account JSON credentials string. "
                 "Go to AI Models → Transcriber and paste your Google Cloud service-account JSON."
             )
+        import json as _json
+        try:
+            _json.loads(credentials)
+        except _json.JSONDecodeError as exc:
+            logger.error(
+                f"Google STT: credentials is not valid JSON "
+                f"(first 100 chars: {str(credentials)[:100]!r}): {exc}"
+            )
+            raise ValueError(
+                "Google STT credentials must be a valid Google Cloud service-account JSON string. "
+                "Go to AI Models → Transcriber and paste the full JSON key file content."
+            ) from exc
 
         settings_kwargs = {"model": user_config.stt.model}
         try:
@@ -327,48 +349,107 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         speed = getattr(user_config.tts, "speed", None)
         location = getattr(user_config.tts, "location", None) or None
         credentials = getattr(user_config.tts, "credentials", None)
-        # Some deployments store the service-account JSON in api_key instead of credentials
+        if credentials and contains_masked_key(str(credentials)):
+            credentials = None
+        # Only treat api_key as credentials if it looks like JSON (starts with '{').
+        # A regular Google API key (AIzaSy...) must not be passed to json.loads().
         if not credentials:
-            credentials = getattr(user_config.tts, "api_key", None) or None
+            api_key_fallback = getattr(user_config.tts, "api_key", None) or None
+            if api_key_fallback and not contains_masked_key(str(api_key_fallback)):
+                if str(api_key_fallback).strip().startswith("{"):
+                    credentials = api_key_fallback
+        logger.info(
+            f"Google TTS: model={model!r} credentials_set={bool(credentials)} "
+            f"credentials_first_char={(str(credentials)[0] if credentials else 'N/A')!r}"
+        )
         if not credentials:
             raise ValueError(
                 "Google TTS requires a service-account JSON credentials string. "
                 "Go to AI Models → Voice Engine and paste your Google Cloud service-account JSON."
             )
+        import json as _json
+        try:
+            _json.loads(credentials)
+        except _json.JSONDecodeError as exc:
+            logger.error(
+                f"Google TTS: credentials is not valid JSON "
+                f"(first 100 chars: {str(credentials)[:100]!r}): {exc}"
+            )
+            raise ValueError(
+                "Google TTS credentials must be a valid Google Cloud service-account JSON string. "
+                "Go to AI Models → Voice Engine and paste the full JSON key file content."
+            ) from exc
 
-        settings_kwargs = {
-            "model": model,
-            "voice": voice,
-            "language": language,
-        }
-        if speed is not None and speed != 1.0:
-            settings_kwargs["speaking_rate"] = speed
-
-        return GoogleTTSService(
-            credentials=credentials,
-            location=location,
-            settings=GoogleTTSSettings(**settings_kwargs),
-            text_filters=[xml_function_tag_filter],
-            skip_aggregator_types=["recording_router", "recording"],
-            silence_time_s=1.0,
+        # Chirp 3 HD voices use the streaming API; all other voice families
+        # (Wavenet, Neural2, Standard, Journey) require the HTTP batch API.
+        is_chirp3_hd = "Chirp3-HD" in voice or "Chirp3_HD" in voice
+        logger.info(
+            f"Google TTS: voice={voice!r} is_chirp3_hd={is_chirp3_hd} "
+            f"→ {'streaming' if is_chirp3_hd else 'http'} service"
         )
+
+        if is_chirp3_hd:
+            settings_kwargs = {
+                "model": model,
+                "voice": voice,
+                "language": language,
+            }
+            if speed is not None and speed != 1.0:
+                settings_kwargs["speaking_rate"] = speed
+            return GoogleTTSService(
+                credentials=credentials,
+                location=location,
+                settings=GoogleTTSSettings(**settings_kwargs),
+                text_filters=[xml_function_tag_filter],
+                skip_aggregator_types=["recording_router", "recording"],
+                silence_time_s=1.0,
+            )
+        else:
+            http_settings_kwargs = {
+                "voice": voice,
+                "language": language,
+            }
+            if speed is not None and speed != 1.0:
+                http_settings_kwargs["speaking_rate"] = speed
+            return GoogleHttpTTSService(
+                credentials=credentials,
+                location=location,
+                settings=GoogleHttpTTSSettings(**http_settings_kwargs),
+                text_filters=[xml_function_tag_filter],
+                skip_aggregator_types=["recording_router", "recording"],
+                silence_time_s=1.0,
+            )
     elif user_config.tts.provider == ServiceProviders.ELEVENLABS.value:
+        api_key = user_config.tts.api_key
+        if api_key and contains_masked_key(str(api_key)):
+            api_key = None
+        if not api_key:
+            raise ValueError(
+                "ElevenLabs TTS requires an API key. "
+                "Go to AI Models → Voice Engine and ensure your ElevenLabs connection has an API key."
+            )
         # Backward compatible with older configuration "Name - voice_id"
         try:
             voice_id = user_config.tts.voice.split(" - ")[1]
         except IndexError:
             voice_id = user_config.tts.voice
-        logger.info(f"ElevenLabs TTS: voice_id={voice_id!r} model={user_config.tts.model!r} api_key_set={bool(user_config.tts.api_key)!r}")
+        logger.info(
+            f"ElevenLabs TTS: voice_id={voice_id!r} model={user_config.tts.model!r} "
+            f"api_key_set={bool(api_key)} speed={user_config.tts.speed}"
+        )
         # ElevenLabs TTS uses WebSocket. Users configure base_url with an HTTP
         # scheme (matching ElevenLabs documentation, e.g.
         # https://api.eu.residency.elevenlabs.io); rewrite it to the WS scheme.
         _validate_runtime_service_url(user_config.tts.base_url, "base_url")
-        elevenlabs_url = user_config.tts.base_url.replace("https://", "wss://").replace(
-            "http://", "ws://"
+        elevenlabs_url = (
+            user_config.tts.base_url
+            .rstrip("/")
+            .replace("https://", "wss://")
+            .replace("http://", "ws://")
         )
         return ElevenLabsTTSService(
-            reconnect_on_error=False,
-            api_key=user_config.tts.api_key,
+            reconnect_on_error=True,
+            api_key=api_key,
             url=elevenlabs_url,
             settings=ElevenLabsTTSSettings(
                 voice=voice_id,
@@ -796,6 +877,8 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
         project_id = getattr(realtime_config, "project_id", None)
         location = getattr(realtime_config, "location", None) or "us-east4"
         credentials = getattr(realtime_config, "credentials", None)
+        if credentials and contains_masked_key(str(credentials)):
+            credentials = None
 
         settings_kwargs = {
             "model": model,
@@ -839,7 +922,10 @@ def create_llm_service(user_config):
     elif provider == ServiceProviders.GOOGLE_VERTEX.value:
         kwargs["project_id"] = user_config.llm.project_id
         kwargs["location"] = user_config.llm.location
-        kwargs["credentials"] = user_config.llm.credentials
+        creds = user_config.llm.credentials
+        if creds and contains_masked_key(str(creds)):
+            creds = None
+        kwargs["credentials"] = creds
     elif provider == ServiceProviders.MINIMAX.value:
         kwargs["base_url"] = user_config.llm.base_url
         kwargs["temperature"] = user_config.llm.temperature

@@ -298,6 +298,7 @@ class CampaignClient(BaseDBClient):
                 source_id=parent_campaign.source_id,
                 created_by=parent_campaign.created_by,
                 organization_id=parent_campaign.organization_id,
+                telephony_configuration_id=parent_campaign.telephony_configuration_id,
                 retry_config=retry_config
                 if retry_config
                 else CampaignModel.retry_config.default.arg,
@@ -1024,10 +1025,10 @@ class CampaignClient(BaseDBClient):
             if not campaign:
                 return False
 
-            if campaign.state in ("running", "syncing", "paused"):
+            if campaign.state in ("running", "syncing"):
                 raise ValueError(
                     f"Cannot delete a campaign in '{campaign.state}' state. "
-                    "Stop or pause it first."
+                    "Stop it first."
                 )
 
             # Delink workflow_runs so we don't lose call history
@@ -1035,6 +1036,18 @@ class CampaignClient(BaseDBClient):
                 update(WorkflowRunModel)
                 .where(WorkflowRunModel.campaign_id == campaign_id)
                 .values(campaign_id=None)
+            )
+
+            # Clear redialed_campaign_id from any parent campaign that stored this
+            # campaign's id in orchestrator_metadata["redialed_campaign_id"].
+            # redialed_campaign_id is NOT a real column — it lives in the JSON blob.
+            await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET orchestrator_metadata = (orchestrator_metadata::jsonb - 'redialed_campaign_id')::json "
+                    "WHERE orchestrator_metadata->>'redialed_campaign_id' = :cid_str"
+                ),
+                {"cid_str": str(campaign_id)},
             )
 
             # Delete campaign (queued_runs cascade automatically via DB FK)

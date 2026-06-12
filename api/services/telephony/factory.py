@@ -35,9 +35,12 @@ async def load_telephony_config_by_id(
 
     Returns a dict in the shape each provider class expects in its constructor
     (provider name + provider-specific credentials + ``from_numbers`` list of
-    raw address strings). Raises ``ValueError`` if the config doesn't exist
-    or doesn't belong to ``organization_id`` — the org scope is what makes
-    this safe to expose to user-driven request flows.
+    raw address strings). Raises ``ValueError`` if the config doesn't exist.
+
+    Cross-org fallback: if the config is not found under organization_id (e.g.
+    the config belongs to the admin org but a client org's campaign uses it),
+    a superuser-scoped lookup is attempted. The cfg_id was already validated at
+    campaign-create time so this is safe from webhook/callback call paths.
     """
     try:
         resolved_cfg_id = int(telephony_configuration_id)
@@ -49,6 +52,15 @@ async def load_telephony_config_by_id(
     row = await db_client.get_telephony_configuration_for_org(
         resolved_cfg_id, organization_id
     )
+    if not row:
+        # Cross-org fallback — config may belong to the admin org.
+        row = await db_client.get_telephony_configuration(resolved_cfg_id)
+        if row:
+            logger.info(
+                f"load_telephony_config_by_id: config {resolved_cfg_id} "
+                f"not in org {organization_id}, resolved via cross-org lookup "
+                f"(owner org: {row.organization_id})"
+            )
     if not row:
         raise ValueError(
             f"Telephony configuration {resolved_cfg_id} not found "

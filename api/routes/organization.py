@@ -331,12 +331,15 @@ async def update_telephony_configuration(
     request: TelephonyConfigurationUpdateRequest,
     user: UserModel = Depends(get_user),
 ):
-    if not user.selected_organization_id:
+    if not user.selected_organization_id and not user.is_superuser:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    existing = await db_client.get_telephony_configuration_for_org(
-        config_id, user.selected_organization_id
-    )
+    if user.is_superuser:
+        existing = await db_client.get_telephony_configuration(config_id)
+    else:
+        existing = await db_client.get_telephony_configuration_for_org(
+            config_id, user.selected_organization_id
+        )
     if not existing:
         raise HTTPException(status_code=404, detail="Telephony configuration not found")
 
@@ -355,7 +358,7 @@ async def update_telephony_configuration(
 
     row = await db_client.update_telephony_configuration(
         config_id=config_id,
-        organization_id=user.selected_organization_id,
+        organization_id=existing.organization_id,
         name=request.name,
         credentials=credentials,
     )
@@ -368,12 +371,19 @@ async def update_telephony_configuration(
     response_model=TelephonyConfigurationDetail,
 )
 async def set_default_outbound(config_id: int, user: UserModel = Depends(get_user)):
-    if not user.selected_organization_id:
+    if not user.selected_organization_id and not user.is_superuser:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    row = await db_client.set_default_telephony_configuration(
-        config_id, user.selected_organization_id
-    )
+    # Resolve org_id: superusers look up the config's own org
+    if user.is_superuser:
+        cfg = await db_client.get_telephony_configuration(config_id)
+        if not cfg:
+            raise HTTPException(status_code=404, detail="Telephony configuration not found")
+        org_id = cfg.organization_id
+    else:
+        org_id = user.selected_organization_id
+
+    row = await db_client.set_default_telephony_configuration(config_id, org_id)
     if not row:
         raise HTTPException(status_code=404, detail="Telephony configuration not found")
     return _detail_response(row)
@@ -383,13 +393,19 @@ async def set_default_outbound(config_id: int, user: UserModel = Depends(get_use
 async def delete_telephony_configuration(
     config_id: int, user: UserModel = Depends(get_user)
 ):
-    if not user.selected_organization_id:
+    if not user.selected_organization_id and not user.is_superuser:
         raise HTTPException(status_code=400, detail="No organization selected")
 
+    if user.is_superuser:
+        cfg = await db_client.get_telephony_configuration(config_id)
+        if not cfg:
+            raise HTTPException(status_code=404, detail="Telephony configuration not found")
+        org_id = cfg.organization_id
+    else:
+        org_id = user.selected_organization_id
+
     try:
-        deleted = await db_client.delete_telephony_configuration(
-            config_id, user.selected_organization_id
-        )
+        deleted = await db_client.delete_telephony_configuration(config_id, org_id)
     except TelephonyConfigurationInUseError as e:
         raise HTTPException(status_code=409, detail=str(e))
 
