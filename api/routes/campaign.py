@@ -1105,16 +1105,8 @@ async def download_campaign_report(
     )
 
 
-@router.delete("/{campaign_id}")
-async def delete_campaign(
-    campaign_id: int,
-    user: UserModel = Depends(get_user),
-) -> dict:
-    """Delete a campaign permanently.
-
-    Only campaigns in 'completed', 'failed', or 'created' state may be deleted.
-    Running or paused campaigns must be stopped first.
-    """
+async def _do_delete_campaign(campaign_id: int, user: UserModel) -> dict:
+    """Shared logic for both DELETE and POST /delete endpoints."""
     try:
         if user.is_superuser:
             _ref = await db_client.get_campaign_by_id(campaign_id)
@@ -1130,3 +1122,21 @@ async def delete_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
 
     return {"status": "deleted", "campaign_id": campaign_id}
+
+
+@router.delete("/{campaign_id}")
+async def delete_campaign(
+    campaign_id: int,
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Delete a campaign permanently (DELETE method)."""
+    return await _do_delete_campaign(campaign_id, user)
+
+
+@router.post("/{campaign_id}/delete")
+async def delete_campaign_post(
+    campaign_id: int,
+    user: UserModel = Depends(get_user),
+) -> dict:
+    """Delete a campaign permanently (POST fallback for proxies that block DELETE)."""
+    return await _do_delete_campaign(campaign_id, user)

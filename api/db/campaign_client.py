@@ -1031,11 +1031,22 @@ class CampaignClient(BaseDBClient):
                     "Stop it first."
                 )
 
-            # Delink workflow_runs so we don't lose call history
+            # Delink workflow_runs so we don't lose call history.
+            # Also null queued_run_id: the queued_runs FK has no ON DELETE SET NULL,
+            # so leaving it set causes a FK violation when the campaign cascade fires.
             await session.execute(
                 update(WorkflowRunModel)
                 .where(WorkflowRunModel.campaign_id == campaign_id)
-                .values(campaign_id=None)
+                .values(campaign_id=None, queued_run_id=None)
+            )
+
+            # Null the self-referential parent_queued_run_id so the cascade can
+            # delete retry queued_runs (which reference their parent) without hitting
+            # the RESTRICT default on that FK.
+            await session.execute(
+                update(QueuedRunModel)
+                .where(QueuedRunModel.campaign_id == campaign_id)
+                .values(parent_queued_run_id=None)
             )
 
             # Clear redialed_campaign_id from any parent campaign that stored this
