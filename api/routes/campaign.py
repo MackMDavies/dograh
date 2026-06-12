@@ -648,18 +648,20 @@ async def update_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Running/syncing campaigns cannot have concurrency or schedule changed mid-flight,
-    # but name can always be updated regardless of state.
+    # Running/paused campaigns cannot have concurrency or schedule changed mid-flight.
+    # Failed campaigns must remain fully editable so the agent/telephony/concurrency
+    # can be corrected before relaunching. Completed campaigns are terminal — block
+    # config changes there only.
     non_name_fields_requested = (
         request.retry_config is not None
         or request.max_concurrency is not None
         or request.schedule_config is not None
         or request.circuit_breaker is not None
     )
-    if non_name_fields_requested and campaign.state in ["completed", "failed"]:
+    if non_name_fields_requested and campaign.state == "completed":
         raise HTTPException(
             status_code=400,
-            detail=f"Cannot update settings on a {campaign.state} campaign",
+            detail="Cannot update settings on a completed campaign",
         )
 
     if request.max_concurrency is not None:
