@@ -336,7 +336,7 @@ async def get_daily_usage_breakdown(
     days: int = Query(7, ge=1, le=30, description="Number of days to include"),
     user: UserModel = Depends(get_user),
 ):
-    """Get daily usage breakdown for the last N days. Only available for organizations with pricing."""
+    """Get daily usage breakdown for the last N days."""
     if not user.is_superuser and not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
@@ -346,7 +346,6 @@ async def get_daily_usage_breakdown(
         start_date = start_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
         if user.is_superuser:
-            # Aggregate across all orgs; use $0 price (no USD cost for superuser view)
             breakdown = await db_client.get_daily_usage_breakdown(
                 None,
                 start_date,
@@ -356,19 +355,15 @@ async def get_daily_usage_breakdown(
             )
             return breakdown
 
-        # Get organization to check if it has pricing
         org = await db_client.get_organization_by_id(user.selected_organization_id)
-        if not org or org.price_per_second_usd is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Daily breakdown is only available for organizations with pricing configured",
-            )
+        if not org:
+            raise HTTPException(status_code=404, detail="Organization not found")
 
         breakdown = await db_client.get_daily_usage_breakdown(
             user.selected_organization_id,
             start_date,
             end_date,
-            org.price_per_second_usd,
+            price_per_second_usd=org.price_per_second_usd or 0.0,
             user_id=user.id,
         )
 

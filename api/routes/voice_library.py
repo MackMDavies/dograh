@@ -749,6 +749,8 @@ async def generate_voice_preview(
 
     # 7. Return the updated voice (use voice_org_id to handle cross-org voices)
     updated_voice = await db_client.get_voice_by_uuid(voice_uuid, voice_org_id)
+    if updated_voice is None:
+        raise HTTPException(status_code=404, detail="Voice not found after preview generation")
     return _serialize(updated_voice)
 
 
