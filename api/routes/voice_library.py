@@ -306,7 +306,13 @@ async def sync_provider_voices(user: UserModel = Depends(get_user)):
 
 @router.get("/elevenlabs/voices", response_model=list[ElevenLabsCatalogVoiceSchema])
 async def get_elevenlabs_catalog(user: UserModel = Depends(get_user)) -> list[ElevenLabsCatalogVoiceSchema]:
+    # Try user-level key → org TTS connection → system superuser key
     api_key = await get_caller_elevenlabs_api_key(user.id)
+    if not api_key:
+        conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        api_key = conn.api_key if (conn and conn.api_key) else None
+    if not api_key:
+        api_key = await get_system_elevenlabs_api_key()
     if not api_key:
         raise HTTPException(status_code=400, detail="ElevenLabs API key not configured in your Voice Models settings")
     try:
@@ -332,6 +338,11 @@ async def import_elevenlabs_voices(
     user: UserModel = Depends(get_user),
 ) -> list[VoiceLibraryResponseSchema]:
     api_key = await get_caller_elevenlabs_api_key(user.id)
+    if not api_key:
+        conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        api_key = conn.api_key if (conn and conn.api_key) else None
+    if not api_key:
+        api_key = await get_system_elevenlabs_api_key()
     if not api_key:
         raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
     try:
