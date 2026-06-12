@@ -747,8 +747,8 @@ async def generate_voice_preview(
         audio_preview_url=preview_url,
     )
 
-    # 7. Return the updated voice
-    updated_voice = await db_client.get_voice_by_uuid(voice_uuid, org_id)
+    # 7. Return the updated voice (use voice_org_id to handle cross-org voices)
+    updated_voice = await db_client.get_voice_by_uuid(voice_uuid, voice_org_id)
     return _serialize(updated_voice)
 
 
