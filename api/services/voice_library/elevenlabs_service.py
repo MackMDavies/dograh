@@ -62,6 +62,9 @@ async def clone_voice_with_elevenlabs(
     content_type: str = "audio/webm",
 ) -> dict:
     """Submit audio to ElevenLabs Instant Voice Clone API. Returns {voice_id: str}."""
+    # ElevenLabs rejects MIME types with codec suffixes like "audio/webm;codecs=opus"
+    if ";" in content_type:
+        content_type = content_type.split(";")[0].strip()
     async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         response = await client.post(
             f"{ELEVENLABS_BASE_URL}/v1/voices/add",
@@ -69,6 +72,10 @@ async def clone_voice_with_elevenlabs(
             files={"files": (filename, audio_data, content_type)},
             data={"name": name, "description": description},
         )
+        if not response.is_success:
+            logger.error(
+                f"ElevenLabs clone rejected: HTTP {response.status_code} — {response.text}"
+            )
         response.raise_for_status()
         return response.json()
 

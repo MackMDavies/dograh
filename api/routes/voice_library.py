@@ -6,6 +6,7 @@ import uuid as uuid_lib
 from typing import Optional
 
 import aiohttp
+import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
 from loguru import logger
 
@@ -541,6 +542,11 @@ async def _process_clone_background(
         el_voice_id = result.get("voice_id")
         await db_client.update_voice_status(voice_uuid, "ready", provider_voice_id=el_voice_id)
         logger.info(f"Voice clone {voice_uuid} ready — EL voice_id: {el_voice_id}")
+    except httpx.HTTPStatusError as e:
+        logger.error(
+            f"Voice clone {voice_uuid} failed — ElevenLabs HTTP {e.response.status_code}: {e.response.text}"
+        )
+        await db_client.update_voice_status(voice_uuid, "failed")
     except Exception as e:
         logger.error(f"Voice clone {voice_uuid} failed: {e}")
         await db_client.update_voice_status(voice_uuid, "failed")
