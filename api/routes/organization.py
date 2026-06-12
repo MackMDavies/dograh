@@ -441,6 +441,24 @@ async def _ensure_config_belongs_to_org(config_id: int, organization_id: int):
     return cfg
 
 
+async def _resolve_config_org_id(config_id: int, user: UserModel) -> int:
+    """Return the organization_id for a telephony config.
+
+    Superusers may have a selected_organization_id that differs from the org
+    that owns the config (or it may be null), so we look up the config directly.
+    Regular users must own the config.
+    """
+    if user.is_superuser:
+        cfg = await db_client.get_telephony_configuration(config_id)
+        if not cfg:
+            raise HTTPException(status_code=404, detail="Telephony configuration not found")
+        return cfg.organization_id
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    return user.selected_organization_id
+
+
 async def _ensure_workflow_belongs_to_org(workflow_id: int, organization_id: int):
     workflow = await db_client.get_workflow(
         workflow_id, organization_id=organization_id
@@ -577,9 +595,7 @@ async def update_phone_number(
     request: PhoneNumberUpdateRequest,
     user: UserModel = Depends(get_user),
 ):
-    if not user.selected_organization_id:
-        raise HTTPException(status_code=400, detail="No organization selected")
-    await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    effective_org_id = await _resolve_config_org_id(config_id, user)
 
     existing = await db_client.get_phone_number_for_config(phone_number_id, config_id)
     if not existing:
@@ -587,7 +603,7 @@ async def update_phone_number(
 
     if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(
-            request.inbound_workflow_id, user.selected_organization_id
+            request.inbound_workflow_id, effective_org_id
         )
 
     row = await db_client.update_phone_number(
@@ -608,7 +624,7 @@ async def update_phone_number(
     # Sync the provider application or address with the inbound
     # calling webhook address
     response.provider_sync = await _sync_inbound_for_phone_number(
-        config_id, user.selected_organization_id, row.address
+        config_id, effective_org_id, row.address
     )
     return response
 
@@ -622,9 +638,7 @@ async def set_default_caller_id(
     phone_number_id: int,
     user: UserModel = Depends(get_user),
 ):
-    if not user.selected_organization_id:
-        raise HTTPException(status_code=400, detail="No organization selected")
-    await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    await _resolve_config_org_id(config_id, user)
 
     row = await db_client.set_default_caller_id(phone_number_id, config_id)
     if not row:
@@ -638,9 +652,7 @@ async def delete_phone_number(
     phone_number_id: int,
     user: UserModel = Depends(get_user),
 ):
-    if not user.selected_organization_id:
-        raise HTTPException(status_code=400, detail="No organization selected")
-    await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+    await _resolve_config_org_id(config_id, user)
 
     existing = await db_client.get_phone_number_for_config(phone_number_id, config_id)
     if not existing:
