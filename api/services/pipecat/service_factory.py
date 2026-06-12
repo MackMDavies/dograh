@@ -695,6 +695,12 @@ def create_llm_service_from_provider(
             settings=OpenAILLMSettings(model=model, temperature=0.1),
             **kwargs,
         )
+    elif provider == ServiceProviders.ANTHROPIC.value:
+        from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMSettings
+        return AnthropicLLMService(
+            api_key=api_key,
+            settings=AnthropicLLMSettings(model=model, temperature=0.1),
+        )
     elif provider == ServiceProviders.GROQ.value:
         return GroqLLMService(
             api_key=api_key,

@@ -41,6 +41,7 @@ class ServiceType(Enum):
 
 class ServiceProviders(str, Enum):
     OPENAI = "openai"
+    ANTHROPIC = "anthropic"
     DEEPGRAM = "deepgram"
     GROQ = "groq"
     XAI = "xai"
@@ -71,6 +72,7 @@ class ServiceProviders(str, Enum):
 class BaseServiceConfiguration(BaseModel):
     provider: Literal[
         ServiceProviders.OPENAI,
+        ServiceProviders.ANTHROPIC,
         ServiceProviders.DEEPGRAM,
         ServiceProviders.GROQ,
         ServiceProviders.XAI,
@@ -209,6 +211,7 @@ def provider_model_config(
 
 # Suggested models for each provider (used for UI dropdown)
 OPENAI_PROVIDER_MODEL_CONFIG = provider_model_config("OpenAI")
+ANTHROPIC_PROVIDER_MODEL_CONFIG = provider_model_config("Anthropic")
 GOOGLE_PROVIDER_MODEL_CONFIG = provider_model_config("Google")
 GROQ_PROVIDER_MODEL_CONFIG = provider_model_config("Groq")
 XAI_PROVIDER_MODEL_CONFIG = provider_model_config(
@@ -246,6 +249,17 @@ SPEACHES_PROVIDER_MODEL_CONFIG = provider_model_config(
     ),
     provider_docs_url="https://github.com/speaches-ai/speaches",
 )
+
+ANTHROPIC_MODELS = [
+    "claude-sonnet-4-6",
+    "claude-opus-4-8",
+    "claude-haiku-4-5-20251001",
+    "claude-opus-4-5-20251181",
+    "claude-3-5-sonnet-20241022",
+    "claude-3-5-haiku-20241022",
+    "claude-3-opus-20240229",
+    "claude-3-haiku-20240307",
+]
 
 OPENAI_MODELS = [
     "gpt-4.1",
@@ -310,6 +324,17 @@ class OpenAILLMService(BaseLLMConfiguration):
     base_url: str = Field(
         default="https://api.openai.com/v1",
         description="Override only if using an OpenAI-compatible API (e.g. local LLM, proxy).",
+    )
+
+
+@register_llm
+class AnthropicLLMConfiguration(BaseLLMConfiguration):
+    model_config = ANTHROPIC_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.ANTHROPIC] = ServiceProviders.ANTHROPIC
+    model: str = Field(
+        default="claude-sonnet-4-6",
+        description="Anthropic Claude model identifier.",
+        json_schema_extra={"examples": ANTHROPIC_MODELS, "allow_custom_input": True},
     )
 
 
@@ -684,6 +709,7 @@ REALTIME_PROVIDERS = {
 LLMConfig = Annotated[
     Union[
         OpenAILLMService,
+        AnthropicLLMConfiguration,
         GoogleVertexLLMConfiguration,
         GroqLLMService,
         XAILLMConfiguration,
