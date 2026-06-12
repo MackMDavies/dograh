@@ -8,6 +8,7 @@ from loguru import logger
 from api.constants import MPS_API_URL
 from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import ServiceProviders
+from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
 from api.utils.url_security import validate_user_configured_service_url
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
@@ -447,7 +448,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             .replace("https://", "wss://")
             .replace("http://", "ws://")
         )
-        return ElevenLabsTTSService(
+        return DograhElevenLabsTTSService(
             reconnect_on_error=True,
             api_key=api_key,
             url=elevenlabs_url,
@@ -696,8 +697,9 @@ def create_llm_service_from_provider(
             **kwargs,
         )
     elif provider == ServiceProviders.ANTHROPIC.value:
-        from pipecat.services.anthropic.llm import AnthropicLLMService, AnthropicLLMSettings
-        return AnthropicLLMService(
+        from api.services.pipecat.anthropic_llm import DograhAnthropicLLMService
+        from pipecat.services.anthropic.llm import AnthropicLLMSettings
+        return DograhAnthropicLLMService(
             api_key=api_key,
             settings=AnthropicLLMSettings(model=model, temperature=0.1),
         )
