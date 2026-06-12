@@ -371,4 +371,5 @@ async def get_daily_usage_breakdown(
     except HTTPException:
         raise
     except Exception as e:
+        logger.exception(f"Daily breakdown failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
