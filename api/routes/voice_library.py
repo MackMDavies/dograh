@@ -306,10 +306,13 @@ async def sync_provider_voices(user: UserModel = Depends(get_user)):
 
 @router.get("/elevenlabs/voices", response_model=list[ElevenLabsCatalogVoiceSchema])
 async def get_elevenlabs_catalog(user: UserModel = Depends(get_user)) -> list[ElevenLabsCatalogVoiceSchema]:
-    # Try user-level key → org TTS connection → system superuser key
+    # Try user-level key → org TTS connection → all-org search (superuser) → system superuser key
     api_key = await get_caller_elevenlabs_api_key(user.id)
     if not api_key:
         conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        if not conn and user.is_superuser:
+            all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+            conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
         api_key = conn.api_key if (conn and conn.api_key) else None
     if not api_key:
         api_key = await get_system_elevenlabs_api_key()
@@ -340,6 +343,9 @@ async def import_elevenlabs_voices(
     api_key = await get_caller_elevenlabs_api_key(user.id)
     if not api_key:
         conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        if not conn and user.is_superuser:
+            all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+            conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
         api_key = conn.api_key if (conn and conn.api_key) else None
     if not api_key:
         api_key = await get_system_elevenlabs_api_key()
@@ -389,6 +395,9 @@ async def get_google_tts_catalog(
 ) -> list[GoogleTTSCatalogVoiceSchema]:
     """Fetch available Google Cloud TTS voices via the org's connected credentials."""
     conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "google")
+    if not conn and user.is_superuser:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "google"), None)
     if not conn:
         raise HTTPException(status_code=400, detail="No Google TTS connection configured for this organisation")
     credentials_json = _get_google_credentials_json(conn)
@@ -419,6 +428,9 @@ async def import_google_tts_voices(
 ) -> list[VoiceLibraryResponseSchema]:
     """Import selected Google Cloud TTS voices into the org's voice library."""
     conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "google")
+    if not conn and user.is_superuser:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "google"), None)
     if not conn:
         raise HTTPException(status_code=400, detail="No Google TTS connection configured")
     credentials_json = _get_google_credentials_json(conn)
