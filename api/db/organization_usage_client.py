@@ -480,7 +480,7 @@ class OrganizationUsageClient(BaseDBClient):
                 WorkflowRunModel.is_completed == True,
             ]
             if organization_id is not None:
-                base_where.append(UserModel.selected_organization_id == organization_id)
+                base_where.append(WorkflowModel.organization_id == organization_id)
 
             daily_usage = await session.execute(
                 select(
@@ -491,7 +491,6 @@ class OrganizationUsageClient(BaseDBClient):
                     func.count(WorkflowRunModel.id).label("call_count"),
                 )
                 .join(WorkflowModel, WorkflowModel.id == WorkflowRunModel.workflow_id)
-                .join(UserModel, UserModel.id == WorkflowModel.user_id)
                 .where(*base_where)
                 .group_by(date_expr)
                 .order_by(date_expr.asc())
