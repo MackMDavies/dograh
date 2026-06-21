@@ -430,10 +430,10 @@ async def retry_document_processing(
         if not document:
             raise HTTPException(status_code=404, detail="Document not found")
 
-        if document.processing_status != "failed":
+        if document.processing_status not in ("failed", "processing"):
             raise HTTPException(
                 status_code=400,
-                detail=f"Document is '{document.processing_status}', not 'failed' — cannot retry.",
+                detail=f"Document is '{document.processing_status}' — only failed or stuck-processing documents can be retried.",
             )
 
         s3_key = (document.custom_metadata or {}).get("s3_key", "")
