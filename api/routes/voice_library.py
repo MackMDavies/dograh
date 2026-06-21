@@ -15,6 +15,7 @@ from api.db.models import UserModel
 from api.schemas.voice_library import (
     ElevenLabsCatalogVoiceSchema,
     ElevenLabsImportRequestSchema,
+    ElevenLabsSharedVoiceSchema,
     GoogleTTSCatalogVoiceSchema,
     GoogleTTSImportRequestSchema,
     VoiceLibraryResponseSchema,
@@ -25,6 +26,7 @@ from api.services.storage import storage_fs
 from api.services.voice_library.elevenlabs_service import (
     clone_voice_with_elevenlabs,
     fetch_elevenlabs_catalog,
+    fetch_elevenlabs_shared_voices,
     get_caller_elevenlabs_api_key,
     get_system_elevenlabs_api_key,
 )
@@ -99,6 +101,100 @@ _PROVIDER_PREDEFINED_VOICES: dict[str, list[dict]] = {
         {"name": "Orpheus", "voice_id": "aura-orpheus-en", "gender": "male"},
         {"name": "Helios",  "voice_id": "aura-helios-en",  "gender": "male"},
         {"name": "Zeus",    "voice_id": "aura-zeus-en",    "gender": "male"},
+    ],
+    "aws_polly": [
+        {"name": "Joanna",   "voice_id": "Joanna",   "gender": "female", "language": "en-US"},
+        {"name": "Matthew",  "voice_id": "Matthew",  "gender": "male",   "language": "en-US"},
+        {"name": "Ivy",      "voice_id": "Ivy",      "gender": "female", "language": "en-US"},
+        {"name": "Kendra",   "voice_id": "Kendra",   "gender": "female", "language": "en-US"},
+        {"name": "Kimberly", "voice_id": "Kimberly", "gender": "female", "language": "en-US"},
+        {"name": "Salli",    "voice_id": "Salli",    "gender": "female", "language": "en-US"},
+        {"name": "Joey",     "voice_id": "Joey",     "gender": "male",   "language": "en-US"},
+        {"name": "Justin",   "voice_id": "Justin",   "gender": "male",   "language": "en-US"},
+        {"name": "Ruth",     "voice_id": "Ruth",     "gender": "female", "language": "en-US"},
+        {"name": "Stephen",  "voice_id": "Stephen",  "gender": "male",   "language": "en-US"},
+        {"name": "Amy",      "voice_id": "Amy",      "gender": "female", "language": "en-GB"},
+        {"name": "Brian",    "voice_id": "Brian",    "gender": "male",   "language": "en-GB"},
+        {"name": "Emma",     "voice_id": "Emma",     "gender": "female", "language": "en-GB"},
+        {"name": "Aria",     "voice_id": "Aria",     "gender": "female", "language": "en-NZ"},
+        {"name": "Ayanda",   "voice_id": "Ayanda",   "gender": "female", "language": "en-ZA"},
+        {"name": "Camila",   "voice_id": "Camila",   "gender": "female", "language": "es-US"},
+        {"name": "Lupe",     "voice_id": "Lupe",     "gender": "female", "language": "es-US"},
+        {"name": "Pedro",    "voice_id": "Pedro",    "gender": "male",   "language": "es-US"},
+        {"name": "Penelope", "voice_id": "Penelope", "gender": "female", "language": "es-US"},
+        {"name": "Mizuki",   "voice_id": "Mizuki",   "gender": "female", "language": "ja-JP"},
+        {"name": "Takumi",   "voice_id": "Takumi",   "gender": "male",   "language": "ja-JP"},
+        {"name": "Seoyeon",  "voice_id": "Seoyeon",  "gender": "female", "language": "ko-KR"},
+        {"name": "Zhiyu",    "voice_id": "Zhiyu",    "gender": "female", "language": "cmn-CN"},
+        {"name": "Daniel",   "voice_id": "Daniel",   "gender": "male",   "language": "de-DE"},
+        {"name": "Vicki",    "voice_id": "Vicki",    "gender": "female", "language": "de-DE"},
+        {"name": "Mathieu",  "voice_id": "Mathieu",  "gender": "male",   "language": "fr-FR"},
+        {"name": "Lea",      "voice_id": "Lea",      "gender": "female", "language": "fr-FR"},
+        {"name": "Giorgio",  "voice_id": "Giorgio",  "gender": "male",   "language": "it-IT"},
+        {"name": "Bianca",   "voice_id": "Bianca",   "gender": "female", "language": "it-IT"},
+        {"name": "Vitoria",  "voice_id": "Vitoria",  "gender": "female", "language": "pt-BR"},
+        {"name": "Camila",   "voice_id": "Camila",   "gender": "female", "language": "pt-BR"},
+    ],
+    "azure_tts": [
+        {"name": "Jenny (en-US)",       "voice_id": "en-US-JennyNeural",     "gender": "female", "language": "en-US"},
+        {"name": "Guy (en-US)",         "voice_id": "en-US-GuyNeural",       "gender": "male",   "language": "en-US"},
+        {"name": "Aria (en-US)",        "voice_id": "en-US-AriaNeural",      "gender": "female", "language": "en-US"},
+        {"name": "Davis (en-US)",       "voice_id": "en-US-DavisNeural",     "gender": "male",   "language": "en-US"},
+        {"name": "Amber (en-US)",       "voice_id": "en-US-AmberNeural",     "gender": "female", "language": "en-US"},
+        {"name": "Christopher (en-US)", "voice_id": "en-US-ChristopherNeural", "gender": "male", "language": "en-US"},
+        {"name": "Elizabeth (en-US)",   "voice_id": "en-US-ElizabethNeural", "gender": "female", "language": "en-US"},
+        {"name": "Eric (en-US)",        "voice_id": "en-US-EricNeural",      "gender": "male",   "language": "en-US"},
+        {"name": "Sonia (en-GB)",       "voice_id": "en-GB-SoniaNeural",     "gender": "female", "language": "en-GB"},
+        {"name": "Ryan (en-GB)",        "voice_id": "en-GB-RyanNeural",      "gender": "male",   "language": "en-GB"},
+        {"name": "Libby (en-GB)",       "voice_id": "en-GB-LibbyNeural",     "gender": "female", "language": "en-GB"},
+        {"name": "Maisie (en-GB)",      "voice_id": "en-GB-MaisieNeural",    "gender": "female", "language": "en-GB"},
+        {"name": "Natasha (en-AU)",     "voice_id": "en-AU-NatashaNeural",   "gender": "female", "language": "en-AU"},
+        {"name": "William (en-AU)",     "voice_id": "en-AU-WilliamNeural",   "gender": "male",   "language": "en-AU"},
+        {"name": "Neerja (en-IN)",      "voice_id": "en-IN-NeerjaNeural",    "gender": "female", "language": "en-IN"},
+        {"name": "Prabhat (en-IN)",     "voice_id": "en-IN-PrabhatNeural",   "gender": "male",   "language": "en-IN"},
+        {"name": "Elvira (es-ES)",      "voice_id": "es-ES-ElviraNeural",    "gender": "female", "language": "es-ES"},
+        {"name": "Alvaro (es-ES)",      "voice_id": "es-ES-AlvaroNeural",    "gender": "male",   "language": "es-ES"},
+        {"name": "Dalia (es-MX)",       "voice_id": "es-MX-DaliaNeural",     "gender": "female", "language": "es-MX"},
+        {"name": "Jorge (es-MX)",       "voice_id": "es-MX-JorgeNeural",     "gender": "male",   "language": "es-MX"},
+        {"name": "Denise (fr-FR)",      "voice_id": "fr-FR-DeniseNeural",    "gender": "female", "language": "fr-FR"},
+        {"name": "Henri (fr-FR)",       "voice_id": "fr-FR-HenriNeural",     "gender": "male",   "language": "fr-FR"},
+        {"name": "Katja (de-DE)",       "voice_id": "de-DE-KatjaNeural",     "gender": "female", "language": "de-DE"},
+        {"name": "Conrad (de-DE)",      "voice_id": "de-DE-ConradNeural",    "gender": "male",   "language": "de-DE"},
+        {"name": "Elsa (it-IT)",        "voice_id": "it-IT-ElsaNeural",      "gender": "female", "language": "it-IT"},
+        {"name": "Diego (it-IT)",       "voice_id": "it-IT-DiegoNeural",     "gender": "male",   "language": "it-IT"},
+        {"name": "Francisca (pt-BR)",   "voice_id": "pt-BR-FranciscaNeural", "gender": "female", "language": "pt-BR"},
+        {"name": "Antonio (pt-BR)",     "voice_id": "pt-BR-AntonioNeural",   "gender": "male",   "language": "pt-BR"},
+        {"name": "Xiaoxiao (zh-CN)",    "voice_id": "zh-CN-XiaoxiaoNeural",  "gender": "female", "language": "zh-CN"},
+        {"name": "Yunxi (zh-CN)",       "voice_id": "zh-CN-YunxiNeural",     "gender": "male",   "language": "zh-CN"},
+        {"name": "Nanami (ja-JP)",      "voice_id": "ja-JP-NanamiNeural",    "gender": "female", "language": "ja-JP"},
+        {"name": "Keita (ja-JP)",       "voice_id": "ja-JP-KeitaNeural",     "gender": "male",   "language": "ja-JP"},
+        {"name": "SunHi (ko-KR)",       "voice_id": "ko-KR-SunHiNeural",     "gender": "female", "language": "ko-KR"},
+        {"name": "InJoon (ko-KR)",      "voice_id": "ko-KR-InJoonNeural",    "gender": "male",   "language": "ko-KR"},
+        {"name": "Swara (hi-IN)",       "voice_id": "hi-IN-SwaraNeural",     "gender": "female", "language": "hi-IN"},
+        {"name": "Madhur (hi-IN)",      "voice_id": "hi-IN-MadhurNeural",    "gender": "male",   "language": "hi-IN"},
+        {"name": "Zariyah (ar-SA)",     "voice_id": "ar-SA-ZariyahNeural",   "gender": "female", "language": "ar-SA"},
+        {"name": "Hamed (ar-SA)",       "voice_id": "ar-SA-HamedNeural",     "gender": "male",   "language": "ar-SA"},
+    ],
+    "playht": [
+        {"name": "Jennifer (US Female)", "voice_id": "s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json", "gender": "female"},
+        {"name": "Matt (US Male)",       "voice_id": "s3://voice-cloning-zero-shot/baf1ef41-36b6-428c-9bdf-50ba54682bd8/original/manifest.json",   "gender": "male"},
+        {"name": "Mel (Parrot)",         "voice_id": "s3://peregrine-voices/mel parrot/manifest.json", "gender": "female"},
+        {"name": "Oliver",               "voice_id": "s3://peregrine-voices/oliver/manifest.json",     "gender": "male"},
+        {"name": "Ryan",                 "voice_id": "s3://peregrine-voices/ryan/manifest.json",       "gender": "male"},
+        {"name": "Sally",                "voice_id": "s3://peregrine-voices/sally/manifest.json",      "gender": "female"},
+        {"name": "Futuristic Racer",     "voice_id": "s3://peregrine-voices/futuristic racer/manifest.json", "gender": "male"},
+    ],
+    "neets": [
+        {"name": "US Female 2",  "voice_id": "us-female-2",  "gender": "female"},
+        {"name": "US Male 2",    "voice_id": "us-male-2",    "gender": "male"},
+        {"name": "US Female 5",  "voice_id": "us-female-5",  "gender": "female"},
+        {"name": "US Male 5",    "voice_id": "us-male-5",    "gender": "male"},
+        {"name": "Clara",        "voice_id": "clara",         "gender": "female"},
+        {"name": "James",        "voice_id": "james",         "gender": "male"},
+        {"name": "Aria",         "voice_id": "aria",          "gender": "female"},
+        {"name": "Ryan",         "voice_id": "ryan",          "gender": "male"},
+        {"name": "Sophia",       "voice_id": "sophia",        "gender": "female"},
+        {"name": "Oliver",       "voice_id": "oliver",        "gender": "male"},
     ],
 }
 
@@ -388,6 +484,128 @@ async def import_elevenlabs_voices(
     return created
 
 
+@router.get("/elevenlabs/shared-voices", response_model=list[ElevenLabsSharedVoiceSchema])
+async def get_elevenlabs_shared_voices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    gender: Optional[str] = Query(None),
+    age: Optional[str] = Query(None),
+    use_case: Optional[str] = Query(None),
+    accent: Optional[str] = Query(None),
+    category: Optional[str] = Query(None),
+    user: UserModel = Depends(get_user),
+) -> list[ElevenLabsSharedVoiceSchema]:
+    """Browse the ElevenLabs public shared voice library (6,000+ community voices).
+
+    Shared voices can be imported into your library and used directly for TTS.
+    """
+    api_key = await get_caller_elevenlabs_api_key(user.id)
+    if not api_key:
+        conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        if not conn and user.is_superuser:
+            all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+            conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
+        api_key = conn.api_key if (conn and conn.api_key) else None
+    if not api_key:
+        api_key = await get_system_elevenlabs_api_key()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
+    try:
+        result = await fetch_elevenlabs_shared_voices(
+            api_key,
+            page_size=page_size,
+            page=page,
+            search=search,
+            language=language,
+            gender=gender,
+            age=age,
+            use_case=use_case,
+            accent=accent,
+            category=category,
+        )
+    except Exception as e:
+        logger.error(f"EL shared voices fetch failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch ElevenLabs shared voices")
+    voices = result.get("voices", [])
+    return [
+        ElevenLabsSharedVoiceSchema(
+            voice_id=v.get("voice_id", ""),
+            name=v.get("name", ""),
+            preview_url=v.get("preview_url"),
+            labels=v.get("labels", {}),
+            category=v.get("category"),
+            description=v.get("description"),
+            language=v.get("labels", {}).get("language") or v.get("language"),
+            gender=v.get("labels", {}).get("gender") or v.get("gender"),
+            use_case=v.get("labels", {}).get("use_case") or v.get("use_case"),
+            accent=v.get("labels", {}).get("accent") or v.get("accent"),
+            age=v.get("labels", {}).get("age") or v.get("age"),
+        )
+        for v in voices
+    ]
+
+
+@router.post("/import/elevenlabs/shared", response_model=list[VoiceLibraryResponseSchema], status_code=201)
+async def import_elevenlabs_shared_voices(
+    body: ElevenLabsImportRequestSchema,
+    user: UserModel = Depends(get_user),
+) -> list[VoiceLibraryResponseSchema]:
+    """Import voices from the ElevenLabs shared/public library into your voice library.
+
+    Shared voices work directly with TTS — they do not consume a voice slot.
+    """
+    api_key = await get_caller_elevenlabs_api_key(user.id)
+    if not api_key:
+        conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "elevenlabs")
+        if not conn and user.is_superuser:
+            all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+            conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
+        api_key = conn.api_key if (conn and conn.api_key) else None
+    if not api_key:
+        api_key = await get_system_elevenlabs_api_key()
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
+
+    created = []
+    for voice_id in body.voice_ids:
+        existing = await db_client.get_voice_by_provider_id(voice_id, user.selected_organization_id)
+        if existing:
+            logger.info(f"EL shared voice {voice_id} already in library, skipping")
+            continue
+        # Fetch voice details from the shared library
+        try:
+            result = await fetch_elevenlabs_shared_voices(api_key, page_size=1, search=voice_id)
+            voices = result.get("voices", [])
+            el_voice = next((v for v in voices if v.get("voice_id") == voice_id), None)
+        except Exception:
+            el_voice = None
+
+        name = el_voice.get("name", voice_id) if el_voice else voice_id
+        labels = el_voice.get("labels", {}) if el_voice else {}
+        preview_url = el_voice.get("preview_url") if el_voice else None
+
+        voice = await db_client.create_voice(
+            user_id=user.id,
+            organization_id=user.selected_organization_id,
+            name=name,
+            provider="elevenlabs",
+            provider_voice_id=voice_id,
+            is_public=body.is_public,
+            language=labels.get("language"),
+            accent=labels.get("accent"),
+            gender=labels.get("gender"),
+            age=labels.get("age"),
+            use_case=labels.get("use_case"),
+            audio_preview_url=preview_url,
+            labels=labels,
+            status="ready",
+        )
+        created.append(_serialize(voice))
+    return created
+
+
 @router.get("/google/voices", response_model=list[GoogleTTSCatalogVoiceSchema])
 async def get_google_tts_catalog(
     language: Optional[str] = Query(None, description="Filter by BCP-47 language code"),
@@ -500,6 +718,8 @@ async def clone_voice(
             tts_provider = "elevenlabs"  # will attempt system fallback in background
 
     provider = "xai" if tts_provider == "xai" else "dograh_clone"
+    content_type = file.content_type or "audio/webm"
+    filename = file.filename or "recording.webm"
     voice = await db_client.create_voice(
         user_id=user.id,
         organization_id=org_id,
@@ -513,9 +733,8 @@ async def clone_voice(
         age=age or None,
         use_case=use_case or None,
         status="pending",
+        labels={"clone_audio_filename": filename, "clone_audio_content_type": content_type},
     )
-    content_type = file.content_type or "audio/webm"
-    filename = file.filename or "recording.webm"
     if tts_provider == "xai":
         background_tasks.add_task(
             _process_xai_clone_background,
@@ -541,6 +760,48 @@ async def clone_voice(
     return _serialize(voice)
 
 
+async def _store_clone_audio(voice_uuid: str, audio_data: bytes) -> None:
+    """Persist clone audio bytes to object storage so the voice can be retried."""
+    audio_key = f"voice-clone-audio/{voice_uuid}.webm"
+    fd, tmp_path = tempfile.mkstemp(suffix=".webm", prefix="dograh_clone_")
+    os.close(fd)
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(audio_data)
+        await storage_fs.aupload_file(tmp_path, audio_key)
+        logger.info(f"Stored clone audio for {voice_uuid} at {audio_key}")
+    except Exception as e:
+        logger.warning(f"Could not store clone audio for {voice_uuid}: {e}")
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
+async def _load_clone_audio(voice_uuid: str) -> bytes | None:
+    """Retrieve stored clone audio bytes from object storage."""
+    audio_key = f"voice-clone-audio/{voice_uuid}.webm"
+    fd, tmp_path = tempfile.mkstemp(suffix=".webm", prefix="dograh_clone_")
+    os.close(fd)
+    try:
+        ok = await storage_fs.adownload_file(audio_key, tmp_path)
+        if not ok:
+            return None
+        with open(tmp_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        logger.warning(f"Could not load clone audio for {voice_uuid}: {e}")
+        return None
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 async def _process_clone_background(
     voice_uuid: str,
     name: str,
@@ -550,29 +811,33 @@ async def _process_clone_background(
     content_type: str,
     org_id: int,
 ) -> None:
+    await _store_clone_audio(voice_uuid, audio_data)
     # Prefer the org's own connected ElevenLabs key; fall back to system superuser key.
     conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
     api_key = conn.api_key if (conn and conn.api_key) else None
     if not api_key:
         api_key = await get_system_elevenlabs_api_key()
     if not api_key:
-        logger.error(f"No ElevenLabs API key for org {org_id} — cannot clone voice {voice_uuid}")
-        await db_client.update_voice_status(voice_uuid, "failed")
+        error_msg = f"No ElevenLabs API key found for this organisation — add one in AI Models → ElevenLabs"
+        logger.error(f"Voice clone {voice_uuid}: {error_msg}")
+        await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
         return
     try:
         await db_client.update_voice_status(voice_uuid, "processing")
         result = await clone_voice_with_elevenlabs(api_key, name, audio_data, description, filename, content_type)
         el_voice_id = result.get("voice_id")
-        await db_client.update_voice_status(voice_uuid, "ready", provider_voice_id=el_voice_id)
+        await db_client.update_voice_status(voice_uuid, "ready", provider_voice_id=el_voice_id,
+                                            labels_patch={"clone_error": None})
         logger.info(f"Voice clone {voice_uuid} ready — EL voice_id: {el_voice_id}")
     except httpx.HTTPStatusError as e:
-        logger.error(
-            f"Voice clone {voice_uuid} failed — ElevenLabs HTTP {e.response.status_code}: {e.response.text}"
-        )
-        await db_client.update_voice_status(voice_uuid, "failed")
+        detail = e.response.text[:300]
+        error_msg = f"ElevenLabs rejected the audio (HTTP {e.response.status_code}): {detail}"
+        logger.error(f"Voice clone {voice_uuid} failed — {error_msg}")
+        await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
     except Exception as e:
-        logger.error(f"Voice clone {voice_uuid} failed: {e}")
-        await db_client.update_voice_status(voice_uuid, "failed")
+        error_msg = str(e)[:300]
+        logger.error(f"Voice clone {voice_uuid} failed: {error_msg}")
+        await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
 
 
 async def _process_xai_clone_background(
@@ -584,10 +849,12 @@ async def _process_xai_clone_background(
     content_type: str,
     org_id: int,
 ) -> None:
+    await _store_clone_audio(voice_uuid, audio_data)
     conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
     if not conn or not conn.api_key:
-        logger.error(f"No xAI TTS connection for org {org_id} — cannot clone voice {voice_uuid}")
-        await db_client.update_voice_status(voice_uuid, "failed")
+        error_msg = "No xAI TTS API key found for this organisation — add one in AI Models → xAI"
+        logger.error(f"Voice clone {voice_uuid}: {error_msg}")
+        await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
         return
     try:
         await db_client.update_voice_status(voice_uuid, "processing")
@@ -604,16 +871,63 @@ async def _process_xai_clone_background(
             ) as resp:
                 if resp.status != 201:
                     error_text = await resp.text()
-                    logger.error(f"xAI custom voice creation failed {resp.status}: {error_text}")
-                    await db_client.update_voice_status(voice_uuid, "failed")
+                    error_msg = f"xAI rejected the audio (HTTP {resp.status}): {error_text[:200]}"
+                    logger.error(f"Voice clone {voice_uuid}: {error_msg}")
+                    await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
                     return
                 result = await resp.json()
         xai_voice_id = result.get("voice_id")
-        await db_client.update_voice_status(voice_uuid, "ready", provider_voice_id=xai_voice_id)
+        await db_client.update_voice_status(voice_uuid, "ready", provider_voice_id=xai_voice_id,
+                                            labels_patch={"clone_error": None})
         logger.info(f"xAI voice clone {voice_uuid} ready — voice_id: {xai_voice_id}")
     except Exception as e:
-        logger.error(f"xAI voice clone {voice_uuid} failed: {e}")
-        await db_client.update_voice_status(voice_uuid, "failed")
+        error_msg = str(e)[:300]
+        logger.error(f"xAI voice clone {voice_uuid} failed: {error_msg}")
+        await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
+
+
+@router.post("/{voice_uuid}/retry", response_model=VoiceLibraryResponseSchema)
+async def retry_voice_clone(
+    voice_uuid: str,
+    background_tasks: BackgroundTasks,
+    user: UserModel = Depends(get_user),
+) -> VoiceLibraryResponseSchema:
+    """Retry a failed voice clone using the original stored audio — no re-recording needed."""
+    voice = await db_client.get_voice_by_uuid(voice_uuid, user.selected_organization_id)
+    if not voice:
+        raise HTTPException(status_code=404, detail="Voice not found")
+    if voice.status not in ("failed",):
+        raise HTTPException(status_code=409, detail="Only failed voices can be retried")
+
+    audio_data = await _load_clone_audio(voice_uuid)
+    if not audio_data or len(audio_data) < 1000:
+        raise HTTPException(
+            status_code=409,
+            detail="Original audio not found — please re-record the voice clone",
+        )
+
+    await db_client.update_voice_status(voice_uuid, "pending", labels_patch={"clone_error": None})
+
+    labels = voice.labels or {}
+    orig_filename = labels.get("clone_audio_filename") or "recording.webm"
+    orig_content_type = labels.get("clone_audio_content_type") or "audio/webm"
+    provider = voice.provider
+    org_id = voice.organization_id
+    if provider == "xai":
+        background_tasks.add_task(
+            _process_xai_clone_background,
+            voice_uuid, voice.name, voice.description or "",
+            audio_data, orig_filename, orig_content_type, org_id,
+        )
+    else:
+        background_tasks.add_task(
+            _process_clone_background,
+            voice_uuid, voice.name, voice.description or "",
+            audio_data, orig_filename, orig_content_type, org_id,
+        )
+
+    updated = await db_client.get_voice_by_uuid(voice_uuid, user.selected_organization_id)
+    return _serialize(updated)
 
 
 @router.post("/{voice_uuid}/generate-preview", response_model=VoiceLibraryResponseSchema)

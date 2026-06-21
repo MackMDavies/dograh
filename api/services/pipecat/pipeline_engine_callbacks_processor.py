@@ -53,6 +53,8 @@ class PipelineEngineCallbacksProcessor(FrameProcessor):
             # which can act as reference while fixing the aggregated trascript
             await self._llm_text_frame_callback(frame.text)
 
+        if isinstance(frame, TTSSpeakFrame):
+            logger.info(f"[DIAG-CBPROC] callback_processor: pushing TTSSpeakFrame downstream len={len(frame.text)}")
         await self.push_frame(frame, direction)
 
     async def _start(self, _: StartFrame):

@@ -29,6 +29,7 @@ from api.routes.workflow_recording import router as workflow_recording_router
 from api.routes.voice_library import router as voice_library_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
 from api.routes.ai_providers import router as ai_providers_router
+from api.routes.memory_tools import router as memory_tools_router
 from api.services.integrations import all_routers
 
 router = APIRouter(
@@ -63,6 +64,7 @@ router.include_router(node_types_router)
 router.include_router(agent_stream_router)
 router.include_router(voice_library_router)
 router.include_router(ai_providers_router)
+router.include_router(memory_tools_router)
 
 for _integration_router in all_routers():
     router.include_router(_integration_router)

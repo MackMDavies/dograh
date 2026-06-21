@@ -181,6 +181,18 @@ services:
       SUPABASE_URL: "${SUPABASE_URL:-}"
       SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:-}"
 
+      # Sysevo caller memory integration
+      # Set SYSEVO_MEMORY_PRE_CALL_URL to enable automatic caller memory injection
+      # for all inbound telephony calls (Twilio, Vonage, Telnyx, Asterisk, etc.).
+      # The agent's system prompt can reference {{caller_name}}, {{caller_memory}}, etc.
+      # Set SYSEVO_POST_CALL_MEMORY_URL to enable post-call fact extraction via Claude.
+      # Both URLs point to Sysevo Supabase edge functions.
+      # SYSEVO_MEMORY_SECRET must match the SYSEVO_MEMORY_SECRET set in Supabase secrets.
+      SYSEVO_MEMORY_PRE_CALL_URL: "${SYSEVO_MEMORY_PRE_CALL_URL:-}"
+      SYSEVO_PRE_CALL_CHECK_URL: "${SYSEVO_PRE_CALL_CHECK_URL:-}"
+      SYSEVO_POST_CALL_MEMORY_URL: "${SYSEVO_POST_CALL_MEMORY_URL:-}"
+      SYSEVO_MEMORY_SECRET: "${SYSEVO_MEMORY_SECRET:-}"
+
       # CORS / deployment
       DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"

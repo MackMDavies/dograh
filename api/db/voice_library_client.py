@@ -183,6 +183,7 @@ class VoiceLibraryClient(BaseDBClient):
         status: str,
         provider_voice_id: Optional[str] = None,
         audio_preview_url: Optional[str] = None,
+        labels_patch: Optional[dict] = None,
     ) -> None:
         async with self.async_session() as session:
             result = await session.execute(
@@ -198,6 +199,15 @@ class VoiceLibraryClient(BaseDBClient):
                 voice.provider_voice_id = provider_voice_id
             if audio_preview_url:
                 voice.audio_preview_url = audio_preview_url
+            if labels_patch:
+                from sqlalchemy import update as sa_update
+                merged = dict(voice.labels or {})
+                merged.update(labels_patch)
+                await session.execute(
+                    sa_update(VoiceLibraryModel)
+                    .where(VoiceLibraryModel.uuid == voice_uuid)
+                    .values(labels=merged)
+                )
             await session.commit()
 
     async def delete_voice(

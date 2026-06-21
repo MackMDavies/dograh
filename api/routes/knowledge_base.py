@@ -443,6 +443,13 @@ async def retry_document_processing(
                 detail="Document has no S3 key stored; cannot re-process.",
             )
 
+        # Auto-correct a generic MIME type using the stored filename so the
+        # processor doesn't reject the document as an unsupported file type.
+        corrected_mime = db_client.get_mime_type(document.filename)
+        if document.mime_type in ("application/octet-stream", "", None) and corrected_mime != "application/octet-stream":
+            await db_client.update_document_metadata(document.id, mime_type=corrected_mime)
+            logger.info(f"Corrected MIME type for {document_uuid}: {document.mime_type!r} → {corrected_mime!r}")
+
         # Clear any stale chunks and reset status to pending.
         await db_client.delete_document_chunks(document.id)
         await db_client.reset_document_for_retry(document.id)

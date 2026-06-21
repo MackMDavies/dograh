@@ -8,6 +8,7 @@ from sqlalchemy import delete, select
 
 from api.db.base_client import BaseDBClient
 from api.db.models import OrgAvailableModelModel, OrgProviderConnectionModel
+from api.services.configuration.pricing import get_model_pricing
 
 
 # Comprehensive fallback catalog — used when live fetch fails or provider has no listing API.
@@ -21,6 +22,7 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         ],
         "anthropic": [
             "claude-opus-4-8",
+            "claude-opus-4-7",
             "claude-sonnet-4-6",
             "claude-haiku-4-5-20251001",
             "claude-3-7-sonnet-20250219",
@@ -65,6 +67,47 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         ],
         "minimax": ["MiniMax-M2.7", "MiniMax-M2.7-highspeed", "MiniMax-Text-01"],
         "speaches": ["custom"],
+        "mistral": [
+            "mistral-large-latest",
+            "mistral-medium-latest",
+            "mistral-small-latest",
+            "mistral-nemo",
+            "codestral-latest",
+            "open-mistral-7b",
+            "open-mixtral-8x7b",
+            "open-mixtral-8x22b",
+        ],
+        "together": [
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "meta-llama/Llama-3.1-405B-Instruct-Turbo",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+            "Qwen/Qwen2.5-72B-Instruct-Turbo",
+            "deepseek-ai/DeepSeek-V3",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+            "mistralai/Mistral-7B-Instruct-v0.3",
+            "google/gemma-2-27b-it",
+        ],
+        "cerebras": [
+            "llama3.3-70b",
+            "llama3.1-70b",
+            "llama3.1-8b",
+            "llama3.1-405b",
+        ],
+        "fireworks": [
+            "accounts/fireworks/models/llama-v3p3-70b-instruct",
+            "accounts/fireworks/models/llama-v3p1-8b-instruct",
+            "accounts/fireworks/models/llama-v3p1-405b-instruct",
+            "accounts/fireworks/models/mixtral-8x7b-instruct",
+            "accounts/fireworks/models/qwen2p5-72b-instruct",
+            "accounts/fireworks/models/deepseek-v3",
+        ],
+        "cohere": [
+            "command-r-plus-08-2024",
+            "command-r-08-2024",
+            "command-r",
+            "command-light",
+            "command-r7b-12-2024",
+        ],
     },
     "tts": {
         "elevenlabs": [
@@ -85,6 +128,10 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         "sarvam": ["bulbul:v2", "bulbul:v3"],
         "minimax": ["speech-02-hd", "speech-02-turbo", "speech-01-turbo", "speech-01"],
         "speaches": ["tts-1", "tts-1-hd", "hexgrad/Kokoro-82M"],
+        "aws_polly": ["neural", "long-form", "standard", "generative"],
+        "azure_tts": ["neural", "standard"],
+        "playht": ["Play3.0-mini", "PlayHT2.0-turbo", "PlayHT2.0", "PlayDialog"],
+        "neets": ["style-diff-500", "ar-diff-50k", "vits"],
     },
     "stt": {
         "deepgram": [
@@ -101,6 +148,8 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         "speechmatics": ["enhanced", "standard"],
         "sarvam": ["saarika:v2"],
         "speaches": ["whisper-1"],
+        "azure_speech": ["realtime", "whisper"],
+        "aws_transcribe": ["general", "phone-call", "dictation"],
     },
     "embeddings": {
         "openai": [
@@ -123,7 +172,7 @@ async def _fetch_live_models(provider: str, service_type: str, api_key: Optional
     if not api_key:
         return []
     try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with httpx.AsyncClient(timeout=5.0) as client:
             # ── OpenAI ─────────────────────────────────────────────────────────
             if provider == "openai":
                 r = await client.get("https://api.openai.com/v1/models",
@@ -255,6 +304,65 @@ async def _fetch_live_models(provider: str, service_type: str, api_key: Optional
                     if isinstance(m, dict) and m.get("id")
                 )
 
+            # ── Mistral AI ─────────────────────────────────────────────────────
+            elif provider == "mistral" and service_type == "llm":
+                r = await client.get("https://api.mistral.ai/v1/models",
+                                     headers={"Authorization": f"Bearer {api_key}"})
+                if r.status_code != 200:
+                    return []
+                return sorted(
+                    m.get("id", "") for m in r.json().get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                )
+
+            # ── Together AI ────────────────────────────────────────────────────
+            elif provider == "together" and service_type == "llm":
+                r = await client.get("https://api.together.xyz/v1/models",
+                                     headers={"Authorization": f"Bearer {api_key}"})
+                if r.status_code != 200:
+                    return []
+                data = r.json()
+                items = data if isinstance(data, list) else data.get("data", [])
+                return sorted(
+                    m.get("id", "") for m in items
+                    if isinstance(m, dict) and m.get("id")
+                    and m.get("type", "") in ("chat", "language", "")
+                )
+
+            # ── Cerebras ───────────────────────────────────────────────────────
+            elif provider == "cerebras" and service_type == "llm":
+                r = await client.get("https://api.cerebras.ai/v1/models",
+                                     headers={"Authorization": f"Bearer {api_key}"})
+                if r.status_code != 200:
+                    return []
+                return sorted(
+                    m.get("id", "") for m in r.json().get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                )
+
+            # ── Fireworks AI ───────────────────────────────────────────────────
+            elif provider == "fireworks" and service_type == "llm":
+                r = await client.get("https://api.fireworks.ai/inference/v1/models",
+                                     headers={"Authorization": f"Bearer {api_key}"})
+                if r.status_code != 200:
+                    return []
+                return sorted(
+                    m.get("id", "") for m in r.json().get("data", [])
+                    if isinstance(m, dict) and m.get("id")
+                )
+
+            # ── Cohere ─────────────────────────────────────────────────────────
+            elif provider == "cohere" and service_type == "llm":
+                r = await client.get("https://api.cohere.com/v2/models",
+                                     headers={"Authorization": f"Bearer {api_key}"})
+                if r.status_code != 200:
+                    return []
+                return sorted(
+                    m.get("name", "") for m in r.json().get("models", [])
+                    if isinstance(m, dict) and m.get("name")
+                    and "command" in m.get("name", "").lower()
+                )
+
     except Exception as exc:
         logger.warning(f"Live model fetch failed for {provider}/{service_type}: {exc}")
     return []
@@ -341,7 +449,7 @@ class ProviderConnectionClient(BaseDBClient):
                     OrgProviderConnectionModel.provider == provider,
                 )
             )
-            conn = existing.scalar_one_or_none()
+            conn = existing.scalars().first()
 
             if conn is not None:
                 if api_key is not None:
@@ -368,9 +476,12 @@ class ProviderConnectionClient(BaseDBClient):
             await session.commit()
             await session.refresh(conn)
 
-        # Always reseed models on create/re-activate using live API + fallback catalog.
-        # This ensures both new connections and re-activated ones always have a full model list.
-        await self.reseed_models_for_connection(conn.id, organization_id)
+        # Reseed models — failure here is non-fatal; the connection is already saved.
+        # Users can manually sync models via the "Sync Models" button.
+        try:
+            await self.reseed_models_for_connection(conn.id, organization_id)
+        except Exception as exc:
+            logger.error(f"Model seeding failed for connection {conn.id} ({provider}/{service_type}): {exc}")
         return conn
 
     async def reseed_models_for_connection(
@@ -409,6 +520,9 @@ class ProviderConnectionClient(BaseDBClient):
         if not model_ids:
             return 0
 
+        # Deduplicate while preserving order (live API can return duplicates)
+        model_ids = list(dict.fromkeys(model_ids))
+
         async with self.async_session() as session:
             # Delete all current models for this connection
             await session.execute(
@@ -416,9 +530,10 @@ class ProviderConnectionClient(BaseDBClient):
                     OrgAvailableModelModel.connection_id == connection_id,
                 )
             )
-            # Re-insert with preserved settings
+            # Re-insert with preserved settings and auto-populated pricing
             for i, model_id in enumerate(model_ids):
                 prev = existing.get(model_id)
+                pricing = get_model_pricing(model_id)
                 session.add(OrgAvailableModelModel(
                     connection_id=connection_id,
                     organization_id=organization_id,
@@ -426,6 +541,8 @@ class ProviderConnectionClient(BaseDBClient):
                     model_id=model_id,
                     is_client_available=prev.is_client_available if prev else True,
                     is_default=prev.is_default if prev else (i == 0),
+                    cost_per_min_usd=pricing[0] if pricing else (prev.cost_per_min_usd if prev else None),
+                    native_cost_display=pricing[1] if pricing else (prev.native_cost_display if prev else None),
                 ))
             await session.commit()
 

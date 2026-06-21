@@ -5,6 +5,8 @@ from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
 
 from api.db import db_client
+from api.services.memory_webhook import fire_post_call_memory
+from api.services.wallet_webhook import fire_post_call_wallet_debit
 from api.services.pricing.workflow_run_cost import calculate_workflow_run_cost
 from api.services.storage import get_current_storage_backend, storage_fs
 from api.tasks.run_integrations import run_integrations_post_workflow_run
@@ -174,5 +176,19 @@ async def process_workflow_completion(
         await calculate_workflow_run_cost(workflow_run_id)
     except Exception as e:
         logger.error(f"Error calculating cost for workflow {workflow_run_id}: {e}")
+
+    # Step 5: Fire Sysevo caller memory extraction (non-fatal, no-ops if URL not set)
+    if os.getenv("SYSEVO_POST_CALL_MEMORY_URL"):
+        try:
+            await fire_post_call_memory(workflow_run_id)
+        except Exception as e:
+            logger.error(f"Post-call memory webhook failed for run {workflow_run_id}: {e}")
+
+    # Step 6: Debit Sysevo wallet for call usage (non-fatal)
+    if os.getenv("SYSEVO_POST_CALL_MEMORY_URL"):
+        try:
+            await fire_post_call_wallet_debit(workflow_run_id)
+        except Exception as e:
+            logger.error(f"Post-call wallet debit failed for run {workflow_run_id}: {e}")
 
     logger.info(f"Completed workflow completion processing for run {workflow_run_id}")

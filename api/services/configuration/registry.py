@@ -67,6 +67,20 @@ class ServiceProviders(str, Enum):
     ULTRAVOX_REALTIME = "ultravox_realtime"
     GOOGLE_REALTIME = "google_realtime"
     GOOGLE_VERTEX_REALTIME = "google_vertex_realtime"
+    # ── New LLM providers ─────────────────────────────────────────────────────
+    MISTRAL = "mistral"
+    TOGETHER = "together"
+    CEREBRAS = "cerebras"
+    FIREWORKS = "fireworks"
+    COHERE = "cohere"
+    # ── New TTS providers ─────────────────────────────────────────────────────
+    AWS_POLLY = "aws_polly"
+    AZURE_TTS = "azure_tts"
+    PLAYHT = "playht"
+    NEETS = "neets"
+    # ── New STT providers ─────────────────────────────────────────────────────
+    AZURE_SPEECH = "azure_speech"
+    AWS_TRANSCRIBE = "aws_transcribe"
 
 
 class BaseServiceConfiguration(BaseModel):
@@ -93,6 +107,17 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.ULTRAVOX_REALTIME,
         ServiceProviders.GOOGLE_REALTIME,
         ServiceProviders.GOOGLE_VERTEX_REALTIME,
+        ServiceProviders.MISTRAL,
+        ServiceProviders.TOGETHER,
+        ServiceProviders.CEREBRAS,
+        ServiceProviders.FIREWORKS,
+        ServiceProviders.COHERE,
+        ServiceProviders.AWS_POLLY,
+        ServiceProviders.AZURE_TTS,
+        ServiceProviders.PLAYHT,
+        ServiceProviders.NEETS,
+        ServiceProviders.AZURE_SPEECH,
+        ServiceProviders.AWS_TRANSCRIBE,
         # ServiceProviders.SARVAM,
     ]
     api_key: str | list[str]
@@ -251,10 +276,11 @@ SPEACHES_PROVIDER_MODEL_CONFIG = provider_model_config(
 )
 
 ANTHROPIC_MODELS = [
-    "claude-sonnet-4-6",
     "claude-opus-4-8",
+    "claude-opus-4-7",
+    "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
-    "claude-opus-4-5-20251181",
+    "claude-opus-4-5-20251101",
     "claude-3-5-sonnet-20241022",
     "claude-3-5-haiku-20241022",
     "claude-3-opus-20240229",
@@ -475,6 +501,187 @@ class AWSBedrockLLMConfiguration(BaseLLMConfiguration):
     api_key: str | list[str] | None = Field(
         default=None,
         description="Not used for Bedrock — authentication is via the AWS credentials above. Leave blank.",
+    )
+
+
+MISTRAL_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Mistral AI",
+    description="Mistral AI models via OpenAI-compatible API. EU GDPR compliant with data residency options.",
+    provider_docs_url="https://docs.mistral.ai/",
+)
+TOGETHER_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Together AI",
+    description="100+ open-source models hosted on Together AI's inference platform.",
+    provider_docs_url="https://docs.together.ai/",
+)
+CEREBRAS_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Cerebras",
+    description="Ultra-low latency inference on Cerebras Wafer-Scale silicon.",
+    provider_docs_url="https://inference-docs.cerebras.ai/",
+)
+FIREWORKS_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Fireworks AI",
+    description="Fast and cheap open-source model inference on Fireworks AI.",
+    provider_docs_url="https://docs.fireworks.ai/",
+)
+COHERE_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Cohere",
+    description="Command models optimised for RAG, multilingual tasks, and enterprise workloads.",
+    provider_docs_url="https://docs.cohere.com/",
+)
+AWS_POLLY_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "AWS Polly",
+    description="Amazon Polly TTS — 60+ voices, 30+ languages, standard and neural engines.",
+    provider_docs_url="https://docs.aws.amazon.com/polly/",
+)
+AZURE_TTS_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Azure TTS",
+    description="Microsoft Azure Text-to-Speech — 400+ neural voices across 140+ languages.",
+    provider_docs_url="https://learn.microsoft.com/en-us/azure/ai-services/speech-service/",
+)
+PLAYHT_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "PlayHT",
+    description="PlayHT ultra-realistic TTS with voice cloning and instant custom voices.",
+    provider_docs_url="https://docs.play.ht/",
+)
+NEETS_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Neets.ai",
+    description="Ultra-low-cost TTS — among the cheapest non-self-hosted providers.",
+    provider_docs_url="https://neets.ai/docs",
+)
+AZURE_SPEECH_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Azure Speech",
+    description="Microsoft Azure Speech-to-Text — real-time transcription with 100+ language support.",
+    provider_docs_url="https://learn.microsoft.com/en-us/azure/ai-services/speech-service/",
+)
+AWS_TRANSCRIBE_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "AWS Transcribe",
+    description="Amazon Transcribe streaming STT — accurate, low-latency transcription.",
+    provider_docs_url="https://docs.aws.amazon.com/transcribe/",
+)
+
+MISTRAL_MODELS = [
+    "mistral-large-latest",
+    "mistral-medium-latest",
+    "mistral-small-latest",
+    "mistral-nemo",
+    "codestral-latest",
+    "open-mistral-7b",
+    "open-mixtral-8x7b",
+    "open-mixtral-8x22b",
+]
+
+TOGETHER_MODELS = [
+    "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+    "meta-llama/Llama-3.1-405B-Instruct-Turbo",
+    "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo",
+    "meta-llama/Llama-3.2-11B-Vision-Instruct-Turbo",
+    "Qwen/Qwen2.5-72B-Instruct-Turbo",
+    "Qwen/Qwen2.5-7B-Instruct-Turbo",
+    "deepseek-ai/DeepSeek-V3",
+    "mistralai/Mixtral-8x7B-Instruct-v0.1",
+    "mistralai/Mistral-7B-Instruct-v0.3",
+    "google/gemma-2-27b-it",
+]
+
+CEREBRAS_MODELS = [
+    "llama3.3-70b",
+    "llama3.1-70b",
+    "llama3.1-8b",
+    "llama3.1-405b",
+]
+
+FIREWORKS_MODELS = [
+    "accounts/fireworks/models/llama-v3p3-70b-instruct",
+    "accounts/fireworks/models/llama-v3p1-8b-instruct",
+    "accounts/fireworks/models/llama-v3p1-405b-instruct",
+    "accounts/fireworks/models/mixtral-8x7b-instruct",
+    "accounts/fireworks/models/qwen2p5-72b-instruct",
+    "accounts/fireworks/models/deepseek-v3",
+    "accounts/fireworks/models/gemma2-9b-it",
+]
+
+COHERE_MODELS = [
+    "command-r-plus-08-2024",
+    "command-r-08-2024",
+    "command-r",
+    "command-light",
+    "command-r7b-12-2024",
+]
+
+
+@register_llm
+class MistralLLMConfiguration(BaseLLMConfiguration):
+    model_config = MISTRAL_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.MISTRAL] = ServiceProviders.MISTRAL
+    model: str = Field(
+        default="mistral-large-latest",
+        description="Mistral model identifier.",
+        json_schema_extra={"examples": MISTRAL_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.mistral.ai/v1",
+        description="Override only if using a Mistral-compatible proxy or custom endpoint.",
+    )
+
+
+@register_llm
+class TogetherLLMConfiguration(BaseLLMConfiguration):
+    model_config = TOGETHER_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.TOGETHER] = ServiceProviders.TOGETHER
+    model: str = Field(
+        default="meta-llama/Llama-3.3-70B-Instruct-Turbo",
+        description="Together AI model slug.",
+        json_schema_extra={"examples": TOGETHER_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.together.xyz/v1",
+        description="Override only if routing through a custom Together-compatible gateway.",
+    )
+
+
+@register_llm
+class CerebrasLLMConfiguration(BaseLLMConfiguration):
+    model_config = CEREBRAS_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.CEREBRAS] = ServiceProviders.CEREBRAS
+    model: str = Field(
+        default="llama3.3-70b",
+        description="Cerebras-hosted model identifier.",
+        json_schema_extra={"examples": CEREBRAS_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.cerebras.ai/v1",
+        description="Override only if using a Cerebras-compatible proxy.",
+    )
+
+
+@register_llm
+class FireworksLLMConfiguration(BaseLLMConfiguration):
+    model_config = FIREWORKS_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.FIREWORKS] = ServiceProviders.FIREWORKS
+    model: str = Field(
+        default="accounts/fireworks/models/llama-v3p3-70b-instruct",
+        description="Fireworks AI model path (accounts/fireworks/models/...).",
+        json_schema_extra={"examples": FIREWORKS_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.fireworks.ai/inference/v1",
+        description="Override only if routing through a Fireworks-compatible gateway.",
+    )
+
+
+@register_llm
+class CohereLLMConfiguration(BaseLLMConfiguration):
+    model_config = COHERE_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.COHERE] = ServiceProviders.COHERE
+    model: str = Field(
+        default="command-r-plus-08-2024",
+        description="Cohere Command model identifier.",
+        json_schema_extra={"examples": COHERE_MODELS, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.cohere.com/compatibility/v1",
+        description="Cohere OpenAI-compatible endpoint. Override only if using a custom proxy.",
     )
 
 
@@ -720,6 +927,11 @@ LLMConfig = Annotated[
         AWSBedrockLLMConfiguration,
         SpeachesLLMConfiguration,
         MiniMaxLLMConfiguration,
+        MistralLLMConfiguration,
+        TogetherLLMConfiguration,
+        CerebrasLLMConfiguration,
+        FireworksLLMConfiguration,
+        CohereLLMConfiguration,
     ],
     Field(discriminator="provider"),
 ]
@@ -1071,6 +1283,170 @@ class XAITTSConfiguration(BaseTTSConfiguration):
     )
 
 
+AWS_POLLY_ENGINES = ["neural", "long-form", "standard", "generative"]
+AWS_POLLY_VOICES = [
+    "Joanna", "Matthew", "Ivy", "Kendra", "Kimberly", "Salli", "Joey", "Justin",
+    "Kevin", "Ruth", "Stephen", "Amy", "Brian", "Emma", "Aria",
+    "Ayanda", "Camila", "Chantal", "Conchita", "Daniel", "Enrique", "Filiz",
+    "Gabrielle", "Geraint", "Giorgio", "Gwyneth", "Hans", "Ines", "Karl",
+    "Lotte", "Lucia", "Lupe", "Mads", "Maja", "Marlene", "Mathieu",
+    "Miguel", "Mizuki", "Naja", "Nicole", "Pedro", "Penelope", "Raveena",
+    "Ruben", "Russell", "Seoyeon", "Takumi", "Tatyana", "Vicki", "Vitoria",
+    "Zeina", "Zhiyu",
+]
+
+
+@register_tts
+class AWSPollyTTSConfiguration(BaseTTSConfiguration):
+    model_config = AWS_POLLY_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.AWS_POLLY] = ServiceProviders.AWS_POLLY
+    model: str = Field(
+        default="neural",
+        description="AWS Polly engine type. 'neural' for high-quality voices, 'standard' for legacy, 'long-form' for long content, 'generative' for generative voices.",
+        json_schema_extra={"examples": AWS_POLLY_ENGINES},
+    )
+    voice: str = Field(
+        default="Joanna",
+        description="AWS Polly voice ID (e.g. Joanna, Matthew, Amy).",
+        json_schema_extra={"examples": AWS_POLLY_VOICES, "allow_custom_input": True},
+    )
+    aws_access_key: str = Field(
+        default="",
+        description="AWS access key ID with polly:SynthesizeSpeech permission.",
+    )
+    aws_secret_key: str = Field(
+        default="",
+        description="AWS secret access key paired with the access key ID.",
+    )
+    aws_region: str = Field(
+        default="us-east-1",
+        description="AWS region where Amazon Polly is available.",
+    )
+    language: str = Field(
+        default="en-US",
+        description="BCP-47 language code for synthesis.",
+    )
+    api_key: str | list[str] | None = Field(
+        default=None,
+        description="Not used for AWS Polly — authentication is via AWS credentials above. Leave blank.",
+    )
+
+
+AZURE_TTS_VOICES = [
+    "en-US-JennyNeural", "en-US-GuyNeural", "en-US-AriaNeural", "en-US-DavisNeural",
+    "en-US-AmberNeural", "en-US-AnaNeural", "en-US-AshleyNeural", "en-US-BrandonNeural",
+    "en-US-ChristopherNeural", "en-US-CoraNeural", "en-US-ElizabethNeural",
+    "en-US-EricNeural", "en-US-JacobNeural", "en-US-JaneNeural",
+    "en-GB-SoniaNeural", "en-GB-RyanNeural", "en-GB-LibbyNeural", "en-GB-MaisieNeural",
+    "en-AU-NatashaNeural", "en-AU-WilliamNeural",
+    "en-IN-NeerjaNeural", "en-IN-PrabhatNeural",
+    "es-ES-ElviraNeural", "es-ES-AlvaroNeural",
+    "fr-FR-DeniseNeural", "fr-FR-HenriNeural",
+    "de-DE-KatjaNeural", "de-DE-ConradNeural",
+    "it-IT-ElsaNeural", "it-IT-DiegoNeural",
+    "pt-BR-FranciscaNeural", "pt-BR-AntonioNeural",
+    "zh-CN-XiaoxiaoNeural", "zh-CN-YunxiNeural",
+    "ja-JP-NanamiNeural", "ja-JP-KeitaNeural",
+    "ko-KR-SunHiNeural", "ko-KR-InJoonNeural",
+    "ar-SA-ZariyahNeural", "ar-SA-HamedNeural",
+    "hi-IN-SwaraNeural", "hi-IN-MadhurNeural",
+]
+
+
+@register_tts
+class AzureTTSConfiguration(BaseTTSConfiguration):
+    model_config = AZURE_TTS_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.AZURE_TTS] = ServiceProviders.AZURE_TTS
+    model: str = Field(
+        default="neural",
+        description="Azure TTS engine type (neural, standard). Neural recommended for quality.",
+        json_schema_extra={"examples": ["neural", "standard"]},
+    )
+    voice: str = Field(
+        default="en-US-JennyNeural",
+        description="Azure voice name (e.g. en-US-JennyNeural).",
+        json_schema_extra={"examples": AZURE_TTS_VOICES, "allow_custom_input": True},
+    )
+    region: str = Field(
+        default="eastus",
+        description="Azure region for the Speech service (e.g. eastus, westus2, eastasia).",
+    )
+    language: str = Field(
+        default="en-US",
+        description="BCP-47 language code for synthesis.",
+    )
+    speed: float = Field(
+        default=1.0, ge=0.5, le=2.0, description="Speech speed multiplier."
+    )
+
+
+PLAYHT_TTS_MODELS = ["Play3.0-mini", "PlayHT2.0-turbo", "PlayHT2.0", "PlayDialog"]
+PLAYHT_TTS_VOICES = [
+    "s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json",
+    "s3://voice-cloning-zero-shot/baf1ef41-36b6-428c-9bdf-50ba54682bd8/original/manifest.json",
+    "s3://peregrine-voices/mel parrot/manifest.json",
+    "s3://peregrine-voices/oliver/manifest.json",
+    "s3://peregrine-voices/ryan/manifest.json",
+]
+
+
+@register_tts
+class PlayHTTTSConfiguration(BaseTTSConfiguration):
+    model_config = PLAYHT_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.PLAYHT] = ServiceProviders.PLAYHT
+    model: str = Field(
+        default="Play3.0-mini",
+        description="PlayHT TTS model.",
+        json_schema_extra={"examples": PLAYHT_TTS_MODELS},
+    )
+    voice: str = Field(
+        default="s3://voice-cloning-zero-shot/d9ff78ba-d016-47f6-b0ef-dd630f59414e/female-cs/manifest.json",
+        description="PlayHT voice S3 manifest URL or cloned voice ID.",
+        json_schema_extra={"examples": PLAYHT_TTS_VOICES, "allow_custom_input": True},
+    )
+    user_id: str = Field(
+        description="PlayHT User ID from your PlayHT dashboard.",
+    )
+    language: str = Field(
+        default="english",
+        description="Language name for synthesis (e.g. 'english', 'spanish').",
+    )
+    speed: float = Field(
+        default=1.0, ge=0.1, le=5.0, description="Speech speed multiplier."
+    )
+
+
+NEETS_TTS_MODELS = ["style-diff-500", "ar-diff-50k", "vits"]
+NEETS_TTS_VOICES = [
+    "us-female-2", "us-male-2", "us-female-5", "us-male-5",
+    "clara", "james", "aria", "ryan", "sophia", "oliver",
+]
+
+
+@register_tts
+class NeetsTTSConfiguration(BaseTTSConfiguration):
+    model_config = NEETS_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.NEETS] = ServiceProviders.NEETS
+    model: str = Field(
+        default="style-diff-500",
+        description="Neets.ai TTS model.",
+        json_schema_extra={"examples": NEETS_TTS_MODELS},
+    )
+    voice: str = Field(
+        default="us-female-2",
+        description="Neets.ai voice ID.",
+        json_schema_extra={"examples": NEETS_TTS_VOICES, "allow_custom_input": True},
+    )
+    base_url: str = Field(
+        default="https://api.neets.ai/v1/tts",
+        description="Neets.ai API endpoint.",
+    )
+    language: str = Field(
+        default="en",
+        description="ISO 639-1 language code.",
+    )
+
+
 TTSConfig = Annotated[
     Union[
         DeepgramTTSConfiguration,
@@ -1085,6 +1461,10 @@ TTSConfig = Annotated[
         SpeachesTTSConfiguration,
         MiniMaxTTSConfiguration,
         XAITTSConfiguration,
+        AWSPollyTTSConfiguration,
+        AzureTTSConfiguration,
+        PlayHTTTSConfiguration,
+        NeetsTTSConfiguration,
     ],
     Field(discriminator="provider"),
 ]
@@ -1330,6 +1710,79 @@ class XAISTTConfiguration(BaseSTTConfiguration):
     )
 
 
+AZURE_SPEECH_STT_MODELS = ["realtime", "whisper"]
+AZURE_SPEECH_STT_LANGUAGES = [
+    "en-US", "en-GB", "en-AU", "en-IN", "es-ES", "es-MX",
+    "fr-FR", "de-DE", "it-IT", "pt-BR", "zh-CN", "ja-JP",
+    "ko-KR", "ar-SA", "hi-IN", "nl-NL", "pl-PL", "ru-RU",
+    "sv-SE", "tr-TR", "vi-VN", "th-TH",
+]
+
+
+@register_stt
+class AzureSpeechSTTConfiguration(BaseSTTConfiguration):
+    model_config = AZURE_SPEECH_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.AZURE_SPEECH] = ServiceProviders.AZURE_SPEECH
+    model: str = Field(
+        default="realtime",
+        description="Azure Speech model type. 'realtime' for live transcription, 'whisper' for Whisper on Azure.",
+        json_schema_extra={"examples": AZURE_SPEECH_STT_MODELS},
+    )
+    region: str = Field(
+        default="eastus",
+        description="Azure region for the Speech service (e.g. eastus, westus2).",
+    )
+    language: str = Field(
+        default="en-US",
+        description="Primary BCP-47 language code for recognition.",
+        json_schema_extra={"examples": AZURE_SPEECH_STT_LANGUAGES, "allow_custom_input": True},
+    )
+    api_key: str | list[str] | None = Field(
+        default=None,
+        description="Azure Cognitive Services subscription key.",
+    )
+
+
+AWS_TRANSCRIBE_STT_MODELS = ["general", "phone-call", "dictation"]
+AWS_TRANSCRIBE_STT_LANGUAGES = [
+    "en-US", "en-GB", "en-AU", "en-IN", "es-US", "es-ES",
+    "fr-FR", "fr-CA", "de-DE", "it-IT", "pt-BR", "zh-CN",
+    "ja-JP", "ko-KR", "ar-SA", "hi-IN", "nl-NL", "ru-RU",
+]
+
+
+@register_stt
+class AWSTranscribeSTTConfiguration(BaseSTTConfiguration):
+    model_config = AWS_TRANSCRIBE_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.AWS_TRANSCRIBE] = ServiceProviders.AWS_TRANSCRIBE
+    model: str = Field(
+        default="general",
+        description="Transcribe specialty model: 'general' for broad use, 'phone-call' for telephony, 'dictation' for dictation.",
+        json_schema_extra={"examples": AWS_TRANSCRIBE_STT_MODELS},
+    )
+    language: str = Field(
+        default="en-US",
+        description="BCP-47 language code for transcription.",
+        json_schema_extra={"examples": AWS_TRANSCRIBE_STT_LANGUAGES, "allow_custom_input": True},
+    )
+    aws_access_key: str = Field(
+        default="",
+        description="AWS access key ID with transcribe:StartStreamTranscription permission.",
+    )
+    aws_secret_key: str = Field(
+        default="",
+        description="AWS secret access key paired with the access key ID.",
+    )
+    aws_region: str = Field(
+        default="us-east-1",
+        description="AWS region where Amazon Transcribe is available.",
+    )
+    api_key: str | list[str] | None = Field(
+        default=None,
+        description="Not used for AWS Transcribe — authentication is via AWS credentials above. Leave blank.",
+    )
+
+
 STTConfig = Annotated[
     Union[
         DeepgramSTTConfiguration,
@@ -1343,6 +1796,8 @@ STTConfig = Annotated[
         AssemblyAISTTConfiguration,
         GladiaSTTConfiguration,
         XAISTTConfiguration,
+        AzureSpeechSTTConfiguration,
+        AWSTranscribeSTTConfiguration,
     ],
     Field(discriminator="provider"),
 ]

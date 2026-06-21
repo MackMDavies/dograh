@@ -9,11 +9,20 @@ from api.constants import MPS_API_URL
 from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import ServiceProviders
 from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
+from api.services.pipecat.minimax_llm import DograhMiniMaxLLMService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
 from api.utils.url_security import validate_user_configured_service_url
 from pipecat.services.assemblyai.stt import AssemblyAISTTService, AssemblyAISTTSettings
 from pipecat.services.aws.llm import AWSBedrockLLMService, AWSBedrockLLMSettings
+from pipecat.services.aws.stt import AWSTranscribeSTTService, AWSTranscribeSTTSettings
+from pipecat.services.aws.tts import AWSPollyTTSService, AWSPollyTTSSettings
 from pipecat.services.azure.llm import AzureLLMService, AzureLLMSettings
+from pipecat.services.azure.stt import AzureSTTService, AzureSTTSettings
+from pipecat.services.azure.tts import AzureTTSService, AzureTTSSettings
+from pipecat.services.cerebras.llm import CerebrasLLMService, CerebrasLLMSettings
+from pipecat.services.fireworks.llm import FireworksLLMService, FireworksLLMSettings
+from pipecat.services.mistral.llm import MistralLLMService, MistralLLMSettings
+from pipecat.services.together.llm import TogetherLLMService, TogetherLLMSettings
 from pipecat.services.cartesia.stt import CartesiaSTTService
 from pipecat.services.cartesia.tts import (
     CartesiaTTSService,
@@ -39,7 +48,6 @@ from pipecat.services.google.vertex.llm import (
     GoogleVertexLLMSettings,
 )
 from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
-from pipecat.services.minimax.llm import MiniMaxLLMService
 from pipecat.services.minimax.tts import MiniMaxTTSSettings
 from pipecat.services.openai.base_llm import OpenAILLMSettings
 from pipecat.services.openai.llm import OpenAILLMService
@@ -132,6 +140,15 @@ def create_stt_service(
     elif user_config.stt.provider == ServiceProviders.GOOGLE.value:
         language = getattr(user_config.stt, "language", None) or "en-US"
         location = getattr(user_config.stt, "location", None) or "global"
+        # Chirp models (chirp, chirp_2, chirp_3, chirp-*) are region-specific and
+        # do not exist in the "global" location. Fall back to us-central1.
+        stt_model_name = (user_config.stt.model or "").lower()
+        if location == "global" and stt_model_name.startswith("chirp"):
+            location = "us-central1"
+            logger.info(
+                f"Google STT: chirp model '{user_config.stt.model}' is not available in "
+                f"'global' — redirecting to location='us-central1'"
+            )
         credentials = getattr(user_config.stt, "credentials", None)
         if credentials and contains_masked_key(str(credentials)):
             credentials = None
@@ -298,6 +315,46 @@ def create_stt_service(
             ),
             sample_rate=audio_config.transport_in_sample_rate,
         )
+    elif user_config.stt.provider == ServiceProviders.AZURE_SPEECH.value:
+        api_key = user_config.stt.api_key
+        region = getattr(user_config.stt, "region", None) or "eastus"
+        language = getattr(user_config.stt, "language", None) or "en-US"
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Azure Speech STT requires an API key (Azure Cognitive Services subscription key).",
+            )
+        try:
+            lang_enum = Language(language)
+        except ValueError:
+            lang_enum = Language.EN_US
+        return AzureSTTService(
+            api_key=api_key,
+            region=region,
+            settings=AzureSTTSettings(language=lang_enum),
+            sample_rate=audio_config.transport_in_sample_rate,
+        )
+    elif user_config.stt.provider == ServiceProviders.AWS_TRANSCRIBE.value:
+        aws_access_key = getattr(user_config.stt, "aws_access_key", None) or None
+        aws_secret_key = getattr(user_config.stt, "aws_secret_key", None) or None
+        aws_region = getattr(user_config.stt, "aws_region", None) or "us-east-1"
+        language = getattr(user_config.stt, "language", None) or "en-US"
+        if not aws_access_key or not aws_secret_key:
+            raise HTTPException(
+                status_code=400,
+                detail="AWS Transcribe requires aws_access_key and aws_secret_key. Configure them in your STT settings.",
+            )
+        try:
+            lang_enum = Language(language)
+        except ValueError:
+            lang_enum = Language.EN_US
+        return AWSTranscribeSTTService(
+            aws_access_key_id=aws_access_key,
+            api_key=aws_secret_key,
+            region=aws_region,
+            settings=AWSTranscribeSTTSettings(language=lang_enum),
+            sample_rate=audio_config.transport_in_sample_rate,
+        )
     else:
         raise HTTPException(
             status_code=400, detail=f"Invalid STT provider {user_config.stt.provider}"
@@ -428,6 +485,15 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             raise ValueError(
                 "ElevenLabs TTS requires an API key. "
                 "Go to AI Models → Voice Engine and ensure your ElevenLabs connection has an API key."
+            )
+        # Speech-to-Speech models (e.g. eleven_multilingual_sts_v2) require audio input, not text.
+        # Using them with the TTS WebSocket causes a silent pipeline deadlock.
+        tts_model = (user_config.tts.model or "").lower()
+        if "_sts_" in tts_model:
+            raise ValueError(
+                f"ElevenLabs model '{user_config.tts.model}' is a Speech-to-Speech model and "
+                "cannot be used as a Text-to-Speech engine. "
+                "Please select a TTS model such as 'eleven_multilingual_v2' or 'eleven_flash_v2_5'."
             )
         # Backward compatible with older configuration "Name - voice_id"
         try:
@@ -642,6 +708,119 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
         )
+    elif user_config.tts.provider == ServiceProviders.AWS_POLLY.value:
+        aws_access_key = getattr(user_config.tts, "aws_access_key", None) or None
+        aws_secret_key = getattr(user_config.tts, "aws_secret_key", None) or None
+        aws_region = getattr(user_config.tts, "aws_region", None) or "us-east-1"
+        voice = getattr(user_config.tts, "voice", None) or "Joanna"
+        engine = getattr(user_config.tts, "model", None) or "neural"
+        language = getattr(user_config.tts, "language", None) or "en-US"
+        if not aws_access_key or not aws_secret_key:
+            raise HTTPException(
+                status_code=400,
+                detail="AWS Polly requires aws_access_key and aws_secret_key. Configure them in your TTS settings.",
+            )
+        try:
+            lang_enum = Language(language)
+        except ValueError:
+            lang_enum = Language.EN_US
+        return AWSPollyTTSService(
+            aws_access_key_id=aws_access_key,
+            api_key=aws_secret_key,
+            region=aws_region,
+            settings=AWSPollyTTSSettings(
+                voice=voice,
+                language=lang_enum,
+                engine=engine if engine in ("standard", "neural", "long-form", "generative") else "neural",
+            ),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
+    elif user_config.tts.provider == ServiceProviders.AZURE_TTS.value:
+        api_key = user_config.tts.api_key
+        region = getattr(user_config.tts, "region", None) or "eastus"
+        voice = getattr(user_config.tts, "voice", None) or "en-US-JennyNeural"
+        language = getattr(user_config.tts, "language", None) or "en-US"
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="Azure TTS requires an API key (Azure Cognitive Services subscription key).",
+            )
+        try:
+            lang_enum = Language(language)
+        except ValueError:
+            lang_enum = Language.EN_US
+        return AzureTTSService(
+            api_key=api_key,
+            region=region,
+            settings=AzureTTSSettings(voice=voice, language=lang_enum),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
+    elif user_config.tts.provider == ServiceProviders.PLAYHT.value:
+        import aiohttp as _aiohttp
+
+        api_key = user_config.tts.api_key
+        user_id = getattr(user_config.tts, "user_id", None)
+        voice = getattr(user_config.tts, "voice", None) or ""
+        model = getattr(user_config.tts, "model", None) or "Play3.0-mini"
+        speed = getattr(user_config.tts, "speed", None) or 1.0
+        if not api_key or not user_id:
+            raise HTTPException(
+                status_code=400,
+                detail="PlayHT requires both an API key and a User ID. Configure them in your TTS settings.",
+            )
+
+        async def _playht_tts_generator(text_queue):
+            """Minimal inline PlayHT TTS via REST — returns audio bytes."""
+            session = _aiohttp.ClientSession()
+            try:
+                payload = {
+                    "text": "",
+                    "voice": voice,
+                    "output_format": "wav",
+                    "voice_engine": model,
+                    "speed": speed,
+                }
+                async with session.post(
+                    "https://api.play.ht/api/v2/tts/stream",
+                    headers={
+                        "Authorization": f"Bearer {api_key}",
+                        "X-User-ID": user_id,
+                        "Content-Type": "application/json",
+                        "Accept": "audio/wav",
+                    },
+                    json=payload,
+                ) as resp:
+                    if resp.status != 200:
+                        error = await resp.text()
+                        raise ValueError(f"PlayHT API error {resp.status}: {error[:200]}")
+                    return await resp.read()
+            finally:
+                await session.close()
+
+        # Use OpenAI-compatible TTS fallback via OpenAI service with PlayHT's API
+        # PlayHT doesn't have an OpenAI-compatible wrapper, so raise a helpful error
+        # if direct HTTP calls aren't available through the existing Pipecat service set.
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "PlayHT real-time streaming TTS is not yet supported in the pipeline runtime. "
+                "Use ElevenLabs, Azure TTS, or AWS Polly for production voice calls. "
+                "PlayHT is available for model/pricing configuration only."
+            ),
+        )
+    elif user_config.tts.provider == ServiceProviders.NEETS.value:
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                "Neets.ai real-time streaming TTS is not yet supported in the pipeline runtime. "
+                "Use ElevenLabs, Deepgram, or Cartesia for production voice calls. "
+                "Neets.ai is available for model/pricing configuration only."
+            ),
+        )
     else:
         raise HTTPException(
             status_code=400, detail=f"Invalid TTS provider {user_config.tts.provider}"
@@ -770,13 +949,53 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.MINIMAX.value:
         base_url = base_url or "https://api.minimax.io/v1"
         _validate_runtime_service_url(base_url, "base_url")
-        return MiniMaxLLMService(
+        return DograhMiniMaxLLMService(
             api_key=api_key,
             base_url=base_url,
-            settings=MiniMaxLLMService.Settings(
+            settings=DograhMiniMaxLLMService.Settings(
                 model=model,
                 temperature=temperature if temperature is not None else 1.0,
             ),
+        )
+    elif provider == ServiceProviders.MISTRAL.value:
+        mistral_base_url = base_url or "https://api.mistral.ai/v1"
+        _validate_runtime_service_url(mistral_base_url, "base_url")
+        return MistralLLMService(
+            api_key=api_key,
+            base_url=mistral_base_url,
+            settings=MistralLLMSettings(model=model, temperature=0.1),
+        )
+    elif provider == ServiceProviders.TOGETHER.value:
+        together_base_url = base_url or "https://api.together.xyz/v1"
+        _validate_runtime_service_url(together_base_url, "base_url")
+        return TogetherLLMService(
+            api_key=api_key,
+            base_url=together_base_url,
+            settings=TogetherLLMSettings(model=model, temperature=0.1),
+        )
+    elif provider == ServiceProviders.CEREBRAS.value:
+        cerebras_base_url = base_url or "https://api.cerebras.ai/v1"
+        _validate_runtime_service_url(cerebras_base_url, "base_url")
+        return CerebrasLLMService(
+            api_key=api_key,
+            base_url=cerebras_base_url,
+            settings=CerebrasLLMSettings(model=model, temperature=0.1),
+        )
+    elif provider == ServiceProviders.FIREWORKS.value:
+        fireworks_base_url = base_url or "https://api.fireworks.ai/inference/v1"
+        _validate_runtime_service_url(fireworks_base_url, "base_url")
+        return FireworksLLMService(
+            api_key=api_key,
+            base_url=fireworks_base_url,
+            settings=FireworksLLMSettings(model=model, temperature=0.1),
+        )
+    elif provider == ServiceProviders.COHERE.value:
+        cohere_base_url = base_url or "https://api.cohere.com/compatibility/v1"
+        _validate_runtime_service_url(cohere_base_url, "base_url")
+        return OpenAILLMService(
+            api_key=api_key,
+            base_url=cohere_base_url,
+            settings=OpenAILLMSettings(model=model, temperature=0.1),
         )
     else:
         raise HTTPException(status_code=400, detail=f"Invalid LLM provider {provider}")
@@ -937,5 +1156,13 @@ def create_llm_service(user_config):
     elif provider == ServiceProviders.MINIMAX.value:
         kwargs["base_url"] = user_config.llm.base_url
         kwargs["temperature"] = user_config.llm.temperature
+    elif provider in (
+        ServiceProviders.MISTRAL.value,
+        ServiceProviders.TOGETHER.value,
+        ServiceProviders.CEREBRAS.value,
+        ServiceProviders.FIREWORKS.value,
+        ServiceProviders.COHERE.value,
+    ):
+        kwargs["base_url"] = user_config.llm.base_url
 
     return create_llm_service_from_provider(provider, model, api_key, **kwargs)

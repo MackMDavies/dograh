@@ -1,4 +1,5 @@
 import asyncio
+import os
 from typing import Optional
 
 from fastapi import HTTPException
@@ -17,6 +18,7 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
+from api.services.pipecat.memory_pre_call import execute_memory_pre_call_fetch
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -558,6 +560,30 @@ async def _run_pipeline(
                 call_context_vars=merged_call_context_vars,
                 workflow_id=workflow_id,
                 organization_id=workflow.organization_id,
+            )
+        )
+
+    # Sysevo caller memory pre-call fetch — fires automatically for any
+    # telephony call (inbound or outbound) that has a caller_number, as long
+    # as SYSEVO_MEMORY_PRE_CALL_URL is configured on this server and the
+    # workflow's start node hasn't already claimed the pre_call_fetch slot.
+    _sysevo_memory_url = os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if (
+        not pre_call_fetch_task
+        and _sysevo_memory_url
+        and merged_call_context_vars.get("caller_number")
+    ):
+        logger.info(
+            f"[memory] firing Sysevo memory pre-call fetch for run {workflow_run_id} "
+            f"caller={merged_call_context_vars['caller_number']}"
+        )
+        pre_call_fetch_task = asyncio.create_task(
+            execute_memory_pre_call_fetch(
+                url=_sysevo_memory_url,
+                secret=_sysevo_memory_secret,
+                call_context_vars=merged_call_context_vars,
+                workflow_id=workflow_id,
             )
         )
 

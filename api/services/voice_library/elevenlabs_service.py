@@ -89,3 +89,46 @@ async def fetch_elevenlabs_catalog(api_key: str) -> list[dict]:
         )
         response.raise_for_status()
         return response.json().get("voices", [])
+
+
+async def fetch_elevenlabs_shared_voices(
+    api_key: str,
+    page_size: int = 30,
+    page: int = 1,
+    search: Optional[str] = None,
+    language: Optional[str] = None,
+    gender: Optional[str] = None,
+    age: Optional[str] = None,
+    use_case: Optional[str] = None,
+    accent: Optional[str] = None,
+    category: Optional[str] = None,
+) -> dict:
+    """Search the ElevenLabs public shared voice library.
+
+    Returns a dict with 'voices' list and 'has_more' / 'total_count' fields.
+    Shared voices can be used directly in TTS by voice_id without adding to account.
+    """
+    params: dict = {"page_size": page_size, "page": page}
+    if search:
+        params["search"] = search
+    if language:
+        params["language"] = language
+    if gender:
+        params["gender"] = gender
+    if age:
+        params["age"] = age
+    if use_case:
+        params["use_case"] = use_case
+    if accent:
+        params["accent"] = accent
+    if category:
+        params["category"] = category
+
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0)) as client:
+        response = await client.get(
+            f"{ELEVENLABS_BASE_URL}/v1/shared-voices",
+            headers={"xi-api-key": api_key},
+            params=params,
+        )
+        response.raise_for_status()
+        return response.json()
