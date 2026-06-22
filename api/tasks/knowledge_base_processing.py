@@ -313,8 +313,14 @@ async def process_knowledge_base_document(
         )
 
     except Exception as e:
+        # Use positional-arg formatting to avoid loguru calling .format() on a
+        # message that may contain dict-literal curly braces (e.g. SQLAlchemy
+        # error messages with parameter lists), which would cause a secondary
+        # KeyError and prevent the status from being set to "failed".
         logger.error(
-            f"Error processing knowledge base document {document_id}: {e}",
+            "Error processing knowledge base document {}: {}",
+            document_id,
+            type(e).__name__,
             exc_info=True,
         )
         await db_client.update_document_status(

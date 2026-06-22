@@ -91,10 +91,14 @@ class OpenAIEmbeddingService(BaseEmbeddingService):
         self._ensure_api_key_configured()
 
         try:
-            response = await self.client.embeddings.create(
-                input=texts,
-                model=self.model_id,
-            )
+            kwargs = {"input": texts, "model": self.model_id}
+            # text-embedding-3-* supports the `dimensions` parameter to constrain
+            # output size. Always request EMBEDDING_DIMENSION (1536) so vectors fit
+            # the VECTOR(1536) DB column regardless of which 3rd-gen model is used
+            # (e.g. text-embedding-3-large defaults to 3072 without this).
+            if self.model_id.startswith("text-embedding-3"):
+                kwargs["dimensions"] = EMBEDDING_DIMENSION
+            response = await self.client.embeddings.create(**kwargs)
             return [item.embedding for item in response.data]
         except Exception as e:
             logger.error(f"Error generating OpenAI embeddings: {e}")
