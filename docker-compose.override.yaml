@@ -1,0 +1,70 @@
+# Sysevo production overrides.
+# - API built from source; Dograh UI replaced with a no-op (Sysevo SPA on Vercel).
+# - All services restart automatically on crash or reboot.
+# - API memory capped at 1.5GB to prevent OOM-killing nginx.
+# - Dedicated worker service runs ARQ background jobs independently of the API.
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: dograh-local/dograh-api:local
+    pull_policy: never
+    restart: unless-stopped
+    mem_limit: 512m
+    command: ["python", "-m", "arq", "api.tasks.arq.WorkerSettings"]
+    volumes:
+      - ./api:/app/api:ro
+    environment:
+      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      REDIS_URL: "redis://:redissecret@redis:6379"
+      ENABLE_AWS_S3: "false"
+      MINIO_ENDPOINT: "minio:9000"
+      MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}"
+      MINIO_ACCESS_KEY: "minioadmin"
+      MINIO_SECRET_KEY: "minioadmin"
+      MINIO_BUCKET: "voice-audio"
+      MINIO_SECURE: "false"
+      OSS_JWT_SECRET: "${OSS_JWT_SECRET:?OSS_JWT_SECRET must be set}"
+      AUTH_PROVIDER: "${AUTH_PROVIDER:-local}"
+      SUPABASE_URL: "${SUPABASE_URL:-}"
+      SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:-}"
+      DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
+      BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-http://localhost:8000}"
+      PYTHONUNBUFFERED: "1"
+      PYTHONPATH: "/app"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+    networks:
+      - app-network
+
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    image: dograh-local/dograh-api:local
+    pull_policy: never
+    restart: unless-stopped
+    mem_limit: 1500m
+  ui:
+    image: busybox:latest
+    command: ["sh", "-c", "httpd -f -p 3010 -h /tmp"]
+    pull_policy: if_not_present
+    restart: unless-stopped
+  postgres:
+    restart: unless-stopped
+  redis:
+    restart: unless-stopped
+  minio:
+    restart: unless-stopped
+  nginx:
+    restart: unless-stopped
+  coturn:
+    restart: unless-stopped
+  cloudflared:
+    restart: unless-stopped
