@@ -173,6 +173,20 @@ class UserClient(BaseDBClient):
             )
             return result.scalars().first()
 
+    async def get_platform_organization_id(self) -> int | None:
+        """Return the selected_organization_id of the first superuser.
+
+        Voice hub subscription clients share the platform admin's AI providers
+        and models. This method resolves the org that owns those resources.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(UserModel.selected_organization_id)
+                .where(UserModel.is_superuser.is_(True))
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
     async def create_user_with_email(
         self, email: str, password_hash: str, name: str | None = None
     ) -> UserModel:

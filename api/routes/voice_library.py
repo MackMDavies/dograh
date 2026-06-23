@@ -54,8 +54,15 @@ async def list_voices(
     status: Optional[str] = Query(None),
     user: UserModel = Depends(get_user),
 ) -> list[VoiceLibraryResponseSchema]:
+    # Non-superuser clients share the platform admin's voice library
+    if user.is_superuser:
+        effective_org_id = user.selected_organization_id
+    else:
+        platform_org_id = await db_client.get_platform_organization_id()
+        effective_org_id = platform_org_id if platform_org_id is not None else user.selected_organization_id
+
     voices = await db_client.list_voices(
-        organization_id=user.selected_organization_id,
+        organization_id=effective_org_id,
         user_id=user.id,
         is_superuser=user.is_superuser,
         language=language,

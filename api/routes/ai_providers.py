@@ -239,12 +239,18 @@ async def list_client_models(
     organization_id: Optional[int] = None,
     user=Depends(get_user),
 ):
-    """List only models marked as client-available. Used by client model selector."""
-    # Superusers can pass an explicit organization_id to view another org's models.
-    if user.is_superuser and organization_id is not None:
-        effective_org_id = organization_id
+    """List only models marked as client-available. Used by client model selector.
+
+    Superusers see their own org's models (for admin preview / org override).
+    Non-superusers (voice hub subscription clients) always see models from the
+    platform admin's org — the superuser who configured the providers.
+    """
+    if user.is_superuser:
+        effective_org_id = organization_id if organization_id is not None else user.selected_organization_id
     else:
-        effective_org_id = user.selected_organization_id
+        # All voice hub clients share the platform admin's AI providers/models.
+        platform_org_id = await db_client.get_platform_organization_id()
+        effective_org_id = platform_org_id if platform_org_id is not None else user.selected_organization_id
 
     conns = await db_client.list_connections(effective_org_id)
     provider_by_conn = {c.id: c.provider for c in conns}
