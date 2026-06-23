@@ -46,20 +46,25 @@ async def resolve_org_provider_config(
             continue  # already configured — don't overwrite
 
         connections = await db_client.list_connections(organization_id, service_type_str)
+        using_fallback = False
         if not connections:
             # Platform-level fallback: org has no connection for this service type,
             # so search across all orgs (lowest id = platform/admin org first).
             all_org_conns = await db_client.list_all_connections_superuser(service_type_str)
             connections = all_org_conns
+            using_fallback = True
         if not connections:
             continue
 
         # Use the first active connection (lowest id = oldest = implicit default)
         conn = connections[0]
 
-        # Find the default model for this connection
+        # Find the default model for this connection.
+        # When using the platform fallback the connection belongs to a different org
+        # (e.g. the admin org), so fetch models from that org, not the caller's.
+        models_org_id = conn.organization_id if using_fallback else organization_id
         all_models = await db_client.list_available_models(
-            organization_id, service_type=service_type_str
+            models_org_id, service_type=service_type_str
         )
         conn_models = [m for m in all_models if m.connection_id == conn.id]
         if not conn_models:
