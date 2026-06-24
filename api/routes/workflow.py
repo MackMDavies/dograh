@@ -1273,7 +1273,7 @@ async def get_workflow_run(
 ) -> WorkflowRunResponseSchema:
     run = await db_client.get_workflow_run(
         run_id,
-        organization_id=None if user.is_superuser else user.selected_organization_id,
+        organization_id=None,  # platform fallback: client orgs don't own runs directly
     )
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found")

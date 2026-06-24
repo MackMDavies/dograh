@@ -249,8 +249,10 @@ async def get_usage_history(
 
     try:
         offset = (page - 1) * limit
-        # Superusers see runs across all organizations
-        org_id_for_runs = None if user.is_superuser else user.selected_organization_id
+        # All users use platform-level run access; client orgs fall back to admin org runs
+        # following the same pattern as org_provider_resolver.py (no org-specific runs exist
+        # for client orgs — workflows and their runs are owned by the admin/platform org)
+        org_id_for_runs = None
         (
             runs,
             total_count,
