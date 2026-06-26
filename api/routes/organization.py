@@ -1,3 +1,4 @@
+from datetime import datetime
 from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -996,3 +997,97 @@ async def get_campaign_defaults(user: UserModel = Depends(get_user)):
         default_retry_config=RetryConfigResponse(**DEFAULT_CAMPAIGN_RETRY_CONFIG),
         last_campaign_settings=last_campaign_settings,
     )
+
+
+# ---------------------------------------------------------------------------
+# Organisation API keys
+# ---------------------------------------------------------------------------
+
+
+class ApiKeyListItem(BaseModel):
+    id: int
+    name: str
+    prefix: str
+    created_at: datetime
+    last_used_at: Optional[datetime] = None
+
+
+class ApiKeyListResponse(BaseModel):
+    api_keys: List[ApiKeyListItem]
+
+
+class CreateApiKeyRequest(BaseModel):
+    name: str
+
+
+class CreateApiKeyResponse(BaseModel):
+    id: int
+    name: str
+    prefix: str
+    key: str
+    created_at: datetime
+
+
+@router.get("/api-keys", response_model=ApiKeyListResponse)
+async def list_api_keys(user: UserModel = Depends(get_user)):
+    """List all active API keys for the user's organisation."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    keys = await db_client.get_api_keys_by_organization(user.selected_organization_id)
+    return ApiKeyListResponse(
+        api_keys=[
+            ApiKeyListItem(
+                id=k.id,
+                name=k.name,
+                prefix=k.key_prefix,
+                created_at=k.created_at,
+                last_used_at=k.last_used_at,
+            )
+            for k in keys
+        ]
+    )
+
+
+@router.post("/api-keys", response_model=CreateApiKeyResponse)
+async def create_api_key(
+    request: CreateApiKeyRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Create a new organisation-scoped API key. The raw key is returned once."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    if not request.name.strip():
+        raise HTTPException(status_code=422, detail="Key name cannot be empty")
+
+    key_model, raw_key = await db_client.create_api_key(
+        organization_id=user.selected_organization_id,
+        name=request.name.strip(),
+        created_by=user.id,
+    )
+    return CreateApiKeyResponse(
+        id=key_model.id,
+        name=key_model.name,
+        prefix=key_model.key_prefix,
+        key=raw_key,
+        created_at=key_model.created_at,
+    )
+
+
+@router.delete("/api-keys/{key_id}")
+async def delete_api_key(key_id: int, user: UserModel = Depends(get_user)):
+    """Archive (soft-delete) an organisation API key."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    # Verify the key belongs to this org before archiving
+    keys = await db_client.get_api_keys_by_organization(user.selected_organization_id)
+    if not any(k.id == key_id for k in keys):
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    deleted = await db_client.archive_api_key(key_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="API key not found")
+
+    return {"message": "API key deleted"}
