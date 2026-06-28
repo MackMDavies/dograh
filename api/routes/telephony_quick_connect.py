@@ -140,11 +140,24 @@ async def quick_connect(
             provisioner.provision_number, target_e164, voice_url, address_sid
         )
     except TwilioRestException as exc:
-        needs_address = "requires an address" in (exc.msg or "").lower()
-        if needs_address and body.mode == "forward":
+        err_lower = (exc.msg or "").lower()
+        # Twilio blocks local-number purchase in regulated countries (e.g. GB)
+        # until a registered Address and/or Regulatory Bundle is supplied.
+        needs_regulatory = any(
+            token in err_lower
+            for token in (
+                "requires an address",
+                "addresssid",
+                "bundle required",
+                "bundle is required",
+                "regulatory bundle",
+                "not provided for country",
+            )
+        )
+        if needs_regulatory and body.mode == "forward":
             # Forwarding only needs a reachable destination, so if the local country
-            # requires an address we don't have, fall back to a US number (no address
-            # required). The caller still dials the user's own number.
+            # needs regulatory paperwork we don't have, fall back to a US number
+            # (no address/bundle required). The caller still dials the user's number.
             us_numbers = await asyncio.to_thread(
                 provisioner.search_available_numbers, "US", None, 1
             )
@@ -163,13 +176,14 @@ async def quick_connect(
                     status_code=502,
                     detail=f"Twilio provisioning failed: {exc2.msg}",
                 )
-        elif needs_address:
+        elif needs_regulatory:
             raise HTTPException(
                 status_code=502,
                 detail=(
-                    f"Twilio requires a registered address to buy numbers in {target_country}. "
-                    f"Add one in your Twilio console under Phone Numbers, Regulatory Compliance, "
-                    f"Addresses, then try again."
+                    f"Twilio requires regulatory compliance (a registered Address and "
+                    f"Regulatory Bundle) before you can buy local numbers in {target_country}. "
+                    f"Complete it in your Twilio console under Phone Numbers, Regulatory "
+                    f"Compliance, then try again, or choose a different country."
                 ),
             )
         else:
