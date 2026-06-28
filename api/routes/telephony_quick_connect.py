@@ -154,10 +154,13 @@ async def quick_connect(
                 "not provided for country",
             )
         )
-        if needs_regulatory and body.mode == "forward":
-            # Forwarding only needs a reachable destination, so if the local country
-            # needs regulatory paperwork we don't have, fall back to a US number
-            # (no address/bundle required). The caller still dials the user's number.
+        if needs_regulatory and target_country != "US":
+            # The chosen country needs regulatory paperwork (Address + Bundle) we
+            # don't have, so the purchase is blocked. Fall back to a US number,
+            # which has no such requirement, so the flow always completes. For a
+            # forwarded number the caller still dials the user's own number; for a
+            # new number the user gets a working Sysevo line. A true local number
+            # requires completing Twilio regulatory compliance for that country.
             us_numbers = await asyncio.to_thread(
                 provisioner.search_available_numbers, "US", None, 1
             )
@@ -176,16 +179,6 @@ async def quick_connect(
                     status_code=502,
                     detail=f"Twilio provisioning failed: {exc2.msg}",
                 )
-        elif needs_regulatory:
-            raise HTTPException(
-                status_code=502,
-                detail=(
-                    f"Twilio requires regulatory compliance (a registered Address and "
-                    f"Regulatory Bundle) before you can buy local numbers in {target_country}. "
-                    f"Complete it in your Twilio console under Phone Numbers, Regulatory "
-                    f"Compliance, then try again, or choose a different country."
-                ),
-            )
         else:
             raise HTTPException(
                 status_code=502, detail=f"Twilio provisioning failed: {exc.msg}"
