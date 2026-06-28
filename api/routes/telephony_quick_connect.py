@@ -130,14 +130,17 @@ async def quick_connect(
             )
         target_e164 = numbers[0]
 
-    # Some countries (e.g. GB) require a registered Twilio Address to buy local
-    # numbers. Attach one automatically if the platform account has it.
+    # Regulated countries (e.g. GB and most of the EU) require a registered Twilio
+    # Address and an approved Regulatory Bundle to buy local numbers. Attach both
+    # automatically when the platform account has them — that lets the number
+    # provision IN-COUNTRY (UK -> UK) instead of falling back to a US line.
     address_sid = await asyncio.to_thread(provisioner.get_address_sid, target_country)
+    bundle_sid = await asyncio.to_thread(provisioner.get_bundle_sid, target_country)
 
     # Provision on Twilio
     try:
         provisioned = await asyncio.to_thread(
-            provisioner.provision_number, target_e164, voice_url, address_sid
+            provisioner.provision_number, target_e164, voice_url, address_sid, bundle_sid
         )
     except TwilioRestException as exc:
         err_lower = (exc.msg or "").lower()
