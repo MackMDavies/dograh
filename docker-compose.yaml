@@ -11,7 +11,7 @@ services:
         max-size: "10m"
         max-file: "3"
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -192,6 +192,10 @@ services:
       SYSEVO_PRE_CALL_CHECK_URL: "${SYSEVO_PRE_CALL_CHECK_URL:-}"
       SYSEVO_POST_CALL_MEMORY_URL: "${SYSEVO_POST_CALL_MEMORY_URL:-}"
       SYSEVO_MEMORY_SECRET: "${SYSEVO_MEMORY_SECRET:-}"
+      # Direct wallet debit URL — set this to enable per-client minute billing.
+      # Format: https://<project>.supabase.co/functions/v1/wallet-debit
+      # If unset, the URL is derived from SYSEVO_POST_CALL_MEMORY_URL (requires that to be set).
+      SYSEVO_WALLET_DEBIT_URL: "${SYSEVO_WALLET_DEBIT_URL:-}"
 
       # CORS / deployment
       DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
