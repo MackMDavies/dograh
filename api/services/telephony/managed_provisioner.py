@@ -23,6 +23,11 @@ class ProvisionedNumber:
 
 class ManagedProvisioner:
     def __init__(self, account_sid: str, auth_token: str) -> None:
+        # Retained so callers can persist the resolved account_sid on the managed
+        # telephony config (needed for inbound webhook matching + signature
+        # verification) regardless of whether creds came from DB or env.
+        self.account_sid = account_sid
+        self.auth_token = auth_token
         self._client = Client(account_sid, auth_token)
 
     # ── Carrier lookup ────────────────────────────────────────────────────────
@@ -100,13 +105,36 @@ class ManagedProvisioner:
             return "US"
 
 
-def get_managed_provisioner() -> Optional[ManagedProvisioner]:
-    """
-    Return a ManagedProvisioner if platform credentials are configured,
-    otherwise None. Routes call this and return 503 when None.
-    """
+def _provisioner_from_env() -> Optional[ManagedProvisioner]:
     sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
     token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
     if not sid or not token:
         return None
     return ManagedProvisioner(account_sid=sid, auth_token=token)
+
+
+async def get_managed_provisioner() -> Optional[ManagedProvisioner]:
+    """
+    Return a ManagedProvisioner if platform credentials are configured,
+    otherwise None. Routes call this and return 503 when None.
+
+    Resolution order: DB-stored credentials (set via the admin UI) first, then
+    the SYSEVO_TWILIO_* environment variables as a fallback. The DB is read on
+    every call (no per-worker caching) so a credential saved on one worker takes
+    effect across all workers immediately.
+    """
+    # Imported lazily to avoid an import cycle (db_client pulls in many models).
+    from api.db import db_client
+
+    try:
+        creds = await db_client.get_platform_twilio_credentials()
+        if creds:
+            return ManagedProvisioner(
+                account_sid=creds["account_sid"], auth_token=creds["auth_token"]
+            )
+    except Exception as exc:  # noqa: BLE001 — never block provisioning on DB hiccups
+        logger.warning(
+            f"[managed_provisioner] DB credential load failed, "
+            f"falling back to env: {exc}"
+        )
+    return _provisioner_from_env()

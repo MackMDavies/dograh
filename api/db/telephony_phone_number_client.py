@@ -90,10 +90,18 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             return list(result.scalars().all())
 
     async def get_phone_number(
-        self, phone_number_id: int
+        self, phone_number_id: int, organization_id: Optional[int] = None
     ) -> Optional[TelephonyPhoneNumberModel]:
         async with self.async_session() as session:
-            return await session.get(TelephonyPhoneNumberModel, phone_number_id)
+            if organization_id is None:
+                return await session.get(TelephonyPhoneNumberModel, phone_number_id)
+            result = await session.execute(
+                select(TelephonyPhoneNumberModel).where(
+                    TelephonyPhoneNumberModel.id == phone_number_id,
+                    TelephonyPhoneNumberModel.organization_id == organization_id,
+                )
+            )
+            return result.scalars().first()
 
     async def get_phone_number_for_config(
         self, phone_number_id: int, telephony_configuration_id: int
@@ -337,11 +345,18 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             return result.scalars().first()
 
     async def delete_phone_number(
-        self, phone_number_id: int, telephony_configuration_id: int
+        self,
+        phone_number_id: int,
+        telephony_configuration_id: Optional[int] = None,
+        organization_id: Optional[int] = None,
     ) -> bool:
         async with self.async_session() as session:
             row = await session.get(TelephonyPhoneNumberModel, phone_number_id)
-            if not row or row.telephony_configuration_id != telephony_configuration_id:
+            if row is None:
+                return False
+            if telephony_configuration_id is not None and row.telephony_configuration_id != telephony_configuration_id:
+                return False
+            if organization_id is not None and row.organization_id != organization_id:
                 return False
             await session.delete(row)
             await session.commit()

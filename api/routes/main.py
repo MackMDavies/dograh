@@ -19,6 +19,7 @@ from api.routes.s3_signed_url import router as s3_router
 from api.routes.service_keys import router as service_keys_router
 from api.routes.superuser import router as superuser_router
 from api.routes.telephony import router as telephony_router
+from api.routes.telephony_quick_connect import router as telephony_quick_connect_router
 from api.routes.tool import router as tool_router
 from api.routes.turn_credentials import router as turn_credentials_router
 from api.routes.user import router as user_router
@@ -30,6 +31,7 @@ from api.routes.voice_library import router as voice_library_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
 from api.routes.ai_providers import router as ai_providers_router
 from api.routes.memory_tools import router as memory_tools_router
+from api.routes.admin_telephony import router as admin_telephony_router
 from api.services.integrations import all_routers
 
 router = APIRouter(
@@ -38,6 +40,7 @@ router = APIRouter(
 )
 
 router.include_router(telephony_router)
+router.include_router(telephony_quick_connect_router)
 router.include_router(superuser_router)
 router.include_router(workflow_router)
 router.include_router(workflow_text_chat_router)
@@ -65,6 +68,7 @@ router.include_router(agent_stream_router)
 router.include_router(voice_library_router)
 router.include_router(ai_providers_router)
 router.include_router(memory_tools_router)
+router.include_router(admin_telephony_router)
 
 for _integration_router in all_routers():
     router.include_router(_integration_router)

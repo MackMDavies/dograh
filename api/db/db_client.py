@@ -21,6 +21,7 @@ from api.db.workflow_run_text_session_client import WorkflowRunTextSessionClient
 from api.db.voice_library_client import VoiceLibraryClient
 from api.db.workflow_template_client import WorkflowTemplateClient
 from api.db.provider_connection_client import ProviderConnectionClient
+from api.db.platform_settings_client import PlatformSettingsClient
 
 
 class DBClient(
@@ -47,6 +48,7 @@ class DBClient(
     FolderClient,
     VoiceLibraryClient,
     ProviderConnectionClient,
+    PlatformSettingsClient,
 ):
     """
     Unified database client that combines all specialized database operations.

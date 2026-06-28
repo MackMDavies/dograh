@@ -1,4 +1,6 @@
 """Tests for ManagedProvisioner — all Twilio REST calls are mocked."""
+import asyncio
+
 import pytest
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -67,3 +69,51 @@ class TestReleaseNumber:
 
         assert result is True
         mock_client.incoming_phone_numbers.return_value.delete.assert_called_once()
+        mock_client.incoming_phone_numbers.assert_called_once_with("PNabc123")
+
+
+class TestGetManagedProvisioner:
+    def test_returns_none_when_no_db_and_env_vars_absent(self):
+        with patch.dict("os.environ", {}, clear=True):
+            import os
+            os.environ.pop("SYSEVO_TWILIO_ACCOUNT_SID", None)
+            os.environ.pop("SYSEVO_TWILIO_AUTH_TOKEN", None)
+            from api.services.telephony import managed_provisioner as mp
+            from api.db import db_client as db_instance
+            with patch.object(
+                db_instance, "get_platform_twilio_credentials",
+                new=AsyncMock(return_value=None),
+            ):
+                result = asyncio.run(mp.get_managed_provisioner())
+        assert result is None
+
+    def test_falls_back_to_env_when_no_db_credentials(self):
+        with patch.dict("os.environ", {
+            "SYSEVO_TWILIO_ACCOUNT_SID": "ACtest",
+            "SYSEVO_TWILIO_AUTH_TOKEN": "tokentest",
+        }):
+            from api.services.telephony import managed_provisioner as mp
+            from api.db import db_client as db_instance
+            with patch.object(
+                db_instance, "get_platform_twilio_credentials",
+                new=AsyncMock(return_value=None),
+            ):
+                result = asyncio.run(mp.get_managed_provisioner())
+        assert isinstance(result, ManagedProvisioner)
+        assert result.account_sid == "ACtest"
+
+    def test_db_credentials_take_precedence_over_env(self):
+        with patch.dict("os.environ", {
+            "SYSEVO_TWILIO_ACCOUNT_SID": "ACenv",
+            "SYSEVO_TWILIO_AUTH_TOKEN": "envtoken",
+        }):
+            from api.services.telephony import managed_provisioner as mp
+            from api.db import db_client as db_instance
+            db_creds = {"account_sid": "ACdb", "auth_token": "dbtoken"}
+            with patch.object(
+                db_instance, "get_platform_twilio_credentials",
+                new=AsyncMock(return_value=db_creds),
+            ):
+                result = asyncio.run(mp.get_managed_provisioner())
+        assert isinstance(result, ManagedProvisioner)
+        assert result.account_sid == "ACdb"

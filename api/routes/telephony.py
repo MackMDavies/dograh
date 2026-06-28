@@ -146,6 +146,12 @@ async def initiate_call(
     if not quota_result.has_quota:
         raise HTTPException(status_code=402, detail=quota_result.error_message)
 
+    # Wallet balance check — no minutes/dollars = no call.
+    from api.services.wallet_check import check_wallet_before_call
+    wallet_allowed, wallet_block_reason = await check_wallet_before_call(workflow.id)
+    if not wallet_allowed:
+        raise HTTPException(status_code=402, detail=wallet_block_reason or "insufficient_balance")
+
     # Determine the workflow run mode based on provider type
     workflow_run_mode = provider.PROVIDER_NAME
 
@@ -753,6 +759,17 @@ async def handle_inbound_run(request: Request):
                 TelephonyError.QUOTA_EXCEEDED
             )
 
+        # 4b. Wallet balance check — no minutes/dollars = no call.
+        from api.services.wallet_check import check_wallet_before_call
+        wallet_allowed, wallet_block_reason = await check_wallet_before_call(workflow_id)
+        if not wallet_allowed:
+            logger.warning(
+                f"Inbound call blocked for workflow {workflow_id}: {wallet_block_reason}"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.QUOTA_EXCEEDED
+            )
+
         # 5. Create workflow run + return provider-shaped response.
         workflow_run_id = await _create_inbound_workflow_run(
             workflow_id,
@@ -884,6 +901,17 @@ async def handle_inbound_telephony(
         if not quota_result.has_quota:
             logger.warning(
                 f"User {user_id} has exceeded quota for inbound calls: {quota_result.error_message}"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.QUOTA_EXCEEDED
+            )
+
+        # Wallet balance check — no minutes/dollars = no call.
+        from api.services.wallet_check import check_wallet_before_call
+        wallet_allowed, wallet_block_reason = await check_wallet_before_call(workflow_id)
+        if not wallet_allowed:
+            logger.warning(
+                f"[legacy] Inbound call blocked for workflow {workflow_id}: {wallet_block_reason}"
             )
             return provider_class.generate_validation_error_response(
                 TelephonyError.QUOTA_EXCEEDED

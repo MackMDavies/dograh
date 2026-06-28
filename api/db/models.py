@@ -288,6 +288,34 @@ class TelephonyPhoneNumberModel(Base):
     )
 
 
+class PlatformTwilioCredentialsModel(Base):
+    """
+    Single-row store for the platform-level (Sysevo-managed) Twilio account used
+    by Quick Connect to provision/forward numbers on behalf of any org.
+
+    ``account_sid`` is non-secret and stored in clear (shown as a masked preview
+    in the admin UI). ``auth_token_encrypted`` is encrypted at rest via
+    ``api.services.crypto``. When no row exists, the provisioner falls back to
+    the ``SYSEVO_TWILIO_ACCOUNT_SID`` / ``SYSEVO_TWILIO_AUTH_TOKEN`` env vars.
+    """
+
+    __tablename__ = "platform_twilio_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    account_sid = Column(String(64), nullable=False)
+    auth_token_encrypted = Column(String, nullable=False)
+    is_active = Column(
+        Boolean, nullable=False, default=True, server_default=text("true")
+    )
+    last_validated_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class IntegrationModel(Base):
     __tablename__ = "integrations"
 
