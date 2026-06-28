@@ -71,18 +71,41 @@ class ManagedProvisioner:
 
     # ── Provisioning ──────────────────────────────────────────────────────────
 
-    def provision_number(self, e164: str, voice_url: str) -> ProvisionedNumber:
+    def provision_number(
+        self, e164: str, voice_url: str, address_sid: Optional[str] = None
+    ) -> ProvisionedNumber:
         """
         Purchase *e164* from the platform Twilio account and wire its inbound
-        webhook to *voice_url*.  Raises TwilioRestException on failure.
+        webhook to *voice_url*. Pass *address_sid* for countries whose regulations
+        require a registered address (e.g. GB). Raises TwilioRestException on failure.
         """
-        purchased = self._client.incoming_phone_numbers.create(
-            phone_number=e164,
-            voice_url=voice_url,
-            voice_method="POST",
-        )
+        kwargs: Dict[str, Any] = {
+            "phone_number": e164,
+            "voice_url": voice_url,
+            "voice_method": "POST",
+        }
+        if address_sid:
+            kwargs["address_sid"] = address_sid
+        purchased = self._client.incoming_phone_numbers.create(**kwargs)
         logger.info(f"[managed_provisioner] Provisioned {e164} → SID {purchased.sid}")
         return ProvisionedNumber(e164=purchased.phone_number, twilio_sid=purchased.sid)
+
+    def get_address_sid(self, iso_country: str) -> Optional[str]:
+        """
+        Return the SID of a registered Twilio Address for *iso_country*, or None.
+        Some countries require an address to buy local numbers; if the platform
+        account has one registered, we attach it automatically.
+        """
+        try:
+            addresses = self._client.addresses.list(
+                iso_country=iso_country, limit=1
+            )
+            return addresses[0].sid if addresses else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[managed_provisioner] Address lookup failed for {iso_country}: {exc}"
+            )
+            return None
 
     def release_number(self, twilio_sid: str) -> bool:
         """Release a number back to Twilio. Returns True on success."""

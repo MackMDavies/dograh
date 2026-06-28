@@ -114,6 +114,7 @@ async def quick_connect(
     voice_url = f"{backend_url}/api/v1/telephony/inbound/run"
 
     # Determine the number to purchase
+    target_country = (body.country or "US").upper()
     if body.mode == "new" and body.existing_number:
         # Path B: user already picked a specific number from /available-numbers
         target_e164 = body.existing_number
@@ -129,13 +130,52 @@ async def quick_connect(
             )
         target_e164 = numbers[0]
 
+    # Some countries (e.g. GB) require a registered Twilio Address to buy local
+    # numbers. Attach one automatically if the platform account has it.
+    address_sid = await asyncio.to_thread(provisioner.get_address_sid, target_country)
+
     # Provision on Twilio
     try:
         provisioned = await asyncio.to_thread(
-            provisioner.provision_number, target_e164, voice_url
+            provisioner.provision_number, target_e164, voice_url, address_sid
         )
     except TwilioRestException as exc:
-        raise HTTPException(status_code=502, detail=f"Twilio provisioning failed: {exc.msg}")
+        needs_address = "requires an address" in (exc.msg or "").lower()
+        if needs_address and body.mode == "forward":
+            # Forwarding only needs a reachable destination, so if the local country
+            # requires an address we don't have, fall back to a US number (no address
+            # required). The caller still dials the user's own number.
+            us_numbers = await asyncio.to_thread(
+                provisioner.search_available_numbers, "US", None, 1
+            )
+            if not us_numbers:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Twilio provisioning failed: {exc.msg}",
+                )
+            try:
+                provisioned = await asyncio.to_thread(
+                    provisioner.provision_number, us_numbers[0], voice_url
+                )
+                target_country = "US"
+            except TwilioRestException as exc2:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Twilio provisioning failed: {exc2.msg}",
+                )
+        elif needs_address:
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Twilio requires a registered address to buy numbers in {target_country}. "
+                    f"Add one in your Twilio console under Phone Numbers, Regulatory Compliance, "
+                    f"Addresses, then try again."
+                ),
+            )
+        else:
+            raise HTTPException(
+                status_code=502, detail=f"Twilio provisioning failed: {exc.msg}"
+            )
 
     try:
         # Find or create a "Sysevo Managed" telephony config for this org.
@@ -168,8 +208,8 @@ async def quick_connect(
             organization_id=org_id,
             telephony_configuration_id=managed_config.id,
             address=provisioned.e164,
-            country_code=body.country,
-            label=f"Sysevo ({body.country})",
+            country_code=target_country,
+            label=f"Sysevo ({target_country})",
             inbound_workflow_id=workflow_id,
             extra_metadata={
                 "is_managed": True,
