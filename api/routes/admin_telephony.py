@@ -8,7 +8,7 @@ from typing import Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
@@ -170,7 +170,14 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
                 TelephonyPhoneNumberModel.inbound_workflow_id == WorkflowModel.id,
             )
             .where(
-                TelephonyPhoneNumberModel.extra_metadata["is_managed"].astext == "true"
+                # extra_metadata is a generic JSON column (not JSONB); the ORM
+                # `[...].astext` accessor mis-renders against it and matched 0
+                # rows. json_extract_path_text emits the same `->>` operator that
+                # correctly matches the stored is_managed value.
+                func.json_extract_path_text(
+                    TelephonyPhoneNumberModel.extra_metadata, "is_managed"
+                )
+                == "true"
             )
             .order_by(TelephonyPhoneNumberModel.id.desc())
         )
