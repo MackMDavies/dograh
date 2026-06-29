@@ -19,10 +19,23 @@ from api.db.models import (
     TelephonyPhoneNumberModel,
     UserModel,
     WorkflowModel,
+    WorkflowRunModel,
 )
 from api.services.auth.depends import get_superuser
 
 router = APIRouter(prefix="/admin/telephony", tags=["admin-telephony"])
+
+# Approx Twilio monthly rental for a local number, in USD cents — standard
+# published rates (admins can confirm exact amounts in the Twilio console).
+_NUMBER_MONTHLY_COST_CENTS = {
+    "US": 115, "CA": 115, "PR": 115,
+    "GB": 115, "IE": 115,
+    "AU": 600, "NZ": 600,
+    "FR": 150, "DE": 150, "NL": 150, "ES": 150, "IT": 150, "BE": 150,
+    "CH": 300, "AT": 150, "SE": 150, "NO": 300, "DK": 150, "FI": 150,
+    "PT": 150, "PL": 150,
+}
+_DEFAULT_MONTHLY_COST_CENTS = 150
 
 
 class ManagedStatusResponse(BaseModel):
@@ -55,11 +68,14 @@ class ManagedNumberItem(BaseModel):
     twilio_sid_preview: Optional[str]  # first 6 chars + "****"
     is_active: bool
     created_at: Optional[str]
+    monthly_cost_cents: int  # estimated Twilio rental cost (USD cents)
+    call_count: int          # calls run through the number (runs of its inbound workflow)
 
 
 class ManagedNumbersResponse(BaseModel):
     numbers: list[ManagedNumberItem]
     total: int
+    total_monthly_cost_cents: int
 
 
 def _mask_sid(sid: Optional[str]) -> Optional[str]:
@@ -184,11 +200,27 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
         result = await session.execute(stmt)
         rows = result.all()
 
+        # Calls run through each number = runs of its inbound workflow.
+        wf_ids = [num.inbound_workflow_id for num, _, _ in rows if num.inbound_workflow_id]
+        run_counts: dict[int, int] = {}
+        if wf_ids:
+            run_stmt = (
+                select(WorkflowRunModel.workflow_id, func.count(WorkflowRunModel.id))
+                .where(WorkflowRunModel.workflow_id.in_(wf_ids))
+                .group_by(WorkflowRunModel.workflow_id)
+            )
+            run_counts = {wf: cnt for wf, cnt in (await session.execute(run_stmt)).all()}
+
     items = []
+    total_cost = 0
     for num, org, workflow in rows:
         meta = num.extra_metadata or {}
         raw_sid = meta.get("managed_twilio_sid", "")
         sid_preview = (raw_sid[:6] + "****") if raw_sid else None
+        cost = _NUMBER_MONTHLY_COST_CENTS.get(
+            (num.country_code or "").upper(), _DEFAULT_MONTHLY_COST_CENTS
+        )
+        total_cost += cost
         items.append(
             ManagedNumberItem(
                 phone_number_id=num.id,
@@ -206,7 +238,11 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
                     if getattr(num, "created_at", None)
                     else None
                 ),
+                monthly_cost_cents=cost,
+                call_count=run_counts.get(num.inbound_workflow_id, 0),
             )
         )
 
-    return ManagedNumbersResponse(numbers=items, total=len(items))
+    return ManagedNumbersResponse(
+        numbers=items, total=len(items), total_monthly_cost_cents=total_cost
+    )
