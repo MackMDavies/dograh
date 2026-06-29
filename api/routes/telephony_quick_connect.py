@@ -249,7 +249,10 @@ async def delete_managed_number(
     user: UserModel = Depends(get_user),
 ):
     """Release a Sysevo-managed number back to Twilio and remove DB records."""
-    org_id = user.selected_organization_id
+    # Superusers manage numbers across all orgs (matching the configs list view,
+    # which also shows all orgs to superusers). Everyone else stays strictly
+    # scoped to their own org for tenant isolation.
+    org_id = None if user.is_superuser else user.selected_organization_id
     row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Phone number not found.")
@@ -287,7 +290,8 @@ async def toggle_managed_number(
     forwarding (calls stop reaching the agent) and re-enabling reconnects it —
     without releasing the number.
     """
-    org_id = user.selected_organization_id
+    # Superusers manage across all orgs; other users stay org-scoped (isolation).
+    org_id = None if user.is_superuser else user.selected_organization_id
     row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Phone number not found.")
