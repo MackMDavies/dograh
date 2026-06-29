@@ -269,3 +269,38 @@ async def delete_managed_number(
             released = await asyncio.to_thread(provisioner.release_number, twilio_sid)
             if not released:
                 logger.warning(f"[quick_connect] Failed to release Twilio SID {twilio_sid} for phone_number_id={phone_number_id}")
+
+
+class ToggleActiveRequest(BaseModel):
+    is_active: bool
+
+
+@router.patch("/managed-numbers/{phone_number_id}")
+async def toggle_managed_number(
+    phone_number_id: int,
+    body: ToggleActiveRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Enable/disable routing for a Sysevo-managed number. The inbound dispatcher
+    only routes calls for ``is_active`` numbers, so disabling effectively pauses
+    forwarding (calls stop reaching the agent) and re-enabling reconnects it —
+    without releasing the number.
+    """
+    org_id = user.selected_organization_id
+    row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Phone number not found.")
+
+    meta = row.extra_metadata or {}
+    if not meta.get("is_managed"):
+        raise HTTPException(status_code=400, detail="This number is not a Sysevo-managed number.")
+
+    updated = await db_client.update_phone_number(
+        phone_number_id,
+        telephony_configuration_id=row.telephony_configuration_id,
+        is_active=body.is_active,
+    )
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Failed to update the number.")
+    return {"id": updated.id, "is_active": updated.is_active}
