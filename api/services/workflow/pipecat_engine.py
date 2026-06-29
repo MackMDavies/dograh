@@ -530,6 +530,14 @@ class PipecatEngine:
         # Register knowledge base retrieval handler.
         # Merge per-node document_uuids with workflow-level assignments (assigned + global).
         kb_doc_uuids = list(node.document_uuids or [])
+        # Include the global node's documents — Agent Settings / Simple View assign the
+        # agent-wide knowledge base there, and older agents may carry it only on global.
+        gnode_id = getattr(self.workflow, "global_node_id", None)
+        if gnode_id:
+            gnode = self.workflow.nodes.get(gnode_id)
+            for uid in (getattr(gnode, "document_uuids", None) or []):
+                if uid not in kb_doc_uuids:
+                    kb_doc_uuids.append(uid)
         workflow_id = await self._get_workflow_id()
         organization_id = await self._get_organization_id()
         if workflow_id and organization_id:
@@ -557,6 +565,7 @@ class PipecatEngine:
         functions = await compose_functions_for_node(
             node=node,
             custom_tool_manager=self._custom_tool_manager,
+            kb_document_uuids=kb_doc_uuids,
         )
         await self._update_llm_context(system_prompt, functions)
 

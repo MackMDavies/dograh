@@ -87,6 +87,7 @@ async def compose_functions_for_node(
     *,
     node: "Node",
     custom_tool_manager: Optional["CustomToolManager"],
+    kb_document_uuids: Optional[list[str]] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -103,9 +104,14 @@ async def compose_functions_for_node(
     """
     functions: list[dict] = []
 
-    # Knowledge base retrieval tool
-    if node.document_uuids:
-        kb_tool_def = get_knowledge_base_tool(node.document_uuids)
+    # Knowledge base retrieval tool. Expose it whenever ANY documents are available
+    # to this node — per-node refs MERGED with workflow-level assignments and global
+    # docs (passed in as kb_document_uuids) — not just the per-node field. Otherwise a
+    # KB assigned at the agent/workflow level (or marked global) is registered as a
+    # handler but the LLM is never told the tool exists, so it silently has no effect.
+    kb_uuids = kb_document_uuids if kb_document_uuids is not None else (node.document_uuids or [])
+    if kb_uuids:
+        kb_tool_def = get_knowledge_base_tool(kb_uuids)
         kb_schema = get_function_schema(
             kb_tool_def["function"]["name"],
             kb_tool_def["function"]["description"],
