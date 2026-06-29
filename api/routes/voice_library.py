@@ -754,6 +754,7 @@ async def clone_voice(
             org_id,
         )
     else:
+        el_api_key = await _resolve_elevenlabs_api_key(user)
         background_tasks.add_task(
             _process_clone_background,
             voice.uuid,
@@ -762,7 +763,7 @@ async def clone_voice(
             audio_data,
             filename,
             content_type,
-            org_id,
+            el_api_key,
         )
     return _serialize(voice)
 
@@ -809,6 +810,32 @@ async def _load_clone_audio(voice_uuid: str) -> bytes | None:
             pass
 
 
+async def _resolve_elevenlabs_api_key(user: UserModel) -> Optional[str]:
+    """Resolve an ElevenLabs key using the SAME cascade as the catalog/browse
+    endpoints, so cloning works wherever browsing voices does:
+      1) the caller's own TTS configuration (config.tts)
+      2) the org's connected ElevenLabs key (org provider connection)
+      3) any org's connected key (superuser only)
+      4) the system superuser key
+    Previously clone only checked (2)+(4), so a key added under (1) — where the
+    browse endpoints find it — was invisible to cloning.
+    """
+    key = await get_caller_elevenlabs_api_key(user.id)
+    if key:
+        return key
+    conn = await db_client.get_connection_by_provider(
+        user.selected_organization_id, "tts", "elevenlabs"
+    )
+    if conn and conn.api_key:
+        return conn.api_key
+    if user.is_superuser:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
+        if conn and conn.api_key:
+            return conn.api_key
+    return await get_system_elevenlabs_api_key()
+
+
 async def _process_clone_background(
     voice_uuid: str,
     name: str,
@@ -816,16 +843,12 @@ async def _process_clone_background(
     audio_data: bytes,
     filename: str,
     content_type: str,
-    org_id: int,
+    api_key: Optional[str],
 ) -> None:
     await _store_clone_audio(voice_uuid, audio_data)
-    # Prefer the org's own connected ElevenLabs key; fall back to system superuser key.
-    conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
-    api_key = conn.api_key if (conn and conn.api_key) else None
+    # api_key is resolved at request time via _resolve_elevenlabs_api_key.
     if not api_key:
-        api_key = await get_system_elevenlabs_api_key()
-    if not api_key:
-        error_msg = f"No ElevenLabs API key found for this organisation — add one in AI Models → ElevenLabs"
+        error_msg = "No ElevenLabs API key found — add one in AI Models → ElevenLabs (under TTS)"
         logger.error(f"Voice clone {voice_uuid}: {error_msg}")
         await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
         return
@@ -927,10 +950,11 @@ async def retry_voice_clone(
             audio_data, orig_filename, orig_content_type, org_id,
         )
     else:
+        el_api_key = await _resolve_elevenlabs_api_key(user)
         background_tasks.add_task(
             _process_clone_background,
             voice_uuid, voice.name, voice.description or "",
-            audio_data, orig_filename, orig_content_type, org_id,
+            audio_data, orig_filename, orig_content_type, el_api_key,
         )
 
     updated = await db_client.get_voice_by_uuid(voice_uuid, user.selected_organization_id)
