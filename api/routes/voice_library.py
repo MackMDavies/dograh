@@ -988,27 +988,42 @@ async def generate_voice_preview(
     # Use the voice's own org to resolve the TTS connection.
     voice_org_id = voice.organization_id or org_id
 
-    # 2. Validate provider supports preview generation
+    # 2. Validate provider supports preview generation. Cloned voices store
+    # provider="dograh_clone" but are ElevenLabs-backed, so preview them via EL.
+    preview_provider = "elevenlabs" if voice.provider == "dograh_clone" else voice.provider
     _PREVIEW_SUPPORTED = {"xai", "openai", "elevenlabs", "google", "deepgram"}
-    if voice.provider not in _PREVIEW_SUPPORTED:
+    if preview_provider not in _PREVIEW_SUPPORTED:
         raise HTTPException(
             status_code=422,
             detail=f"Preview generation is not supported for provider '{voice.provider}'",
         )
 
-    # 3. Get the org's TTS connection for this provider
-    conn = await db_client.get_connection_by_provider(voice_org_id, "tts", voice.provider)
-    if not conn:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No active {voice.provider} TTS connection found for this organisation",
-        )
-    # Google TTS uses service-account credentials, not api_key
-    if voice.provider != "google" and not conn.api_key:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No active {voice.provider} TTS connection found for this organisation",
-        )
+    # 3. Resolve the API key. ElevenLabs (incl. cloned voices) uses the same robust
+    # cascade as cloning/browse so client accounts can preview with the platform key;
+    # other providers use the voice's own org TTS connection.
+    conn = None
+    api_key: Optional[str] = None
+    if preview_provider == "elevenlabs":
+        api_key = await _resolve_elevenlabs_api_key(user)
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="No ElevenLabs API key available to generate a preview",
+            )
+    else:
+        conn = await db_client.get_connection_by_provider(voice_org_id, "tts", preview_provider)
+        if not conn:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No active {preview_provider} TTS connection found for this organisation",
+            )
+        # Google TTS uses service-account credentials, not api_key
+        if preview_provider != "google" and not conn.api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No active {preview_provider} TTS connection found for this organisation",
+            )
+        api_key = conn.api_key
 
     # 4. Call provider TTS API to generate the preview
     sample_text = f"Hello, I'm {voice.name}. How can I help you today?"
@@ -1051,12 +1066,12 @@ async def generate_voice_preview(
                         raise HTTPException(status_code=502, detail=f"OpenAI TTS API returned {resp.status}")
                     audio_bytes = await resp.read()
 
-        elif voice.provider == "elevenlabs":
+        elif preview_provider == "elevenlabs":
             async with aiohttp.ClientSession() as http:
                 async with http.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice.provider_voice_id}",
                     json={"text": sample_text, "model_id": "eleven_monolingual_v1"},
-                    headers={"xi-api-key": conn.api_key, "Content-Type": "application/json"},
+                    headers={"xi-api-key": api_key, "Content-Type": "application/json"},
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()
