@@ -203,6 +203,14 @@ async def enrich_overrides_with_org_api_keys(
         if not provider:
             continue
 
+        # Cloned voices are stored with provider="dograh_clone" but are ElevenLabs-
+        # backed. Normalize to elevenlabs so the EL key (including the platform-level
+        # fallback below, used by client orgs with no EL connection of their own) is
+        # resolved and the runtime builds an ElevenLabs TTS service.
+        if service_type_str == "tts" and provider == "dograh_clone":
+            provider = "elevenlabs"
+            override["provider"] = provider
+
         # Only skip the org connection lookup when a real JSON-format credential is
         # already present. A real api_key alone is not sufficient — service-account
         # providers (e.g. Google STT) also need extra_config["credentials"] (JSON)
