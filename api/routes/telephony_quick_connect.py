@@ -6,9 +6,10 @@ platform-level Twilio account (SYSEVO_TWILIO_ACCOUNT_SID / AUTH_TOKEN).
 Users never supply credentials — Sysevo handles Twilio internally.
 """
 import asyncio
+import os
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel
 from twilio.base.exceptions import TwilioRestException
@@ -308,3 +309,45 @@ async def toggle_managed_number(
     if updated is None:
         raise HTTPException(status_code=500, detail="Failed to update the number.")
     return {"id": updated.id, "is_active": updated.is_active}
+
+
+class ManagedNumberBillingRequest(BaseModel):
+    phone_number_id: int
+    action: Literal["pause", "resume", "release"]
+
+
+@router.post("/internal/managed-number-billing")
+async def managed_number_billing(
+    body: ManagedNumberBillingRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """
+    Internal endpoint for the Supabase rental-billing cron. Secret-authenticated
+    (no user scope) so it can pause/resume routing or release a managed number
+    on (non-)payment of the monthly fee, regardless of which org it belongs to.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or x_sysevo_secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = await db_client.get_phone_number(body.phone_number_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Phone number not found.")
+
+    if body.action in ("pause", "resume"):
+        await db_client.update_phone_number(
+            body.phone_number_id,
+            telephony_configuration_id=row.telephony_configuration_id,
+            is_active=(body.action == "resume"),
+        )
+        return {"ok": True, "action": body.action}
+
+    # release: hand the Twilio number back, then remove the DB row.
+    meta = row.extra_metadata or {}
+    twilio_sid = meta.get("managed_twilio_sid")
+    await db_client.delete_phone_number(body.phone_number_id)
+    if twilio_sid:
+        provisioner = await get_managed_provisioner()
+        if provisioner:
+            await asyncio.to_thread(provisioner.release_number, twilio_sid)
+    return {"ok": True, "action": "release"}
