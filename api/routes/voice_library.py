@@ -713,16 +713,17 @@ async def clone_voice(
 
     org_id = user.selected_organization_id
 
-    # Auto-detect best available cloning provider from org's TTS connections.
+    # Auto-detect cloning provider. Prefer ElevenLabs — it's the reliable instant
+    # voice-cloning path and is resolvable across the caller's config / org / (for
+    # superusers) any org. xAI custom-voice cloning needs a special team
+    # entitlement ("Custom voices are not enabled for this team"), so only fall to
+    # it when there's an xAI key and no ElevenLabs key is reachable anywhere.
     if tts_provider == "auto":
-        xai_conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
-        el_conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
-        if xai_conn and xai_conn.api_key:
-            tts_provider = "xai"
-        elif el_conn and el_conn.api_key:
+        if await _resolve_elevenlabs_api_key(user):
             tts_provider = "elevenlabs"
         else:
-            tts_provider = "elevenlabs"  # will attempt system fallback in background
+            xai_conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
+            tts_provider = "xai" if (xai_conn and xai_conn.api_key) else "elevenlabs"
 
     provider = "xai" if tts_provider == "xai" else "dograh_clone"
     content_type = file.content_type or "audio/webm"
@@ -941,20 +942,27 @@ async def retry_voice_clone(
     labels = voice.labels or {}
     orig_filename = labels.get("clone_audio_filename") or "recording.webm"
     orig_content_type = labels.get("clone_audio_content_type") or "audio/webm"
-    provider = voice.provider
     org_id = voice.organization_id
-    if provider == "xai":
+    el_api_key = await _resolve_elevenlabs_api_key(user)
+    if el_api_key:
+        # Prefer ElevenLabs on retry — this also recovers voices that originally
+        # auto-selected xAI (whose custom-voice cloning isn't enabled for the team).
+        background_tasks.add_task(
+            _process_clone_background,
+            voice_uuid, voice.name, voice.description or "",
+            audio_data, orig_filename, orig_content_type, el_api_key,
+        )
+    elif voice.provider == "xai":
         background_tasks.add_task(
             _process_xai_clone_background,
             voice_uuid, voice.name, voice.description or "",
             audio_data, orig_filename, orig_content_type, org_id,
         )
     else:
-        el_api_key = await _resolve_elevenlabs_api_key(user)
         background_tasks.add_task(
             _process_clone_background,
             voice_uuid, voice.name, voice.description or "",
-            audio_data, orig_filename, orig_content_type, el_api_key,
+            audio_data, orig_filename, orig_content_type, None,
         )
 
     updated = await db_client.get_voice_by_uuid(voice_uuid, user.selected_organization_id)
