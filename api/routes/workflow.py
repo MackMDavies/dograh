@@ -263,7 +263,7 @@ class WorkflowVersionResponse(BaseModel):
 
 
 class UpdateWorkflowStatusRequest(BaseModel):
-    status: str  # "active" or "archived"
+    status: str  # "active", "deactivated", or "archived"
 
 
 class CreateWorkflowRunRequest(BaseModel):
@@ -908,6 +908,8 @@ async def update_workflow_status(
             "created_at": workflow.created_at,
             "workflow_definition": mask_workflow_definition(
                 workflow.released_definition.workflow_json
+                if workflow.released_definition
+                else {}
             ),
             "current_definition_id": workflow.current_definition_id,
             "template_context_variables": workflow.template_context_variables,
@@ -1375,7 +1377,7 @@ async def get_workflow_runs(
 
     runs, total_count = await db_client.get_workflow_runs_by_workflow_id(
         workflow_id,
-        organization_id=None if user.is_superuser else user.selected_organization_id,
+        organization_id=None,  # platform fallback: client orgs don't own runs directly
         limit=limit,
         offset=offset,
         filters=filter_criteria if filter_criteria else None,
@@ -1384,6 +1386,15 @@ async def get_workflow_runs(
     )
 
     total_pages = (total_count + limit - 1) // limit
+
+    # Inject public artifact URLs for each run that has artifacts
+    for run in runs:
+        token = run.public_access_token
+        if (run.transcript_url or run.recording_url) and not token:
+            # Bulk-ensure tokens would be expensive; skip here — detail endpoint handles it
+            pass
+        run.transcript_public_url = artifact_url(token, "transcript")
+        run.recording_public_url = artifact_url(token, "recording")
 
     return WorkflowRunsResponse(
         runs=runs,

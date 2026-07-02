@@ -146,6 +146,12 @@ async def initiate_call(
     if not quota_result.has_quota:
         raise HTTPException(status_code=402, detail=quota_result.error_message)
 
+    # Agent activation gate — deactivated agents cannot place calls.
+    from api.services.workflow_active_check import check_workflow_active
+    allowed, reason = await check_workflow_active(workflow.id)
+    if not allowed:
+        raise HTTPException(status_code=409, detail=f"Agent is not active ({reason})")
+
     # Wallet balance check — no minutes/dollars = no call.
     from api.services.wallet_check import check_wallet_before_call
     wallet_allowed, wallet_block_reason = await check_wallet_before_call(workflow.id)
@@ -728,6 +734,17 @@ async def handle_inbound_run(request: Request):
             )
             return provider_class.generate_validation_error_response(
                 TelephonyError.WORKFLOW_NOT_FOUND
+            )
+
+        # Agent activation gate — deactivated agents cannot receive calls.
+        from api.services.workflow_active_check import check_workflow_active
+        allowed, reason = await check_workflow_active(workflow_id)
+        if not allowed:
+            logger.warning(
+                f"Inbound rejected: workflow {workflow_id} not active ({reason})"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.WORKFLOW_DEACTIVATED
             )
         user_id = workflow.user_id
 

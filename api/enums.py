@@ -96,6 +96,7 @@ class WorkflowStatus(Enum):
 
     ACTIVE = "active"
     ARCHIVED = "archived"
+    DEACTIVATED = "deactivated"
     # Future statuses can be added here like:
     # DRAFT = "draft"
     # PAUSED = "paused"

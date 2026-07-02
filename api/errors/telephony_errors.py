@@ -11,6 +11,7 @@ class TelephonyError(Enum):
 
     PROVIDER_MISMATCH = "PROVIDER_MISMATCH"
     WORKFLOW_NOT_FOUND = "WORKFLOW_NOT_FOUND"
+    WORKFLOW_DEACTIVATED = "WORKFLOW_DEACTIVATED"
     ACCOUNT_VALIDATION_FAILED = "ACCOUNT_VALIDATION_FAILED"
     PHONE_NUMBER_NOT_CONFIGURED = "PHONE_NUMBER_NOT_CONFIGURED"
     SIGNATURE_VALIDATION_FAILED = "SIGNATURE_VALIDATION_FAILED"
@@ -23,6 +24,7 @@ class TelephonyError(Enum):
 TELEPHONY_ERROR_MESSAGES = {
     TelephonyError.PROVIDER_MISMATCH: "Configuration error: This phone number is configured for a different telephony provider. Please check your dashboard settings and update your webhook URL configuration.",
     TelephonyError.WORKFLOW_NOT_FOUND: "Workflow not found. Please verify the workflow ID in your webhook URL is correct and the workflow exists in your dashboard.",
+    TelephonyError.WORKFLOW_DEACTIVATED: "Agent is not active. This agent has been deactivated and cannot receive calls. Reactivate it in your dashboard to resume.",
     TelephonyError.ACCOUNT_VALIDATION_FAILED: "Authentication error: Account credentials do not match. Please verify your account SID configuration in the dashboard matches your telephony provider settings.",
     TelephonyError.PHONE_NUMBER_NOT_CONFIGURED: "Phone number not configured: This number is not set up for inbound calls in your account. Please add this number to your telephony configuration.",
     TelephonyError.SIGNATURE_VALIDATION_FAILED: "Security error: Webhook signature validation failed. Please verify your auth token configuration and ensure requests are coming from your telephony provider.",

@@ -32,6 +32,7 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.services.workflow_active_check import check_workflow_active
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"
@@ -558,6 +559,16 @@ class ARIConnection:
                 logger.warning(
                     f"[ARI org={self.organization_id}] Workflow {inbound_workflow_id} "
                     f"not found or doesn't belong to this organization — hanging up"
+                )
+                await self._delete_channel(channel_id)
+                return
+
+            # 2b. Agent activation gate — deactivated agents cannot receive calls.
+            allowed, reason = await check_workflow_active(inbound_workflow_id)
+            if not allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"workflow {inbound_workflow_id} not active ({reason}) — hanging up"
                 )
                 await self._delete_channel(channel_id)
                 return

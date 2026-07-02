@@ -92,6 +92,18 @@ class CampaignCallDispatcher:
             )
             return 0
 
+        # Agent activation gate — pause the campaign if its agent is deactivated
+        # so no further batches dispatch.
+        from api.services.workflow_active_check import check_workflow_active
+
+        allowed, reason = await check_workflow_active(campaign.workflow_id)
+        if not allowed:
+            logger.info(
+                f"Campaign {campaign_id} paused: workflow not active ({reason})"
+            )
+            await db_client.update_campaign(campaign_id=campaign_id, state="paused")
+            return 0
+
         # Atomically claim queued runs for processing (thread-safe)
         # This uses SELECT FOR UPDATE SKIP LOCKED to prevent race conditions
         queued_runs = await db_client.claim_queued_runs_for_processing(

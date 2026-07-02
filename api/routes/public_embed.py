@@ -19,6 +19,7 @@ from pydantic import BaseModel
 
 from api.db import db_client
 from api.enums import WorkflowRunMode
+from api.services.wallet_check import check_wallet_before_call
 from api.routes.turn_credentials import (
     TURN_SECRET,
     TurnCredentialsResponse,
@@ -157,6 +158,24 @@ async def initialize_embed_session(request: Request, init_request: InitEmbedRequ
             f"Domain validation failed: {origin} not in {embed_token.allowed_domains}"
         )
         raise HTTPException(status_code=403, detail=f"Domain not allowed: {origin}")
+
+    # Agent activation gate — deactivated agents cannot serve the widget.
+    from api.services.workflow_active_check import check_workflow_active
+
+    active_allowed, active_reason = await check_workflow_active(embed_token.workflow_id)
+    if not active_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent is not active ({active_reason})",
+        )
+
+    # Check Sysevo wallet balance before creating the run
+    wallet_allowed, wallet_reason = await check_wallet_before_call(embed_token.workflow_id)
+    if not wallet_allowed:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient balance: {wallet_reason}",
+        )
 
     # Create workflow run
     try:

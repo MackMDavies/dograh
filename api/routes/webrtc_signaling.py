@@ -47,6 +47,7 @@ from api.services.pipecat.ws_sender_registry import (
     unregister_ws_sender,
 )
 from api.services.quota_service import check_dograh_quota
+from api.services.wallet_check import check_wallet_before_call
 
 router = APIRouter(prefix="/ws")
 
@@ -339,6 +340,36 @@ class SignalingManager:
                     "payload": {
                         "error_type": quota_result.error_code,
                         "message": quota_result.error_message,
+                    },
+                }
+            )
+            return
+
+        # Agent activation gate — deactivated agents cannot place web test calls.
+        from api.services.workflow_active_check import check_workflow_active
+
+        active_allowed, active_reason = await check_workflow_active(workflow_id)
+        if not active_allowed:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "payload": {
+                        "error_type": "workflow_not_active",
+                        "message": "This agent has been deactivated. Reactivate it in your dashboard to resume.",
+                    },
+                }
+            )
+            return
+
+        # Check Sysevo wallet balance — blocks test calls when client has no minutes/dollars
+        wallet_allowed, wallet_reason = await check_wallet_before_call(workflow_id)
+        if not wallet_allowed:
+            await ws.send_json(
+                {
+                    "type": "error",
+                    "payload": {
+                        "error_type": "wallet_insufficient_balance",
+                        "message": "Insufficient balance. Please top up your wallet to continue.",
                     },
                 }
             )
