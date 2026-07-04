@@ -1275,7 +1275,7 @@ async def get_workflow_run(
 ) -> WorkflowRunResponseSchema:
     run = await db_client.get_workflow_run(
         run_id,
-        organization_id=None,  # platform fallback: client orgs don't own runs directly
+        organization_id=None if user.is_superuser else user.selected_organization_id,
     )
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found")
@@ -1377,7 +1377,7 @@ async def get_workflow_runs(
 
     runs, total_count = await db_client.get_workflow_runs_by_workflow_id(
         workflow_id,
-        organization_id=None,  # platform fallback: client orgs don't own runs directly
+        organization_id=None if user.is_superuser else user.selected_organization_id,
         limit=limit,
         offset=offset,
         filters=filter_criteria if filter_criteria else None,
