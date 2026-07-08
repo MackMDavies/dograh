@@ -34,6 +34,7 @@ from api.services.telephony.transfer_event_protocol import (
 )
 from api.services.workflow_active_check import check_workflow_active
 from api.services.wallet_check import check_wallet_before_call
+from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"
@@ -598,6 +599,16 @@ class ARIConnection:
                 await self._delete_channel(channel_id)
                 return
 
+            # 3b. Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+            _cc_allowed, _cc_slot = await acquire_call_slot(self.organization_id)
+            if not _cc_allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"concurrent-call limit reached — hanging up"
+                )
+                await self._delete_channel(channel_id)
+                return
+
             # 4. Create workflow run
             call_id = channel_id
             workflow_run = await db_client.create_workflow_run(
@@ -617,6 +628,8 @@ class ARIConnection:
                     "call_id": call_id,
                 },
             )
+
+            await bind_slot(workflow_run.id, self.organization_id, _cc_slot)
 
             logger.info(
                 f"[ARI org={self.organization_id}] Created inbound workflow run "
