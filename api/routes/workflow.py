@@ -31,6 +31,7 @@ from api.services.mps_service_key_client import mps_service_key_client
 from api.services.posthog_client import capture_event
 from api.services.reports import generate_workflow_report_csv
 from api.services.storage import storage_fs
+from api.services.workflow.disposition_shape import normalize_disposition_codes
 from api.services.workflow.dto import ReactFlowDTO, sanitize_workflow_definition
 from api.services.workflow.duplicate import duplicate_workflow
 from api.services.workflow.errors import ItemKind, WorkflowError
@@ -172,8 +173,14 @@ def _validation_errors_http_exception(
     )
 
 
+class DispositionItem(BaseModel):
+    code: str
+    label: str
+
+
 class CallDispositionCodes(BaseModel):
-    disposition_codes: list[str] = []
+    items: list[DispositionItem] = []
+    disposition_codes: list[str] = []  # legacy, kept for back-compat reads
 
 
 class WorkflowResponse(BaseModel):
@@ -249,6 +256,7 @@ class UpdateWorkflowRequest(BaseModel):
     workflow_definition: dict | None = None
     template_context_variables: dict | None = None
     workflow_configurations: dict | None = None
+    call_disposition_codes: dict | None = None
 
 
 class WorkflowVersionResponse(BaseModel):
@@ -1116,12 +1124,19 @@ async def update_workflow(
                         workflow_definition, e.trigger_paths
                     )
 
+        normalized_dispositions = (
+            normalize_disposition_codes(request.call_disposition_codes)
+            if request.call_disposition_codes is not None
+            else None
+        )
+
         workflow = await db_client.update_workflow(
             workflow_id=workflow_id,
             name=request.name,
             workflow_definition=workflow_definition,
             template_context_variables=request.template_context_variables,
             workflow_configurations=workflow_configurations,
+            call_disposition_codes=normalized_dispositions,
             organization_id=effective_org_id,
         )
 
@@ -1234,29 +1249,68 @@ async def create_workflow_run(
         request: The create workflow run request
         user: The user to create the workflow run for
     """
+    # API/MCP-initiated runs require a usable billing card (postpaid API billing gate).
+    # No-op unless the gate is enabled server-side; fail-open on infra errors.
+    api_key_id = getattr(user, "api_key_id", None)
+    if api_key_id:
+        from api.services.api_billing_gate import check_api_billing_gate
+
+        allowed, reason = await check_api_billing_gate(api_key_id)
+        if not allowed:
+            raise HTTPException(status_code=402, detail=reason)
+
     if user.is_superuser:
         _wf_ref = await db_client.get_workflow_by_id(workflow_id)
         if not _wf_ref:
             raise HTTPException(status_code=404, detail="Workflow not found")
         effective_org_id = _wf_ref.organization_id
-        run = await db_client.create_workflow_run(
-            request.name,
-            workflow_id,
-            request.mode,
-            user.id,
-            use_draft=True,
-            organization_id=effective_org_id,
-            bypass_user_check=True,
-        )
     else:
-        run = await db_client.create_workflow_run(
-            request.name,
-            workflow_id,
-            request.mode,
-            user.id,
-            use_draft=True,
-            organization_id=user.selected_organization_id,
-        )
+        effective_org_id = user.selected_organization_id
+
+    # Concurrency gate — for live-audio runs (browser voice), refuse if the org is at
+    # its plan's simultaneous-call limit. Text/chat runs don't occupy a call slot.
+    from api.services.telephony.call_concurrency import (
+        acquire_call_slot,
+        bind_slot,
+        is_live_call_mode,
+        release_slot_for_failed_start,
+    )
+
+    _cc_gated = is_live_call_mode(request.mode)
+    _cc_slot = None
+    if _cc_gated:
+        _cc_allowed, _cc_slot = await acquire_call_slot(effective_org_id)
+        if not _cc_allowed:
+            raise HTTPException(status_code=429, detail="Concurrent call limit reached")
+
+    try:
+        if user.is_superuser:
+            run = await db_client.create_workflow_run(
+                request.name,
+                workflow_id,
+                request.mode,
+                user.id,
+                use_draft=True,
+                organization_id=effective_org_id,
+                bypass_user_check=True,
+                api_key_id=getattr(user, "api_key_id", None),
+            )
+        else:
+            run = await db_client.create_workflow_run(
+                request.name,
+                workflow_id,
+                request.mode,
+                user.id,
+                use_draft=True,
+                organization_id=effective_org_id,
+                api_key_id=getattr(user, "api_key_id", None),
+            )
+    except Exception:
+        await release_slot_for_failed_start(effective_org_id, _cc_slot)
+        raise
+
+    if _cc_gated:
+        await bind_slot(run.id, effective_org_id, _cc_slot)
     return {
         "id": run.id,
         "workflow_id": run.workflow_id,
