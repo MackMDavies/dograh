@@ -104,6 +104,18 @@ class CampaignCallDispatcher:
             await db_client.update_campaign(campaign_id=campaign_id, state="paused")
             return 0
 
+        # Wallet gate — pause the campaign if the account is out of minutes/balance
+        # so outbound dialing can't run up a bill the account can't cover.
+        from api.services.wallet_check import check_wallet_before_call
+
+        wallet_allowed, wallet_reason = await check_wallet_before_call(campaign.workflow_id)
+        if not wallet_allowed:
+            logger.info(
+                f"Campaign {campaign_id} paused: wallet blocked ({wallet_reason})"
+            )
+            await db_client.update_campaign(campaign_id=campaign_id, state="paused")
+            return 0
+
         # Atomically claim queued runs for processing (thread-safe)
         # This uses SELECT FOR UPDATE SKIP LOCKED to prevent race conditions
         queued_runs = await db_client.claim_queued_runs_for_processing(

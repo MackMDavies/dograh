@@ -16,6 +16,7 @@ from twilio.base.exceptions import TwilioRestException
 
 from api.db import db_client
 from api.db.models import UserModel
+from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
 from api.services.telephony.managed_provisioner import get_managed_provisioner
 from api.utils.common import get_backend_endpoints
@@ -351,3 +352,41 @@ async def managed_number_billing(
         if provisioner:
             await asyncio.to_thread(provisioner.release_number, twilio_sid)
     return {"ok": True, "action": "release"}
+
+
+class OrgConcurrencyRequest(BaseModel):
+    workflow_id: int
+    max_concurrent: int
+
+
+@router.post("/internal/org-concurrency")
+async def set_org_concurrency(
+    body: OrgConcurrencyRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """
+    Internal endpoint for the Sysevo billing webhook. Secret-authenticated.
+
+    Sets the organization's CONCURRENT_CALL_LIMIT from the Sysevo plan tier
+    (Free 2 / Starter 5 / Growth 10 / Business 20). The org is derived from the
+    supplied workflow (a Sysevo agent) and validated by lookup — a webhook
+    callback with no user scope, so the org is derived from the payload.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or x_sysevo_secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    workflow = await db_client.get_workflow_by_id(body.workflow_id)
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    await db_client.upsert_configuration(
+        workflow.organization_id,
+        OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
+        {"value": int(body.max_concurrent)},
+    )
+    return {
+        "ok": True,
+        "organization_id": workflow.organization_id,
+        "max_concurrent": int(body.max_concurrent),
+    }

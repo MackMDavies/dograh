@@ -33,6 +33,7 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEventType,
 )
 from api.services.workflow_active_check import check_workflow_active
+from api.services.wallet_check import check_wallet_before_call
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"
@@ -569,6 +570,16 @@ class ARIConnection:
                 logger.warning(
                     f"[ARI org={self.organization_id}] ARI inbound rejected: "
                     f"workflow {inbound_workflow_id} not active ({reason}) — hanging up"
+                )
+                await self._delete_channel(channel_id)
+                return
+
+            # 2c. Wallet gate — no plan/pack minutes and no PAYG balance = no call.
+            wallet_allowed, wallet_reason = await check_wallet_before_call(inbound_workflow_id)
+            if not wallet_allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"wallet blocked ({wallet_reason}) — hanging up"
                 )
                 await self._delete_channel(channel_id)
                 return
