@@ -6,15 +6,17 @@ platform-level Twilio account (SYSEVO_TWILIO_ACCOUNT_SID / AUTH_TOKEN).
 Users never supply credentials — Sysevo handles Twilio internally.
 """
 import asyncio
+import os
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel
 from twilio.base.exceptions import TwilioRestException
 
 from api.db import db_client
 from api.db.models import UserModel
+from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
 from api.services.telephony.managed_provisioner import get_managed_provisioner
 from api.utils.common import get_backend_endpoints
@@ -130,14 +132,17 @@ async def quick_connect(
             )
         target_e164 = numbers[0]
 
-    # Some countries (e.g. GB) require a registered Twilio Address to buy local
-    # numbers. Attach one automatically if the platform account has it.
+    # Regulated countries (e.g. GB and most of the EU) require a registered Twilio
+    # Address and an approved Regulatory Bundle to buy local numbers. Attach both
+    # automatically when the platform account has them — that lets the number
+    # provision IN-COUNTRY (UK -> UK) instead of falling back to a US line.
     address_sid = await asyncio.to_thread(provisioner.get_address_sid, target_country)
+    bundle_sid = await asyncio.to_thread(provisioner.get_bundle_sid, target_country)
 
     # Provision on Twilio
     try:
         provisioned = await asyncio.to_thread(
-            provisioner.provision_number, target_e164, voice_url, address_sid
+            provisioner.provision_number, target_e164, voice_url, address_sid, bundle_sid
         )
     except TwilioRestException as exc:
         err_lower = (exc.msg or "").lower()
@@ -246,7 +251,10 @@ async def delete_managed_number(
     user: UserModel = Depends(get_user),
 ):
     """Release a Sysevo-managed number back to Twilio and remove DB records."""
-    org_id = user.selected_organization_id
+    # Superusers manage numbers across all orgs (matching the configs list view,
+    # which also shows all orgs to superusers). Everyone else stays strictly
+    # scoped to their own org for tenant isolation.
+    org_id = None if user.is_superuser else user.selected_organization_id
     row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
     if row is None:
         raise HTTPException(status_code=404, detail="Phone number not found.")
@@ -266,3 +274,119 @@ async def delete_managed_number(
             released = await asyncio.to_thread(provisioner.release_number, twilio_sid)
             if not released:
                 logger.warning(f"[quick_connect] Failed to release Twilio SID {twilio_sid} for phone_number_id={phone_number_id}")
+
+
+class ToggleActiveRequest(BaseModel):
+    is_active: bool
+
+
+@router.patch("/managed-numbers/{phone_number_id}")
+async def toggle_managed_number(
+    phone_number_id: int,
+    body: ToggleActiveRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Enable/disable routing for a Sysevo-managed number. The inbound dispatcher
+    only routes calls for ``is_active`` numbers, so disabling effectively pauses
+    forwarding (calls stop reaching the agent) and re-enabling reconnects it —
+    without releasing the number.
+    """
+    # Superusers manage across all orgs; other users stay org-scoped (isolation).
+    org_id = None if user.is_superuser else user.selected_organization_id
+    row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Phone number not found.")
+
+    meta = row.extra_metadata or {}
+    if not meta.get("is_managed"):
+        raise HTTPException(status_code=400, detail="This number is not a Sysevo-managed number.")
+
+    updated = await db_client.update_phone_number(
+        phone_number_id,
+        telephony_configuration_id=row.telephony_configuration_id,
+        is_active=body.is_active,
+    )
+    if updated is None:
+        raise HTTPException(status_code=500, detail="Failed to update the number.")
+    return {"id": updated.id, "is_active": updated.is_active}
+
+
+class ManagedNumberBillingRequest(BaseModel):
+    phone_number_id: int
+    action: Literal["pause", "resume", "release"]
+
+
+@router.post("/internal/managed-number-billing")
+async def managed_number_billing(
+    body: ManagedNumberBillingRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """
+    Internal endpoint for the Supabase rental-billing cron. Secret-authenticated
+    (no user scope) so it can pause/resume routing or release a managed number
+    on (non-)payment of the monthly fee, regardless of which org it belongs to.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or x_sysevo_secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    row = await db_client.get_phone_number(body.phone_number_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Phone number not found.")
+
+    if body.action in ("pause", "resume"):
+        await db_client.update_phone_number(
+            body.phone_number_id,
+            telephony_configuration_id=row.telephony_configuration_id,
+            is_active=(body.action == "resume"),
+        )
+        return {"ok": True, "action": body.action}
+
+    # release: hand the Twilio number back, then remove the DB row.
+    meta = row.extra_metadata or {}
+    twilio_sid = meta.get("managed_twilio_sid")
+    await db_client.delete_phone_number(body.phone_number_id)
+    if twilio_sid:
+        provisioner = await get_managed_provisioner()
+        if provisioner:
+            await asyncio.to_thread(provisioner.release_number, twilio_sid)
+    return {"ok": True, "action": "release"}
+
+
+class OrgConcurrencyRequest(BaseModel):
+    workflow_id: int
+    max_concurrent: int
+
+
+@router.post("/internal/org-concurrency")
+async def set_org_concurrency(
+    body: OrgConcurrencyRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """
+    Internal endpoint for the Sysevo billing webhook. Secret-authenticated.
+
+    Sets the organization's CONCURRENT_CALL_LIMIT from the Sysevo plan tier
+    (Free 2 / Starter 5 / Growth 10 / Business 20). The org is derived from the
+    supplied workflow (a Sysevo agent) and validated by lookup — a webhook
+    callback with no user scope, so the org is derived from the payload.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or x_sysevo_secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    workflow = await db_client.get_workflow_by_id(body.workflow_id)
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+
+    await db_client.upsert_configuration(
+        workflow.organization_id,
+        OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
+        {"value": int(body.max_concurrent)},
+    )
+    return {
+        "ok": True,
+        "organization_id": workflow.organization_id,
+        "max_concurrent": int(body.max_concurrent),
+    }

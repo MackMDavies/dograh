@@ -117,12 +117,19 @@ class VoiceLibraryClient(BaseDBClient):
                     VoiceLibraryModel.user_id == user_id,
                 )
             else:
-                base_filter = and_(
-                    VoiceLibraryModel.organization_id == organization_id,
-                    or_(
-                        and_(VoiceLibraryModel.is_public == True, VoiceLibraryModel.status == "ready"),
-                        VoiceLibraryModel.user_id == user_id,
+                # The shared platform library (public + ready in the platform org)
+                # OR the caller's OWN voices — including pending/processing/failed
+                # clones, which are created in the caller's own org, not the platform
+                # org. The previous `organization_id == platform_org AND (...)` form
+                # hid a client's own failed/pending clone entirely. user_id == self
+                # is owner-scoped, so this stays tenant-safe.
+                base_filter = or_(
+                    and_(
+                        VoiceLibraryModel.organization_id == organization_id,
+                        VoiceLibraryModel.is_public == True,
+                        VoiceLibraryModel.status == "ready",
                     ),
+                    VoiceLibraryModel.user_id == user_id,
                 )
 
             filters = [base_filter]

@@ -251,6 +251,15 @@ async def _execute_resolved_target(
         initial_context["api_key_created_by"] = api_key_created_by
     initial_context.update(request.initial_context or {})
 
+    # Postpaid API-billing gate: block if the payer has no usable card (no-op unless the
+    # gate is enabled server-side; fail-open on infra errors).
+    if api_key_id is not None:
+        from api.services.api_billing_gate import check_api_billing_gate
+
+        allowed, reason = await check_api_billing_gate(api_key_id)
+        if not allowed:
+            raise HTTPException(status_code=402, detail=reason)
+
     workflow_run = await db_client.create_workflow_run(
         name=workflow_run_name,
         workflow_id=target.workflow.id,
@@ -259,6 +268,9 @@ async def _execute_resolved_target(
         user_id=execution_user_id,
         use_draft=use_draft,
         organization_id=target.organization_id,
+        # Set the api_key_id COLUMN (not just initial_context) so the post-call hook
+        # routes these calls to postpaid API accrual.
+        api_key_id=api_key_id,
     )
 
     logger.info(

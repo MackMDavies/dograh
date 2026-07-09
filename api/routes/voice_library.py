@@ -713,16 +713,17 @@ async def clone_voice(
 
     org_id = user.selected_organization_id
 
-    # Auto-detect best available cloning provider from org's TTS connections.
+    # Auto-detect cloning provider. Prefer ElevenLabs — it's the reliable instant
+    # voice-cloning path and is resolvable across the caller's config / org / (for
+    # superusers) any org. xAI custom-voice cloning needs a special team
+    # entitlement ("Custom voices are not enabled for this team"), so only fall to
+    # it when there's an xAI key and no ElevenLabs key is reachable anywhere.
     if tts_provider == "auto":
-        xai_conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
-        el_conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
-        if xai_conn and xai_conn.api_key:
-            tts_provider = "xai"
-        elif el_conn and el_conn.api_key:
+        if await _resolve_elevenlabs_api_key(user):
             tts_provider = "elevenlabs"
         else:
-            tts_provider = "elevenlabs"  # will attempt system fallback in background
+            xai_conn = await db_client.get_connection_by_provider(org_id, "tts", "xai")
+            tts_provider = "xai" if (xai_conn and xai_conn.api_key) else "elevenlabs"
 
     provider = "xai" if tts_provider == "xai" else "dograh_clone"
     content_type = file.content_type or "audio/webm"
@@ -754,6 +755,7 @@ async def clone_voice(
             org_id,
         )
     else:
+        el_api_key = await _resolve_elevenlabs_api_key(user)
         background_tasks.add_task(
             _process_clone_background,
             voice.uuid,
@@ -762,7 +764,7 @@ async def clone_voice(
             audio_data,
             filename,
             content_type,
-            org_id,
+            el_api_key,
         )
     return _serialize(voice)
 
@@ -809,6 +811,32 @@ async def _load_clone_audio(voice_uuid: str) -> bytes | None:
             pass
 
 
+async def _resolve_elevenlabs_api_key(user: UserModel) -> Optional[str]:
+    """Resolve an ElevenLabs key using the SAME cascade as the catalog/browse
+    endpoints, so cloning works wherever browsing voices does:
+      1) the caller's own TTS configuration (config.tts)
+      2) the org's connected ElevenLabs key (org provider connection)
+      3) any org's connected key (superuser only)
+      4) the system superuser key
+    Previously clone only checked (2)+(4), so a key added under (1) — where the
+    browse endpoints find it — was invisible to cloning.
+    """
+    key = await get_caller_elevenlabs_api_key(user.id)
+    if key:
+        return key
+    conn = await db_client.get_connection_by_provider(
+        user.selected_organization_id, "tts", "elevenlabs"
+    )
+    if conn and conn.api_key:
+        return conn.api_key
+    if user.is_superuser:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
+        if conn and conn.api_key:
+            return conn.api_key
+    return await get_system_elevenlabs_api_key()
+
+
 async def _process_clone_background(
     voice_uuid: str,
     name: str,
@@ -816,16 +844,12 @@ async def _process_clone_background(
     audio_data: bytes,
     filename: str,
     content_type: str,
-    org_id: int,
+    api_key: Optional[str],
 ) -> None:
     await _store_clone_audio(voice_uuid, audio_data)
-    # Prefer the org's own connected ElevenLabs key; fall back to system superuser key.
-    conn = await db_client.get_connection_by_provider(org_id, "tts", "elevenlabs")
-    api_key = conn.api_key if (conn and conn.api_key) else None
+    # api_key is resolved at request time via _resolve_elevenlabs_api_key.
     if not api_key:
-        api_key = await get_system_elevenlabs_api_key()
-    if not api_key:
-        error_msg = f"No ElevenLabs API key found for this organisation — add one in AI Models → ElevenLabs"
+        error_msg = "No ElevenLabs API key found — add one in AI Models → ElevenLabs (under TTS)"
         logger.error(f"Voice clone {voice_uuid}: {error_msg}")
         await db_client.update_voice_status(voice_uuid, "failed", labels_patch={"clone_error": error_msg})
         return
@@ -918,9 +942,17 @@ async def retry_voice_clone(
     labels = voice.labels or {}
     orig_filename = labels.get("clone_audio_filename") or "recording.webm"
     orig_content_type = labels.get("clone_audio_content_type") or "audio/webm"
-    provider = voice.provider
     org_id = voice.organization_id
-    if provider == "xai":
+    el_api_key = await _resolve_elevenlabs_api_key(user)
+    if el_api_key:
+        # Prefer ElevenLabs on retry — this also recovers voices that originally
+        # auto-selected xAI (whose custom-voice cloning isn't enabled for the team).
+        background_tasks.add_task(
+            _process_clone_background,
+            voice_uuid, voice.name, voice.description or "",
+            audio_data, orig_filename, orig_content_type, el_api_key,
+        )
+    elif voice.provider == "xai":
         background_tasks.add_task(
             _process_xai_clone_background,
             voice_uuid, voice.name, voice.description or "",
@@ -930,7 +962,7 @@ async def retry_voice_clone(
         background_tasks.add_task(
             _process_clone_background,
             voice_uuid, voice.name, voice.description or "",
-            audio_data, orig_filename, orig_content_type, org_id,
+            audio_data, orig_filename, orig_content_type, None,
         )
 
     updated = await db_client.get_voice_by_uuid(voice_uuid, user.selected_organization_id)
@@ -956,27 +988,42 @@ async def generate_voice_preview(
     # Use the voice's own org to resolve the TTS connection.
     voice_org_id = voice.organization_id or org_id
 
-    # 2. Validate provider supports preview generation
+    # 2. Validate provider supports preview generation. Cloned voices store
+    # provider="dograh_clone" but are ElevenLabs-backed, so preview them via EL.
+    preview_provider = "elevenlabs" if voice.provider == "dograh_clone" else voice.provider
     _PREVIEW_SUPPORTED = {"xai", "openai", "elevenlabs", "google", "deepgram"}
-    if voice.provider not in _PREVIEW_SUPPORTED:
+    if preview_provider not in _PREVIEW_SUPPORTED:
         raise HTTPException(
             status_code=422,
             detail=f"Preview generation is not supported for provider '{voice.provider}'",
         )
 
-    # 3. Get the org's TTS connection for this provider
-    conn = await db_client.get_connection_by_provider(voice_org_id, "tts", voice.provider)
-    if not conn:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No active {voice.provider} TTS connection found for this organisation",
-        )
-    # Google TTS uses service-account credentials, not api_key
-    if voice.provider != "google" and not conn.api_key:
-        raise HTTPException(
-            status_code=400,
-            detail=f"No active {voice.provider} TTS connection found for this organisation",
-        )
+    # 3. Resolve the API key. ElevenLabs (incl. cloned voices) uses the same robust
+    # cascade as cloning/browse so client accounts can preview with the platform key;
+    # other providers use the voice's own org TTS connection.
+    conn = None
+    api_key: Optional[str] = None
+    if preview_provider == "elevenlabs":
+        api_key = await _resolve_elevenlabs_api_key(user)
+        if not api_key:
+            raise HTTPException(
+                status_code=400,
+                detail="No ElevenLabs API key available to generate a preview",
+            )
+    else:
+        conn = await db_client.get_connection_by_provider(voice_org_id, "tts", preview_provider)
+        if not conn:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No active {preview_provider} TTS connection found for this organisation",
+            )
+        # Google TTS uses service-account credentials, not api_key
+        if preview_provider != "google" and not conn.api_key:
+            raise HTTPException(
+                status_code=400,
+                detail=f"No active {preview_provider} TTS connection found for this organisation",
+            )
+        api_key = conn.api_key
 
     # 4. Call provider TTS API to generate the preview
     sample_text = f"Hello, I'm {voice.name}. How can I help you today?"
@@ -1019,12 +1066,12 @@ async def generate_voice_preview(
                         raise HTTPException(status_code=502, detail=f"OpenAI TTS API returned {resp.status}")
                     audio_bytes = await resp.read()
 
-        elif voice.provider == "elevenlabs":
+        elif preview_provider == "elevenlabs":
             async with aiohttp.ClientSession() as http:
                 async with http.post(
                     f"https://api.elevenlabs.io/v1/text-to-speech/{voice.provider_voice_id}",
                     json={"text": sample_text, "model_id": "eleven_monolingual_v1"},
-                    headers={"xi-api-key": conn.api_key, "Content-Type": "application/json"},
+                    headers={"xi-api-key": api_key, "Content-Type": "application/json"},
                 ) as resp:
                     if resp.status != 200:
                         error_text = await resp.text()

@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 
 from api.services.workflow.pipecat_engine_custom_tools import get_function_schema
 from api.services.workflow.tools.knowledge_base import get_knowledge_base_tool
+from api.services.workflow.unresolved_variables import (
+    find_unresolved_variables,
+    build_unresolved_directive,
+)
 
 # ---------------------------------------------------------------------------
 # Recording response mode markers
@@ -52,6 +56,7 @@ def compose_system_prompt_for_node(
     workflow: "WorkflowGraph",
     format_prompt: Callable[[str], str],
     has_recordings: bool,
+    call_context_vars: dict | None = None,
 ) -> str:
     """Compose the full system prompt text for a workflow node.
 
@@ -80,6 +85,30 @@ def compose_system_prompt_for_node(
     if has_recordings and "RECORDING_ID:" in formatted_node_prompt:
         parts.append(RECORDING_RESPONSE_MODE_INSTRUCTIONS)
 
+    # WS4 auto-reword: warn the model about variables this node's speech
+    # references that have no value, so it rewords / asks instead of speaking
+    # a blank. Scans the global + node prompt, greeting, and outgoing transition
+    # speech against the live call context.
+    if call_context_vars is not None:
+        raw_texts: list[str] = []
+        if workflow.global_node_id and node.add_global_prompt:
+            global_raw = workflow.nodes[workflow.global_node_id].prompt
+            if global_raw:
+                raw_texts.append(global_raw)
+        if node.prompt:
+            raw_texts.append(node.prompt)
+        if node.greeting:
+            raw_texts.append(node.greeting)
+        for edge in node.out_edges:
+            if edge.transition_speech:
+                raw_texts.append(edge.transition_speech)
+
+        directive = build_unresolved_directive(
+            find_unresolved_variables(raw_texts, call_context_vars)
+        )
+        if directive:
+            parts.append(directive)
+
     return "\n\n".join(parts)
 
 
@@ -87,6 +116,7 @@ async def compose_functions_for_node(
     *,
     node: "Node",
     custom_tool_manager: Optional["CustomToolManager"],
+    kb_document_uuids: Optional[list[str]] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -103,9 +133,14 @@ async def compose_functions_for_node(
     """
     functions: list[dict] = []
 
-    # Knowledge base retrieval tool
-    if node.document_uuids:
-        kb_tool_def = get_knowledge_base_tool(node.document_uuids)
+    # Knowledge base retrieval tool. Expose it whenever ANY documents are available
+    # to this node — per-node refs MERGED with workflow-level assignments and global
+    # docs (passed in as kb_document_uuids) — not just the per-node field. Otherwise a
+    # KB assigned at the agent/workflow level (or marked global) is registered as a
+    # handler but the LLM is never told the tool exists, so it silently has no effect.
+    kb_uuids = kb_document_uuids if kb_document_uuids is not None else (node.document_uuids or [])
+    if kb_uuids:
+        kb_tool_def = get_knowledge_base_tool(kb_uuids)
         kb_schema = get_function_schema(
             kb_tool_def["function"]["name"],
             kb_tool_def["function"]["description"],

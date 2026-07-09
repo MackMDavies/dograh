@@ -45,13 +45,17 @@ def client():
 
 
 def test_disposition_code_new_value_is_not_same_reference(client):
-    """The assigned list must NOT be the same object as the original.
+    """The assigned dict must NOT be the same object as the original.
 
     If it is, SQLAlchemy won't detect the change because old == new
     (the old was mutated in-place).
+
+    Storage shape is now canonical {"items": [{"code", "label"}, ...]} (see
+    api.services.workflow.disposition_shape), but the aliasing hazard this
+    test guards against is unchanged.
     """
-    initial_codes = {"disposition_codes": ["existing_code"]}
-    original_list = initial_codes["disposition_codes"]
+    initial_codes = {"items": [{"code": "existing_code", "label": "existing_code"}]}
+    original_items = initial_codes["items"]
 
     workflow = MagicMock()
     workflow.call_disposition_codes = initial_codes
@@ -73,13 +77,13 @@ def test_disposition_code_new_value_is_not_same_reference(client):
 
     # Verify the disposition code was added
     assigned = workflow.call_disposition_codes
-    assert "new_code" in assigned["disposition_codes"]
+    assert {"code": "new_code", "label": "new_code"} in assigned["items"]
 
     # THE CRITICAL CHECK: the list inside the assigned value must be a *different*
     # object from the original list. If it's the same object, SQLAlchemy's change
     # detection won't work because the "old" value was mutated in-place.
-    assert assigned["disposition_codes"] is not original_list, (
-        "The assigned disposition_codes list is the same object as the original. "
+    assert assigned["items"] is not original_items, (
+        "The assigned items list is the same object as the original. "
         "This means SQLAlchemy won't detect the change because the old value "
         "was mutated in-place via list.append()."
     )

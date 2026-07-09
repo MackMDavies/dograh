@@ -167,3 +167,14 @@ class S3FileSystem(BaseFileSystem):
             return True
         except ClientError:
             return False
+
+    async def aread_bytes(self, file_path: str) -> Optional[bytes]:
+        """Read file content from S3 into memory."""
+        try:
+            async with self.session.client(
+                "s3", region_name=self.region_name
+            ) as s3_client:
+                response = await s3_client.get_object(Bucket=self.bucket_name, Key=file_path)
+                return await response["Body"].read()
+        except ClientError:
+            return None

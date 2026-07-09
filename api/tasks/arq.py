@@ -12,7 +12,7 @@ from api.tasks.function_names import FunctionNames
 setup_logging()
 
 # Now import ARQ and task dependencies
-from arq import create_pool
+from arq import create_pool, cron
 from arq.connections import ArqRedis, RedisSettings
 
 parsed_url = urlparse(REDIS_URL)
@@ -49,6 +49,7 @@ from api.tasks.s3_upload import (
     process_workflow_completion,
     upload_voicemail_audio_to_s3,
 )
+from api.services.api_usage_counter import flush_api_request_usage
 
 
 class WorkerSettings:
@@ -60,7 +61,8 @@ class WorkerSettings:
         process_campaign_batch,
         process_knowledge_base_document,
     ]
-    cron_jobs = []
+    # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
+    cron_jobs = [cron(flush_api_request_usage, minute=0)]
     redis_settings = REDIS_SETTINGS
     max_jobs = 10
 

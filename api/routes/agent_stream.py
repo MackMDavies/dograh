@@ -80,6 +80,22 @@ async def agent_stream_websocket(
         )
         return
 
+    # Wallet balance check — no plan/pack minutes and no PAYG balance = no call.
+    from api.services.wallet_check import check_wallet_before_call
+    _w_allowed, _w_reason = await check_wallet_before_call(workflow.id)
+    if not _w_allowed:
+        logger.warning(f"agent-stream wallet blocked for workflow {workflow.id}: {_w_reason}")
+        await websocket.close(code=1008, reason=f"Insufficient balance ({_w_reason})")
+        return
+
+    # Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+    from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
+    _cc_allowed, _cc_slot = await acquire_call_slot(workflow.organization_id)
+    if not _cc_allowed:
+        logger.warning(f"agent-stream concurrent-call limit reached for org {workflow.organization_id}")
+        await websocket.close(code=1008, reason="Concurrent call limit reached")
+        return
+
     numeric_suffix = int(str(uuid.uuid4()).replace("-", "")[:8], 16) % 100000000
     workflow_run_name = f"WR-AGS-{numeric_suffix:08d}"
     call_id = params.get("callId") or params.get("CallSid")
@@ -104,6 +120,8 @@ async def agent_stream_websocket(
             },
         },
     )
+
+    await bind_slot(workflow_run.id, workflow.organization_id, _cc_slot)
 
     set_current_run_id(workflow_run.id)
     set_current_org_id(workflow.organization_id)

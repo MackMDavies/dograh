@@ -19,6 +19,8 @@ from pydantic import BaseModel
 
 from api.db import db_client
 from api.enums import WorkflowRunMode
+from api.services.wallet_check import check_wallet_before_call
+from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot, release_slot_for_failed_start
 from api.routes.turn_credentials import (
     TURN_SECRET,
     TurnCredentialsResponse,
@@ -158,6 +160,29 @@ async def initialize_embed_session(request: Request, init_request: InitEmbedRequ
         )
         raise HTTPException(status_code=403, detail=f"Domain not allowed: {origin}")
 
+    # Agent activation gate — deactivated agents cannot serve the widget.
+    from api.services.workflow_active_check import check_workflow_active
+
+    active_allowed, active_reason = await check_workflow_active(embed_token.workflow_id)
+    if not active_allowed:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Agent is not active ({active_reason})",
+        )
+
+    # Check Sysevo wallet balance before creating the run
+    wallet_allowed, wallet_reason = await check_wallet_before_call(embed_token.workflow_id)
+    if not wallet_allowed:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Insufficient balance: {wallet_reason}",
+        )
+
+    # Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+    _cc_allowed, _cc_slot = await acquire_call_slot(embed_token.organization_id)
+    if not _cc_allowed:
+        raise HTTPException(status_code=429, detail="Concurrent call limit reached")
+
     # Create workflow run
     try:
         workflow_run = await db_client.create_workflow_run(
@@ -168,8 +193,11 @@ async def initialize_embed_session(request: Request, init_request: InitEmbedRequ
             initial_context=init_request.context_variables,
         )
     except Exception as e:
+        await release_slot_for_failed_start(embed_token.organization_id, _cc_slot)
         logger.error(f"Failed to create workflow run: {e}")
         raise HTTPException(status_code=500, detail="Failed to create workflow run")
+
+    await bind_slot(workflow_run.id, embed_token.organization_id, _cc_slot)
 
     # Generate session token
     session_token = generate_session_token()

@@ -13,28 +13,44 @@ ELEVENLABS_BASE_URL = "https://api.elevenlabs.io"
 
 
 async def get_system_elevenlabs_api_key() -> Optional[str]:
-    """Return the ElevenLabs API key from the first superuser's TTS configuration."""
+    """Return the platform ElevenLabs key used for clients who don't bring their own.
+
+    Looks in two places, in order:
+      1) a superuser's TTS *user-configuration* (config.tts), and
+      2) any active ElevenLabs *org provider connection* — this is where the
+         admin's "AI Models -> ElevenLabs" key is actually saved.
+    Previously only (1) was checked, so a key added via AI Models (which writes
+    the connection, not the user-config) was invisible and clients got
+    'No ElevenLabs API key found'.
+    """
+    # 1) superuser user-configuration (legacy location)
     async with db_client.async_session() as session:
         result = await session.execute(
             select(UserModel).where(UserModel.is_superuser == True).limit(1)
         )
         superuser = result.scalars().first()
-    if not superuser:
-        logger.warning("No superuser found — cannot retrieve system EL API key")
-        return None
+    if superuser:
+        config = await db_client.get_user_configurations(superuser.id)
+        if config.tts:
+            tts = config.tts.model_dump()
+            if tts.get("provider") == "elevenlabs":
+                api_key = tts.get("api_key")
+                if isinstance(api_key, list):
+                    api_key = api_key[0] if api_key else None
+                if api_key:
+                    return api_key
 
-    config = await db_client.get_user_configurations(superuser.id)
-    if not config.tts:
-        return None
-    tts = config.tts.model_dump()
-    if tts.get("provider") != "elevenlabs":
-        return None
-    api_key = tts.get("api_key")
-    if not api_key:
-        return None
-    if isinstance(api_key, list):
-        return api_key[0] if api_key else None
-    return api_key
+    # 2) any active ElevenLabs org provider connection (AI Models -> ElevenLabs)
+    try:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "elevenlabs" and c.api_key), None)
+        if conn and conn.api_key:
+            return conn.api_key
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning(f"Could not read org provider connections for system EL key: {e}")
+
+    logger.warning("No system ElevenLabs API key found (user-config or org connection)")
+    return None
 
 
 async def get_caller_elevenlabs_api_key(user_id: int) -> Optional[str]:

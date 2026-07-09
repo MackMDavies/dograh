@@ -32,6 +32,9 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.services.workflow_active_check import check_workflow_active
+from api.services.wallet_check import check_wallet_before_call
+from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"
@@ -562,6 +565,26 @@ class ARIConnection:
                 await self._delete_channel(channel_id)
                 return
 
+            # 2b. Agent activation gate — deactivated agents cannot receive calls.
+            allowed, reason = await check_workflow_active(inbound_workflow_id)
+            if not allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"workflow {inbound_workflow_id} not active ({reason}) — hanging up"
+                )
+                await self._delete_channel(channel_id)
+                return
+
+            # 2c. Wallet gate — no plan/pack minutes and no PAYG balance = no call.
+            wallet_allowed, wallet_reason = await check_wallet_before_call(inbound_workflow_id)
+            if not wallet_allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"wallet blocked ({wallet_reason}) — hanging up"
+                )
+                await self._delete_channel(channel_id)
+                return
+
             user_id = workflow.user_id
 
             # 3. Check quota (apply per-workflow model_overrides).
@@ -572,6 +595,16 @@ class ARIConnection:
                 logger.warning(
                     f"[ARI org={self.organization_id}] Quota exceeded for user {user_id} "
                     f"— hanging up inbound call {channel_id}"
+                )
+                await self._delete_channel(channel_id)
+                return
+
+            # 3b. Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+            _cc_allowed, _cc_slot = await acquire_call_slot(self.organization_id)
+            if not _cc_allowed:
+                logger.warning(
+                    f"[ARI org={self.organization_id}] ARI inbound rejected: "
+                    f"concurrent-call limit reached — hanging up"
                 )
                 await self._delete_channel(channel_id)
                 return
@@ -595,6 +628,8 @@ class ARIConnection:
                     "call_id": call_id,
                 },
             )
+
+            await bind_slot(workflow_run.id, self.organization_id, _cc_slot)
 
             logger.info(
                 f"[ARI org={self.organization_id}] Created inbound workflow run "

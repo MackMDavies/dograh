@@ -146,6 +146,12 @@ async def initiate_call(
     if not quota_result.has_quota:
         raise HTTPException(status_code=402, detail=quota_result.error_message)
 
+    # Agent activation gate — deactivated agents cannot place calls.
+    from api.services.workflow_active_check import check_workflow_active
+    allowed, reason = await check_workflow_active(workflow.id)
+    if not allowed:
+        raise HTTPException(status_code=409, detail=f"Agent is not active ({reason})")
+
     # Wallet balance check — no minutes/dollars = no call.
     from api.services.wallet_check import check_wallet_before_call
     wallet_allowed, wallet_block_reason = await check_wallet_before_call(workflow.id)
@@ -158,29 +164,39 @@ async def initiate_call(
     workflow_run_id = request.workflow_run_id
 
     if not workflow_run_id:
-        # Merge template context variables (e.g. caller_number, called_number
-        # set in workflow settings for testing pre-call data fetch).
-        template_vars = workflow.template_context_variables or {}
+        # Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+        from api.services.telephony.call_concurrency import (
+            acquire_call_slot,
+            bind_slot,
+            release_slot_for_failed_start,
+        )
+        _cc_allowed, _cc_slot = await acquire_call_slot(effective_org_id)
+        if not _cc_allowed:
+            raise HTTPException(status_code=429, detail="Concurrent call limit reached")
 
         numeric_suffix = int(str(uuid.uuid4()).replace("-", "")[:8], 16) % 100000000
         workflow_run_name = f"WR-TEL-OUT-{numeric_suffix:08d}"
-        workflow_run = await db_client.create_workflow_run(
-            workflow_run_name,
-            workflow.id,
-            workflow_run_mode,
-            user_id=execution_user_id,
-            call_type=CallType.OUTBOUND,
-            initial_context={
-                **template_vars,
-                "phone_number": phone_number,
-                "called_number": phone_number,
-                "provider": provider.PROVIDER_NAME,
-                "telephony_configuration_id": telephony_configuration_id,
-            },
-            use_draft=True,
-            organization_id=effective_org_id,
-        )
+        try:
+            workflow_run = await db_client.create_workflow_run(
+                workflow_run_name,
+                workflow.id,
+                workflow_run_mode,
+                user_id=execution_user_id,
+                call_type=CallType.OUTBOUND,
+                initial_context={
+                    "phone_number": phone_number,
+                    "called_number": phone_number,
+                    "provider": provider.PROVIDER_NAME,
+                    "telephony_configuration_id": telephony_configuration_id,
+                },
+                use_draft=True,
+                organization_id=effective_org_id,
+            )
+        except Exception:
+            await release_slot_for_failed_start(effective_org_id, _cc_slot)
+            raise
         workflow_run_id = workflow_run.id
+        await bind_slot(workflow_run_id, effective_org_id, _cc_slot)
     else:
         workflow_run = await db_client.get_workflow_run(
             workflow_run_id, organization_id=effective_org_id
@@ -729,6 +745,17 @@ async def handle_inbound_run(request: Request):
             return provider_class.generate_validation_error_response(
                 TelephonyError.WORKFLOW_NOT_FOUND
             )
+
+        # Agent activation gate — deactivated agents cannot receive calls.
+        from api.services.workflow_active_check import check_workflow_active
+        allowed, reason = await check_workflow_active(workflow_id)
+        if not allowed:
+            logger.warning(
+                f"Inbound rejected: workflow {workflow_id} not active ({reason})"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.WORKFLOW_DEACTIVATED
+            )
         user_id = workflow.user_id
 
         # 3. Verify webhook signature against the matched config's credentials.
@@ -770,6 +797,17 @@ async def handle_inbound_run(request: Request):
                 TelephonyError.QUOTA_EXCEEDED
             )
 
+        # 4c. Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+        from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
+        _cc_allowed, _cc_slot = await acquire_call_slot(config.organization_id)
+        if not _cc_allowed:
+            logger.warning(
+                f"Inbound call blocked for workflow {workflow_id}: concurrent-call limit reached"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.QUOTA_EXCEEDED
+            )
+
         # 5. Create workflow run + return provider-shaped response.
         workflow_run_id = await _create_inbound_workflow_run(
             workflow_id,
@@ -779,6 +817,7 @@ async def handle_inbound_run(request: Request):
             telephony_configuration_id=telephony_configuration_id,
             from_phone_number_id=phone_row.id,
         )
+        await bind_slot(workflow_run_id, config.organization_id, _cc_slot)
 
         backend_endpoint, wss_backend_endpoint = await get_backend_endpoints()
         websocket_url = (
@@ -917,6 +956,17 @@ async def handle_inbound_telephony(
                 TelephonyError.QUOTA_EXCEEDED
             )
 
+        # Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
+        from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
+        _cc_allowed, _cc_slot = await acquire_call_slot(workflow_context["organization_id"])
+        if not _cc_allowed:
+            logger.warning(
+                f"[legacy] Inbound call blocked for workflow {workflow_id}: concurrent-call limit reached"
+            )
+            return provider_class.generate_validation_error_response(
+                TelephonyError.QUOTA_EXCEEDED
+            )
+
         # Create workflow run
         workflow_run_id = await _create_inbound_workflow_run(
             workflow_id,
@@ -926,6 +976,7 @@ async def handle_inbound_telephony(
             telephony_configuration_id=workflow_context["telephony_configuration_id"],
             from_phone_number_id=workflow_context.get("from_phone_number_id"),
         )
+        await bind_slot(workflow_run_id, workflow_context["organization_id"], _cc_slot)
 
         # Generate response URLs
         backend_endpoint, wss_backend_endpoint = await get_backend_endpoints()

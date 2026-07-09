@@ -3,7 +3,7 @@ services:
     image: pgvector/pgvector:pg17
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: postgres
     logging:
       driver: "json-file"
@@ -25,9 +25,9 @@ services:
   redis:
     image: redis:7
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: >
-      --requirepass redissecret
+      --requirepass ${REDIS_PASSWORD}
     volumes:
       - redis_data:/data
     healthcheck:
@@ -137,10 +137,10 @@ services:
       BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-http://localhost:8000}"
 
       # Database configuration (using containerized postgres)
-      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
+      DATABASE_URL: "postgresql+asyncpg://dograh_app:${DOGRAH_APP_DB_PASSWORD}@postgres:5432/postgres"
 
       # Redis configuration (using containerized redis)
-      REDIS_URL: "redis://:redissecret@redis:6379"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
 
       # Storage configuration - using local MinIO
       ENABLE_AWS_S3: "false"

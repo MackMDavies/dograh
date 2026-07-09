@@ -17,6 +17,7 @@ import httpx
 from loguru import logger
 
 from api.db import db_client
+from api.services.telephony.call_concurrency import release_call_slot
 
 _TIMEOUT = 15.0
 
@@ -27,15 +28,26 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
     Resolves duration from usage_info, model info from the run config,
     and sends to the Sysevo wallet-debit edge function.
 
-    Silently no-ops if SYSEVO_POST_CALL_MEMORY_URL is not configured.
+    Silently no-ops if no Sysevo edge-function URL is configured at all.
     """
-    memory_url = os.getenv("SYSEVO_POST_CALL_MEMORY_URL")
-    if not memory_url:
-        return
+    # Release this call's concurrency slot first — unconditionally, before any
+    # early-return below (a call with no duration still occupied a slot).
+    await release_call_slot(workflow_run_id)
 
-    # Derive wallet-debit URL from the post-call memory URL base
-    base_url = memory_url.rsplit("/", 1)[0]
-    debit_url = f"{base_url}/wallet-debit"
+    debit_url = os.getenv("SYSEVO_WALLET_DEBIT_URL")
+    if not debit_url:
+        # Derive from any configured Sysevo edge-function URL — all share the same base
+        for _env in (
+            "SYSEVO_POST_CALL_MEMORY_URL",
+            "SYSEVO_PRE_CALL_CHECK_URL",
+            "SYSEVO_MEMORY_PRE_CALL_URL",
+        ):
+            _url = os.getenv(_env)
+            if _url:
+                debit_url = f"{_url.rsplit('/', 1)[0]}/wallet-debit"
+                break
+    if not debit_url:
+        return
 
     memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
 
@@ -86,6 +98,9 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
             payload["stt_provider"] = stt_provider
         if tts_provider:
             payload["tts_provider"] = tts_provider
+        # API-initiated runs carry api_key_id — wallet-debit routes these to postpaid accrual.
+        if getattr(workflow_run, "api_key_id", None):
+            payload["api_key_id"] = workflow_run.api_key_id
 
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if memory_secret:

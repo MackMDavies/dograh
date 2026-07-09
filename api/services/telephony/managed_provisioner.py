@@ -72,12 +72,18 @@ class ManagedProvisioner:
     # ── Provisioning ──────────────────────────────────────────────────────────
 
     def provision_number(
-        self, e164: str, voice_url: str, address_sid: Optional[str] = None
+        self,
+        e164: str,
+        voice_url: str,
+        address_sid: Optional[str] = None,
+        bundle_sid: Optional[str] = None,
     ) -> ProvisionedNumber:
         """
         Purchase *e164* from the platform Twilio account and wire its inbound
-        webhook to *voice_url*. Pass *address_sid* for countries whose regulations
-        require a registered address (e.g. GB). Raises TwilioRestException on failure.
+        webhook to *voice_url*. Pass *address_sid* / *bundle_sid* for countries
+        whose regulations require a registered Address and/or an approved
+        Regulatory Bundle (e.g. GB and most of the EU). Raises TwilioRestException
+        on failure.
         """
         kwargs: Dict[str, Any] = {
             "phone_number": e164,
@@ -86,6 +92,8 @@ class ManagedProvisioner:
         }
         if address_sid:
             kwargs["address_sid"] = address_sid
+        if bundle_sid:
+            kwargs["bundle_sid"] = bundle_sid
         purchased = self._client.incoming_phone_numbers.create(**kwargs)
         logger.info(f"[managed_provisioner] Provisioned {e164} → SID {purchased.sid}")
         return ProvisionedNumber(e164=purchased.phone_number, twilio_sid=purchased.sid)
@@ -104,6 +112,25 @@ class ManagedProvisioner:
         except Exception as exc:  # noqa: BLE001
             logger.warning(
                 f"[managed_provisioner] Address lookup failed for {iso_country}: {exc}"
+            )
+            return None
+
+    def get_bundle_sid(self, iso_country: str) -> Optional[str]:
+        """
+        Return an approved Regulatory Bundle SID for *iso_country*, or None.
+        Regulated countries (GB, most of the EU) require an approved Bundle to
+        buy local numbers. When the platform account has a twilio-approved bundle
+        for the country, we attach it automatically so the number provisions
+        in-country (instead of falling back to a US line).
+        """
+        try:
+            bundles = self._client.numbers.v2.regulatory_compliance.bundles.list(
+                iso_country=iso_country, status="twilio-approved", limit=1
+            )
+            return bundles[0].sid if bundles else None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                f"[managed_provisioner] Bundle lookup failed for {iso_country}: {exc}"
             )
             return None
 

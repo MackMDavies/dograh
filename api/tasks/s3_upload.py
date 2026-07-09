@@ -185,7 +185,7 @@ async def process_workflow_completion(
             logger.error(f"Post-call memory webhook failed for run {workflow_run_id}: {e}")
 
     # Step 6: Debit Sysevo wallet for call usage (non-fatal)
-    if os.getenv("SYSEVO_POST_CALL_MEMORY_URL"):
+    if any(os.getenv(v) for v in ("SYSEVO_WALLET_DEBIT_URL", "SYSEVO_POST_CALL_MEMORY_URL", "SYSEVO_PRE_CALL_CHECK_URL", "SYSEVO_MEMORY_PRE_CALL_URL")):
         try:
             await fire_post_call_wallet_debit(workflow_run_id)
         except Exception as e:

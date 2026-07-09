@@ -111,3 +111,15 @@ class BaseFileSystem(ABC):
             bool: True if file was copied successfully, False otherwise
         """
         pass
+
+    @abstractmethod
+    async def aread_bytes(self, file_path: str) -> Optional[bytes]:
+        """Read file content from storage into memory.
+
+        Args:
+            file_path: Path to the file in storage
+
+        Returns:
+            Optional[bytes]: File content if successful, None otherwise
+        """
+        pass
