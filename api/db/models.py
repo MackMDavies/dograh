@@ -22,6 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship
 
 from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG
+from api.services.crypto import EncryptedJSON, EncryptedString
 
 from ..enums import (
     CallType,
@@ -186,7 +187,7 @@ class TelephonyConfigurationModel(Base):
     )
     name = Column(String(64), nullable=False)
     provider = Column(String(32), nullable=False)
-    credentials = Column(JSON, nullable=False, default=dict)
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)  # Fernet-encrypted at rest
     is_default_outbound = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -1421,7 +1422,7 @@ class OrgProviderConnectionModel(Base):
     service_type = Column(String(20), nullable=False)  # llm | tts | stt | embeddings | realtime
     provider = Column(String(50), nullable=False)      # openai | google | anthropic | …
     display_name = Column(String(100), nullable=True)  # optional admin label
-    api_key = Column(Text, nullable=True)              # stored as plain text (same as existing UserConfigurationModel)
+    api_key = Column(EncryptedString, nullable=True)   # Fernet-encrypted at rest (see api.services.crypto)
     extra_config = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)
