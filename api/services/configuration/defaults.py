@@ -11,10 +11,10 @@ left as ``None``.
 
 
 from api.services.configuration.registry import (
-    DeepgramSTTConfiguration,
     ElevenlabsTTSConfiguration,
     OpenAIEmbeddingsConfiguration,
     OpenAILLMService,
+    OpenAISTTConfiguration,
     ServiceProviders,
 )
 
@@ -22,7 +22,11 @@ from api.services.configuration.registry import (
 _DEFAULTS = {
     "llm": (ServiceProviders.OPENAI, OpenAILLMService),
     "tts": (ServiceProviders.ELEVENLABS, ElevenlabsTTSConfiguration),
-    "stt": (ServiceProviders.DEEPGRAM, DeepgramSTTConfiguration),
+    # Default transcriber: OpenAI gpt-4o-transcribe — markedly stronger on accents,
+    # noisy audio and multilingual/code-switching than Deepgram Nova-3, and reuses
+    # the OpenAI API key already required for the default LLM/embeddings. Clients can
+    # still switch to any other provider (Deepgram/Speechmatics/etc.) per agent.
+    "stt": (ServiceProviders.OPENAI, OpenAISTTConfiguration),
     "embeddings": (ServiceProviders.OPENAI, OpenAIEmbeddingsConfiguration),
 }
 
