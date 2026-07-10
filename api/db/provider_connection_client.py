@@ -552,17 +552,20 @@ class ProviderConnectionClient(BaseDBClient):
     async def update_connection(
         self,
         connection_id: int,
-        organization_id: int,
+        organization_id: Optional[int],
         api_key: Optional[str] = None,
         extra_config: Optional[dict] = None,
         display_name: Optional[str] = None,
     ) -> Optional[OrgProviderConnectionModel]:
+        # organization_id=None targets the connection in any org (superuser).
         async with self.async_session() as session:
-            result = await session.execute(
-                select(OrgProviderConnectionModel).where(
-                    OrgProviderConnectionModel.id == connection_id,
-                    OrgProviderConnectionModel.organization_id == organization_id,
+            conditions = [OrgProviderConnectionModel.id == connection_id]
+            if organization_id is not None:
+                conditions.append(
+                    OrgProviderConnectionModel.organization_id == organization_id
                 )
+            result = await session.execute(
+                select(OrgProviderConnectionModel).where(*conditions)
             )
             conn = result.scalar_one_or_none()
             if not conn:
@@ -577,13 +580,16 @@ class ProviderConnectionClient(BaseDBClient):
             await session.refresh(conn)
             return conn
 
-    async def delete_connection(self, connection_id: int, organization_id: int) -> bool:
+    async def delete_connection(self, connection_id: int, organization_id: Optional[int] = None) -> bool:
+        # organization_id=None targets the connection in any org (superuser).
         async with self.async_session() as session:
-            result = await session.execute(
-                select(OrgProviderConnectionModel).where(
-                    OrgProviderConnectionModel.id == connection_id,
-                    OrgProviderConnectionModel.organization_id == organization_id,
+            conditions = [OrgProviderConnectionModel.id == connection_id]
+            if organization_id is not None:
+                conditions.append(
+                    OrgProviderConnectionModel.organization_id == organization_id
                 )
+            result = await session.execute(
+                select(OrgProviderConnectionModel).where(*conditions)
             )
             conn = result.scalar_one_or_none()
             if not conn:
