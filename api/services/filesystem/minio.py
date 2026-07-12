@@ -190,6 +190,24 @@ class MinioFileSystem(BaseFileSystem):
         except S3Error:
             return False
 
+    async def aread_bytes(self, file_path: str) -> Optional[bytes]:
+        """Read file content from MinIO into memory."""
+        try:
+            def _get():
+                response = self.client.get_object(self.bucket_name, file_path)
+                try:
+                    return response.read()
+                finally:
+                    response.close()
+                    response.release_conn()
+
+            return await asyncio.to_thread(_get)
+        except S3Error:
+            return None
+        except Exception as e:
+            logger.error(f"Error reading MinIO object {file_path}: {e}")
+            return None
+
     async def acopy_file(self, source_path: str, destination_path: str) -> bool:
         """Copy a file within MinIO (server-side copy)."""
         try:

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional, TypedDict, Union
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from loguru import logger
 from pydantic import BaseModel, ValidationError
 
@@ -9,6 +9,7 @@ from api.db import db_client
 from api.db.models import (
     UserModel,
 )
+from api.services.api_key_link_webhook import fire_api_key_link
 from api.services.auth.depends import get_user
 from api.services.configuration.check_validity import (
     APIKeyStatusResponse,
@@ -240,6 +241,7 @@ async def get_api_keys(
 @router.post("/api-keys")
 async def create_api_key(
     request: CreateAPIKeyRequest,
+    background_tasks: BackgroundTasks,
     user: UserModel = Depends(get_user),
 ) -> CreateAPIKeyResponse:
     """Create a new API key for the user's selected organization."""
@@ -250,6 +252,12 @@ async def create_api_key(
         organization_id=user.selected_organization_id,
         name=request.name,
         created_by=user.id,
+    )
+
+    # Record the payer link (dograh_api_key_id -> client_account) server-side, after the
+    # response is sent. Non-fatal: link failures never affect key creation.
+    background_tasks.add_task(
+        fire_api_key_link, user.provider_id, api_key.id, api_key.key_prefix
     )
 
     return CreateAPIKeyResponse(

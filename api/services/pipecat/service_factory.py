@@ -878,9 +878,11 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.ANTHROPIC.value:
         from api.services.pipecat.anthropic_llm import DograhAnthropicLLMService
         from pipecat.services.anthropic.llm import AnthropicLLMSettings
+        _anthr_is_v4 = "-4" in model.split("/")[-1].lower()
+        _anthr_settings = AnthropicLLMSettings(model=model) if _anthr_is_v4 else AnthropicLLMSettings(model=model, temperature=0.1)
         return DograhAnthropicLLMService(
             api_key=api_key,
-            settings=AnthropicLLMSettings(model=model, temperature=0.1),
+            settings=_anthr_settings,
         )
     elif provider == ServiceProviders.GROQ.value:
         return GroqLLMService(

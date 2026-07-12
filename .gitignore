@@ -19,3 +19,8 @@ coturn/
 *.wav
 dograh_pcm_cache/
 node_modules/
+
+# Editing/deploy backups and env dumps — never commit (may contain secrets)
+*.bak
+*.bak.*
+.env.bak*

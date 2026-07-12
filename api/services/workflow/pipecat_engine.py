@@ -561,6 +561,7 @@ class PipecatEngine:
             workflow=self.workflow,
             format_prompt=self._format_prompt,
             has_recordings=self._has_recordings,
+            call_context_vars=self._call_context_vars,
         )
         functions = await compose_functions_for_node(
             node=node,

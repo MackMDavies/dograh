@@ -58,6 +58,7 @@ from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.variable_resolution import extract_variable_defaults
 from api.services.workflow.workflow_graph import WorkflowGraph
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -384,6 +385,16 @@ async def _run_pipeline(
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
+    # Seed workflow-level variable defaults as the BASE layer for every call
+    # type (campaign, telephony, inbound). initial_context + telephony extras
+    # already merged above take precedence; caller memory (fill-if-absent later)
+    # fills only what remains. Uses extract_variable_defaults so canonical
+    # object-shaped variables ({default,source,...}) contribute only their
+    # default string, never the raw object.
+    workflow_defaults = extract_variable_defaults(workflow.template_context_variables)
+    if workflow_defaults:
+        merged_call_context_vars = {**workflow_defaults, **merged_call_context_vars}
+
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
     if run_definition is None:
@@ -543,6 +554,7 @@ async def _run_pipeline(
 
     # Pre-call fetch: fire early so it runs concurrently with remaining setup
     pre_call_fetch_task = None
+    pre_call_fetch_is_memory = False
     start_node = workflow_graph.nodes.get(workflow_graph.start_node_id)
     if (
         start_node
@@ -586,6 +598,7 @@ async def _run_pipeline(
                 workflow_id=workflow_id,
             )
         )
+        pre_call_fetch_is_memory = True
 
     # Create in-memory logs buffer early so it can be used by engine callbacks
     in_memory_logs_buffer = InMemoryLogsBuffer(workflow_run_id)
@@ -935,6 +948,7 @@ async def _run_pipeline(
         pipeline_metrics_aggregator=pipeline_metrics_aggregator,
         audio_config=audio_config,
         pre_call_fetch_task=pre_call_fetch_task,
+        pre_call_fetch_is_memory=pre_call_fetch_is_memory,
         user_provider_id=user_provider_id,
         integration_runtime_sessions=integration_runtime_sessions,
     )

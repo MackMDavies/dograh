@@ -12,6 +12,10 @@ if TYPE_CHECKING:
 
 from api.services.workflow.pipecat_engine_custom_tools import get_function_schema
 from api.services.workflow.tools.knowledge_base import get_knowledge_base_tool
+from api.services.workflow.unresolved_variables import (
+    find_unresolved_variables,
+    build_unresolved_directive,
+)
 
 # ---------------------------------------------------------------------------
 # Recording response mode markers
@@ -52,6 +56,7 @@ def compose_system_prompt_for_node(
     workflow: "WorkflowGraph",
     format_prompt: Callable[[str], str],
     has_recordings: bool,
+    call_context_vars: dict | None = None,
 ) -> str:
     """Compose the full system prompt text for a workflow node.
 
@@ -79,6 +84,30 @@ def compose_system_prompt_for_node(
 
     if has_recordings and "RECORDING_ID:" in formatted_node_prompt:
         parts.append(RECORDING_RESPONSE_MODE_INSTRUCTIONS)
+
+    # WS4 auto-reword: warn the model about variables this node's speech
+    # references that have no value, so it rewords / asks instead of speaking
+    # a blank. Scans the global + node prompt, greeting, and outgoing transition
+    # speech against the live call context.
+    if call_context_vars is not None:
+        raw_texts: list[str] = []
+        if workflow.global_node_id and node.add_global_prompt:
+            global_raw = workflow.nodes[workflow.global_node_id].prompt
+            if global_raw:
+                raw_texts.append(global_raw)
+        if node.prompt:
+            raw_texts.append(node.prompt)
+        if node.greeting:
+            raw_texts.append(node.greeting)
+        for edge in node.out_edges:
+            if edge.transition_speech:
+                raw_texts.append(edge.transition_speech)
+
+        directive = build_unresolved_directive(
+            find_unresolved_variables(raw_texts, call_context_vars)
+        )
+        if directive:
+            parts.append(directive)
 
     return "\n\n".join(parts)
 

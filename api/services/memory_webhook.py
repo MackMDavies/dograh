@@ -69,12 +69,17 @@ async def fire_post_call_memory(workflow_run_id: int) -> None:
             or None
         )
 
+        # The mapped call disposition (authoritative outcome for this call);
+        # Sysevo writes it into caller_memory.last_outcome.
+        disposition: str | None = gathered.get("mapped_call_disposition") or None
+
         payload: dict[str, Any] = {
             "run_id": workflow_run_id,
             "workflow_id": workflow_run.workflow_id,
             "caller_number": caller_number,
             "transcript": transcript,
             "call_summary": call_summary,
+            "disposition": disposition,
             "duration_secs": duration_secs,
             "gathered_context": gathered,
         }

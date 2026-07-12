@@ -547,6 +547,9 @@ class WorkflowRunModel(Base):
     queued_run_id = Column(Integer, ForeignKey("queued_runs.id"), nullable=True)
     queued_run = relationship("QueuedRunModel", foreign_keys=[queued_run_id])
     public_access_token = Column(String(36), nullable=True)
+    # Set when the run was initiated via an API key (X-API-Key). Drives postpaid API
+    # billing: the post-call hook forwards this so wallet-debit accrues instead of debiting.
+    api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True)
     text_session = relationship(
         "WorkflowRunTextSessionModel",
         back_populates="workflow_run",

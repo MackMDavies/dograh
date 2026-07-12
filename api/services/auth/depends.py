@@ -264,6 +264,16 @@ async def _handle_api_key_auth(api_key: str) -> UserModel:
     # Set the organization context to the API key's organization
     user.selected_organization_id = api_key_model.organization_id
 
+    # Mark this request as API-initiated so run creation can attribute usage to the
+    # postpaid API billing account instead of the prepaid wallet. Transient attribute
+    # on the request-scoped user instance (not persisted on the users table).
+    user.api_key_id = api_key_model.id
+
+    # Meter this request for postpaid API billing (fire-and-forget, never blocks auth).
+    from api.services.api_usage_counter import record_api_request
+
+    record_api_request(api_key_model.id)
+
     logger.debug(
         f"Authenticated via API key: {api_key_model.key_prefix}... "
         f"(user_id={user.id}, org_id={api_key_model.organization_id})"

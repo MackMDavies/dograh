@@ -16,6 +16,7 @@ from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggr
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.variable_resolution import fill_if_absent
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
 from pipecat.frames.frames import (
@@ -67,6 +68,7 @@ def register_event_handlers(
     pipeline_metrics_aggregator: PipelineMetricsAggregator,
     audio_config=AudioConfig,
     pre_call_fetch_task: asyncio.Task | None = None,
+    pre_call_fetch_is_memory: bool = False,
     user_provider_id: str | None = None,
     integration_runtime_sessions: list[IntegrationRuntimeSession] | None = None,
 ):
@@ -139,7 +141,14 @@ def register_event_handlers(
                     fetch_result = pre_call_fetch_task.result()
 
                 if fetch_result:
-                    engine._call_context_vars.update(fetch_result)
+                    if pre_call_fetch_is_memory:
+                        # Caller memory fills only the gaps — campaign/explicit
+                        # values and non-empty workflow defaults win.
+                        fill_if_absent(engine._call_context_vars, fetch_result)
+                    else:
+                        # Generic pre-call HTTP fetch keeps its enrich/override
+                        # behaviour.
+                        engine._call_context_vars.update(fetch_result)
                     try:
                         await db_client.update_workflow_run(
                             workflow_run_id,
@@ -172,11 +181,13 @@ def register_event_handlers(
     async def on_client_disconnected(_transport, _participant):
         call_disposed = engine.is_call_disposed()
 
-        logger.debug(
-            f"In on_client_disconnected callback handler. Call disposed: {call_disposed}"
+        logger.info(
+            f"In on_client_disconnected callback handler for run {workflow_run_id}. "
+            f"Call disposed: {call_disposed}"
         )
 
-        # Stop recordings
+        # Stop recordings — fires on_audio_data as background task with accumulated audio
+        logger.debug(f"Calling audio_buffer.stop_recording() in on_client_disconnected for run {workflow_run_id}")
         await audio_buffer.stop_recording()
 
         await engine.end_call_with_reason(
@@ -221,11 +232,12 @@ def register_event_handlers(
         task: PipelineTask,
         _frame: Frame,
     ):
-        logger.debug(f"In on_pipeline_finished callback handler")
+        logger.info(f"In on_pipeline_finished callback handler for run {workflow_run_id}")
 
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
 
-        # Stop recordings
+        # Stop recordings (no-op if already stopped by on_client_disconnected or process_frame)
+        logger.debug(f"Calling audio_buffer.stop_recording() in on_pipeline_finished for run {workflow_run_id}")
         await audio_buffer.stop_recording()
 
         gathered_context = await engine.get_gathered_context()
@@ -365,11 +377,22 @@ def register_event_handlers(
         audio_temp_path = None
         transcript_temp_path = None
 
+        # Yield the event loop so any pending on_audio_data background tasks (fired
+        # by stop_recording() or intermediate buffer flushes) have a chance to
+        # complete and append their chunks to in_memory_audio_buffer before we check.
+        await asyncio.sleep(0)
+
         try:
+            logger.info(
+                f"Audio buffer size for run {workflow_run_id}: "
+                f"{in_memory_audio_buffer.size} bytes, empty={in_memory_audio_buffer.is_empty}"
+            )
             if not in_memory_audio_buffer.is_empty:
                 audio_temp_path = await in_memory_audio_buffer.write_to_temp_file()
             else:
-                logger.debug("Audio buffer is empty, skipping upload")
+                logger.warning(
+                    f"Audio buffer is empty for run {workflow_run_id}, skipping recording upload"
+                )
 
             transcript_temp_path = in_memory_logs_buffer.write_transcript_to_temp_file()
             if not transcript_temp_path:
@@ -402,11 +425,15 @@ def register_audio_data_handler(
     @audio_buffer.event_handler("on_audio_data")
     async def on_audio_data(buffer, audio, sample_rate, num_channels):
         if not audio:
+            logger.debug(f"on_audio_data fired with empty audio for run {workflow_run_id}, skipping")
             return
 
         # Use in-memory buffer
         try:
             await in_memory_buffer.append(audio)
+            logger.debug(
+                f"Appended {len(audio)} bytes to in-memory audio buffer for run {workflow_run_id} "
+                f"(total: {in_memory_buffer.size} bytes)"
+            )
         except MemoryError as e:
             logger.error(f"Memory buffer full: {e}")
-            # Could implement overflow to disk here if needed
