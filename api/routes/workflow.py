@@ -1,10 +1,11 @@
 import json
+import os
 import re
 import uuid
 from datetime import datetime
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from httpx import HTTPStatusError
 from loguru import logger
@@ -19,6 +20,7 @@ from api.enums import CallType, PostHogEvent, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.sdk_expose import sdk_expose
 from api.services.auth.depends import get_user
+from api.utils.transcript import generate_transcript_text
 from api.services.configuration.masking import (
     mask_workflow_configurations,
     mask_workflow_definition,
@@ -1320,6 +1322,47 @@ async def create_workflow_run(
         "definition_id": run.definition_id,
         "initial_context": run.initial_context,
         "gathered_context": run.gathered_context,
+    }
+
+
+@router.get("/internal/run-transcript/{run_id}")
+async def internal_run_transcript(
+    run_id: int,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """Internal, secret-authed transcript fetch for the Sysevo analysis backfill.
+
+    Rebuilds a run's transcript from its realtime feedback logs and returns it,
+    bypassing org scoping (trusted machine-to-machine, same as the post-call
+    memory webhook). Lets Sysevo replay AI analysis for calls whose analysis
+    failed (e.g. an LLM outage) without needing a per-org API key. Auth is the
+    shared SYSEVO_MEMORY_SECRET already used by the other internal endpoints.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or x_sysevo_secret != expected:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    run = await db_client.get_workflow_run(run_id, organization_id=None)
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    logs = run.logs or {}
+    events = (
+        logs.get("realtime_feedback_events", [])
+        if isinstance(logs, dict)
+        else (logs or [])
+    )
+    transcript = generate_transcript_text(events)
+    call_summary = (
+        (run.gathered_context or {}).get("call_summary")
+        if run.gathered_context
+        else None
+    )
+    return {
+        "run_id": run.id,
+        "workflow_id": run.workflow_id,
+        "transcript": transcript,
+        "call_summary": call_summary,
     }
 
 
