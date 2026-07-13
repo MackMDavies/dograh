@@ -34,6 +34,7 @@ class WorkflowRunClient(BaseDBClient):
         use_draft: bool = False,
         organization_id: int | None = None,
         bypass_user_check: bool = False,
+        api_key_id: int | None = None,
     ) -> WorkflowRunModel:
         async with self.async_session() as session:
             workflow_query = select(WorkflowModel).options(joinedload(WorkflowModel.user)).where(
@@ -102,6 +103,7 @@ class WorkflowRunClient(BaseDBClient):
                 queued_run_id=queued_run_id,
                 storage_backend=current_backend.value,
                 call_type=call_type.value,
+                api_key_id=api_key_id,
             )
             session.add(new_run)
             try:
@@ -350,6 +352,7 @@ class WorkflowRunClient(BaseDBClient):
                         "initial_context": run.initial_context,
                         "gathered_context": run.gathered_context,
                         "call_type": run.call_type,
+                        "public_access_token": run.public_access_token,
                     }
                 )
                 for run in result.scalars().all()

@@ -1,15 +1,14 @@
 """Public download endpoints for workflow recordings and transcripts.
 
 These endpoints provide secure, token-based public access to workflow artifacts
-without requiring authentication. Tokens are generated on-demand during
-post-call processing for runs that execute integrations, QA, or campaign
-reporting.
+without requiring authentication. Content is proxied directly through the API
+server so MinIO/S3 does not need to be publicly accessible.
 """
 
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import RedirectResponse
+from fastapi.responses import Response
 from loguru import logger
 
 from api.db import db_client
@@ -28,11 +27,8 @@ async def download_workflow_artifact(
 ):
     """Download a workflow recording or transcript via public access token.
 
-    This endpoint:
-    1. Validates the public access token
-    2. Looks up the corresponding workflow run
-    3. Generates a signed URL for the requested artifact
-    4. Redirects to the signed URL
+    Proxies content directly from storage — MinIO/S3 does not need to be
+    publicly accessible. Content is streamed through this API server.
 
     Args:
         token: The public access token (UUID format)
@@ -40,10 +36,7 @@ async def download_workflow_artifact(
         inline: If true, sets Content-Disposition to inline for browser preview
 
     Returns:
-        RedirectResponse to the signed URL (302 redirect)
-
-    Raises:
-        HTTPException 404: If token is invalid or artifact not found
+        Response with the artifact content and appropriate content-type
     """
     # 1. Lookup workflow run by token
     workflow_run = await db_client.get_workflow_run_by_public_token(token)
@@ -54,8 +47,12 @@ async def download_workflow_artifact(
     # 2. Get file path based on artifact type
     if artifact_type == "recording":
         file_path = workflow_run.recording_url
+        media_type = "audio/wav"
+        filename = f"recording-{workflow_run.id}.wav"
     else:  # transcript
         file_path = workflow_run.transcript_url
+        media_type = "text/plain; charset=utf-8"
+        filename = f"transcript-{workflow_run.id}.txt"
 
     if not file_path:
         logger.warning(
@@ -73,24 +70,30 @@ async def download_workflow_artifact(
         logger.error(f"Invalid storage backend: {workflow_run.storage_backend}")
         raise HTTPException(status_code=500, detail="Storage configuration error")
 
-    # 4. Generate signed URL (1 hour expiration)
+    # 4. Read content directly from storage (no browser redirect needed)
     try:
-        signed_url = await storage.aget_signed_url(
-            file_path=file_path,
-            expiration=3600,  # 1 hour
-            force_inline=inline,
-        )
+        content = await storage.aread_bytes(file_path)
     except Exception as e:
-        logger.error(f"Failed to generate signed URL: {e}")
-        raise HTTPException(status_code=500, detail="Failed to generate download URL")
+        logger.error(f"Failed to read artifact from storage: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read artifact")
 
-    if not signed_url:
-        logger.error(f"Storage returned None for signed URL: {file_path}")
-        raise HTTPException(status_code=500, detail="Failed to generate download URL")
+    if content is None:
+        logger.warning(f"Storage returned no content for {artifact_type}: {file_path}")
+        raise HTTPException(
+            status_code=404,
+            detail=f"Artifact not found in storage: {file_path}",
+        )
+
+    disposition = "inline" if inline else "attachment"
+    headers = {
+        "Content-Disposition": f'{disposition}; filename="{filename}"',
+        "Cache-Control": "private, max-age=3600",
+        "Access-Control-Allow-Origin": "*",
+    }
 
     logger.info(
-        f"Generated signed URL for {artifact_type}: workflow_run_id={workflow_run.id}, token={token[:8]}..."
+        f"Serving {artifact_type} for workflow_run_id={workflow_run.id}, "
+        f"size={len(content)} bytes, token={token[:8]}..."
     )
 
-    # 5. Redirect to signed URL
-    return RedirectResponse(url=signed_url, status_code=302)
+    return Response(content=content, media_type=media_type, headers=headers)

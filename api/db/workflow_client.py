@@ -8,6 +8,10 @@ from sqlalchemy.orm import load_only, selectinload
 
 from api.db.base_client import BaseDBClient
 from api.db.models import CampaignModel, OrganizationModel, UserModel, WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
+from api.services.workflow.disposition_shape import (
+    append_disposition_code,
+    normalize_disposition_codes,
+)
 
 
 class WorkflowClient(BaseDBClient):
@@ -588,6 +592,7 @@ class WorkflowClient(BaseDBClient):
         workflow_definition: dict | None,
         template_context_variables: dict | None,
         workflow_configurations: dict | None,
+        call_disposition_codes: dict | None = None,
         user_id: int = None,
         organization_id: int = None,
     ) -> WorkflowModel:
@@ -604,6 +609,7 @@ class WorkflowClient(BaseDBClient):
             workflow_definition: The new workflow definition
             template_context_variables: The template context variables
             workflow_configurations: The workflow configurations
+            call_disposition_codes: The call disposition codes (workflow-level)
             user_id: The user ID (for backwards compatibility)
             organization_id: The organization ID
 
@@ -633,6 +639,11 @@ class WorkflowClient(BaseDBClient):
             # Name is a workflow-level field, not versioned
             if name is not None:
                 workflow.name = name
+
+            # call_disposition_codes is a workflow-level field, not versioned
+            # (same as name) — persisted here, in the same commit as name.
+            if call_disposition_codes is not None:
+                workflow.call_disposition_codes = call_disposition_codes
 
             try:
                 await session.commit()
@@ -934,7 +945,7 @@ class WorkflowClient(BaseDBClient):
     ) -> None:
         """Add a disposition code to the workflow's call_disposition_codes if not already present.
 
-        The codes are stored as {"disposition_codes": ["code1", "code2", ...]}.
+        The codes are stored as {"items": [{"code": "...", "label": "..."}, ...]}.
         """
         if not disposition_code:
             return
@@ -948,12 +959,11 @@ class WorkflowClient(BaseDBClient):
                 return
 
             existing = workflow.call_disposition_codes or {}
-            codes = list(existing.get("disposition_codes", []))
-            if disposition_code in codes:
+            updated = append_disposition_code(existing, disposition_code)
+            # append_disposition_code is idempotent; skip the write if nothing changed
+            if updated == normalize_disposition_codes(existing):
                 return
-
-            codes.append(disposition_code)
-            workflow.call_disposition_codes = {"disposition_codes": codes}
+            workflow.call_disposition_codes = updated
 
             try:
                 await session.commit()

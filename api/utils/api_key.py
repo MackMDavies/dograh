@@ -12,7 +12,7 @@ def generate_api_key() -> Tuple[str, str, str]:
         - key_hash: SHA256 hash of the key for storage
         - key_prefix: First 8 characters for display purposes
     """
-    raw_api_key = f"dgr_{secrets.token_urlsafe(32)}"
+    raw_api_key = f"sys_{secrets.token_urlsafe(32)}"
     key_hash = hashlib.sha256(raw_api_key.encode()).hexdigest()
     key_prefix = raw_api_key[:8]
 

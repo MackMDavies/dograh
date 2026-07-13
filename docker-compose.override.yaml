@@ -16,8 +16,8 @@ services:
     volumes:
       - ./api:/app/api:ro
     environment:
-      DATABASE_URL: "postgresql+asyncpg://postgres:postgres@postgres:5432/postgres"
-      REDIS_URL: "redis://:redissecret@redis:6379"
+      DATABASE_URL: "postgresql+asyncpg://dograh_app:${DOGRAH_APP_DB_PASSWORD}@postgres:5432/postgres"
+      REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
       ENABLE_AWS_S3: "false"
       MINIO_ENDPOINT: "minio:9000"
       MINIO_PUBLIC_ENDPOINT: "${MINIO_PUBLIC_ENDPOINT:-http://localhost:9000}"
@@ -31,6 +31,11 @@ services:
       SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:-}"
       DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
       BACKEND_API_ENDPOINT: "${BACKEND_API_ENDPOINT:-http://localhost:8000}"
+      SYSEVO_MEMORY_PRE_CALL_URL: "${SYSEVO_MEMORY_PRE_CALL_URL:-}"
+      SYSEVO_PRE_CALL_CHECK_URL: "${SYSEVO_PRE_CALL_CHECK_URL:-}"
+      SYSEVO_POST_CALL_MEMORY_URL: "${SYSEVO_POST_CALL_MEMORY_URL:-}"
+      SYSEVO_MEMORY_SECRET: "${SYSEVO_MEMORY_SECRET:-}"
+      SYSEVO_WALLET_DEBIT_URL: "${SYSEVO_WALLET_DEBIT_URL:-}"
       PYTHONUNBUFFERED: "1"
       PYTHONPATH: "/app"
     depends_on:
@@ -51,6 +56,8 @@ services:
     pull_policy: never
     restart: unless-stopped
     mem_limit: 1500m
+    volumes:
+      - ./api/.env:/app/api/.env:ro
   ui:
     image: busybox:latest
     command: ["sh", "-c", "httpd -f -p 3010 -h /tmp"]
