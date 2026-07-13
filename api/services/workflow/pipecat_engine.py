@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     LLMService = Union[OpenAILLMService, AnthropicLLMService, GoogleLLMService]
 
 import asyncio
+import time
 
 from loguru import logger
 
@@ -112,6 +113,14 @@ class PipecatEngine:
 
         # Tracks whether the bot is currently speaking (for allow_interrupt logic)
         self._bot_is_speaking: bool = False
+
+        # Safety net for should_mute_user: if a BotStoppedSpeakingFrame is never
+        # delivered (e.g. the greeting audio never plays out on a flaky WebRTC
+        # transport), the bot-speech mute must not persist forever and lock the
+        # caller out. Track when the mute became active and force-release after a
+        # ceiling longer than any single utterance.
+        self._mute_active_since: Optional[float] = None
+        self._max_bot_mute_seconds: float = 15.0
 
         # Custom tool manager (initialized in initialize())
         self._custom_tool_manager: Optional[CustomToolManager] = None
@@ -829,20 +838,40 @@ class PipecatEngine:
             self._bot_is_speaking = False
             self._queued_speech_mute_state = "idle"
 
-        # Always mute if pipeline is shutting down
+        # Always mute if pipeline is shutting down (real shutdown — never auto-released)
         if self._mute_pipeline:
             return True
 
-        # Mute while queued speech (transition/tool message) is pending or playing
-        if self._queued_speech_mute_state != "idle":
+        # Determine whether a bot-speech mute condition is currently active:
+        #  - queued speech (transition/tool message) pending or playing, OR
+        #  - the bot is speaking and the current node forbids interruption.
+        muted = self._queued_speech_mute_state != "idle" or (
+            self._bot_is_speaking
+            and self._current_node is not None
+            and not self._current_node.allow_interrupt
+        )
+
+        if muted:
+            now = time.monotonic()
+            if self._mute_active_since is None:
+                self._mute_active_since = now
+            elif now - self._mute_active_since > self._max_bot_mute_seconds:
+                # A BotStoppedSpeakingFrame was never delivered for this turn
+                # (stuck bot turn — e.g. greeting audio dropped on connect).
+                # Self-heal so the caller is never permanently muted.
+                logger.warning(
+                    "should_mute_user: bot-speech mute held for >"
+                    f"{self._max_bot_mute_seconds}s without a BotStoppedSpeakingFrame "
+                    "— force-releasing user mute (stuck bot turn)."
+                )
+                self._bot_is_speaking = False
+                self._queued_speech_mute_state = "idle"
+                self._mute_active_since = None
+                return False
             return True
 
-        # Mute if bot is speaking and current node doesn't allow interruption
-        if self._bot_is_speaking and self._current_node:
-            # If we should not allow interruption, mute the pipeline
-            if not self._current_node.allow_interrupt:
-                return True
-
+        # Not muted — clear the timer.
+        self._mute_active_since = None
         return False
 
     def create_user_idle_handler(self):
