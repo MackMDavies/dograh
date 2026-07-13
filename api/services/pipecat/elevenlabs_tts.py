@@ -21,6 +21,27 @@ class DograhElevenLabsTTSService(ElevenLabsTTSService):
         try:
             await asyncio.wait_for(super().start(frame), timeout=_START_TIMEOUT_S)
             logger.info(f"DograhElevenLabs: start() completed in {time.monotonic()-t0:.2f}s")
+            # DIAG: one-shot direct HTTP TTS test of the resolved key + voice.
+            # Distinguishes an account/key/quota problem (HTTP fails) from a
+            # multi-stream websocket integration problem (HTTP works, WS silent).
+            try:
+                import httpx as _httpx
+                async with _httpx.AsyncClient(timeout=12) as _c:
+                    _r = await _c.post(
+                        f"https://api.elevenlabs.io/v1/text-to-speech/{self._settings.voice}",
+                        headers={"xi-api-key": self._api_key or ""},
+                        json={"text": "test", "model_id": self._settings.model},
+                    )
+                _info = (
+                    f"OK {len(_r.content)} audio bytes"
+                    if _r.status_code == 200
+                    else _r.text[:300]
+                )
+                logger.warning(
+                    f"[DIAG-EL-HTTP] direct TTS status={_r.status_code} voice={self._settings.voice} {_info}"
+                )
+            except Exception as _e:
+                logger.warning(f"[DIAG-EL-HTTP] direct TTS error: {_e!r}")
         except asyncio.TimeoutError:
             elapsed = time.monotonic() - t0
             logger.error(f"DograhElevenLabs: start() TIMED OUT after {elapsed:.1f}s!")
