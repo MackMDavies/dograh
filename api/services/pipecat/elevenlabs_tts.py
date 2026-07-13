@@ -63,7 +63,16 @@ class DograhElevenLabsTTSService(ElevenLabsTTSService):
                 )
 
     async def _connect_websocket(self):
-        logger.info("DograhElevenLabs: _connect_websocket() entry")
+        logger.info(
+            f"DograhElevenLabs: _connect_websocket() entry (auto_mode={getattr(self, '_auto_mode', None)})"
+        )
+        # On the ElevenLabs multi-stream-input endpoint, audio is only generated
+        # when a context is CLOSED (on_turn_context_completed -> _close_context)
+        # OR when auto_mode is enabled. We were seeing text sent but ZERO audio
+        # returned on every turn — the close trigger wasn't firing. Force
+        # auto_mode so ElevenLabs generates audio on each text send. This is set
+        # before the URL is built in super()._connect_websocket().
+        self._auto_mode = True
         try:
             await asyncio.wait_for(super()._connect_websocket(), timeout=_CONNECT_TIMEOUT_S)
             logger.info("DograhElevenLabs: _connect_websocket() succeeded")
