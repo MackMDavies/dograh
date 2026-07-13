@@ -43,9 +43,24 @@ class DograhElevenLabsTTSService(ElevenLabsTTSService):
 
     async def process_frame(self, frame, direction):
         from pipecat.frames.frames import TTSSpeakFrame
-        if isinstance(frame, TTSSpeakFrame):
+        is_static_speak = isinstance(frame, TTSSpeakFrame)
+        if is_static_speak:
             logger.info(f"[DIAG] DograhElevenLabs: process_frame received TTSSpeakFrame len={len(frame.text)}")
         await super().process_frame(frame, direction)
+        if is_static_speak:
+            # A static TTSSpeakFrame (e.g. the agent's First Message greeting) has
+            # no LLMFullResponseEndFrame to trigger generation on the ElevenLabs
+            # multi-stream endpoint, so ElevenLabs buffers the text and never
+            # renders audio — the greeting comes out silent and the pipeline
+            # stalls waiting for it. Force a flush so the static utterance is
+            # actually synthesized.
+            try:
+                await self.flush_audio()
+                logger.info("[DIAG] DograhElevenLabs: flushed context after TTSSpeakFrame")
+            except Exception as e:
+                logger.warning(
+                    f"DograhElevenLabs: flush_audio after TTSSpeakFrame failed: {e}"
+                )
 
     async def _connect_websocket(self):
         logger.info("DograhElevenLabs: _connect_websocket() entry")
