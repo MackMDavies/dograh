@@ -403,7 +403,7 @@ async def _run_pipeline(
     run_configs = run_definition.workflow_configurations or {}
 
     # Extract configurations from the version's workflow_configurations
-    max_call_duration_seconds = 300  # Default 5 minutes
+    max_call_duration_seconds = 600  # Default 10 minutes (aligned with agent UI default)
     max_user_idle_timeout = 10.0  # Default 10 seconds
     smart_turn_stop_secs = 2.0  # Default 2 seconds for incomplete turn timeout
     turn_stop_strategy = "transcription"  # Default to transcription-based detection
