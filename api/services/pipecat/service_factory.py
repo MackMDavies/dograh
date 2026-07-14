@@ -514,10 +514,21 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             .replace("https://", "wss://")
             .replace("http://", "ws://")
         )
+        # ElevenLabs' multi-stream-input endpoint does not reliably honour a
+        # pcm_8000 request (it returns ~16kHz audio) while pipecat still tags
+        # the frames with the requested rate. On telephony (8kHz pipeline) that
+        # mislabels 16kHz audio as 8kHz, so the μ-law serializer plays it ~2x
+        # slow — the "deformed / slowed-down" agent voice on outbound calls.
+        # Pin the output to a rate ElevenLabs reliably honours (pcm_16000) so
+        # frames are truthfully tagged and the telephony serializer resamples
+        # 16k→8k correctly. WebRTC already runs at 16kHz, so this is a no-op
+        # there (no regression); only telephony changes (8000 → 16000).
+        el_sample_rate = max(audio_config.pipeline_sample_rate, 16000)
         return DograhElevenLabsTTSService(
             reconnect_on_error=True,
             api_key=api_key,
             url=elevenlabs_url,
+            sample_rate=el_sample_rate,
             settings=ElevenLabsTTSSettings(
                 voice=voice_id,
                 model=user_config.tts.model,
