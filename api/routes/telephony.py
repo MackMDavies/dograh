@@ -270,7 +270,43 @@ async def initiate_call(
         initial_context=updated_initial_context,
     )
 
-    return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+    return {
+        "message": f"Call initiated successfully with run name {workflow_run_name}",
+        "workflow_run_id": workflow_run_id,
+    }
+
+
+# Normalized live-status labels the frontend polls for after dispatch.
+_TERMINAL_CALL_STATUSES = frozenset(
+    {"completed", "busy", "no-answer", "canceled", "failed", "error"}
+)
+
+
+@router.get("/call-status/{workflow_run_id}")
+async def get_call_status(
+    workflow_run_id: int, user: UserModel = Depends(get_user)
+):
+    """Return the latest telephony status for a run so the test-call dialog can
+    show live progress (ringing → answered / busy / no-answer / failed)."""
+    run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+    # Tenant isolation: non-superusers may only read runs in their own org. The
+    # run's org is carried by its parent workflow (WorkflowRunModel has none).
+    if not user.is_superuser:
+        _wf = await db_client.get_workflow_by_id(run.workflow_id)
+        if not _wf or _wf.organization_id != user.selected_organization_id:
+            raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    callbacks = (run.logs or {}).get("telephony_status_callbacks", [])
+    latest = callbacks[-1] if callbacks else None
+    status = (latest or {}).get("status") or "initiated"
+    return {
+        "workflow_run_id": workflow_run_id,
+        "status": status,
+        "terminal": status in _TERMINAL_CALL_STATUSES,
+        "duration": (latest or {}).get("duration"),
+    }
 
 
 async def _verify_organization_phone_number(
