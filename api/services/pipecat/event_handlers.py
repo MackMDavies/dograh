@@ -7,7 +7,9 @@ from api.enums import PostHogEvent, WorkflowRunState
 from api.services.campaign.circuit_breaker import circuit_breaker
 from api.services.integrations import IntegrationRuntimeSession
 from api.services.pipecat.audio_config import AudioConfig
-from api.services.pipecat.audio_playback import play_audio_loop
+# Max time the greeting will wait on an in-flight pre-call fetch before starting
+# anyway. Keeps a slow memory service from stalling the agent on pickup.
+_PRE_CALL_GREETING_WAIT_S = 1.5
 from api.services.pipecat.in_memory_buffers import (
     InMemoryAudioBuffer,
     InMemoryLogsBuffer,
@@ -117,28 +119,28 @@ def register_event_handlers(
                 )
             )
 
-            # Wait for pre-call fetch if in progress, playing ringer meanwhile
+            # Wait (briefly) for the pre-call fetch if it's still in flight.
+            # We deliberately do NOT play an audible ringer here: on an answered
+            # call — especially outbound — a ring tone after pickup is confusing
+            # and was heard as the "ringing sound effect" that delayed the agent.
+            # Cap the wait so a slow memory service can never stall the greeting;
+            # if it hasn't returned in time, start the greeting now (the shielded
+            # task keeps running, and outbound memory lookups add nothing anyway).
             if pre_call_fetch_task is not None:
-                if not pre_call_fetch_task.done():
-                    logger.info(
-                        "Pre-call fetch still in progress, playing ringer while waiting"
-                    )
-                    stop_ringer = asyncio.Event()
-                    sample_rate = audio_config.pipeline_sample_rate or 16000
-                    ringer_task = asyncio.create_task(
-                        play_audio_loop(
-                            stop_event=stop_ringer,
-                            sample_rate=sample_rate,
-                            queue_frame=transport.output().queue_frame,
-                        )
-                    )
-                    try:
-                        fetch_result = await pre_call_fetch_task
-                    finally:
-                        stop_ringer.set()
-                        await ringer_task
-                else:
+                fetch_result = None
+                if pre_call_fetch_task.done():
                     fetch_result = pre_call_fetch_task.result()
+                else:
+                    try:
+                        fetch_result = await asyncio.wait_for(
+                            asyncio.shield(pre_call_fetch_task),
+                            timeout=_PRE_CALL_GREETING_WAIT_S,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.info(
+                            f"Pre-call fetch slow (>{_PRE_CALL_GREETING_WAIT_S:.1f}s); "
+                            "starting greeting without blocking on it"
+                        )
 
                 if fetch_result:
                     if pre_call_fetch_is_memory:
