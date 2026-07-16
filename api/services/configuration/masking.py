@@ -23,6 +23,30 @@ SERVICE_SECRET_FIELDS = ("api_key", "credentials", "aws_access_key", "aws_secret
 MODEL_OVERRIDE_FIELDS = ("llm", "tts", "stt", "realtime")
 
 
+def strip_workflow_config_secrets(config: dict | None) -> dict | None:
+    """Remove provider secret fields from a workflow's persisted model_overrides.
+
+    Provider API keys must NEVER be written into ``workflow_configurations`` —
+    they would sit in the DB as plaintext-at-rest. Keys are re-injected on every
+    call at runtime from the org's (encrypted) provider connections and the
+    user's global config (see run_pipeline enrich_* calls), so stripping them
+    here does not affect provider auth. Non-dict input is returned unchanged.
+    """
+    if not isinstance(config, dict):
+        return config
+    overrides = config.get("model_overrides")
+    if not isinstance(overrides, dict):
+        return config
+    result = copy.deepcopy(config)
+    result_overrides = result.get("model_overrides") or {}
+    for section in MODEL_OVERRIDE_FIELDS:
+        section_cfg = result_overrides.get(section)
+        if isinstance(section_cfg, dict):
+            for secret_field in SERVICE_SECRET_FIELDS:
+                section_cfg.pop(secret_field, None)
+    return result
+
+
 def contains_masked_key(value: str | list[str] | None) -> bool:
     """Return True if *value* looks like a masked placeholder."""
     if value is None:

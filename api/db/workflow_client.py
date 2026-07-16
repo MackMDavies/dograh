@@ -84,6 +84,14 @@ class WorkflowClient(BaseDBClient):
         If a draft already exists, it is updated in place.
         If no draft exists, a new one is created with the next version number.
         """
+        # Never persist provider secrets into workflow_configurations — they are
+        # re-injected at runtime from the org's encrypted provider connections.
+        # This is the single chokepoint for all config writes (create/update/
+        # publish route through here), so it keeps plaintext keys out of the DB.
+        from api.services.configuration.masking import strip_workflow_config_secrets
+
+        workflow_configurations = strip_workflow_config_secrets(workflow_configurations)
+
         async with self.async_session() as session:
             # Check for existing draft
             result = await session.execute(
