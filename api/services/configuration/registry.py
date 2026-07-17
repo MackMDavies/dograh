@@ -326,6 +326,12 @@ OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct",
     "deepseek/deepseek-chat-v3-0324",
 ]
+
+# OpenRouter escrows credits against the max_tokens a request declares, and
+# reserves the model's full context window when none is given -- which 402s
+# unless the account holds a balance covering tens of thousands of tokens.
+# A spoken turn never approaches this bound, so declaring it costs nothing.
+OPENROUTER_DEFAULT_MAX_TOKENS = 512
 AZURE_MODELS = ["gpt-4.1-mini"]
 DOGRAH_LLM_MODELS = ["default", "accurate", "fast", "lite", "zen"]
 AWS_BEDROCK_MODELS = [
