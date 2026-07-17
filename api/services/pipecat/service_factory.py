@@ -7,7 +7,10 @@ from loguru import logger
 
 from api.constants import MPS_API_URL
 from api.services.configuration.masking import contains_masked_key
-from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.registry import (
+    OPENROUTER_DEFAULT_MAX_TOKENS,
+    ServiceProviders,
+)
 from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
 from api.services.pipecat.minimax_llm import DograhMiniMaxLLMService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
@@ -915,7 +918,11 @@ def create_llm_service_from_provider(
             kwargs["base_url"] = base_url
         return OpenRouterLLMService(
             api_key=api_key,
-            settings=OpenRouterLLMSettings(model=model, temperature=0.1),
+            settings=OpenRouterLLMSettings(
+                model=model,
+                temperature=0.1,
+                max_tokens=OPENROUTER_DEFAULT_MAX_TOKENS,
+            ),
             **kwargs,
         )
     elif provider == ServiceProviders.GOOGLE.value:
