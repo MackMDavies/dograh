@@ -148,7 +148,12 @@ _TOOL_SPECS = [
 
 
 def _build_tool_definition(action: str, parameters: list, client_account_id: str) -> dict:
-    auth_key = SUPABASE_ANON_KEY or os.getenv("INTERNAL_API_SECRET", "")
+    # Send the INTERNAL_API_SECRET (server-side only). The public anon key is being removed
+    # as an accepted credential on the agent-memory-lookup edge function — it ships in the
+    # browser bundle, so accepting it made that endpoint effectively unauthenticated.
+    # INTERNAL_API_SECRET MUST be set in the Dograh backend env; the anon-key fallback below
+    # keeps mid-call tools working until then (and will be rejected once the edge fn is updated).
+    auth_key = os.getenv("INTERNAL_API_SECRET", "") or SUPABASE_ANON_KEY
     return {
         "schema_version": 1,
         "type": "http_api",
