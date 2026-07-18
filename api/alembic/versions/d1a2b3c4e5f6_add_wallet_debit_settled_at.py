@@ -20,7 +20,10 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision = "d1a2b3c4e5f6"
-down_revision = "f7e8d9c0b1a2"
+# Re-pointed from f7e8d9c0b1a2 to e2f3a4b5c6d7 when consolidating onto the fork: main had
+# its own migration (e2f3a4b5c6d7) off the same base, so this chains after it to keep a
+# single alembic head instead of forking.
+down_revision = "e2f3a4b5c6d7"
 branch_labels = None
 depends_on = None
 
