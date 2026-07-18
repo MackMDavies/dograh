@@ -1,7 +1,8 @@
 import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func
+from sqlalchemy import func, update
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload, selectinload
 
@@ -232,6 +233,97 @@ class WorkflowRunClient(BaseDBClient):
 
             result = await session.execute(query)
             return result.scalars().first()
+
+    async def mark_wallet_debit_settled(self, run_id: int) -> None:
+        """Mark a run's post-call wallet debit as settled (terminal outcome reached).
+
+        Idempotent: safe to call repeatedly. Used by the normal completion path and by
+        the reconcile_wallet_debits sweep once a run's debit succeeds or is terminal.
+        """
+        async with self.async_session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.id == run_id)
+                .values(wallet_debit_settled_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def get_unsettled_wallet_debit_run_ids(
+        self,
+        grace_minutes: int = 10,
+        lookback_hours: int = 24,
+        limit: int = 200,
+    ) -> list[int]:
+        """Completed wallet runs (api_key_id IS NULL) whose post-call debit never settled.
+
+        Bounded window: older than `grace_minutes` (so we don't race the normal post-call
+        path) and newer than `lookback_hours` (keeps the sweep cheap; the migration
+        backfills all pre-existing rows to settled so only post-deploy runs appear here).
+        API-key runs bill postpaid via a separate, independently-reconciled path and are
+        excluded. Oldest first so a persistent failure is retried before newer ones.
+        """
+        now = datetime.now(UTC)
+        newer_than = now - timedelta(hours=lookback_hours)
+        older_than = now - timedelta(minutes=grace_minutes)
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(WorkflowRunModel.id)
+                .where(
+                    WorkflowRunModel.wallet_debit_settled_at.is_(None),
+                    WorkflowRunModel.is_completed.is_(True),
+                    WorkflowRunModel.api_key_id.is_(None),
+                    WorkflowRunModel.created_at >= newer_than,
+                    WorkflowRunModel.created_at <= older_than,
+                )
+                .order_by(WorkflowRunModel.created_at.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
+
+    async def mark_memory_settled(self, run_id: int) -> None:
+        """Mark a run's post-call caller-memory extraction as settled (H4).
+
+        Idempotent. Used by the normal completion path and by the reconcile_memory sweep
+        once the memory webhook succeeds or is terminal.
+        """
+        async with self.async_session() as session:
+            await session.execute(
+                update(WorkflowRunModel)
+                .where(WorkflowRunModel.id == run_id)
+                .values(memory_settled_at=datetime.now(UTC))
+            )
+            await session.commit()
+
+    async def get_unsettled_memory_run_ids(
+        self,
+        grace_minutes: int = 10,
+        lookback_hours: int = 24,
+        limit: int = 200,
+    ) -> list[int]:
+        """Completed runs whose post-call caller-memory extraction never settled (H4).
+
+        Bounded window: older than `grace_minutes` (don't race the normal post-call path)
+        and newer than `lookback_hours` (the migration backfills pre-existing rows to
+        settled, so only post-deploy runs appear here). Oldest first. Runs with no caller
+        number settle terminally on the first re-fire (the webhook returns True), so they
+        don't linger.
+        """
+        now = datetime.now(UTC)
+        newer_than = now - timedelta(hours=lookback_hours)
+        older_than = now - timedelta(minutes=grace_minutes)
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(WorkflowRunModel.id)
+                .where(
+                    WorkflowRunModel.memory_settled_at.is_(None),
+                    WorkflowRunModel.is_completed.is_(True),
+                    WorkflowRunModel.created_at >= newer_than,
+                    WorkflowRunModel.created_at <= older_than,
+                )
+                .order_by(WorkflowRunModel.created_at.asc())
+                .limit(limit)
+            )
+            return list(result.scalars().all())
 
     async def get_workflow_run_by_id(self, run_id: int) -> WorkflowRunModel | None:
         """Get workflow run by ID without user filtering - for background tasks"""

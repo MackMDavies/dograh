@@ -75,7 +75,6 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.turns.user_mute import (
     CallbackUserMuteStrategy,
     FunctionCallUserMuteStrategy,
-    MuteUntilFirstBotCompleteUserMuteStrategy,
 )
 from pipecat.turns.user_start import (
     ExternalUserTurnStartStrategy,
@@ -694,8 +693,14 @@ async def _run_pipeline(
         correct_aggregation_callback=engine.create_aggregation_correction_callback(),
     )
 
+    # NOTE: MuteUntilFirstBotCompleteUserMuteStrategy was removed here. It muted the
+    # caller until the FIRST BotStoppedSpeakingFrame with no timeout, so if the
+    # greeting audio never played out (e.g. dropped in the brief window before the
+    # WebRTC transport can send audio on connect), the caller stayed muted forever
+    # and no user turn ever reached the LLM. Interrupt control during real bot
+    # speech is still enforced by engine.should_mute_user (which now self-heals via
+    # a safety timeout), and FunctionCallUserMuteStrategy still mutes during tool calls.
     user_mute_strategies = [
-        MuteUntilFirstBotCompleteUserMuteStrategy(),
         FunctionCallUserMuteStrategy(),
         CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
     ]
