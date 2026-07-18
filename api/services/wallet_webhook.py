@@ -22,17 +22,29 @@ from api.services.telephony.call_concurrency import release_call_slot
 _TIMEOUT = 15.0
 
 
-async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
+async def fire_post_call_wallet_debit(
+    workflow_run_id: int, release_slot: bool = True
+) -> bool:
     """Debit the account wallet for call usage.
 
     Resolves duration from usage_info, model info from the run config,
     and sends to the Sysevo wallet-debit edge function.
 
-    Silently no-ops if no Sysevo edge-function URL is configured at all.
+    Returns a *settlement* flag for the reconciliation sweep:
+      - True  => terminal outcome; do NOT retry. Covers: no Sysevo integration
+                 configured, run missing, no billable duration, HTTP 2xx, and HTTP 4xx
+                 (a bad request will not succeed on retry).
+      - False => transient failure (timeout, HTTP 5xx, network/exception); the
+                 reconcile_wallet_debits cron should re-fire this run later. Re-firing is
+                 safe because the wallet-debit edge function and wallet_debit RPC are
+                 idempotent on workflow_run_id.
     """
-    # Release this call's concurrency slot first — unconditionally, before any
-    # early-return below (a call with no duration still occupied a slot).
-    await release_call_slot(workflow_run_id)
+    # Release this call's concurrency slot first — before any early-return below
+    # (a call with no duration still occupied a slot). The reconciliation sweep passes
+    # release_slot=False: the slot was already released at original completion (or reclaimed
+    # by its own TTL), and re-releasing here would corrupt the shared concurrency counter.
+    if release_slot:
+        await release_call_slot(workflow_run_id)
 
     debit_url = os.getenv("SYSEVO_WALLET_DEBIT_URL")
     if not debit_url:
@@ -47,7 +59,8 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
                 debit_url = f"{_url.rsplit('/', 1)[0]}/wallet-debit"
                 break
     if not debit_url:
-        return
+        # Sysevo billing integration not active on this deployment — nothing to reconcile.
+        return True
 
     memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
 
@@ -55,7 +68,7 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
         if not workflow_run:
             logger.warning(f"[wallet-debit] run {workflow_run_id} not found")
-            return
+            return True  # nothing we can ever bill for a missing run
 
         usage: dict[str, Any] = workflow_run.usage_info or {}
         duration_secs: float | None = (
@@ -66,7 +79,7 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
 
         if not duration_secs or duration_secs < 1:
             logger.debug(f"[wallet-debit] run {workflow_run_id} — no duration, skipping")
-            return
+            return True  # no billable duration — terminal, don't keep re-checking
 
         # Extract model info from usage_info or initial_context
         initial_ctx: dict[str, Any] = workflow_run.initial_context or {}
@@ -116,13 +129,25 @@ async def fire_post_call_wallet_debit(workflow_run_id: int) -> None:
                 f"[wallet-debit] run {workflow_run_id} duration={duration_secs:.1f}s "
                 f"charged={amount/100:.4f} USD"
             )
-        else:
+            return True
+        elif 400 <= response.status_code < 500:
+            # Bad request (e.g. non-positive duration) — will never succeed on retry.
             logger.warning(
-                f"[wallet-debit] run {workflow_run_id} HTTP {response.status_code}: "
-                f"{response.text[:200]}"
+                f"[wallet-debit] run {workflow_run_id} HTTP {response.status_code} "
+                f"(terminal): {response.text[:200]}"
             )
+            return True
+        else:
+            # 5xx / transient server error — let the reconciliation sweep retry.
+            logger.warning(
+                f"[wallet-debit] run {workflow_run_id} HTTP {response.status_code} "
+                f"(will retry): {response.text[:200]}"
+            )
+            return False
 
     except httpx.TimeoutException:
-        logger.warning(f"[wallet-debit] timed out for run {workflow_run_id}")
+        logger.warning(f"[wallet-debit] timed out for run {workflow_run_id} (will retry)")
+        return False
     except Exception as e:
-        logger.error(f"[wallet-debit] error for run {workflow_run_id}: {e}")
+        logger.error(f"[wallet-debit] error for run {workflow_run_id} (will retry): {e}")
+        return False

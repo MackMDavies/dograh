@@ -5,6 +5,7 @@ from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
 
 from api.db import db_client
+from api.services.call_live_webhook import fire_call_live
 from api.services.memory_webhook import fire_post_call_memory
 from api.services.wallet_webhook import fire_post_call_wallet_debit
 from api.services.pricing.workflow_run_cost import calculate_workflow_run_cost
@@ -177,18 +178,34 @@ async def process_workflow_completion(
     except Exception as e:
         logger.error(f"Error calculating cost for workflow {workflow_run_id}: {e}")
 
-    # Step 5: Fire Sysevo caller memory extraction (non-fatal, no-ops if URL not set)
+    # Step 5: Fire Sysevo caller memory extraction (non-fatal, no-ops if URL not set).
+    # Mark the run settled on a terminal outcome so the reconcile_memory cron leaves it
+    # alone; a transient failure returns False and stays unsettled for the sweep to retry.
     if os.getenv("SYSEVO_POST_CALL_MEMORY_URL"):
         try:
-            await fire_post_call_memory(workflow_run_id)
+            mem_settled = await fire_post_call_memory(workflow_run_id)
+            if mem_settled:
+                await db_client.mark_memory_settled(workflow_run_id)
         except Exception as e:
             logger.error(f"Post-call memory webhook failed for run {workflow_run_id}: {e}")
 
-    # Step 6: Debit Sysevo wallet for call usage (non-fatal)
+    # Step 6: Debit Sysevo wallet for call usage (non-fatal). Mark the run settled on a
+    # terminal outcome so the reconcile_wallet_debits cron leaves it alone; a transient
+    # failure returns False and stays unsettled for the sweep to retry.
     if any(os.getenv(v) for v in ("SYSEVO_WALLET_DEBIT_URL", "SYSEVO_POST_CALL_MEMORY_URL", "SYSEVO_PRE_CALL_CHECK_URL", "SYSEVO_MEMORY_PRE_CALL_URL")):
         try:
-            await fire_post_call_wallet_debit(workflow_run_id)
+            settled = await fire_post_call_wallet_debit(workflow_run_id)
+            if settled:
+                await db_client.mark_wallet_debit_settled(workflow_run_id)
         except Exception as e:
             logger.error(f"Post-call wallet debit failed for run {workflow_run_id}: {e}")
+
+    # Step 7: Clear the Sysevo LIVE-call row for this run (non-fatal, unconditional
+    # so it clears for calls with no caller_number too — e.g. web/widget preview).
+    if os.getenv("SYSEVO_CALL_LIVE_URL"):
+        try:
+            await fire_call_live(event="ended", workflow_run_id=workflow_run_id)
+        except Exception as e:
+            logger.error(f"Call-live 'ended' webhook failed for run {workflow_run_id}: {e}")
 
     logger.info(f"Completed workflow completion processing for run {workflow_run_id}")
