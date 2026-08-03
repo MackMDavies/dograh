@@ -17,6 +17,9 @@ from api.services.campaign.source_sync_factory import get_sync_service
 PHONE_NUMBER_POOL_EXHAUSTED_COUNTER_KEY = "phone_number_pool_exhausted_attempts"
 MAX_PHONE_NUMBER_POOL_EXHAUSTED_ATTEMPTS = 3
 
+CONCURRENT_SLOT_TIMEOUT_COUNTER_KEY = "concurrent_slot_acquisition_timeout_attempts"
+MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS = 3
+
 
 async def sync_campaign_source(ctx: Dict, campaign_id: int) -> None:
     """
@@ -126,6 +129,10 @@ async def process_campaign_batch(
                 campaign_id=campaign_id,
                 key=PHONE_NUMBER_POOL_EXHAUSTED_COUNTER_KEY,
             )
+            await db_client.reset_campaign_metadata_counter(
+                campaign_id=campaign_id,
+                key=CONCURRENT_SLOT_TIMEOUT_COUNTER_KEY,
+            )
 
         # Publish batch completed event - orchestrator will handle next batch scheduling
         publisher = await get_campaign_event_publisher()
@@ -142,12 +149,45 @@ async def process_campaign_batch(
         )
 
     except ConcurrentSlotAcquisitionError as e:
+        # A concurrency squeeze is usually transient (another campaign or an
+        # inbound call briefly using up the org's slots) — retry like
+        # PhoneNumberPoolExhaustedError instead of failing the whole campaign
+        # on the first timeout.
+        attempt = await db_client.increment_campaign_metadata_counter(
+            campaign_id=campaign_id,
+            key=CONCURRENT_SLOT_TIMEOUT_COUNTER_KEY,
+        )
         logger.warning(
-            f"Failed to acquire concurrent slot for campaign {campaign_id}: {e}"
+            f"Failed to acquire concurrent slot for campaign {campaign_id}: {e}; "
+            f"attempt={attempt}/{MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS}"
         )
 
-        # Publish batch failed event with specific error
         publisher = await get_campaign_event_publisher()
+
+        if attempt < MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS:
+            await db_client.append_campaign_log(
+                campaign_id=campaign_id,
+                level="warning",
+                event="concurrent_slot_acquisition_timeout_retry",
+                message=(
+                    f"Concurrent slot acquisition timed out: {e}; retry attempt "
+                    f"{attempt}/{MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS}"
+                ),
+                details={
+                    "error": str(e),
+                    "attempt": attempt,
+                    "max_attempts": MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS,
+                },
+            )
+            await publisher.publish_batch_completed(
+                campaign_id=campaign_id,
+                processed_count=0,
+                failed_count=0,
+                batch_size=batch_size,
+            )
+            return
+
+        # Publish batch failed event with specific error
         await publisher.publish_batch_failed(
             campaign_id=campaign_id,
             error=f"Concurrent slot acquisition timeout: {e}",
@@ -160,8 +200,16 @@ async def process_campaign_batch(
             campaign_id=campaign_id,
             level="error",
             event="batch_failed",
-            message=f"Concurrent slot acquisition timeout: {e}",
-            details={"error": str(e), "reason": "concurrent_slot_timeout"},
+            message=(
+                f"Concurrent slot acquisition timeout after {attempt} "
+                f"consecutive attempts: {e}"
+            ),
+            details={
+                "error": str(e),
+                "reason": "concurrent_slot_timeout",
+                "attempt": attempt,
+                "max_attempts": MAX_CONCURRENT_SLOT_TIMEOUT_ATTEMPTS,
+            },
         )
         raise
 
