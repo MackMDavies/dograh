@@ -648,7 +648,7 @@ class CampaignOrchestrator:
         # all queued_runs are either processed or failed, complete immediately
         # rather than relying solely on the row counters (which may lag).
         non_terminal_count = await db_client.get_queued_runs_count(
-            campaign_id=campaign_id, states=["queued", "in_processing"]
+            campaign_id=campaign_id, states=["queued", "processing"]
         )
 
         if total > 0 and (dispatched >= total or non_terminal_count == 0):
