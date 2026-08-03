@@ -986,7 +986,14 @@ class CampaignClient(BaseDBClient):
 
             remaining_slots = limit - len(scheduled_runs)
 
-            # Then get regular queued runs if we have remaining slots
+            # Then get regular queued runs if we have remaining slots.
+            # Ordered by id (insertion order) rather than random(): random()
+            # forces Postgres to materialize and sort every remaining
+            # 'queued' row for this campaign on every single claim call —
+            # cost that grows with the backlog and gets called repeatedly
+            # (every batch, every few seconds) for a campaign of thousands
+            # of numbers. No behavior depends on dial order being shuffled;
+            # id ordering is a plain indexed range scan instead.
             if remaining_slots > 0:
                 regular_query = (
                     select(QueuedRunModel)
@@ -995,7 +1002,7 @@ class CampaignClient(BaseDBClient):
                         QueuedRunModel.state == "queued",
                         QueuedRunModel.scheduled_for.is_(None),
                     )
-                    .order_by(func.random())
+                    .order_by(QueuedRunModel.id)
                     .limit(remaining_slots)
                     .with_for_update(skip_locked=True)
                 )
