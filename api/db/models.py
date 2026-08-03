@@ -815,6 +815,11 @@ class QueuedRunModel(Base):
         Index(
             "idx_queued_runs_scheduled", "scheduled_for"
         ),  # New index for scheduled retries
+        UniqueConstraint(
+            "campaign_id",
+            "source_uuid",
+            name="uq_queued_runs_campaign_source_uuid",
+        ),
         # Optimized index for checking queued runs efficiently
         Index(
             "idx_queued_runs_campaign_state_optimized",

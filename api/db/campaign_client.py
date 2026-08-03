@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import delete, func, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
@@ -585,11 +586,23 @@ class CampaignClient(BaseDBClient):
 
     # QueuedRun methods
     async def bulk_create_queued_runs(self, queued_runs_data: list[dict]) -> None:
-        """Bulk create queued runs"""
+        """Bulk create queued runs.
+
+        Upserts on (campaign_id, source_uuid) and does nothing on conflict —
+        source_uuid is deterministic per row (e.g. CSV sync derives it from a
+        hash of the source file plus row index), so a retried sync task
+        (arq's default retry-on-failure) re-runs this with the exact same
+        rows instead of double-inserting every number in the campaign.
+        """
+        if not queued_runs_data:
+            return
         async with self.async_session() as session:
-            queued_runs = [QueuedRunModel(**data) for data in queued_runs_data]
-            session.add_all(queued_runs)
+            stmt = pg_insert(QueuedRunModel).values(queued_runs_data)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["campaign_id", "source_uuid"]
+            )
             try:
+                await session.execute(stmt)
                 await session.commit()
             except Exception as e:
                 await session.rollback()
