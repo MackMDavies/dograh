@@ -60,6 +60,15 @@ async def handle_cloudonix_status_callback(
         workflow_run, workflow.organization_id
     )
 
+    is_valid = await provider.verify_inbound_signature(
+        str(request.url), callback_data, dict(request.headers)
+    )
+    if not is_valid:
+        logger.warning(
+            f"[run {workflow_run_id}] Invalid Cloudonix webhook signature on status callback"
+        )
+        return {"status": "error", "reason": "invalid_signature"}
+
     # Parse the callback data into generic format
     parsed_data = provider.parse_status_callback(callback_data)
 
@@ -118,6 +127,21 @@ async def handle_cloudonix_cdr(request: Request):
     workflow_run_id = workflow_run.id
     set_current_run_id(workflow_run_id)
     logger.info(f"[run {workflow_run_id}] Processing Cloudonix CDR for call {call_id}")
+
+    workflow = await db_client.get_workflow_by_id(workflow_run.workflow_id)
+    if not workflow:
+        logger.warning(f"[run {workflow_run_id}] Workflow {workflow_run.workflow_id} not found")
+        return {"status": "ignored", "reason": "workflow_not_found"}
+
+    provider = await get_telephony_provider_for_run(
+        workflow_run, workflow.organization_id
+    )
+    is_valid = await provider.verify_inbound_signature(
+        str(request.url), cdr_data, dict(request.headers)
+    )
+    if not is_valid:
+        logger.warning(f"[run {workflow_run_id}] Invalid Cloudonix webhook signature on CDR")
+        return {"status": "error", "reason": "invalid_signature"}
 
     # Convert CDR to status update using StatusCallbackRequest
     status_update = StatusCallbackRequest.from_cloudonix_cdr(cdr_data)
