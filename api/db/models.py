@@ -22,6 +22,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import declarative_base, relationship
 
 from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG
+from api.services.crypto import EncryptedJSON, EncryptedString
 
 from ..enums import (
     CallType,
@@ -186,7 +187,7 @@ class TelephonyConfigurationModel(Base):
     )
     name = Column(String(64), nullable=False)
     provider = Column(String(32), nullable=False)
-    credentials = Column(JSON, nullable=False, default=dict)
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)  # Fernet-encrypted at rest
     is_default_outbound = Column(
         Boolean, nullable=False, default=False, server_default=text("false")
     )
@@ -550,6 +551,16 @@ class WorkflowRunModel(Base):
     # Set when the run was initiated via an API key (X-API-Key). Drives postpaid API
     # billing: the post-call hook forwards this so wallet-debit accrues instead of debiting.
     api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True)
+    # Post-call wallet debit reconciliation. NULL until the debit webhook reaches a
+    # terminal outcome (charged, accrued, or legitimately skipped). The
+    # reconcile_wallet_debits ARQ cron re-fires the debit for completed wallet runs
+    # (api_key_id IS NULL) still NULL after a grace window. See api/tasks/wallet_reconciliation.py.
+    wallet_debit_settled_at = Column(DateTime(timezone=True), nullable=True)
+    # Post-call caller-memory reconciliation (H4). NULL until the memory webhook reaches a
+    # terminal outcome (memory recorded, or legitimately skipped — no caller_number etc.).
+    # The reconcile_memory ARQ cron re-fires the memory extraction for completed runs still
+    # NULL after a grace window. See api/tasks/memory_reconciliation.py.
+    memory_settled_at = Column(DateTime(timezone=True), nullable=True)
     text_session = relationship(
         "WorkflowRunTextSessionModel",
         back_populates="workflow_run",
@@ -572,6 +583,18 @@ class WorkflowRunModel(Base):
         ),
         Index("idx_workflow_runs_workflow_id", "workflow_id"),
         Index("idx_workflow_runs_campaign_id", "campaign_id"),
+        # Keeps the reconcile_wallet_debits sweep cheap: only unsettled runs are indexed.
+        Index(
+            "idx_workflow_runs_wallet_unsettled",
+            "created_at",
+            postgresql_where=text("wallet_debit_settled_at IS NULL"),
+        ),
+        # Keeps the reconcile_memory sweep cheap: only unsettled runs are indexed.
+        Index(
+            "idx_workflow_runs_memory_unsettled",
+            "created_at",
+            postgresql_where=text("memory_settled_at IS NULL"),
+        ),
     )
 
 
@@ -1421,7 +1444,7 @@ class OrgProviderConnectionModel(Base):
     service_type = Column(String(20), nullable=False)  # llm | tts | stt | embeddings | realtime
     provider = Column(String(50), nullable=False)      # openai | google | anthropic | …
     display_name = Column(String(100), nullable=True)  # optional admin label
-    api_key = Column(Text, nullable=True)              # stored as plain text (same as existing UserConfigurationModel)
+    api_key = Column(EncryptedString, nullable=True)   # Fernet-encrypted at rest (see api.services.crypto)
     extra_config = Column(JSON, nullable=False, default=dict, server_default=text("'{}'::json"))
     is_active = Column(Boolean, nullable=False, default=True, server_default=text("true"))
     created_by = Column(Integer, ForeignKey("users.id"), nullable=True)

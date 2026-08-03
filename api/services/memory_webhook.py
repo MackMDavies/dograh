@@ -22,17 +22,21 @@ from api.utils.transcript import generate_transcript_text
 _TIMEOUT = 30.0
 
 
-async def fire_post_call_memory(workflow_run_id: int) -> None:
+async def fire_post_call_memory(workflow_run_id: int) -> bool:
     """Send post-call data to Sysevo memory extraction endpoint.
 
     Reads transcript from workflow_run.logs['realtime_feedback_events'], which
     is persisted before process_workflow_completion runs.
 
-    Silently no-ops if SYSEVO_POST_CALL_MEMORY_URL is not configured.
+    Returns a *settlement* flag for the reconciliation sweep (H4):
+      - True  => terminal; do NOT retry. Covers: no Sysevo memory URL configured, run
+                 missing, no caller_number (nothing to store), HTTP 2xx, and HTTP 4xx.
+      - False => transient failure (timeout, HTTP 5xx, network/exception); the
+                 reconcile_memory cron should re-fire this run later.
     """
     memory_url = os.getenv("SYSEVO_POST_CALL_MEMORY_URL")
     if not memory_url:
-        return
+        return True
 
     memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
 
@@ -40,14 +44,14 @@ async def fire_post_call_memory(workflow_run_id: int) -> None:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
         if not workflow_run:
             logger.warning(f"[memory-post-call] run {workflow_run_id} not found")
-            return
+            return True
 
         initial_ctx: dict[str, Any] = workflow_run.initial_context or {}
         caller_number: str | None = initial_ctx.get("caller_number")
 
         if not caller_number:
-            # Not a telephony call with a known caller — nothing to store
-            return
+            # Not a telephony call with a known caller — nothing to store (terminal)
+            return True
 
         # Build transcript from realtime feedback events stored in logs
         logs: dict[str, Any] = workflow_run.logs or {}
@@ -95,16 +99,26 @@ async def fire_post_call_memory(workflow_run_id: int) -> None:
 
         if response.is_success:
             logger.info(
-                f"[memory-post-call] run {workflow_run_id} caller={caller_number} "
+                f"[memory-post-call] run {workflow_run_id} caller=***{str(caller_number)[-4:]} "
                 f"→ memory updated ({response.status_code})"
             )
+            return True
+        elif 400 <= response.status_code < 500:
+            logger.warning(
+                f"[memory-post-call] run {workflow_run_id} HTTP {response.status_code} "
+                f"(terminal): {response.text[:200]}"
+            )
+            return True
         else:
             logger.warning(
-                f"[memory-post-call] run {workflow_run_id} HTTP {response.status_code}: "
-                f"{response.text[:200]}"
+                f"[memory-post-call] run {workflow_run_id} HTTP {response.status_code} "
+                f"(will retry): {response.text[:200]}"
             )
+            return False
 
     except httpx.TimeoutException:
-        logger.warning(f"[memory-post-call] timed out for run {workflow_run_id}")
+        logger.warning(f"[memory-post-call] timed out for run {workflow_run_id} (will retry)")
+        return False
     except Exception as e:
-        logger.error(f"[memory-post-call] error for run {workflow_run_id}: {e}")
+        logger.error(f"[memory-post-call] error for run {workflow_run_id} (will retry): {e}")
+        return False

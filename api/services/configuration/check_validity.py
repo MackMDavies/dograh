@@ -11,7 +11,11 @@ from groq import Groq
 from api.schemas.user_configuration import (
     UserConfiguration,
 )
-from api.services.configuration.registry import ServiceConfig, ServiceProviders
+from api.services.configuration.registry import (
+    OPENROUTER_DEFAULT_MAX_TOKENS,
+    ServiceConfig,
+    ServiceProviders,
+)
 from api.services.mps_service_key_client import mps_service_key_client
 from api.utils.url_security import validate_user_configured_service_url
 
@@ -261,6 +265,7 @@ class UserConfigurationValidator:
         if provider in (
             ServiceProviders.OPENAI.value,
             ServiceProviders.OPENAI_REALTIME.value,
+            ServiceProviders.OPENROUTER.value,
         ):
             return validator(provider, api_key, service_config)
         return validator(provider, api_key)
@@ -371,8 +376,80 @@ class UserConfigurationValidator:
     def _check_sarvam_api_key(self, model: str, api_key: str) -> bool:
         return True
 
-    def _check_openrouter_api_key(self, model: str, api_key: str) -> bool:
-        return True
+    def _check_openrouter_api_key(
+        self, model: str, api_key: str, service_config: Optional[ServiceConfig] = None
+    ) -> bool:
+        """Validate an OpenRouter config by running the request the pipeline will run.
+
+        Listing models would only prove the key parses. OpenRouter rejects calls
+        for reasons a listing never surfaces -- an exhausted balance, a retired
+        model slug -- so this issues a real completion bounded by the same
+        max_tokens the pipeline declares, making a save-time pass mean the
+        runtime call is affordable too.
+        """
+        base_url = (
+            getattr(service_config, "base_url", None) if service_config else None
+        ) or "https://openrouter.ai/api/v1"
+        slug = getattr(service_config, "model", None) if service_config else None
+
+        client = openai.OpenAI(api_key=api_key, base_url=base_url)
+        if not slug:
+            try:
+                client.models.list()
+                return True
+            except Exception:
+                raise ValueError(
+                    "Could not validate the OpenRouter API key. Please check that the "
+                    "key is correct and that openrouter.ai is reachable."
+                )
+
+        try:
+            client.chat.completions.create(
+                model=slug,
+                messages=[{"role": "user", "content": "hi"}],
+                max_tokens=OPENROUTER_DEFAULT_MAX_TOKENS,
+            )
+            return True
+        except openai.AuthenticationError:
+            raise ValueError(
+                "Invalid OpenRouter API key. The key was rejected by OpenRouter. "
+                "Please check that it is correct and has not been revoked. "
+                "You can verify your keys at https://openrouter.ai/keys."
+            )
+        except openai.NotFoundError:
+            raise ValueError(
+                f"OpenRouter does not serve the model '{slug}'. Check the slug is in "
+                "'vendor/model' form and is still available -- free ':free' variants are "
+                "periodically retired in favour of their paid slug. You can browse "
+                "current models at https://openrouter.ai/models."
+            )
+        except openai.APIConnectionError:
+            raise ValueError(
+                f"Could not connect to OpenRouter at {base_url}. Please check your "
+                "network connection and try again."
+            )
+        except openai.APIStatusError as e:
+            if e.status_code == 402:
+                raise ValueError(
+                    f"Your OpenRouter account cannot afford a call to '{slug}'. "
+                    "OpenRouter reserves credits up front for each request, so this "
+                    "config would fail on every call. Please top up at "
+                    "https://openrouter.ai/settings/credits."
+                )
+            if e.status_code == 429:
+                raise ValueError(
+                    "OpenRouter is rate limiting this key. Please wait and try again, "
+                    "or upgrade the account at https://openrouter.ai/settings/credits."
+                )
+            raise ValueError(
+                f"OpenRouter rejected a test call to '{slug}' "
+                f"(HTTP {e.status_code}). Please verify the API key and model."
+            )
+        except Exception:
+            raise ValueError(
+                f"Failed to validate the OpenRouter config for '{slug}'. "
+                "Please try again later."
+            )
 
     def _check_xai_api_key(self, model: str, api_key: str) -> bool:
         return True

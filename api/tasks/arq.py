@@ -49,6 +49,8 @@ from api.tasks.s3_upload import (
     process_workflow_completion,
     upload_voicemail_audio_to_s3,
 )
+from api.tasks.wallet_reconciliation import reconcile_wallet_debits
+from api.tasks.memory_reconciliation import reconcile_memory
 from api.services.api_usage_counter import flush_api_request_usage
 
 
@@ -61,8 +63,16 @@ class WorkerSettings:
         process_campaign_batch,
         process_knowledge_base_document,
     ]
-    # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
-    cron_jobs = [cron(flush_api_request_usage, minute=0)]
+    cron_jobs = [
+        # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
+        cron(flush_api_request_usage, minute=0),
+        # Every 10 min: re-fire post-call wallet debits that never settled (crash / lost
+        # job / transient webhook failure). Idempotent on workflow_run_id, so safe to retry.
+        cron(reconcile_wallet_debits, minute=set(range(0, 60, 10))),
+        # Every 10 min (offset by 5): re-fire post-call caller-memory extraction that never
+        # settled. Idempotent per run (dedupe + upsert), so safe to retry. See H4.
+        cron(reconcile_memory, minute=set(range(5, 60, 10))),
+    ]
     redis_settings = REDIS_SETTINGS
     max_jobs = 10
 

@@ -7,7 +7,10 @@ from loguru import logger
 
 from api.constants import MPS_API_URL
 from api.services.configuration.masking import contains_masked_key
-from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.registry import (
+    OPENROUTER_DEFAULT_MAX_TOKENS,
+    ServiceProviders,
+)
 from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
 from api.services.pipecat.minimax_llm import DograhMiniMaxLLMService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
@@ -514,10 +517,21 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             .replace("https://", "wss://")
             .replace("http://", "ws://")
         )
+        # ElevenLabs' multi-stream-input endpoint does not reliably honour a
+        # pcm_8000 request (it returns ~16kHz audio) while pipecat still tags
+        # the frames with the requested rate. On telephony (8kHz pipeline) that
+        # mislabels 16kHz audio as 8kHz, so the μ-law serializer plays it ~2x
+        # slow — the "deformed / slowed-down" agent voice on outbound calls.
+        # Pin the output to a rate ElevenLabs reliably honours (pcm_16000) so
+        # frames are truthfully tagged and the telephony serializer resamples
+        # 16k→8k correctly. WebRTC already runs at 16kHz, so this is a no-op
+        # there (no regression); only telephony changes (8000 → 16000).
+        el_sample_rate = max(audio_config.pipeline_sample_rate, 16000)
         return DograhElevenLabsTTSService(
             reconnect_on_error=True,
             api_key=api_key,
             url=elevenlabs_url,
+            sample_rate=el_sample_rate,
             settings=ElevenLabsTTSSettings(
                 voice=voice_id,
                 model=user_config.tts.model,
@@ -904,7 +918,11 @@ def create_llm_service_from_provider(
             kwargs["base_url"] = base_url
         return OpenRouterLLMService(
             api_key=api_key,
-            settings=OpenRouterLLMSettings(model=model, temperature=0.1),
+            settings=OpenRouterLLMSettings(
+                model=model,
+                temperature=0.1,
+                max_tokens=OPENROUTER_DEFAULT_MAX_TOKENS,
+            ),
             **kwargs,
         )
     elif provider == ServiceProviders.GOOGLE.value:
