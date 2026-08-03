@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Awaitable, Callable, Dict, Literal, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Callable, Dict, Literal, Optional, Union
 
 from pipecat.adapters.schemas.tools_schema import ToolsSchema
 from pipecat.frames.frames import (
@@ -55,6 +55,26 @@ from api.services.workflow.tools.knowledge_base import (
 )
 from api.utils.template_renderer import render_template
 
+# Safety valve for required-variable enforcement: after this many blocked
+# attempts to leave the same node, the transition is allowed through anyway
+# (flagged in gathered_context) instead of trapping the call forever on a
+# caller who genuinely won't or can't provide the requested information.
+_MAX_REQUIRED_VARIABLE_RETRIES = 3
+
+
+def _has_captured_value(value: Any) -> bool:
+    """True when an extracted value counts as genuinely captured.
+
+    Distinguishes "never extracted" / "extracted as an empty string" (not
+    captured) from a legitimate falsy value like `False` or `0` for a
+    boolean/number variable (captured).
+    """
+    if value is None:
+        return False
+    if isinstance(value, str) and not value.strip():
+        return False
+    return True
+
 
 class PipecatEngine:
     def __init__(
@@ -95,6 +115,9 @@ class PipecatEngine:
         self._gathered_context: dict = {}
         self._user_response_timeout_task: Optional[asyncio.Task] = None
         self._pending_extraction_tasks: set[asyncio.Task] = set()
+        # Blocked-transition attempt count per node id, for the required-
+        # variable retry cap. Cleared once a node is successfully exited.
+        self._transition_block_counts: Dict[str, int] = {}
 
         # Will be set later in initialize() when we have
         # access to _context
@@ -242,8 +265,10 @@ class PipecatEngine:
             logger.info(f"Arguments: {function_call_params.arguments}")
 
             try:
-                # Perform variable extraction before transitioning to new node
-                await self._perform_variable_extraction_if_needed(self._current_node)
+                if not await self._enforce_required_variables_before_exit(
+                    name, function_call_params
+                ):
+                    return
 
                 # Queue transition speech/audio before switching nodes
                 speech_type = transition_speech_type or "text"
@@ -464,6 +489,82 @@ class PipecatEngine:
                 f"Performing synchronous variable extraction for node: {node.name}"
             )
             await _do_extraction()
+
+    async def _enforce_required_variables_before_exit(
+        self,
+        transition_name: str,
+        function_call_params: FunctionCallParams,
+    ) -> bool:
+        """Gate a node transition on its `required_for_exit` variables.
+
+        Returns True when the transition may proceed — either the current
+        node declares no required variables (in which case behavior is
+        unchanged: extraction is kicked off in the background as before), all
+        required variables are already present, or the retry budget for this
+        node has been exhausted. Returns False when the transition must be
+        blocked; the LLM's function-call result has already been sent with
+        guidance to keep asking, and the caller should return without
+        transitioning.
+        """
+        node = self._current_node
+        required_vars = getattr(node, "required_variable_names", None) if node else None
+
+        if not required_vars:
+            # No gate declared — preserve prior behavior exactly.
+            await self._perform_variable_extraction_if_needed(node)
+            return True
+
+        # A gate is declared, so gathered_context must be current before we
+        # check it — await extraction synchronously instead of firing it into
+        # the background, otherwise we'd be racing the extraction LLM call.
+        await self._perform_variable_extraction_if_needed(
+            node, run_in_background=False
+        )
+
+        missing = [
+            var_name
+            for var_name in required_vars
+            if not _has_captured_value(self._gathered_context.get(var_name))
+        ]
+
+        if not missing:
+            self._transition_block_counts.pop(node.id, None)
+            return True
+
+        attempts = self._transition_block_counts.get(node.id, 0) + 1
+
+        if attempts > _MAX_REQUIRED_VARIABLE_RETRIES:
+            logger.warning(
+                f"Node '{node.name}': giving up required-variable enforcement "
+                f"after {attempts - 1} blocked attempt(s) — allowing "
+                f"transition '{transition_name}' through with missing "
+                f"variable(s) {missing}"
+            )
+            self._gathered_context.setdefault(
+                "required_variables_unresolved", []
+            ).append({"node": node.name, "missing": missing})
+            self._transition_block_counts.pop(node.id, None)
+            return True
+
+        self._transition_block_counts[node.id] = attempts
+        logger.warning(
+            f"Blocked transition '{transition_name}' from node '{node.name}': "
+            f"missing required variable(s) {missing} "
+            f"(attempt {attempts}/{_MAX_REQUIRED_VARIABLE_RETRIES})"
+        )
+
+        missing_list = ", ".join(missing)
+        blocked_result = {
+            "status": "blocked",
+            "reason": f"Cannot proceed yet — still need: {missing_list}.",
+            "instruction": (
+                f"Continue the conversation and explicitly ask the caller "
+                f"for: {missing_list}. Do not call this function again "
+                f"until you have obtained and confirmed these details."
+            ),
+        }
+        await function_call_params.result_callback(blocked_result)
+        return False
 
     async def _await_pending_extractions(self, timeout: float = 30.0) -> None:
         """Await all in-flight background extraction tasks.

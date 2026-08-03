@@ -80,6 +80,19 @@ class Node:
         self.extraction_enabled = getattr(data, "extraction_enabled", False)
         self.extraction_prompt = getattr(data, "extraction_prompt", None)
         self.extraction_variables = getattr(data, "extraction_variables", None)
+        # Names of extraction variables that gate this node's outgoing
+        # transitions — only meaningful when extraction actually runs, so a
+        # node with extraction disabled can never soft-lock a call on a
+        # variable that would never be populated.
+        self.required_variable_names: List[str] = (
+            [
+                v.name
+                for v in (self.extraction_variables or [])
+                if getattr(v, "required_for_exit", False)
+            ]
+            if self.extraction_enabled
+            else []
+        )
         self.add_global_prompt = getattr(data, "add_global_prompt", True)
         self.greeting = getattr(data, "greeting", None)
         self.greeting_type = getattr(data, "greeting_type", None)
