@@ -703,6 +703,21 @@ class CampaignClient(BaseDBClient):
             result = await session.execute(query)
             return list(result.scalars().all())
 
+    async def get_campaign_run_logs(self, campaign_id: int) -> list[dict]:
+        """Just the ``logs`` JSON for every run in a campaign — for progress
+        computations (e.g. ``_count_failed_campaign_calls``) that only ever
+        inspect ``telephony_status_callbacks`` inside ``logs``. Avoids
+        pulling the full row (usage_info/cost_info/initial_context/
+        gathered_context) across the wire for every dialed number on every
+        poll of an active campaign, which is what
+        ``get_workflow_runs_by_campaign`` does."""
+        async with self.async_session() as session:
+            query = select(WorkflowRunModel.logs).where(
+                WorkflowRunModel.campaign_id == campaign_id
+            )
+            result = await session.execute(query)
+            return [logs or {} for logs in result.scalars().all()]
+
     async def get_completed_runs_for_report(
         self,
         *,
