@@ -855,15 +855,24 @@ class PipecatEngine:
         self,
         reason: str,
         abort_immediately: bool = False,
+        extra_context: Optional[dict] = None,
     ):
         """
         Centralized method to end the call with disposition mapping
+
+        extra_context: merged into gathered_context before the call ends —
+        e.g. on_pipeline_error uses this to tag a distinct failure detail
+        (like LLM rate-limit/quota exhaustion) so it's queryable on the saved
+        workflow_run, not just visible in a transient log line.
         """
         if self._call_disposed:
             logger.debug(f"Call already Disposed: {self._call_disposed}")
             return
 
         self._call_disposed = True
+
+        if extra_context:
+            self._gathered_context.update(extra_context)
 
         # Mute the pipeline
         self._mute_pipeline = True

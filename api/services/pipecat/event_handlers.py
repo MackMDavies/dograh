@@ -14,6 +14,7 @@ from api.services.pipecat.in_memory_buffers import (
     InMemoryAudioBuffer,
     InMemoryLogsBuffer,
 )
+from api.services.pipecat.llm_error_classification import classify_llm_exhaustion
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
@@ -22,6 +23,7 @@ from api.services.workflow.variable_resolution import fill_if_absent
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
 from pipecat.frames.frames import (
+    ErrorFrame,
     Frame,
 )
 from pipecat.pipeline.task import PipelineTask
@@ -205,6 +207,18 @@ def register_event_handlers(
     @task.event_handler("on_pipeline_error")
     async def on_pipeline_error(_task: PipelineTask, frame: Frame):
         logger.warning(f"Pipeline error for workflow run {workflow_run_id}: {frame}")
+
+        # Distinguish an LLM rate-limit/quota-exhaustion failure from a
+        # generic pipeline error: same graceful end-call path either way,
+        # but this failure mode is silent otherwise (the call still "connects"
+        # from the telephony side, so nothing else flags it) and it's the
+        # known recurring "agent rang but no audio" cause when a provider key
+        # runs out of credits — worth a loud, distinct signal so an operator
+        # finds out from a log/campaign-log entry instead of a client report.
+        llm_exhaustion = classify_llm_exhaustion(
+            frame.exception if isinstance(frame, ErrorFrame) else None
+        )
+
         try:
             workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
             if workflow_run and workflow_run.campaign_id:
@@ -214,19 +228,50 @@ def register_event_handlers(
                     workflow_run_id=workflow_run_id,
                     reason="pipeline_error",
                 )
+                if llm_exhaustion:
+                    await db_client.append_campaign_log(
+                        campaign_id=workflow_run.campaign_id,
+                        level="error",
+                        event="llm_provider_exhausted",
+                        message=(
+                            f"Call ended: LLM provider returned a rate-limit/"
+                            f"quota error ({llm_exhaustion['exception_type']}) — "
+                            "check the provider's credits/quota."
+                        ),
+                        details={
+                            "workflow_run_id": workflow_run_id,
+                            "workflow_id": workflow_run.workflow_id,
+                            **llm_exhaustion,
+                        },
+                    )
             asyncio.create_task(
                 _capture_call_event(
                     workflow_run_id,
                     user_provider_id,
                     PostHogEvent.CALL_FAILED,
-                    extra_properties={"error_reason": "pipeline_error"},
+                    extra_properties={
+                        "error_reason": "llm_provider_exhausted"
+                        if llm_exhaustion
+                        else "pipeline_error",
+                    },
                 )
             )
         except Exception as e:
             logger.error(f"Error recording circuit breaker failure: {e}", exc_info=True)
 
+        if llm_exhaustion:
+            organization_id = await engine._get_organization_id()
+            logger.error(
+                f"[LLM_PROVIDER_EXHAUSTED] workflow_run={workflow_run_id} "
+                f"organization_id={organization_id}: {llm_exhaustion['exception_message']}"
+            )
+
         await engine.end_call_with_reason(
-            EndTaskReason.PIPELINE_ERROR.value, abort_immediately=True
+            EndTaskReason.PIPELINE_ERROR.value,
+            abort_immediately=True,
+            extra_context={"llm_provider_exhausted": llm_exhaustion}
+            if llm_exhaustion
+            else None,
         )
 
     @task.event_handler("on_pipeline_finished")
