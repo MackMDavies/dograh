@@ -71,6 +71,18 @@ class ExtractionVariableDTO(BaseModel):
         description="Per-variable hint describing what to look for.",
         editor="textarea",
     )
+    required_for_exit: bool = spec_field(
+        default=False,
+        ui_type=PropertyType.boolean,
+        display_name="Require Before Leaving",
+        description=(
+            "When true, this node's outgoing transitions are blocked until a "
+            "non-empty value for this variable has been captured — the agent "
+            "keeps asking instead of moving on. Use this for information that "
+            "must not be skipped (e.g. phone number, email) before the "
+            "conversation proceeds."
+        ),
+    )
 
 
 class CustomHeaderDTO(BaseModel):
