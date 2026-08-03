@@ -698,6 +698,15 @@ async def update_campaign(
         update_kwargs["orchestrator_metadata"] = metadata
 
     if request.workflow_id is not None:
+        if not user.is_superuser:
+            # Unlike create_campaign (which validates via get_workflow_name),
+            # this write path had no ownership check at all — a client could
+            # repoint an existing campaign at another org's workflow/agent.
+            workflow_name = await db_client.get_workflow_name(
+                request.workflow_id, organization_id=user.selected_organization_id
+            )
+            if not workflow_name:
+                raise HTTPException(status_code=404, detail="Workflow not found")
         update_kwargs["workflow_id"] = request.workflow_id
 
     if request.telephony_configuration_id is not None:
@@ -710,10 +719,19 @@ async def update_campaign(
                 request.telephony_configuration_id, user.selected_organization_id
             )
             if not cfg:
-                # Cross-org fallback for admin configs used by client orgs.
-                cfg = await db_client.get_telephony_configuration(
-                    request.telephony_configuration_id
-                )
+                # Client orgs may also reference the platform admin's
+                # shared/managed telephony config (e.g. "Sysevo Managed") —
+                # same get_platform_organization_id() pattern already used by
+                # ai_providers.py/voice_library.py for other shared platform
+                # resources. This must stay org-scoped to the platform org
+                # specifically: the previous unscoped get_telephony_configuration(id)
+                # fallback let any org reference ANY other org's telephony
+                # config, including its encrypted provider credentials.
+                platform_org_id = await db_client.get_platform_organization_id()
+                if platform_org_id is not None:
+                    cfg = await db_client.get_telephony_configuration_for_org(
+                        request.telephony_configuration_id, platform_org_id
+                    )
         if not cfg:
             raise HTTPException(
                 status_code=400, detail="telephony_configuration_not_found"
