@@ -58,7 +58,10 @@ from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
-from api.services.workflow.variable_resolution import extract_variable_defaults
+from api.services.workflow.variable_resolution import (
+    build_call_context,
+    build_memory_attr_map,
+)
 from api.services.workflow.workflow_graph import WorkflowGraph
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -372,27 +375,26 @@ async def _run_pipeline(
     if workflow_run is None or workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
-    merged_call_context_vars = workflow_run.initial_context
-    # If there is some extra call_context_vars, fold them in. Persistence
-    # happens once below, after runtime_configuration is also resolved.
-    if call_context_vars:
-        merged_call_context_vars = {**merged_call_context_vars, **call_context_vars}
-
     # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
     # access is validated before the pipeline is invoked.
     workflow = await db_client.get_workflow_by_id(workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # Seed workflow-level variable defaults as the BASE layer for every call
-    # type (campaign, telephony, inbound). initial_context + telephony extras
-    # already merged above take precedence; caller memory (fill-if-absent later)
-    # fills only what remains. Uses extract_variable_defaults so canonical
-    # object-shaped variables ({default,source,...}) contribute only their
-    # default string, never the raw object.
-    workflow_defaults = extract_variable_defaults(workflow.template_context_variables)
-    if workflow_defaults:
-        merged_call_context_vars = {**workflow_defaults, **merged_call_context_vars}
+    # Assemble the variable context for this call. Precedence (highest first):
+    # static-pinned vars > telephony/transport extras > initial_context
+    # (campaign contact row, or seeded defaults for a test call) > workflow
+    # defaults. Caller memory fills whatever is still empty, later at call start.
+    # Descriptor objects ({default,source,...}) are collapsed to their default
+    # so they can never reach the renderer and be spoken aloud as JSON.
+    merged_call_context_vars = build_call_context(
+        initial_context=workflow_run.initial_context,
+        extra_context_vars=call_context_vars,
+        template_context_variables=workflow.template_context_variables,
+    )
+
+    # Maps caller-memory attribute names onto the variables they're bound to.
+    memory_attr_map = build_memory_attr_map(workflow.template_context_variables)
 
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
@@ -954,6 +956,7 @@ async def _run_pipeline(
         audio_config=audio_config,
         pre_call_fetch_task=pre_call_fetch_task,
         pre_call_fetch_is_memory=pre_call_fetch_is_memory,
+        memory_attr_map=memory_attr_map,
         user_provider_id=user_provider_id,
         integration_runtime_sessions=integration_runtime_sessions,
     )

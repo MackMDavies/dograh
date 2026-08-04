@@ -19,7 +19,10 @@ from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggr
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
 from api.services.workflow.pipecat_engine import PipecatEngine
-from api.services.workflow.variable_resolution import fill_if_absent
+from api.services.workflow.variable_resolution import (
+    fill_if_absent,
+    remap_memory_variables,
+)
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
 from pipecat.frames.frames import (
@@ -73,6 +76,7 @@ def register_event_handlers(
     audio_config=AudioConfig,
     pre_call_fetch_task: asyncio.Task | None = None,
     pre_call_fetch_is_memory: bool = False,
+    memory_attr_map: dict[str, str] | None = None,
     user_provider_id: str | None = None,
     integration_runtime_sessions: list[IntegrationRuntimeSession] | None = None,
 ):
@@ -146,8 +150,13 @@ def register_event_handlers(
 
                 if fetch_result:
                     if pre_call_fetch_is_memory:
-                        # Caller memory fills only the gaps — campaign/explicit
+                        # Land memory values on the variables they're bound to
+                        # (a variable may map to a differently-named memory
+                        # attribute), then fill only the gaps — campaign/explicit
                         # values and non-empty workflow defaults win.
+                        fetch_result = remap_memory_variables(
+                            fetch_result, memory_attr_map or {}
+                        )
                         fill_if_absent(engine._call_context_vars, fetch_result)
                     else:
                         # Generic pre-call HTTP fetch keeps its enrich/override

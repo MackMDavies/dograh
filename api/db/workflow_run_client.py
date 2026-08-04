@@ -17,6 +17,7 @@ from api.db.models import (
 )
 from api.enums import CallType, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
+from api.services.workflow.variable_resolution import sanitize_context_variables
 
 
 class WorkflowRunClient(BaseDBClient):
@@ -85,8 +86,12 @@ class WorkflowRunClient(BaseDBClient):
             # Get the current storage backend based on ENABLE_AWS_S3 flag
             current_backend = StorageBackend.get_current_backend()
 
-            # Use initial_context from the version if available, else from workflow
-            default_context = (
+            # Use initial_context from the version if available, else from workflow.
+            # Sanitised so canonical descriptor objects ({default,source,...})
+            # are collapsed to their default string — storing the raw config here
+            # would put a dict in front of the renderer, which JSON-dumps it and
+            # the agent then reads it aloud on the call.
+            default_context = sanitize_context_variables(
                 target_def.template_context_variables
                 if target_def and target_def.template_context_variables
                 else workflow.template_context_variables

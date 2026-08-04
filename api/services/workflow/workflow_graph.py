@@ -8,9 +8,15 @@ from api.services.workflow.node_data import BaseNodeData
 from api.services.workflow.node_specs import get_spec
 
 # Regex for matching {{ variable }} template placeholders.
-# Captures: group(1) = variable path, group(2) = filter name, group(3) = filter value.
+# Captures: group(1) = variable path, group(2) = the whole fallback expression.
+# The fallback is captured verbatim (colons included) and only split on ":" by
+# the renderer for the legacy {{var | fallback:default}} form — otherwise a
+# perfectly ordinary default like "Hi: friend" would be truncated at the colon.
 # Shared with api.utils.template_renderer via import.
-TEMPLATE_VAR_PATTERN = r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))?)?\s*\}\}"
+TEMPLATE_VAR_PATTERN = r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^}]+))?\s*\}\}"
+
+# Legacy fallback filter prefix: {{var | fallback:default}}
+LEGACY_FALLBACK_FILTER = "fallback"
 
 # Variables injected by the system at runtime, not from source data.
 _SYSTEM_VARIABLES = {"campaign_id", "provider", "source_uuid"}
