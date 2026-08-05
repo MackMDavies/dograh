@@ -9,6 +9,7 @@ from sqlalchemy import and_, or_, select
 
 from api.db.base_client import BaseDBClient
 from api.db.models import VoiceLibraryModel
+from api.services.voice_library.dedupe import dedupe_voices
 
 
 class VoiceLibraryClient(BaseDBClient):
@@ -151,7 +152,11 @@ class VoiceLibraryClient(BaseDBClient):
                 .where(and_(*filters))
                 .order_by(VoiceLibraryModel.created_at.desc())
             )
-            return list(result.scalars().all())
+            # Collapse duplicate rows for the same provider voice — the sync's
+            # check-then-insert has no unique constraint behind it, and a
+            # superuser's cross-org view can surface the same voice per org.
+            # Either way the picker must list a voice once.
+            return dedupe_voices(list(result.scalars().all()))
 
     async def update_voice(
         self,
