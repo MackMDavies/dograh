@@ -18,6 +18,7 @@ from api.services.pipecat.llm_error_classification import classify_llm_exhaustio
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
+from api.services.pipecat.recovery_speech import pick_recovery_line
 from api.services.workflow.pipecat_engine import PipecatEngine
 from api.services.workflow.variable_resolution import (
     fill_if_absent,
@@ -28,6 +29,7 @@ from api.tasks.function_names import FunctionNames
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
+    TTSSpeakFrame,
 )
 from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
@@ -99,6 +101,9 @@ def register_event_handlers(
         sample_rate=sample_rate,
         num_channels=num_channels,
     )
+    # How many recovery lines have been spoken on this call (capped).
+    recovery_state = {"spoken": 0}
+
     # Track both events to ensure the initial response is only triggered after both occur
     ready_state = {
         "pipeline_started": False,
@@ -216,6 +221,21 @@ def register_event_handlers(
     @task.event_handler("on_pipeline_error")
     async def on_pipeline_error(_task: PipelineTask, frame: Frame):
         logger.warning(f"Pipeline error for workflow run {workflow_run_id}: {frame}")
+
+        # Say something. A stalled LLM (rate limit, timeout) otherwise leaves
+        # the caller in silence, which reads as a dropped call. Capped, so a
+        # genuinely down provider ends the call rather than looping filler.
+        line = pick_recovery_line(recovery_state["spoken"])
+        if line:
+            recovery_state["spoken"] += 1
+            try:
+                await task.queue_frame(
+                    TTSSpeakFrame(
+                        line, append_to_context=False, persist_to_logs=True
+                    )
+                )
+            except Exception as speak_err:
+                logger.warning(f"Could not speak recovery line: {speak_err}")
 
         # Distinguish an LLM rate-limit/quota-exhaustion failure from a
         # generic pipeline error: same graceful end-call path either way,
