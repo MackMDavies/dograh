@@ -116,7 +116,11 @@ async def _run_qa_nodes(
                 f"{len(node_results)} nodes analyzed"
             )
         except Exception as e:
-            logger.error(f"QA analysis failed for node '{node_name}': {e}")
+            # exc_info so the stack is captured — str(e) alone gave us
+            # "'list' object has no attribute 'get'" with no location.
+            logger.error(
+                f"QA analysis failed for node '{node_name}': {e}", exc_info=True
+            )
             results[f"qa_{node_id}"] = {"error": str(e)}
 
     return results

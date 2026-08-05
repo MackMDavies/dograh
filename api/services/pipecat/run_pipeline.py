@@ -841,9 +841,54 @@ async def _run_pipeline(
         @voicemail_detector.event_handler("on_voicemail_detected")
         async def _on_voicemail_detected(_processor):
             logger.info(f"Voicemail detected for workflow run {workflow_run_id}")
+
+            # SYSEVO_VOICEMAIL_MESSAGE: speak a fixed message before hanging up.
+            # Opt-in — with no `message` configured this behaves exactly as
+            # before (immediate CancelFrame, no message left).
+            message = str(voicemail_config.get("message") or "").strip()
+            left_message = False
+
+            if message:
+                try:
+                    from pipecat.frames.frames import TTSSpeakFrame
+
+                    spoken = engine._format_prompt(message)
+                    max_seconds = float(
+                        voicemail_config.get("message_max_seconds", 30)
+                    )
+                    logger.info(
+                        f"Leaving voicemail for run {workflow_run_id} "
+                        f"({len(spoken)} chars, cap {max_seconds}s)"
+                    )
+                    await engine.task.queue_frame(
+                        TTSSpeakFrame(spoken, append_to_context=True)
+                    )
+
+                    loop = asyncio.get_event_loop()
+                    deadline = loop.time() + max_seconds
+                    # Wait for speech to start (TTS has to synthesise first)...
+                    while loop.time() < deadline and not engine._bot_is_speaking:
+                        await asyncio.sleep(0.1)
+                    # ...then for it to finish.
+                    while loop.time() < deadline and engine._bot_is_speaking:
+                        await asyncio.sleep(0.1)
+
+                    left_message = True
+                    if loop.time() >= deadline:
+                        logger.warning(
+                            f"Voicemail message for run {workflow_run_id} hit the "
+                            f"{max_seconds}s cap; ending anyway"
+                        )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to leave voicemail for run {workflow_run_id}: {e}"
+                    )
+
+            engine._gathered_context["voicemail_message_left"] = left_message
             await engine.end_call_with_reason(
                 reason=EndTaskReason.VOICEMAIL_DETECTED.value,
-                abort_immediately=True,
+                # Graceful EndFrame when we spoke, so the audio actually drains.
+                abort_immediately=not left_message,
             )
 
     # Recording router is only meaningful in non-realtime mode (it routes between

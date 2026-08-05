@@ -150,6 +150,27 @@ class CircuitBreakerConfigResponse(BaseModel):
     min_calls_in_window: int = 5
 
 
+class EnqueueRunRequest(BaseModel):
+    source_uuid: str
+    context_variables: dict
+    scheduled_for: Optional[datetime] = None
+    retry_reason: Optional[str] = None
+
+
+class UpdateQueuedRunRequest(BaseModel):
+    """SYSEVO_CALLBACK_PATCH: reschedule, or cancel, a queued callback.
+
+    `reschedule` is explicit rather than inferred from `scheduled_for is not
+    None`, because None is a meaningful value here: clearing the time sends the
+    row back to the review queue, and the dispatcher only claims rows whose time
+    is due, so an unscheduled row can never dial.
+    """
+
+    scheduled_for: Optional[datetime] = None
+    reschedule: bool = False
+    cancel: bool = False
+
+
 class CreateCampaignRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     workflow_id: int
@@ -211,6 +232,10 @@ class CampaignResponse(BaseModel):
     total_queued_count: int = 0
     parent_campaign_id: Optional[int] = None
     redialed_campaign_id: Optional[int] = None
+    # SYSEVO_IS_STANDING: a standing campaign is a dispatch queue (callbacks),
+    # not a user-facing campaign. Exposed so the UI can route it to /callbacks
+    # and keep it out of the campaign list.
+    is_standing: bool = False
     telephony_configuration_id: Optional[int] = None
     telephony_configuration_name: Optional[str] = None
     logs: List[CampaignLogEntryResponse] = Field(default_factory=list)
@@ -314,6 +339,7 @@ def _build_campaign_response(
         total_queued_count=total_queued_count,
         parent_campaign_id=parent_campaign_id,
         redialed_campaign_id=redialed_campaign_id,
+        is_standing=bool(getattr(campaign, "is_standing", False)),
         telephony_configuration_id=campaign.telephony_configuration_id,
         telephony_configuration_name=telephony_configuration_name,
         logs=[
@@ -1160,3 +1186,96 @@ async def delete_campaign_post(
 ) -> dict:
     """Delete a campaign permanently (POST fallback for proxies that block DELETE)."""
     return await _do_delete_campaign(campaign_id, user)
+
+
+@router.post("/{campaign_id}/enqueue")
+async def enqueue_run(
+    campaign_id: int,
+    request: EnqueueRunRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Add a single scheduled run to an existing campaign.
+
+    Exists for callbacks: campaigns are otherwise built wholesale from a source
+    file, and there is no way to add one contact for one future moment.
+    """
+    # Org-scope the campaign. Per api/AGENTS.md an id from the request body
+    # never implies ownership — fetch with the caller's org and 404 otherwise.
+    # NOTE: db_client.get_campaign_by_id has no organization_id parameter (it is
+    # an explicitly internal/unscoped lookup); the org-scoped fetcher used
+    # elsewhere in this file (see get_campaign, start_campaign) is
+    # db_client.get_campaign(campaign_id, organization_id).
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Idempotency: a re-analysed call must not schedule the same callback twice.
+    existing = await db_client.get_queued_run_by_source_uuid(
+        campaign_id=campaign_id, source_uuid=request.source_uuid
+    )
+    if existing:
+        return {"queued_run_id": existing.id, "already_enqueued": True}
+
+    queued_run = await db_client.create_queued_run(
+        campaign_id=campaign_id,
+        source_uuid=request.source_uuid,
+        context_variables=request.context_variables,
+        scheduled_for=request.scheduled_for,
+        retry_reason=request.retry_reason,
+    )
+    return {"queued_run_id": queued_run.id, "already_enqueued": False}
+
+
+@router.patch("/{campaign_id}/queued-runs/{queued_run_id}")
+async def update_queued_run_endpoint(
+    campaign_id: int,
+    queued_run_id: int,
+    request: UpdateQueuedRunRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Reschedule or cancel a queued run. Exists for the callbacks surface."""
+    # Org-scope through the campaign, exactly as enqueue_run does: an id in the
+    # path never implies ownership.
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    queued_run = await db_client.get_queued_run_by_id(queued_run_id)
+    # The run must belong to THIS campaign, or the check above is decorative and
+    # any org could modify any queued run by guessing an id.
+    if not queued_run or queued_run.campaign_id != campaign_id:
+        raise HTTPException(status_code=404, detail="Queued run not found")
+
+    if queued_run.state not in ("queued", "failed"):
+        # processing/processed means the call is in flight or already made:
+        # rescheduling would either double-dial or rewrite history.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot modify a run in state '{queued_run.state}'",
+        )
+
+    updates: dict = {}
+    if request.cancel:
+        # queued_run_state has no 'cancelled' member, and adding one is a
+        # migration for a single UI affordance. 'failed' plus an explicit reason
+        # keeps it out of the dispatcher and readable in History.
+        updates["state"] = "failed"
+        updates["retry_reason"] = "cancelled_by_user"
+        updates["scheduled_for"] = None
+    elif request.reschedule:
+        updates["scheduled_for"] = request.scheduled_for
+        if queued_run.state == "failed":
+            # Re-opening a previously cancelled callback.
+            updates["state"] = "queued"
+    else:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    updated = await db_client.update_queued_run(queued_run_id, **updates)
+    return {
+        "id": updated.id,
+        "state": updated.state,
+        "scheduled_for": updated.scheduled_for.isoformat() if updated.scheduled_for else None,
+        "retry_reason": updated.retry_reason,
+    }

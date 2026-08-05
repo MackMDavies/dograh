@@ -431,6 +431,47 @@ class PipecatEngine:
         # Register the function with the LLM
         self.llm.register_function("retrieve_from_knowledge_base", retrieve_kb_func)
 
+    async def _register_dtmf_function(self) -> None:
+        """SYSEVO_DTMF: let the LLM press keypad digits.
+
+        Automated gatekeepers ("to get through, press nine") were unreachable —
+        the agent could hear the instruction and had no way to act on it, so it
+        just repeated its opener until the system hung up.
+        """
+
+        async def press_keys_func(function_call_params: FunctionCallParams) -> None:
+            raw = str(function_call_params.arguments.get("digits", "") or "")
+            digits = "".join(c for c in raw if c in "0123456789*#")[:8]
+            logger.info(f"LLM Function Call EXECUTED: press_keys ({raw!r} -> {digits!r})")
+
+            if not digits:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "no valid keypad digits supplied"}
+                )
+                return
+
+            try:
+                from pipecat.frames.frames import OutputDTMFFrame
+
+                if self.task is None:
+                    raise RuntimeError("no pipeline task available")
+                await self.task.queue_frame(OutputDTMFFrame.from_string(digits))
+                self._gathered_context.setdefault("dtmf_pressed", []).append(digits)
+                await function_call_params.result_callback(
+                    {
+                        "status": "pressed",
+                        "digits": digits,
+                        "note": "Keys sent. Stay quiet for a moment and wait to be connected.",
+                    }
+                )
+            except Exception as e:
+                logger.error(f"press_keys failed: {e}")
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": str(e)}
+                )
+
+        self.llm.register_function("press_keys", press_keys_func)
+
     async def _perform_variable_extraction_if_needed(
         self, node: Optional[Node], run_in_background: bool = True
     ) -> None:
@@ -665,6 +706,10 @@ class PipecatEngine:
         if kb_doc_uuids:
             await self._register_knowledge_base_function(kb_doc_uuids)
 
+        # SYSEVO_DTMF: available on every node — an IVR or call-control gate can
+        # appear at any point, not just when the call is answered.
+        await self._register_dtmf_function()
+
         # Compose prompt and functions via the context composer module
         system_prompt = compose_system_prompt_for_node(
             node=node,
@@ -823,6 +868,16 @@ class PipecatEngine:
                     # append_to_context=True so the assistant aggregator commits
                     # the greeting to the LLM context once TTS finishes; without
                     # it the LLM would re-greet on its first generation.
+                    # SYSEVO_GREETING_UNINTERRUPTIBLE: mute the caller for the
+                    # duration of the greeting, exactly as queued transition
+                    # speech and custom tool messages already do. Without this
+                    # the opening line is the only speech on the call that can
+                    # be cut off — and callers routinely say "Hello?" in the
+                    # ~1.7s between answering and first audio, which clipped
+                    # the greeting mid-sentence. The _max_bot_mute_seconds
+                    # watchdog still releases the mute if the bot-stopped frame
+                    # never arrives, so this cannot strand a caller.
+                    self._queued_speech_mute_state = "waiting"
                     await self.task.queue_frame(
                         TTSSpeakFrame(greeting_value, append_to_context=True)
                     )

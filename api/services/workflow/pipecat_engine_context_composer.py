@@ -149,6 +149,28 @@ async def compose_functions_for_node(
         )
         functions.append(kb_schema)
 
+    # SYSEVO_DTMF: keypad control. Advertised on every node — registering the
+    # handler without telling the LLM the tool exists makes it silently useless.
+    functions.append(
+        get_function_schema(
+            "press_keys",
+            (
+                "Press digits on the phone keypad. Use this ONLY when an automated "
+                "system or recorded message asks you to press something to continue "
+                "— for example 'this number has call control, to get through press "
+                "nine', or 'press one for sales'. Never use it while talking to a "
+                "person. After pressing, stay quiet and wait to be connected."
+            ),
+            properties={
+                "digits": {
+                    "type": "string",
+                    "description": "Digits to press, e.g. '9' or '1'. 0-9, * and # only.",
+                }
+            },
+            required=["digits"],
+        )
+    )
+
     # Custom tools
     if node.tool_uuids and custom_tool_manager:
         custom_tool_schemas = await custom_tool_manager.get_tool_schemas(

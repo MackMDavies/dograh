@@ -1,5 +1,7 @@
 from typing import Annotated, Optional
 
+import asyncio
+
 import httpx
 from fastapi import Header, HTTPException, Query, WebSocket
 from loguru import logger
@@ -159,19 +161,34 @@ async def _handle_supabase_auth(authorization: str | None) -> UserModel:
             detail="SUPABASE_URL and SUPABASE_ANON_KEY must be set when AUTH_PROVIDER=supabase",
         )
 
-    # Verify the token with Supabase
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{SUPABASE_URL}/auth/v1/user",
-                headers={
-                    "Authorization": f"Bearer {token}",
-                    "apikey": SUPABASE_ANON_KEY,
-                },
-                timeout=10.0,
-            )
-    except httpx.RequestError as e:
-        logger.error(f"Supabase auth request failed: {e}")
+    # Verify the token with Supabase.
+    # SYSEVO_AUTH_RETRY: Supabase auth latency is spiky — probes from this host
+    # measured 0.2s to 11.3s within seconds of each other. One attempt on a 10s
+    # timeout means any request landing in a spike fails the user with "Auth
+    # service unavailable". Retry transport errors only; an invalid token is a
+    # 401 and must never be retried.
+    response = None
+    last_error = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.get(
+                    f"{SUPABASE_URL}/auth/v1/user",
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "apikey": SUPABASE_ANON_KEY,
+                    },
+                    timeout=15.0,
+                )
+            break
+        except httpx.RequestError as e:
+            last_error = e
+            logger.warning(f"Supabase auth attempt {attempt + 1}/3 failed: {e!r}")
+            if attempt < 2:
+                await asyncio.sleep(0.4 * (attempt + 1))
+
+    if response is None:
+        logger.error(f"Supabase auth failed after 3 attempts: {last_error!r}")
         raise HTTPException(status_code=503, detail="Auth service unavailable")
 
     if response.status_code != 200:
@@ -181,6 +198,14 @@ async def _handle_supabase_auth(authorization: str | None) -> UserModel:
     supabase_user_id: str = supabase_user.get("id", "")
     if not supabase_user_id:
         raise HTTPException(status_code=401, detail="Unable to identify user")
+
+    # Sysevo client account (set on app_metadata by sync-user-account-metadata /
+    # provision-voice-account). When present we key the Dograh org by the CLIENT
+    # ACCOUNT so every seat of the account shares one org (and its agents), while
+    # accounts stay isolated. Absent (older token / not-yet-stamped user) → fall
+    # back to the per-user org so auth never breaks during rollout.
+    app_metadata = supabase_user.get("app_metadata") or {}
+    client_account_id = app_metadata.get("sysevo_client_account_id")
 
     # Get or create local user record keyed by Supabase UUID
     try:
@@ -196,7 +221,11 @@ async def _handle_supabase_auth(authorization: str | None) -> UserModel:
 
     # Get or create an organization for this user
     try:
-        org_provider_id = f"supabase_org_{supabase_user_id}"
+        org_provider_id = (
+            f"supabase_org_acct_{client_account_id}"
+            if client_account_id
+            else f"supabase_org_{supabase_user_id}"
+        )
         org, org_was_created = await db_client.get_or_create_organization_by_provider_id(
             org_provider_id=org_provider_id, user_id=user.id
         )

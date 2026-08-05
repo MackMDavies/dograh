@@ -122,6 +122,8 @@ class SuperuserCampaignItem(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    # SYSEVO_IS_STANDING: dispatch queue (callbacks), not a user-facing campaign.
+    is_standing: bool = False
 
 
 @router.get("/campaigns", response_model=List[SuperuserCampaignItem])
@@ -162,6 +164,7 @@ async def list_all_campaigns(
             created_at=c.created_at,
             started_at=c.started_at,
             completed_at=c.completed_at,
+            is_standing=bool(getattr(c, "is_standing", False)),
         )
         for c in campaigns
     ]
