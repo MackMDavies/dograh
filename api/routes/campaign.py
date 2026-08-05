@@ -165,6 +165,13 @@ class CreateCampaignRequest(BaseModel):
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
 
 
+class EnqueueRunRequest(BaseModel):
+    source_uuid: str
+    context_variables: dict
+    scheduled_for: Optional[datetime] = None
+    retry_reason: Optional[str] = None
+
+
 class UpdateCampaignRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     retry_config: Optional[RetryConfigRequest] = None
@@ -1142,3 +1149,42 @@ async def delete_campaign_post(
 ) -> dict:
     """Delete a campaign permanently (POST fallback for proxies that block DELETE)."""
     return await _do_delete_campaign(campaign_id, user)
+
+
+@router.post("/{campaign_id}/enqueue")
+async def enqueue_run(
+    campaign_id: int,
+    request: EnqueueRunRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Add a single scheduled run to an existing campaign.
+
+    Exists for callbacks: campaigns are otherwise built wholesale from a source
+    file, and there is no way to add one contact for one future moment.
+    """
+    # Org-scope the campaign. Per api/AGENTS.md an id from the request body
+    # never implies ownership — fetch with the caller's org and 404 otherwise.
+    # NOTE: db_client.get_campaign_by_id has no organization_id parameter (it is
+    # an explicitly internal/unscoped lookup); the org-scoped fetcher used
+    # elsewhere in this file (see get_campaign, start_campaign) is
+    # db_client.get_campaign(campaign_id, organization_id).
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    # Idempotency: a re-analysed call must not schedule the same callback twice.
+    existing = await db_client.get_queued_run_by_source_uuid(
+        campaign_id=campaign_id, source_uuid=request.source_uuid
+    )
+    if existing:
+        return {"queued_run_id": existing.id, "already_enqueued": True}
+
+    queued_run = await db_client.create_queued_run(
+        campaign_id=campaign_id,
+        source_uuid=request.source_uuid,
+        context_variables=request.context_variables,
+        scheduled_for=request.scheduled_for,
+        retry_reason=request.retry_reason,
+    )
+    return {"queued_run_id": queued_run.id, "already_enqueued": False}
