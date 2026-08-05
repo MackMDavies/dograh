@@ -76,3 +76,32 @@ def test_handles_none_initial_context():
         extra_context_vars=None,
         template_context_variables={"a": "1"},
     ) == {"a": "1"}
+
+
+# --- variable source selection -------------------------------------------------
+
+
+def test_definition_variables_are_preferred_over_workflow_row():
+    """The agent editor saves template variables on the DEFINITION (draft/published),
+    so the pipeline must read them from the run's pinned definition. Reading the
+    workflow row — which the editor never writes — silently disabled the defaults,
+    static and memory-binding layers on every real call."""
+    from api.services.workflow.variable_resolution import pick_template_variables
+
+    assert pick_template_variables(
+        definition_vars={"first_name": "there"}, workflow_vars={}
+    ) == {"first_name": "there"}
+
+
+def test_falls_back_to_workflow_row_when_definition_has_none():
+    from api.services.workflow.variable_resolution import pick_template_variables
+
+    assert pick_template_variables(
+        definition_vars={}, workflow_vars={"company": "your business"}
+    ) == {"company": "your business"}
+
+
+def test_returns_empty_when_neither_side_has_variables():
+    from api.services.workflow.variable_resolution import pick_template_variables
+
+    assert pick_template_variables(definition_vars=None, workflow_vars=None) == {}

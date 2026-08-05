@@ -127,6 +127,20 @@ def extract_variable_defaults(raw: Any) -> dict[str, str]:
     return out
 
 
+def pick_template_variables(*, definition_vars: Any, workflow_vars: Any) -> dict:
+    """Choose which template-variable config a call should use.
+
+    The agent editor persists template variables on the workflow DEFINITION
+    (draft or published), so the run's pinned definition is authoritative. The
+    workflow row is only a legacy fallback for rows written before versioning.
+    """
+    if isinstance(definition_vars, dict) and definition_vars:
+        return definition_vars
+    if isinstance(workflow_vars, dict) and workflow_vars:
+        return workflow_vars
+    return {}
+
+
 def build_call_context(
     *,
     initial_context: Any,

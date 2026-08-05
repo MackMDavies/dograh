@@ -61,6 +61,7 @@ from api.services.workflow.pipecat_engine import PipecatEngine
 from api.services.workflow.variable_resolution import (
     build_call_context,
     build_memory_attr_map,
+    pick_template_variables,
 )
 from api.services.workflow.workflow_graph import WorkflowGraph
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
@@ -381,6 +382,18 @@ async def _run_pipeline(
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
+    # Use the run's pinned definition for graph + configs (not the workflow's current)
+    run_definition = workflow_run.definition
+    if run_definition is None:
+        raise HTTPException(status_code=400, detail="Workflow run has no definition — save and publish the workflow first")
+
+    # The agent editor saves template variables on the DEFINITION, so read them
+    # from the run's pinned version; the workflow row is a legacy fallback only.
+    template_vars = pick_template_variables(
+        definition_vars=run_definition.template_context_variables,
+        workflow_vars=workflow.template_context_variables,
+    )
+
     # Assemble the variable context for this call. Precedence (highest first):
     # static-pinned vars > telephony/transport extras > initial_context
     # (campaign contact row, or seeded defaults for a test call) > workflow
@@ -390,16 +403,11 @@ async def _run_pipeline(
     merged_call_context_vars = build_call_context(
         initial_context=workflow_run.initial_context,
         extra_context_vars=call_context_vars,
-        template_context_variables=workflow.template_context_variables,
+        template_context_variables=template_vars,
     )
 
     # Maps caller-memory attribute names onto the variables they're bound to.
-    memory_attr_map = build_memory_attr_map(workflow.template_context_variables)
-
-    # Use the run's pinned definition for graph + configs (not the workflow's current)
-    run_definition = workflow_run.definition
-    if run_definition is None:
-        raise HTTPException(status_code=400, detail="Workflow run has no definition — save and publish the workflow first")
+    memory_attr_map = build_memory_attr_map(template_vars)
     run_workflow_json = run_definition.workflow_json
     run_configs = run_definition.workflow_configurations or {}
 
