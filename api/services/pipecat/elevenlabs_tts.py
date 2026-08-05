@@ -56,8 +56,47 @@ class DograhElevenLabsTTSService(ElevenLabsTTSService):
         await super()._connect()
         logger.info("DograhElevenLabs: _connect() done")
 
+    async def _close_stale_contexts(self, context_id: str):
+        """Close any ElevenLabs context other than the one we're about to use.
+
+        The multi-stream endpoint keeps a context open until it is explicitly
+        closed. Upstream relies on the InterruptionFrame path to do that and so
+        assumes only one context is ever live -- which is why the base class
+        stitches word alignment through a SINGLE shared _partial_word /
+        _partial_word_start_time / _cumulative_time triple.
+
+        We force auto_mode=True in _connect_websocket() (see the comment there)
+        because the close trigger wasn't firing, which means contexts now stay
+        open. When a second response opens a context while the previous one is
+        still rendering, ElevenLabs returns both streams on the same socket and
+        that shared stitching state merges them -- producing overlapping audio
+        and garbled, slurred word output. Closing the previous context first
+        restores the one-context-at-a-time invariant the base class expects.
+
+        Only *other* contexts are closed: a single response calls run_tts once
+        per sentence with the same context_id, and those must not be cut off.
+        """
+        try:
+            live = list(self.get_audio_contexts() or [])
+        except Exception as e:
+            logger.warning(f"DograhElevenLabs: could not list TTS contexts: {e}")
+            return
+
+        for ctx_id in live:
+            if ctx_id == context_id:
+                continue
+            try:
+                logger.info(f"DograhElevenLabs: closing stale TTS context {ctx_id}")
+                await self._close_context(ctx_id)
+                self._reset_alignment_state(ctx_id)
+            except Exception as e:
+                logger.warning(
+                    f"DograhElevenLabs: failed to close stale TTS context {ctx_id}: {e}"
+                )
+
     async def run_tts(self, text: str, context_id: str):
         logger.info(f"[DIAG] DograhElevenLabs: run_tts() called with text len={len(text)}")
+        await self._close_stale_contexts(context_id)
         async for frame in super().run_tts(text, context_id):
             yield frame
         logger.info("[DIAG] DograhElevenLabs: run_tts() completed")

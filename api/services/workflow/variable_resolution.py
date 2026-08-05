@@ -5,13 +5,86 @@ either a bare default string or an object {default?, source?, memory_attr?} —
 and provides fill-if-absent merging used to layer campaign, default, and
 memory values at the correct precedence.
 """
+from datetime import datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
-# Keys that identify a canonical (WS1) variable descriptor object. A dict whose
-# keys are a subset of these is configuration describing a variable, NOT call
-# data — it must be collapsed to its default before reaching the renderer.
+# SYSEVO_DATE_CONTEXT: the timezone the booking calendar reports
+# (CheckAvailability returns "timezone": "Europe/London"). Date arithmetic here
+# must agree with it, or a call near midnight books the wrong day.
+_BUSINESS_TZ = ZoneInfo("Europe/London")
+
+# Keys that mark a value as a variable DESCRIPTOR rather than call data. Its
+# definition was lost in an edit while the use at is_variable_descriptor()
+# remained, so every campaign dispatch raised NameError and marked the run
+# failed before dialling.
 _DESCRIPTOR_KEYS = {"default", "source", "memory_attr", "type"}
 
+_ORDINALS = {
+    1: "first", 2: "second", 3: "third", 4: "fourth", 5: "fifth", 6: "sixth",
+    7: "seventh", 8: "eighth", 9: "ninth", 10: "tenth", 11: "eleventh",
+    12: "twelfth", 13: "thirteenth", 14: "fourteenth", 15: "fifteenth",
+    16: "sixteenth", 17: "seventeenth", 18: "eighteenth", 19: "nineteenth",
+    20: "twentieth", 21: "twenty-first", 22: "twenty-second",
+    23: "twenty-third", 24: "twenty-fourth", 25: "twenty-fifth",
+    26: "twenty-sixth", 27: "twenty-seventh", 28: "twenty-eighth",
+    29: "twenty-ninth", 30: "thirtieth", 31: "thirty-first",
+}
+
+
+def _spoken_time(dt) -> str:
+    """"17:15" -> "five fifteen in the afternoon"."""
+    h24, mm = dt.hour, dt.minute
+    h12 = h24 % 12 or 12
+    part = "morning" if h24 < 12 else ("afternoon" if h24 < 18 else "evening")
+    words = {
+        1: "one", 2: "two", 3: "three", 4: "four", 5: "five", 6: "six",
+        7: "seven", 8: "eight", 9: "nine", 10: "ten", 11: "eleven", 12: "twelve",
+    }
+    hour = words[h12]
+    if mm == 0:
+        return f"{hour} in the {part}"
+    if mm == 15:
+        return f"quarter past {hour} in the {part}"
+    if mm == 30:
+        return f"half {hour} in the {part}"
+    if mm < 10:
+        return f"{hour} oh {mm} in the {part}"
+    return f"{hour} {mm} in the {part}"
+
+
+def build_date_context() -> dict[str, str]:
+    """SYSEVO_DATE_CONTEXT_V2 — current date/time plus a literal 14-day lookup.
+
+    The agent must never do calendar arithmetic: it booked a customer into
+    2023 doing exactly that. `upcoming_days` lets it read the answer off a
+    list instead of calculating it.
+    """
+    now = datetime.now(_BUSINESS_TZ)
+    tomorrow = now + timedelta(days=1)
+
+    upcoming = []
+    for offset in range(1, 15):
+        dt = now + timedelta(days=offset)
+        label = "tomorrow" if offset == 1 else dt.strftime("%A")
+        upcoming.append(
+            f"{label} {dt.strftime('%-d %B')} = {dt.strftime('%Y-%m-%d')}"
+        )
+
+    return {
+        "current_date": now.strftime("%Y-%m-%d"),
+        "current_day": now.strftime("%A"),
+        "current_year": now.strftime("%Y"),
+        "time_now": now.strftime("%H:%M"),
+        "time_now_spoken": _spoken_time(now),
+        "tomorrow_date": tomorrow.strftime("%Y-%m-%d"),
+        "tomorrow_day": tomorrow.strftime("%A"),
+        "current_date_spoken": (
+            f"{now.strftime('%A')} the {_ORDINALS.get(now.day, str(now.day))} "
+            f"of {now.strftime('%B %Y')}"
+        ),
+        "upcoming_days": "; ".join(upcoming),
+    }
 
 def is_variable_descriptor(value: Any) -> bool:
     """True when *value* is a canonical variable descriptor object.
@@ -171,6 +244,10 @@ def build_call_context(
     statics = extract_static_overrides(template_context_variables)
     if statics:
         merged = {**merged, **statics}
+
+    # SYSEVO_DATE_CONTEXT: applied LAST so the real date can never be shadowed
+    # by a stale campaign column or a static override.
+    merged = {**merged, **build_date_context()}
 
     return merged
 
