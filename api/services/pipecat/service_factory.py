@@ -53,7 +53,7 @@ from pipecat.services.google.vertex.llm import (
 from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
 from pipecat.services.minimax.tts import MiniMaxTTSSettings
 from pipecat.services.openai.base_llm import OpenAILLMSettings
-from pipecat.services.openai.llm import OpenAILLMService
+from api.services.pipecat.openai_llm import DograhOpenAILLMService
 from pipecat.services.openai.stt import (
     OpenAISTTService,
     OpenAISTTSettings,
@@ -867,7 +867,7 @@ def create_llm_service_from_provider(
             _validate_runtime_service_url(base_url, "base_url")
             kwargs["base_url"] = base_url
         if "gpt-5" in model:
-            return OpenAILLMService(
+            return DograhOpenAILLMService(
                 api_key=api_key,
                 settings=OpenAILLMSettings(
                     model=model,
@@ -879,12 +879,12 @@ def create_llm_service_from_provider(
         # Detect by checking if the base model name starts with "o" + digit.
         _base = model.split("/")[-1]
         if re.match(r"^o\d", _base):
-            return OpenAILLMService(
+            return DograhOpenAILLMService(
                 api_key=api_key,
                 settings=OpenAILLMSettings(model=model),
                 **kwargs,
             )
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
             settings=OpenAILLMSettings(model=model, temperature=0.1),
             **kwargs,
@@ -906,7 +906,7 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.XAI.value:
         xai_base_url = base_url or "https://api.x.ai/v1"
         _validate_runtime_service_url(xai_base_url, "base_url")
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
             base_url=xai_base_url,
             settings=OpenAILLMSettings(model=model, temperature=0.1),
@@ -1012,7 +1012,7 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.COHERE.value:
         cohere_base_url = base_url or "https://api.cohere.com/compatibility/v1"
         _validate_runtime_service_url(cohere_base_url, "base_url")
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
             base_url=cohere_base_url,
             settings=OpenAILLMSettings(model=model, temperature=0.1),
