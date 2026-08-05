@@ -13,7 +13,28 @@ from api.services.workflow.node_specs import get_spec
 TEMPLATE_VAR_PATTERN = r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))?)?\s*\}\}"
 
 # Variables injected by the system at runtime, not from source data.
-_SYSTEM_VARIABLES = {"campaign_id", "provider", "source_uuid"}
+# Variables the platform supplies at render time, so they must never be demanded
+# as columns in a campaign's source data. The date/time set below is resolved by
+# _resolve_builtin_variable() in api/utils/template_renderer.py — keep the two in
+# step: a name listed here but not resolved there renders blank on a live call,
+# which is worse than the validation error, because it fails silently.
+_SYSTEM_VARIABLES = {
+    "campaign_id",
+    "provider",
+    "source_uuid",
+    # Date / time built-ins. An agent that has to work the date out itself gets
+    # it wrong — this prompt set was added after a real customer was booked into
+    # the wrong YEAR.
+    "current_time",
+    "current_weekday",
+    "current_date",
+    "current_date_spoken",
+    "current_day",
+    "current_year",
+    "time_now",
+    "time_now_spoken",
+    "upcoming_days",
+}
 
 
 def extract_template_variables(text: str) -> Set[str]:
