@@ -104,8 +104,20 @@ class TwilioProvider(TelephonyProvider):
             async with session.post(endpoint, data=data, auth=auth) as response:
                 if response.status != 201:
                     error_data = await response.json()
+                    # Surface Twilio's human-readable message instead of dumping
+                    # the raw JSON blob at the user. Twilio errors carry a plain
+                    # "message" (and numeric "code"); fall back to the raw body
+                    # only if the shape is unexpected.
+                    twilio_msg = None
+                    if isinstance(error_data, dict):
+                        twilio_msg = error_data.get("message")
+                        code = error_data.get("code")
+                        if twilio_msg and code:
+                            twilio_msg = f"{twilio_msg} (Twilio error {code})"
+                    logger.error(f"Twilio initiate_call failed: {error_data}")
                     raise HTTPException(
-                        status_code=response.status, detail=json.dumps(error_data)
+                        status_code=response.status,
+                        detail=twilio_msg or json.dumps(error_data),
                     )
 
                 response_data = await response.json()
