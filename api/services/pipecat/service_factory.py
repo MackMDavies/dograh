@@ -91,7 +91,13 @@ def _validate_runtime_service_url(url: str, field_name: str) -> None:
 
 
 def create_stt_service(
-    user_config, audio_config: "AudioConfig", keyterms: list[str] | None = None
+    user_config,
+    audio_config: "AudioConfig",
+    keyterms: list[str] | None = None,
+    *,
+    eot_timeout_ms: int = 1000,
+    eot_threshold: float = 0.6,
+    eager_eot_threshold: float = 0.3,
 ):
     """Create and return appropriate STT service based on user configuration
 
@@ -120,9 +126,9 @@ def create_stt_service(
                     # before the LLM was even asked for a response.
                     # eager_eot lets generation start on a weaker signal, which
                     # is what buys back most of the felt latency.
-                    eot_timeout_ms=1200,
-                    eot_threshold=0.6,
-                    eager_eot_threshold=0.3,
+                    eot_timeout_ms=eot_timeout_ms,
+                    eot_threshold=eot_threshold,
+                    eager_eot_threshold=eager_eot_threshold,
                     keyterm=keyterms or [],
                 ),
                 should_interrupt=False,  # Let UserAggregator take care of sending InterruptionFrame
