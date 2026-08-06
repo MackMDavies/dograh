@@ -274,6 +274,30 @@ class PipecatEngine:
             logger.info(f"Arguments: {function_call_params.arguments}")
 
             try:
+                # Already here. Two LLM generations can be in flight at once —
+                # aggressive endpointing splits one utterance into two user
+                # turns, and both turns independently pick the same transition.
+                # Honouring the second one re-runs set_node, reloads the system
+                # instruction and forces a further completion, which is ~2s of
+                # silence that buys nothing.
+                #
+                # The result callback still has to fire or the framework waits
+                # forever for a tool result it has already asked for; what is
+                # deliberately omitted is on_context_updated, since that is what
+                # triggers the redundant generation.
+                if (
+                    self._current_node is not None
+                    and self._current_node.id == transition_to_node
+                ):
+                    logger.info(
+                        f"Function: {name} -> already at node {transition_to_node}, "
+                        "skipping redundant transition"
+                    )
+                    await function_call_params.result_callback(
+                        {"status": "done", "detail": "already_at_node"}
+                    )
+                    return
+
                 if not await self._enforce_required_variables_before_exit(
                     name, function_call_params
                 ):
