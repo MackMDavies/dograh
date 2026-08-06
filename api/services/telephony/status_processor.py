@@ -154,13 +154,24 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         logs={"telephony_status_callbacks": telephony_callback_logs},
     )
 
+    # Release the concurrency slot on ANY terminal status, for ALL calls (test
+    # + campaign) — not just campaign calls. A test call that dispatched but
+    # ended busy/no-answer/failed never started the pipeline, so nothing else
+    # releases its slot and it would leak until the stale TTL, falsely tripping
+    # "Concurrent call limit reached". release_call_slot is idempotent, so this
+    # is harmless when the pipeline end-hook already released it.
+    _terminal = status.status in (
+        "completed", "failed", "busy", "no-answer", "canceled", "error"
+    )
+    if _terminal:
+        await campaign_call_dispatcher.release_call_slot(workflow_run_id)
+
     if status.status == "completed":
         logger.info(
             f"[run {workflow_run_id}] Call completed with duration: {status.duration}s"
         )
 
         if workflow_run.campaign_id:
-            await campaign_call_dispatcher.release_call_slot(workflow_run_id)
             await circuit_breaker.record_and_evaluate(
                 workflow_run.campaign_id, is_failure=False
             )
@@ -178,7 +189,6 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         )
 
         if workflow_run.campaign_id:
-            await campaign_call_dispatcher.release_call_slot(workflow_run_id)
             is_failure = status.status in ("error", "failed")
             await circuit_breaker.record_and_evaluate(
                 workflow_run.campaign_id,
