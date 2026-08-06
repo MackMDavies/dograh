@@ -132,6 +132,7 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         "azure_tts": ["neural", "standard"],
         "playht": ["Play3.0-mini", "PlayHT2.0-turbo", "PlayHT2.0", "PlayDialog"],
         "neets": ["style-diff-500", "ar-diff-50k", "vits"],
+        "fish": ["s1", "s2-pro"],
     },
     "stt": {
         "deepgram": [
@@ -543,6 +544,7 @@ class ProviderConnectionClient(BaseDBClient):
                     is_default=prev.is_default if prev else (i == 0),
                     cost_per_min_usd=pricing[0] if pricing else (prev.cost_per_min_usd if prev else None),
                     native_cost_display=pricing[1] if pricing else (prev.native_cost_display if prev else None),
+                    our_price_per_min_usd=prev.our_price_per_min_usd if prev else None,
                 ))
             await session.commit()
 

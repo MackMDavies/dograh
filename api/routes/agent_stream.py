@@ -100,7 +100,6 @@ async def agent_stream_websocket(
     workflow_run_name = f"WR-AGS-{numeric_suffix:08d}"
     call_id = params.get("callId") or params.get("CallSid")
     initial_context = {
-        **(workflow.template_context_variables or {}),
         "provider": provider_name,
         "caller_number": params.get("from"),
         "called_number": params.get("to"),

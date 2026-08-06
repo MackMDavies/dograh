@@ -24,3 +24,9 @@ node_modules/
 *.bak
 *.bak.*
 .env.bak*
+
+# Sysevo prod: TLS certs live here and MUST NOT be committed (a branch
+# switch used to wipe them and crash-loop nginx_https).
+certs/
+*.patch
+*.bak

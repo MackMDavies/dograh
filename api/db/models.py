@@ -707,6 +707,12 @@ class CampaignModel(Base):
         default="created",
     )
 
+    # A standing campaign never auto-completes. Callbacks are scheduled into it
+    # for a future time, and _has_pending_work() only counts runs due NOW — so a
+    # normal campaign holding only a 2pm callback looks finished at 10am, marks
+    # itself completed, and never fires it. See campaign_orchestrator.
+    is_standing = Column(Boolean, nullable=False, server_default="false")
+
     # Progress tracking
     total_rows = Column(Integer, nullable=True)
     processed_rows = Column(Integer, nullable=False, default=0)

@@ -2,7 +2,7 @@
 
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Dict, Optional, Union
 from zoneinfo import ZoneInfo
 
@@ -112,6 +112,61 @@ def _extract_timezone_from_template(template_str: str) -> Optional[str]:
     return match.group(1).strip() if match else None
 
 
+def _ordinal(n: int) -> str:
+    """5 -> '5th'. Spoken date variants read far better with an ordinal, and TTS
+    pronounces '5th' correctly where a bare '5' becomes 'five'."""
+    if 11 <= n % 100 <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _spoken_time(now: datetime) -> str:
+    """'6:56 in the evening' — AM/PM is read aloud as letters by most TTS."""
+    clock = now.strftime("%I:%M").lstrip("0")
+    if now.hour < 12:
+        return f"{clock} in the morning"
+    if now.hour < 18:
+        return f"{clock} in the afternoon"
+    return f"{clock} in the evening"
+
+
+# Date/time the agent must never work out for itself. Each of these is also
+# listed in _SYSTEM_VARIABLES (api/services/workflow/workflow_graph.py) so a
+# campaign is not asked to supply them as CSV columns — keep the two in step.
+_UPCOMING_DAYS_COUNT = 14
+
+
+def _resolve_datetime_variable(variable_path: str, tz: ZoneInfo) -> Optional[str]:
+    now = datetime.now(tz)
+
+    if variable_path == "current_date":
+        return now.strftime("%Y-%m-%d")
+    if variable_path == "current_day":
+        return now.strftime("%A")
+    if variable_path == "current_year":
+        return now.strftime("%Y")
+    if variable_path == "current_date_spoken":
+        return f"{now.strftime('%A')} the {_ordinal(now.day)} of {now.strftime('%B %Y')}"
+    if variable_path == "time_now":
+        return now.strftime("%H:%M")
+    if variable_path == "time_now_spoken":
+        return _spoken_time(now)
+    if variable_path == "upcoming_days":
+        # Real dates for the next fortnight, so booking "next Thursday" cannot
+        # land in the wrong month or year.
+        return "\n".join(
+            "- {} {} {}".format(
+                (now + timedelta(days=offset)).strftime("%A"),
+                _ordinal((now + timedelta(days=offset)).day),
+                (now + timedelta(days=offset)).strftime("%B %Y"),
+            )
+            for offset in range(1, _UPCOMING_DAYS_COUNT + 1)
+        )
+    return None
+
+
 def _resolve_builtin_variable(
     variable_path: str, default_tz: Optional[str] = None
 ) -> Optional[str]:
@@ -133,6 +188,11 @@ def _resolve_builtin_variable(
         The resolved string value, or None if *variable_path* is not a
         recognised built-in.
     """
+    tz_default = ZoneInfo(default_tz) if default_tz else ZoneInfo("UTC")
+    datetime_value = _resolve_datetime_variable(variable_path, tz_default)
+    if datetime_value is not None:
+        return datetime_value
+
     if variable_path == _CURRENT_TIME_PREFIX:
         tz = ZoneInfo(default_tz) if default_tz else ZoneInfo("UTC")
         return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S %Z")

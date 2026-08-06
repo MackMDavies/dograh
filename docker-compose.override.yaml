@@ -1,7 +1,9 @@
 # Sysevo production overrides.
 # - API built from source; Dograh UI replaced with a no-op (Sysevo SPA on Vercel).
 # - All services restart automatically on crash or reboot.
-# - API memory capped at 1.5GB to prevent OOM-killing nginx.
+# - API memory capped at 3.5GB (was 1.5GB, which left ~113MiB headroom while
+#   idle and could not fit high-concurrency campaigns). Host has ~7.7GB, so this
+#   still leaves room for nginx/postgres/redis — the original reason for a cap.
 # - Dedicated worker service runs ARQ background jobs independently of the API.
 services:
   worker:
@@ -14,6 +16,11 @@ services:
     mem_limit: 512m
     command: ["python", "-m", "arq", "api.tasks.arq.WorkerSettings"]
     volumes:
+      # MUST match the api service. The api writes call audio/transcripts to
+      # /tmp and passes the path via the job payload; without this shared
+      # volume the worker looks in its own empty /tmp and every recording and
+      # transcript is silently lost.
+      - shared-tmp:/tmp
       - ./api:/app/api:ro
     environment:
       DATABASE_URL: "postgresql+asyncpg://dograh_app:${DOGRAH_APP_DB_PASSWORD}@postgres:5432/postgres"
@@ -55,7 +62,7 @@ services:
     image: dograh-local/dograh-api:local
     pull_policy: never
     restart: unless-stopped
-    mem_limit: 1500m
+    mem_limit: 3500m
     volumes:
       - ./api/.env:/app/api/.env:ro
   ui:

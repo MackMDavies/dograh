@@ -270,7 +270,65 @@ async def initiate_call(
         initial_context=updated_initial_context,
     )
 
-    return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+    return {
+        "message": f"Call initiated successfully with run name {workflow_run_name}",
+        "workflow_run_id": workflow_run_id,
+        "workflow_run_name": workflow_run_name,
+    }
+
+
+# Twilio call statuses that mean the call is over (no more polling needed).
+_TERMINAL_CALL_STATUSES = frozenset(
+    {"completed", "busy", "no-answer", "canceled", "failed", "error"}
+)
+
+
+@router.get("/call-status/{workflow_run_id}")
+async def get_call_status(
+    workflow_run_id: int, user: UserModel = Depends(get_user)
+):
+    """Live call status for the Test Phone Call dialog.
+
+    Surfaces the latest provider status-callback (initiated → ringing →
+    in-progress → completed / no-answer / busy) so the UI can show a live
+    Ringing/Connected/Ended indicator instead of a static run name. Falls back
+    to the run's own lifecycle state before the first callback arrives.
+    """
+    run = await db_client.get_workflow_run(
+        workflow_run_id,
+        organization_id=None if user.is_superuser else user.selected_organization_id,
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    status = "initiated"
+    duration = None
+
+    callbacks = (run.logs or {}).get("telephony_status_callbacks") or []
+    if callbacks:
+        last = callbacks[-1]
+        status = last.get("status") or status
+        duration = last.get("duration")
+    else:
+        # No provider callback yet — derive a coarse status from the run state so
+        # a browser/SIP call (which may not emit Twilio-style callbacks) still shows
+        # Connected/Ended rather than being stuck on "Calling…".
+        if run.state == WorkflowRunState.RUNNING.value:
+            status = "in-progress"
+        elif run.state == WorkflowRunState.COMPLETED.value or run.is_completed:
+            status = "completed"
+
+    try:
+        duration = int(duration) if duration is not None else None
+    except (TypeError, ValueError):
+        duration = None
+
+    return {
+        "workflow_run_id": run.id,
+        "status": status,
+        "terminal": status in _TERMINAL_CALL_STATUSES,
+        "duration": duration,
+    }
 
 
 async def _verify_organization_phone_number(

@@ -118,7 +118,23 @@ async def process_workflow_completion(
                 )
                 logger.info(f"Successfully uploaded audio: {recording_url}")
             else:
-                logger.warning(f"Audio temp file not found: {audio_temp_path}")
+                # A path was supplied, so the API DID capture audio and wrote it
+                # to disk — the file is simply not reachable from this process.
+                # That is silent, permanent data loss for every call, not a
+                # per-call hiccup, and it is invisible unless it shouts.
+                #
+                # This is exactly what happened on 2026-08-05: a dedicated ARQ
+                # worker container was added without the `shared-tmp:/tmp` volume
+                # that the api container writes to, so every recording AND
+                # transcript was discarded for six hours behind a WARNING.
+                # If you are reading this in the logs, check that the worker and
+                # api services mount the SAME /tmp volume.
+                logger.error(
+                    f"ARTIFACT LOST for run {workflow_run_id}: audio was captured but the "
+                    f"temp file is unreachable from this process: {audio_temp_path}. "
+                    f"The api and worker containers must share the same /tmp volume "
+                    f"(docker volume `shared-tmp`). The recording is gone."
+                )
         except Exception as e:
             logger.error(f"Error uploading audio for workflow {workflow_run_id}: {e}")
         finally:
@@ -149,8 +165,13 @@ async def process_workflow_completion(
                 )
                 logger.info(f"Successfully uploaded transcript: {transcript_url}")
             else:
-                logger.warning(
-                    f"Transcript temp file not found: {transcript_temp_path}"
+                # See the audio branch above — same failure, same cause. The
+                # transcript was written to disk and is unreachable from here.
+                logger.error(
+                    f"ARTIFACT LOST for run {workflow_run_id}: transcript was captured but the "
+                    f"temp file is unreachable from this process: {transcript_temp_path}. "
+                    f"The api and worker containers must share the same /tmp volume "
+                    f"(docker volume `shared-tmp`). The transcript is gone."
                 )
         except Exception as e:
             logger.error(

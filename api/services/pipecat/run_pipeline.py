@@ -19,6 +19,7 @@ from api.services.pipecat.event_handlers import (
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
 from api.services.pipecat.memory_pre_call import execute_memory_pre_call_fetch
+from api.services.call_live_webhook import fire_call_live
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -79,6 +80,7 @@ from pipecat.transports.smallwebrtc.connection import SmallWebRTCConnection
 from pipecat.turns.user_mute import (
     CallbackUserMuteStrategy,
     FunctionCallUserMuteStrategy,
+    MuteUntilFirstBotCompleteUserMuteStrategy,
 )
 from pipecat.turns.user_start import (
     ExternalUserTurnStartStrategy,
@@ -414,7 +416,12 @@ async def _run_pipeline(
     # Extract configurations from the version's workflow_configurations
     max_call_duration_seconds = 300  # Default 5 minutes
     max_user_idle_timeout = 10.0  # Default 10 seconds
-    smart_turn_stop_secs = 2.0  # Default 2 seconds for incomplete turn timeout
+    # Latency / responsiveness defaults — tuned "ultra-fast" so agents reply almost
+    # immediately after the caller stops, instead of the old 2s/3s waits. Per-agent
+    # overrides come from run_configs (set by the agent editor's Responsiveness control).
+    smart_turn_stop_secs = 0.6  # incomplete-turn timeout (was 2.0)
+    flux_eot_timeout_ms = 1000  # Flux end-of-turn fallback in ms (was 3000)
+    flux_eager_eot_threshold = 0.3  # eager (early) end-of-turn confidence (was 0.5)
     turn_stop_strategy = "transcription"  # Default to transcription-based detection
     keyterms = None  # Dictionary words for STT boosting
 
@@ -427,6 +434,12 @@ async def _run_pipeline(
 
         if "smart_turn_stop_secs" in run_configs:
             smart_turn_stop_secs = run_configs["smart_turn_stop_secs"]
+
+        if "flux_eot_timeout_ms" in run_configs:
+            flux_eot_timeout_ms = run_configs["flux_eot_timeout_ms"]
+
+        if "flux_eager_eot_threshold" in run_configs:
+            flux_eager_eot_threshold = run_configs["flux_eager_eot_threshold"]
 
         if "turn_stop_strategy" in run_configs:
             turn_stop_strategy = run_configs["turn_stop_strategy"]
@@ -524,7 +537,13 @@ async def _run_pipeline(
         # inference calls.
         inference_llm = create_llm_service(user_config)
     else:
-        stt = create_stt_service(user_config, audio_config, keyterms=keyterms)
+        stt = create_stt_service(
+            user_config,
+            audio_config,
+            keyterms=keyterms,
+            eot_timeout_ms=flux_eot_timeout_ms,
+            eager_eot_threshold=flux_eager_eot_threshold,
+        )
         tts = create_tts_service(user_config, audio_config)
         llm = create_llm_service(user_config)
         inference_llm = None
@@ -605,9 +624,25 @@ async def _run_pipeline(
                 secret=_sysevo_memory_secret,
                 call_context_vars=merged_call_context_vars,
                 workflow_id=workflow_id,
+                organization_id=workflow.organization_id,
             )
         )
         pre_call_fetch_is_memory = True
+
+    # Sysevo LIVE-call tracking — fire-and-forget for EVERY call type (inbound,
+    # outbound, campaign, web, widget) the moment the pipeline starts, so the call
+    # shows as live in the Sysevo client + admin dashboards. Keyed by run_id, so
+    # concurrent calls (e.g. a campaign dialer) each get their own live row. The row
+    # is removed by the matching "ended" signal at call completion. Non-fatal.
+    if os.getenv("SYSEVO_CALL_LIVE_URL"):
+        asyncio.create_task(
+            fire_call_live(
+                event="started",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow_id,
+                caller_number=merged_call_context_vars.get("caller_number"),
+            )
+        )
 
     # Create in-memory logs buffer early so it can be used by engine callbacks
     in_memory_logs_buffer = InMemoryLogsBuffer(workflow_run_id)
@@ -703,14 +738,8 @@ async def _run_pipeline(
         correct_aggregation_callback=engine.create_aggregation_correction_callback(),
     )
 
-    # NOTE: MuteUntilFirstBotCompleteUserMuteStrategy was removed here. It muted the
-    # caller until the FIRST BotStoppedSpeakingFrame with no timeout, so if the
-    # greeting audio never played out (e.g. dropped in the brief window before the
-    # WebRTC transport can send audio on connect), the caller stayed muted forever
-    # and no user turn ever reached the LLM. Interrupt control during real bot
-    # speech is still enforced by engine.should_mute_user (which now self-heals via
-    # a safety timeout), and FunctionCallUserMuteStrategy still mutes during tool calls.
     user_mute_strategies = [
+        MuteUntilFirstBotCompleteUserMuteStrategy(),
         FunctionCallUserMuteStrategy(),
         CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
     ]
@@ -841,54 +870,9 @@ async def _run_pipeline(
         @voicemail_detector.event_handler("on_voicemail_detected")
         async def _on_voicemail_detected(_processor):
             logger.info(f"Voicemail detected for workflow run {workflow_run_id}")
-
-            # SYSEVO_VOICEMAIL_MESSAGE: speak a fixed message before hanging up.
-            # Opt-in — with no `message` configured this behaves exactly as
-            # before (immediate CancelFrame, no message left).
-            message = str(voicemail_config.get("message") or "").strip()
-            left_message = False
-
-            if message:
-                try:
-                    from pipecat.frames.frames import TTSSpeakFrame
-
-                    spoken = engine._format_prompt(message)
-                    max_seconds = float(
-                        voicemail_config.get("message_max_seconds", 30)
-                    )
-                    logger.info(
-                        f"Leaving voicemail for run {workflow_run_id} "
-                        f"({len(spoken)} chars, cap {max_seconds}s)"
-                    )
-                    await engine.task.queue_frame(
-                        TTSSpeakFrame(spoken, append_to_context=True)
-                    )
-
-                    loop = asyncio.get_event_loop()
-                    deadline = loop.time() + max_seconds
-                    # Wait for speech to start (TTS has to synthesise first)...
-                    while loop.time() < deadline and not engine._bot_is_speaking:
-                        await asyncio.sleep(0.1)
-                    # ...then for it to finish.
-                    while loop.time() < deadline and engine._bot_is_speaking:
-                        await asyncio.sleep(0.1)
-
-                    left_message = True
-                    if loop.time() >= deadline:
-                        logger.warning(
-                            f"Voicemail message for run {workflow_run_id} hit the "
-                            f"{max_seconds}s cap; ending anyway"
-                        )
-                except Exception as e:
-                    logger.warning(
-                        f"Failed to leave voicemail for run {workflow_run_id}: {e}"
-                    )
-
-            engine._gathered_context["voicemail_message_left"] = left_message
             await engine.end_call_with_reason(
                 reason=EndTaskReason.VOICEMAIL_DETECTED.value,
-                # Graceful EndFrame when we spoke, so the audio actually drains.
-                abort_immediately=not left_message,
+                abort_immediately=True,
             )
 
     # Recording router is only meaningful in non-realtime mode (it routes between

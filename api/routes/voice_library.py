@@ -16,6 +16,9 @@ from api.schemas.voice_library import (
     ElevenLabsCatalogVoiceSchema,
     ElevenLabsImportRequestSchema,
     ElevenLabsSharedVoiceSchema,
+    FishCatalogVoiceSchema,
+    FishImportRequestSchema,
+    FishPublicVoiceSchema,
     GoogleTTSCatalogVoiceSchema,
     GoogleTTSImportRequestSchema,
     VoiceLibraryResponseSchema,
@@ -29,6 +32,13 @@ from api.services.voice_library.elevenlabs_service import (
     fetch_elevenlabs_shared_voices,
     get_caller_elevenlabs_api_key,
     get_system_elevenlabs_api_key,
+)
+from api.services.voice_library.fish_service import (
+    fetch_fish_catalog,
+    fetch_fish_public_voices,
+    fetch_fish_voice_by_id,
+    get_caller_fish_api_key,
+    get_system_fish_api_key,
 )
 from api.services.voice_library.google_service import (
     fetch_google_tts_voices,
@@ -323,6 +333,39 @@ async def sync_provider_voices(user: UserModel = Depends(get_user)):
                 )
                 created += 1
                 logger.info(f"Synced ElevenLabs voice '{vid}' for org {org_id}")
+            continue
+
+        elif conn.provider == "fish" and conn.api_key:
+            try:
+                catalog = await fetch_fish_catalog(conn.api_key)
+            except Exception as e:
+                logger.warning(f"Failed to fetch Fish Audio catalog for org {org_id}: {e}")
+                errors["Fish Audio"] = str(e)
+                continue
+            for fish_voice in catalog:
+                vid = fish_voice.get("_id", "")
+                if not vid:
+                    continue
+                existing = await db_client.get_voice_by_provider_id(vid, org_id)
+                if existing:
+                    continue
+                languages = fish_voice.get("languages") or []
+                samples = fish_voice.get("samples") or []
+                preview_url = samples[0].get("audio") if samples else None
+                await db_client.create_voice(
+                    user_id=user.id,
+                    organization_id=org_id,
+                    name=fish_voice.get("title", vid),
+                    provider="fish",
+                    provider_voice_id=vid,
+                    is_public=True,
+                    status="ready",
+                    language=languages[0] if languages else "en",
+                    audio_preview_url=preview_url,
+                    labels={"provider": "fish", "tags": fish_voice.get("tags") or []},
+                )
+                created += 1
+                logger.info(f"Synced Fish Audio voice '{vid}' for org {org_id}")
             continue
 
         elif conn.provider == "cartesia" and conn.api_key:
@@ -686,6 +729,161 @@ async def import_google_tts_voices(
             gender=voice_data.get("gender"),
             language=lang_codes[0] if lang_codes else None,
             labels={"language_codes": lang_codes, "provider": "google"},
+            status="ready",
+        )
+        created.append(_serialize(voice))
+    return created
+
+
+async def _resolve_fish_api_key(user: UserModel) -> Optional[str]:
+    api_key = await get_caller_fish_api_key(user.id)
+    if api_key:
+        return api_key
+    conn = await db_client.get_connection_by_provider(user.selected_organization_id, "tts", "fish")
+    if not conn and user.is_superuser:
+        all_conns = await db_client.list_all_connections_superuser(service_type="tts")
+        conn = next((c for c in all_conns if c.provider == "fish" and c.api_key), None)
+    if conn and conn.api_key:
+        return conn.api_key
+    return await get_system_fish_api_key()
+
+
+def _fish_voice_to_catalog_schema(v: dict) -> FishCatalogVoiceSchema:
+    samples = v.get("samples") or []
+    return FishCatalogVoiceSchema(
+        voice_id=v.get("_id", ""),
+        name=v.get("title", ""),
+        description=v.get("description") or None,
+        languages=v.get("languages") or [],
+        tags=v.get("tags") or [],
+        preview_url=samples[0].get("audio") if samples else None,
+    )
+
+
+def _fish_voice_to_public_schema(v: dict) -> FishPublicVoiceSchema:
+    samples = v.get("samples") or []
+    author = v.get("author") or {}
+    return FishPublicVoiceSchema(
+        voice_id=v.get("_id", ""),
+        name=v.get("title", ""),
+        description=v.get("description") or None,
+        languages=v.get("languages") or [],
+        tags=v.get("tags") or [],
+        preview_url=samples[0].get("audio") if samples else None,
+        author_nickname=author.get("nickname"),
+    )
+
+
+@router.get("/fish/voices", response_model=list[FishCatalogVoiceSchema])
+async def get_fish_catalog(user: UserModel = Depends(get_user)) -> list[FishCatalogVoiceSchema]:
+    api_key = await _resolve_fish_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Fish Audio API key not configured in your Voice Models settings")
+    try:
+        catalog = await fetch_fish_catalog(api_key)
+    except Exception as e:
+        logger.error(f"Fish Audio catalog fetch failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch Fish Audio catalog")
+    return [_fish_voice_to_catalog_schema(v) for v in catalog]
+
+
+@router.post("/import/fish", response_model=list[VoiceLibraryResponseSchema], status_code=201)
+async def import_fish_voices(
+    body: FishImportRequestSchema,
+    user: UserModel = Depends(get_user),
+) -> list[VoiceLibraryResponseSchema]:
+    api_key = await _resolve_fish_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Fish Audio API key not configured")
+    try:
+        catalog = await fetch_fish_catalog(api_key)
+    except Exception as e:
+        logger.error(f"Fish Audio catalog fetch failed during import: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch Fish Audio catalog")
+
+    catalog_map = {v.get("_id"): v for v in catalog}
+    created = []
+    for voice_id in body.voice_ids:
+        fish_voice = catalog_map.get(voice_id)
+        if not fish_voice:
+            continue
+        existing = await db_client.get_voice_by_provider_id(voice_id, user.selected_organization_id)
+        if existing:
+            logger.info(f"Fish voice {voice_id} already in library, skipping")
+            continue
+        schema = _fish_voice_to_catalog_schema(fish_voice)
+        voice = await db_client.create_voice(
+            user_id=user.id,
+            organization_id=user.selected_organization_id,
+            name=schema.name,
+            provider="fish",
+            provider_voice_id=voice_id,
+            is_public=body.is_public,
+            language=schema.languages[0] if schema.languages else None,
+            audio_preview_url=schema.preview_url,
+            labels={"provider": "fish", "tags": schema.tags},
+            status="ready",
+        )
+        created.append(_serialize(voice))
+    return created
+
+
+@router.get("/fish/public-voices", response_model=list[FishPublicVoiceSchema])
+async def get_fish_public_voices(
+    page: int = Query(1, ge=1),
+    page_size: int = Query(30, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    tag: Optional[str] = Query(None),
+    language: Optional[str] = Query(None),
+    user: UserModel = Depends(get_user),
+) -> list[FishPublicVoiceSchema]:
+    """Browse Fish Audio's public voice library."""
+    api_key = await _resolve_fish_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Fish Audio API key not configured")
+    try:
+        result = await fetch_fish_public_voices(
+            api_key, search=search, tag=tag, language=language, page=page, page_size=page_size
+        )
+    except Exception as e:
+        logger.error(f"Fish Audio public-voice fetch failed: {e}")
+        raise HTTPException(status_code=502, detail="Failed to fetch Fish Audio public voices")
+    items = result.get("items", [])
+    return [_fish_voice_to_public_schema(v) for v in items]
+
+
+@router.post("/import/fish/public", response_model=list[VoiceLibraryResponseSchema], status_code=201)
+async def import_fish_public_voices(
+    body: FishImportRequestSchema,
+    user: UserModel = Depends(get_user),
+) -> list[VoiceLibraryResponseSchema]:
+    api_key = await _resolve_fish_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Fish Audio API key not configured")
+
+    created = []
+    for voice_id in body.voice_ids:
+        existing = await db_client.get_voice_by_provider_id(voice_id, user.selected_organization_id)
+        if existing:
+            logger.info(f"Fish public voice {voice_id} already in library, skipping")
+            continue
+        matched = await fetch_fish_voice_by_id(api_key, voice_id)
+        if not matched:
+            # Without the real metadata the row would be named after its own id
+            # and carry no language/preview — skip rather than import a stub.
+            logger.warning(f"Skipping Fish public voice {voice_id}: could not fetch its details")
+            continue
+        schema = _fish_voice_to_public_schema(matched)
+        voice = await db_client.create_voice(
+            user_id=user.id,
+            organization_id=user.selected_organization_id,
+            name=schema.name,
+            provider="fish",
+            provider_voice_id=voice_id,
+            is_public=body.is_public,
+            language=schema.languages[0] if schema.languages else None,
+            audio_preview_url=schema.preview_url,
+            labels={"provider": "fish", "tags": schema.tags},
             status="ready",
         )
         created.append(_serialize(voice))

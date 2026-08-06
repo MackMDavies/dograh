@@ -813,6 +813,19 @@ class CampaignClient(BaseDBClient):
             await session.refresh(queued_run)
             return queued_run
 
+    async def get_queued_run_by_source_uuid(
+        self, campaign_id: int, source_uuid: str
+    ) -> Optional[QueuedRunModel]:
+        """Used to keep enqueue idempotent — see POST /{campaign_id}/enqueue."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(QueuedRunModel).where(
+                    QueuedRunModel.campaign_id == campaign_id,
+                    QueuedRunModel.source_uuid == source_uuid,
+                )
+            )
+            return result.scalars().first()
+
     async def get_campaign_contacts_paginated(
         self,
         campaign_id: int,

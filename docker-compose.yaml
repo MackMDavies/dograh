@@ -196,6 +196,7 @@ services:
       # Format: https://<project>.supabase.co/functions/v1/wallet-debit
       # If unset, the URL is derived from SYSEVO_POST_CALL_MEMORY_URL (requires that to be set).
       SYSEVO_WALLET_DEBIT_URL: "${SYSEVO_WALLET_DEBIT_URL:-}"
+      INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-}"
 
       # CORS / deployment
       DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
@@ -207,7 +208,7 @@ services:
       POSTHOG_HOST: "https://us.i.posthog.com"
 
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -243,7 +244,7 @@ services:
       POSTHOG_KEY: "phc_ItizB1dP6yv7ZYobbcqrpxTdbomDA8hJFSEmAMdYvIr"
       POSTHOG_HOST: "https://us.posthog.com"
     ports:
-      - "3010:3010"
+      - "127.0.0.1:3010:3010"
     depends_on:
       api:
         condition: service_healthy
@@ -265,7 +266,7 @@ services:
     container_name: cloudflared-tunnel
     command: tunnel --no-autoupdate --url http://api:8000 --metrics 0.0.0.0:2000
     ports:
-      - "2000:2000" # Expose metrics endpoint
+      - "127.0.0.1:2000:2000" # Expose metrics endpoint
     networks:
       - app-network
 

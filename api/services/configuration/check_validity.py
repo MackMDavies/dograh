@@ -1,5 +1,6 @@
 from typing import Optional, TypedDict
 
+import httpx
 import openai
 from deepgram import DeepgramClient
 from groq import Groq
@@ -63,6 +64,7 @@ class UserConfigurationValidator:
             ServiceProviders.GLADIA.value: self._check_gladia_api_key,
             ServiceProviders.RIME.value: self._check_rime_api_key,
             ServiceProviders.MINIMAX.value: self._check_minimax_api_key,
+            ServiceProviders.FISH.value: self._check_fish_api_key,
         }
 
     async def validate(
@@ -503,3 +505,24 @@ class UserConfigurationValidator:
         # MiniMax doesn't publish a cheap key-validation endpoint; trust the key
         # at save time and surface auth errors at first call (same as Rime/Sarvam).
         return True
+
+    def _check_fish_api_key(self, model: str, api_key: str) -> bool:
+        try:
+            response = httpx.get(
+                "https://api.fish.audio/model",
+                headers={"Authorization": f"Bearer {api_key}"},
+                params={"self": "true", "page_size": 1},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            return True
+        except httpx.HTTPStatusError:
+            raise ValueError(
+                "Invalid Fish Audio API key. The key was rejected by the Fish Audio API. "
+                "Please check that your API key is correct and active."
+            )
+        except httpx.RequestError as e:
+            raise ValueError(
+                f"Could not reach the Fish Audio API to validate your key: {e}. "
+                "Please try again."
+            )
