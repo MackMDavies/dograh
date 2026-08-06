@@ -26,6 +26,13 @@ from api.services.workflow.variable_resolution import (
 )
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
+
+# How long to wait for stop_recording()'s background on_audio_data task to
+# append its audio before concluding there is none. 40 x 50ms = 2s, which is
+# generous for an in-process append behind a lock and short enough that a
+# genuinely silent call does not stall teardown.
+AUDIO_FLUSH_POLL_ATTEMPTS = 40
+AUDIO_FLUSH_POLL_INTERVAL_S = 0.05
 from pipecat.frames.frames import (
     ErrorFrame,
     Frame,
@@ -453,10 +460,30 @@ def register_event_handlers(
         audio_temp_path = None
         transcript_temp_path = None
 
-        # Yield the event loop so any pending on_audio_data background tasks (fired
-        # by stop_recording() or intermediate buffer flushes) have a chance to
-        # complete and append their chunks to in_memory_audio_buffer before we check.
-        await asyncio.sleep(0)
+        # Wait for the pending on_audio_data background tasks (fired by
+        # stop_recording() or intermediate buffer flushes) to actually land
+        # their chunks in in_memory_audio_buffer.
+        #
+        # This was a single `await asyncio.sleep(0)`, and that is a RACE, not a
+        # flush. stop_recording() dispatches on_audio_data as a background
+        # task, and that task's InMemoryAudioBuffer.append() awaits an
+        # asyncio.Lock — so one yield is long enough for the task to START and
+        # not to finish. When it lost, the check below found an empty buffer,
+        # logged "Audio buffer is empty ... skipping recording upload", and the
+        # call ended up with no recording at all.
+        #
+        # Measured on production before this change: of fourteen consecutive
+        # runs on one workflow, only two had downloadable audio, with no
+        # pattern by duration, direction or caller — run 2500 (22s) had audio,
+        # run 2498 (22s) did not. Re-probed twenty minutes later the same runs
+        # returned identical 404s, so it was never an upload still in flight.
+        #
+        # Bounded so a call that genuinely captured no audio (an immediate
+        # hangup) still finishes promptly instead of hanging teardown.
+        for _ in range(AUDIO_FLUSH_POLL_ATTEMPTS):
+            if not in_memory_audio_buffer.is_empty:
+                break
+            await asyncio.sleep(AUDIO_FLUSH_POLL_INTERVAL_S)
 
         try:
             logger.info(
