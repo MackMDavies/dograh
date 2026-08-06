@@ -131,12 +131,14 @@ class CampaignRunnerService:
 
     async def _count_failed_campaign_calls(self, campaign_id: int) -> int:
         """Count failed calls by examining workflow_run telephony callbacks"""
-        # Get all workflow runs for this campaign
-        workflow_runs = await db_client.get_workflow_runs_by_campaign(campaign_id)
+        # Only the logs column is needed here, not the full row (cost_info,
+        # initial_context, gathered_context, etc.) — this is polled
+        # continuously by the frontend while a campaign is active.
+        run_logs = await db_client.get_campaign_run_logs(campaign_id)
 
         failed_count = 0
-        for run in workflow_runs:
-            callbacks = run.logs.get("telephony_status_callbacks", [])
+        for logs in run_logs:
+            callbacks = logs.get("telephony_status_callbacks", [])
             if callbacks:
                 # Check final status
                 final_status = callbacks[-1].get("status", "").lower()

@@ -48,6 +48,7 @@ from api.services.pipecat.tracing_config import (
 from api.services.gen_ai import resolve_embeddings_config
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.variable_resolution import build_call_context
 from api.services.workflow.workflow_graph import WorkflowGraph
 
 TEXT_CHAT_CHECKPOINT_VERSION = 1
@@ -430,8 +431,14 @@ async def execute_text_chat_pending_turn(
         "llm_provider": user_config.llm.provider,
         "llm_model": user_config.llm.model,
     }
+    # Same precedence as a voice call so Test Chat and Test Call behave alike:
+    # static > campaign/seeded context > workflow defaults.
     initial_context = {
-        **(workflow_run.initial_context or {}),
+        **build_call_context(
+            initial_context=workflow_run.initial_context,
+            extra_context_vars=None,
+            template_context_variables=workflow.template_context_variables,
+        ),
         "runtime_configuration": runtime_configuration,
     }
 

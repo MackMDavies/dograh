@@ -87,3 +87,27 @@ class GoogleTTSCatalogVoiceSchema(BaseModel):
 class GoogleTTSImportRequestSchema(BaseModel):
     voice_names: list[str]
     is_public: bool = True
+
+
+class FishCatalogVoiceSchema(BaseModel):
+    voice_id: str
+    name: str
+    description: Optional[str] = None
+    languages: list[str] = []
+    tags: list[str] = []
+    preview_url: Optional[str] = None
+
+
+class FishPublicVoiceSchema(BaseModel):
+    voice_id: str
+    name: str
+    description: Optional[str] = None
+    languages: list[str] = []
+    tags: list[str] = []
+    preview_url: Optional[str] = None
+    author_nickname: Optional[str] = None
+
+
+class FishImportRequestSchema(BaseModel):
+    voice_ids: list[str]
+    is_public: bool = True

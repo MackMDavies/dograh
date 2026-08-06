@@ -5,6 +5,10 @@ owned by a telephony configuration. They power both outbound caller-ID
 selection and inbound call routing.
 """
 
+import json
+
+from loguru import logger
+
 from typing import Any, Dict, List, Optional, Tuple
 
 from sqlalchemy import update
@@ -18,6 +22,29 @@ from api.db.models import (
     WorkflowModel,
 )
 from api.utils.telephony_address import normalize_telephony_address
+
+
+def _decrypted_credentials(config) -> dict:
+    """Best-effort decrypt of a telephony config's credentials.
+
+    Stored Fernet-encrypted, so they can never be filtered in SQL. Returns {} on
+    any failure — a config we cannot read must not match, but it also must not
+    break routing for every other config.
+    """
+    raw = getattr(config, "credentials", None)
+    if isinstance(raw, dict):
+        return raw
+    if not raw:
+        return {}
+    try:
+        from api.services.crypto import decrypt_secret
+
+        decrypted = decrypt_secret(raw)
+        return json.loads(decrypted) if isinstance(decrypted, str) else (decrypted or {})
+    except Exception as exc:  # noqa: BLE001 - never break inbound routing
+        logger.warning(f"Could not decrypt telephony credentials for config {getattr(config, 'id', '?')}: {exc}")
+        return {}
+
 
 
 class TelephonyPhoneNumberClient(BaseDBClient):
@@ -183,8 +210,6 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 )
                 .where(
                     TelephonyConfigurationModel.provider == provider,
-                    TelephonyConfigurationModel.credentials.op("->>")(account_id_field)
-                    == account_id,
                     TelephonyPhoneNumberModel.address_normalized
                     == normalized.canonical,
                     TelephonyPhoneNumberModel.is_active.is_(True),
@@ -195,10 +220,29 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     TelephonyConfigurationModel.organization_id == organization_id
                 )
             result = await session.execute(stmt)
-            row = result.first()
-            if not row:
+            rows = result.all()
+            if not rows:
                 return None
-            return row[0], row[1]
+
+            # The account_id match CANNOT be done in SQL. `credentials` is a
+            # Fernet-encrypted string (all four rows on prod begin "g" and are
+            # 228 chars), not queryable JSON, so
+            # `credentials ->> 'account_sid' = :account_id` raised
+            # `operator does not exist: text ->> character varying` and every
+            # inbound call died there and returned a generic hangup — inbound
+            # has never once worked on this deployment. Decrypt and compare in
+            # Python, which is what this lookup did before it was "optimised"
+            # into a single query (see the docstring's own history note).
+            for config, phone in rows:
+                if not account_id or not account_id_field:
+                    return config, phone
+                creds = _decrypted_credentials(config)
+                if creds.get(account_id_field) == account_id:
+                    return config, phone
+
+            # A number we own, but no config whose account matches. Returning
+            # None lets the caller fall back rather than pretending we matched.
+            return None
 
     async def find_inbound_routing_conflict(
         self,
@@ -233,7 +277,7 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 )
                 .where(
                     TelephonyConfigurationModel.provider == provider,
-                    TelephonyConfigurationModel.credentials.op("->>")(account_id_field)
+                    _credentials_json().op("->>")(account_id_field)
                     == account_id,
                     TelephonyPhoneNumberModel.address_normalized
                     == normalized.canonical,

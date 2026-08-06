@@ -774,7 +774,7 @@ class CloudonixProvider(TelephonyProvider):
                 f"Cloudonix x-cx-apikey validation failed. Expected key ending with ...{self.bearer_token[-8:] if len(self.bearer_token) > 8 else 'SHORT_KEY'}"
             )
 
-        return True  # TODO: update this post clarification from cloudonix
+        return is_valid
 
     async def configure_inbound(
         self, address: str, webhook_url: Optional[str]

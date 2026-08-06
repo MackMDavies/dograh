@@ -8,7 +8,11 @@ from zoneinfo import ZoneInfo
 
 from loguru import logger
 
-from api.services.workflow.workflow_graph import TEMPLATE_VAR_PATTERN
+from api.services.workflow.variable_resolution import is_variable_descriptor
+from api.services.workflow.workflow_graph import (
+    LEGACY_FALLBACK_FILTER,
+    TEMPLATE_VAR_PATTERN,
+)
 
 _CURRENT_TIME_PREFIX = "current_time"
 _CURRENT_WEEKDAY_PREFIX = "current_weekday"
@@ -216,6 +220,23 @@ def _resolve_builtin_variable(
     return None
 
 
+def _resolve_fallback(fallback_expr: str, variable_path: str) -> str:
+    """Resolve the text after the ``|`` in a template placeholder.
+
+    Two accepted forms:
+      - ``{{var | some default}}`` — the expression IS the default, verbatim.
+        Colons are part of the text, not a separator.
+      - ``{{var | fallback:some default}}`` — legacy filter form. Bare
+        ``fallback`` with no value falls back to the titleised variable name.
+    """
+    if fallback_expr == LEGACY_FALLBACK_FILTER:
+        return variable_path.title()
+    legacy_prefix = LEGACY_FALLBACK_FILTER + ":"
+    if fallback_expr.startswith(legacy_prefix):
+        return fallback_expr[len(legacy_prefix) :].strip()
+    return fallback_expr
+
+
 def _render_string(template_str: str, context: Dict[str, Any]) -> str:
     """
     Render a string template with variable substitution.
@@ -236,8 +257,7 @@ def _render_string(template_str: str, context: Dict[str, Any]) -> str:
 
     def _replace(match: re.Match[str]) -> str:  # type: ignore[type-arg]
         variable_path = match.group(1).strip()
-        filter_name = match.group(2).strip() if match.group(2) else None
-        filter_value = match.group(3).strip() if match.group(3) else None
+        fallback_expr = match.group(2).strip() if match.group(2) else None
 
         # Check for built-in variables first (current_time, current_weekday)
         builtin_value = _resolve_builtin_variable(variable_path, default_tz)
@@ -247,19 +267,15 @@ def _render_string(template_str: str, context: Dict[str, Any]) -> str:
         # Get value using nested path lookup
         value = get_nested_value(context, variable_path)
 
+        # A canonical variable descriptor is configuration that leaked into the
+        # call context, not a value. Treat it as unset so the fallback applies —
+        # otherwise it would be JSON-dumped and spoken aloud on the call.
+        if is_variable_descriptor(value):
+            value = value.get("default", "")
+
         # Apply fallback: new syntax {{var | default}} or legacy {{var | fallback:default}}
-        if filter_name is not None:
-            if value is None or value == "":
-                if filter_name == "fallback":
-                    # Legacy syntax: {{var | fallback:default}}
-                    value = (
-                        filter_value
-                        if filter_value is not None
-                        else variable_path.title()
-                    )
-                else:
-                    # New syntax: {{var | default}}
-                    value = filter_name
+        if fallback_expr is not None and (value is None or value == ""):
+            value = _resolve_fallback(fallback_expr, variable_path)
 
         # Convert to string for substitution
         if value is None:

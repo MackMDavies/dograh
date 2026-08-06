@@ -7,7 +7,10 @@ from loguru import logger
 
 from api.constants import MPS_API_URL
 from api.services.configuration.masking import contains_masked_key
-from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.registry import (
+    OPENROUTER_DEFAULT_MAX_TOKENS,
+    ServiceProviders,
+)
 from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
 from api.services.pipecat.minimax_llm import DograhMiniMaxLLMService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
@@ -39,6 +42,7 @@ from pipecat.services.dograh.llm import DograhLLMService
 from pipecat.services.dograh.stt import DograhSTTService, DograhSTTSettings
 from pipecat.services.dograh.tts import DograhTTSService, DograhTTSSettings
 from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
+from pipecat.services.fish.tts import FishAudioTTSService, FishAudioTTSSettings
 from pipecat.services.gladia.stt import GladiaSTTService, GladiaSTTSettings
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
 from pipecat.services.google.stt import GoogleSTTService, GoogleSTTSettings
@@ -50,7 +54,7 @@ from pipecat.services.google.vertex.llm import (
 from pipecat.services.groq.llm import GroqLLMService, GroqLLMSettings
 from pipecat.services.minimax.tts import MiniMaxTTSSettings
 from pipecat.services.openai.base_llm import OpenAILLMSettings
-from pipecat.services.openai.llm import OpenAILLMService
+from api.services.pipecat.openai_llm import DograhOpenAILLMService
 from pipecat.services.openai.stt import (
     OpenAISTTService,
     OpenAISTTSettings,
@@ -87,7 +91,13 @@ def _validate_runtime_service_url(url: str, field_name: str) -> None:
 
 
 def create_stt_service(
-    user_config, audio_config: "AudioConfig", keyterms: list[str] | None = None
+    user_config,
+    audio_config: "AudioConfig",
+    keyterms: list[str] | None = None,
+    *,
+    eot_timeout_ms: int = 1000,
+    eot_threshold: float = 0.6,
+    eager_eot_threshold: float = 0.3,
 ):
     """Create and return appropriate STT service based on user configuration
 
@@ -108,9 +118,17 @@ def create_stt_service(
                 api_key=user_config.stt.api_key,
                 settings=DeepgramFluxSTTSettings(
                     model=user_config.stt.model,
-                    eot_timeout_ms=3000,
-                    eot_threshold=0.7,
-                    eager_eot_threshold=0.5,
+                    # SYSEVO_FLUX_LATENCY: these decide how long Flux waits
+                    # after someone stops talking before it will admit the turn
+                    # ended, and they sat in front of EVERY reply. The 3s
+                    # timeout was the worst of it: whenever confidence never
+                    # crossed eot_threshold, the pipeline simply waited it out
+                    # before the LLM was even asked for a response.
+                    # eager_eot lets generation start on a weaker signal, which
+                    # is what buys back most of the felt latency.
+                    eot_timeout_ms=eot_timeout_ms,
+                    eot_threshold=eot_threshold,
+                    eager_eot_threshold=eager_eot_threshold,
                     keyterm=keyterms or [],
                 ),
                 should_interrupt=False,  # Let UserAggregator take care of sending InterruptionFrame
@@ -395,6 +413,7 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             settings=OpenAITTSSettings(
                 model=user_config.tts.model,
                 voice=user_config.tts.voice,
+                speed=getattr(user_config.tts, "speed", None) or 1.0,
             ),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
@@ -532,9 +551,13 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             settings=ElevenLabsTTSSettings(
                 voice=voice_id,
                 model=user_config.tts.model,
-                stability=0.8,
+                # Defaults live on the config (0.8 / 0.75 / 0.0 / False) — these
+                # were hardcoded here, so the UI's tuning sliders never applied.
+                stability=getattr(user_config.tts, "stability", 0.8),
                 speed=user_config.tts.speed,
-                similarity_boost=0.75,
+                similarity_boost=getattr(user_config.tts, "similarity_boost", 0.75),
+                style=getattr(user_config.tts, "style", 0.0),
+                use_speaker_boost=getattr(user_config.tts, "use_speaker_boost", False),
             ),
             text_filters=[xml_function_tag_filter],
             skip_aggregator_types=["recording_router", "recording"],
@@ -719,6 +742,35 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
             skip_aggregator_types=["recording_router", "recording"],
             silence_time_s=1.0,
         )
+    elif user_config.tts.provider == ServiceProviders.FISH.value:
+        latency = getattr(user_config.tts, "latency", None) or "balanced"
+        prosody_speed = getattr(user_config.tts, "prosody_speed", None) or 1.0
+        prosody_volume = getattr(user_config.tts, "prosody_volume", None)
+        if prosody_volume is None:
+            prosody_volume = 0
+        settings_kwargs = {
+            "model": user_config.tts.model,
+            "voice": user_config.tts.voice,
+            "latency": latency,
+            "normalize": getattr(user_config.tts, "normalize", True),
+            "prosody_speed": prosody_speed,
+            "prosody_volume": prosody_volume,
+        }
+        temperature = getattr(user_config.tts, "temperature", None)
+        if temperature is not None:
+            settings_kwargs["temperature"] = temperature
+        top_p = getattr(user_config.tts, "top_p", None)
+        if top_p is not None:
+            settings_kwargs["top_p"] = top_p
+        output_format = getattr(user_config.tts, "output_format", None) or "pcm"
+        return FishAudioTTSService(
+            api_key=user_config.tts.api_key,
+            output_format=output_format,
+            settings=FishAudioTTSSettings(**settings_kwargs),
+            text_filters=[xml_function_tag_filter],
+            skip_aggregator_types=["recording_router", "recording"],
+            silence_time_s=1.0,
+        )
     elif user_config.tts.provider == ServiceProviders.AWS_POLLY.value:
         aws_access_key = getattr(user_config.tts, "aws_access_key", None) or None
         aws_secret_key = getattr(user_config.tts, "aws_secret_key", None) or None
@@ -864,7 +916,7 @@ def create_llm_service_from_provider(
             _validate_runtime_service_url(base_url, "base_url")
             kwargs["base_url"] = base_url
         if "gpt-5" in model:
-            return OpenAILLMService(
+            return DograhOpenAILLMService(
                 api_key=api_key,
                 settings=OpenAILLMSettings(
                     model=model,
@@ -876,14 +928,19 @@ def create_llm_service_from_provider(
         # Detect by checking if the base model name starts with "o" + digit.
         _base = model.split("/")[-1]
         if re.match(r"^o\d", _base):
-            return OpenAILLMService(
+            return DograhOpenAILLMService(
                 api_key=api_key,
                 settings=OpenAILLMSettings(model=model),
                 **kwargs,
             )
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
-            settings=OpenAILLMSettings(model=model, temperature=0.1),
+            # SYSEVO_MAX_TOKENS: hard ceiling on a single spoken turn. ~120
+            # tokens is ~90 words. The agent prompt asks for two sentences;
+            # this stops a drift into 100-word monologues from ever reaching
+            # the caller, and shortens the window in which a second response
+            # can begin while the first is still playing.
+            settings=OpenAILLMSettings(model=model, temperature=0.1, max_tokens=120),
             **kwargs,
         )
     elif provider == ServiceProviders.ANTHROPIC.value:
@@ -903,7 +960,7 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.XAI.value:
         xai_base_url = base_url or "https://api.x.ai/v1"
         _validate_runtime_service_url(xai_base_url, "base_url")
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
             base_url=xai_base_url,
             settings=OpenAILLMSettings(model=model, temperature=0.1),
@@ -915,7 +972,11 @@ def create_llm_service_from_provider(
             kwargs["base_url"] = base_url
         return OpenRouterLLMService(
             api_key=api_key,
-            settings=OpenRouterLLMSettings(model=model, temperature=0.1),
+            settings=OpenRouterLLMSettings(
+                model=model,
+                temperature=0.1,
+                max_tokens=OPENROUTER_DEFAULT_MAX_TOKENS,
+            ),
             **kwargs,
         )
     elif provider == ServiceProviders.GOOGLE.value:
@@ -1005,7 +1066,7 @@ def create_llm_service_from_provider(
     elif provider == ServiceProviders.COHERE.value:
         cohere_base_url = base_url or "https://api.cohere.com/compatibility/v1"
         _validate_runtime_service_url(cohere_base_url, "base_url")
-        return OpenAILLMService(
+        return DograhOpenAILLMService(
             api_key=api_key,
             base_url=cohere_base_url,
             settings=OpenAILLMSettings(model=model, temperature=0.1),

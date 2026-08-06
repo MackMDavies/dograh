@@ -14,15 +14,29 @@ from api.services.pipecat.in_memory_buffers import (
     InMemoryAudioBuffer,
     InMemoryLogsBuffer,
 )
+from api.services.pipecat.llm_error_classification import classify_llm_exhaustion
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
+from api.services.pipecat.recovery_speech import pick_recovery_line
 from api.services.workflow.pipecat_engine import PipecatEngine
-from api.services.workflow.variable_resolution import fill_if_absent
+from api.services.workflow.variable_resolution import (
+    fill_if_absent,
+    remap_memory_variables,
+)
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
+
+# How long to wait for stop_recording()'s background on_audio_data task to
+# append its audio before concluding there is none. 40 x 50ms = 2s, which is
+# generous for an in-process append behind a lock and short enough that a
+# genuinely silent call does not stall teardown.
+AUDIO_FLUSH_POLL_ATTEMPTS = 40
+AUDIO_FLUSH_POLL_INTERVAL_S = 0.05
 from pipecat.frames.frames import (
+    ErrorFrame,
     Frame,
+    TTSSpeakFrame,
 )
 from pipecat.pipeline.task import PipelineTask
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
@@ -71,6 +85,7 @@ def register_event_handlers(
     audio_config=AudioConfig,
     pre_call_fetch_task: asyncio.Task | None = None,
     pre_call_fetch_is_memory: bool = False,
+    memory_attr_map: dict[str, str] | None = None,
     user_provider_id: str | None = None,
     integration_runtime_sessions: list[IntegrationRuntimeSession] | None = None,
 ):
@@ -93,6 +108,9 @@ def register_event_handlers(
         sample_rate=sample_rate,
         num_channels=num_channels,
     )
+    # How many recovery lines have been spoken on this call (capped).
+    recovery_state = {"spoken": 0}
+
     # Track both events to ensure the initial response is only triggered after both occur
     ready_state = {
         "pipeline_started": False,
@@ -144,8 +162,13 @@ def register_event_handlers(
 
                 if fetch_result:
                     if pre_call_fetch_is_memory:
-                        # Caller memory fills only the gaps — campaign/explicit
+                        # Land memory values on the variables they're bound to
+                        # (a variable may map to a differently-named memory
+                        # attribute), then fill only the gaps — campaign/explicit
                         # values and non-empty workflow defaults win.
+                        fetch_result = remap_memory_variables(
+                            fetch_result, memory_attr_map or {}
+                        )
                         fill_if_absent(engine._call_context_vars, fetch_result)
                     else:
                         # Generic pre-call HTTP fetch keeps its enrich/override
@@ -205,6 +228,33 @@ def register_event_handlers(
     @task.event_handler("on_pipeline_error")
     async def on_pipeline_error(_task: PipelineTask, frame: Frame):
         logger.warning(f"Pipeline error for workflow run {workflow_run_id}: {frame}")
+
+        # Say something. A stalled LLM (rate limit, timeout) otherwise leaves
+        # the caller in silence, which reads as a dropped call. Capped, so a
+        # genuinely down provider ends the call rather than looping filler.
+        line = pick_recovery_line(recovery_state["spoken"])
+        if line:
+            recovery_state["spoken"] += 1
+            try:
+                await task.queue_frame(
+                    TTSSpeakFrame(
+                        line, append_to_context=False, persist_to_logs=True
+                    )
+                )
+            except Exception as speak_err:
+                logger.warning(f"Could not speak recovery line: {speak_err}")
+
+        # Distinguish an LLM rate-limit/quota-exhaustion failure from a
+        # generic pipeline error: same graceful end-call path either way,
+        # but this failure mode is silent otherwise (the call still "connects"
+        # from the telephony side, so nothing else flags it) and it's the
+        # known recurring "agent rang but no audio" cause when a provider key
+        # runs out of credits — worth a loud, distinct signal so an operator
+        # finds out from a log/campaign-log entry instead of a client report.
+        llm_exhaustion = classify_llm_exhaustion(
+            frame.exception if isinstance(frame, ErrorFrame) else None
+        )
+
         try:
             workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
             if workflow_run and workflow_run.campaign_id:
@@ -214,19 +264,50 @@ def register_event_handlers(
                     workflow_run_id=workflow_run_id,
                     reason="pipeline_error",
                 )
+                if llm_exhaustion:
+                    await db_client.append_campaign_log(
+                        campaign_id=workflow_run.campaign_id,
+                        level="error",
+                        event="llm_provider_exhausted",
+                        message=(
+                            f"Call ended: LLM provider returned a rate-limit/"
+                            f"quota error ({llm_exhaustion['exception_type']}) — "
+                            "check the provider's credits/quota."
+                        ),
+                        details={
+                            "workflow_run_id": workflow_run_id,
+                            "workflow_id": workflow_run.workflow_id,
+                            **llm_exhaustion,
+                        },
+                    )
             asyncio.create_task(
                 _capture_call_event(
                     workflow_run_id,
                     user_provider_id,
                     PostHogEvent.CALL_FAILED,
-                    extra_properties={"error_reason": "pipeline_error"},
+                    extra_properties={
+                        "error_reason": "llm_provider_exhausted"
+                        if llm_exhaustion
+                        else "pipeline_error",
+                    },
                 )
             )
         except Exception as e:
             logger.error(f"Error recording circuit breaker failure: {e}", exc_info=True)
 
+        if llm_exhaustion:
+            organization_id = await engine._get_organization_id()
+            logger.error(
+                f"[LLM_PROVIDER_EXHAUSTED] workflow_run={workflow_run_id} "
+                f"organization_id={organization_id}: {llm_exhaustion['exception_message']}"
+            )
+
         await engine.end_call_with_reason(
-            EndTaskReason.PIPELINE_ERROR.value, abort_immediately=True
+            EndTaskReason.PIPELINE_ERROR.value,
+            abort_immediately=True,
+            extra_context={"llm_provider_exhausted": llm_exhaustion}
+            if llm_exhaustion
+            else None,
         )
 
     @task.event_handler("on_pipeline_finished")
@@ -379,10 +460,30 @@ def register_event_handlers(
         audio_temp_path = None
         transcript_temp_path = None
 
-        # Yield the event loop so any pending on_audio_data background tasks (fired
-        # by stop_recording() or intermediate buffer flushes) have a chance to
-        # complete and append their chunks to in_memory_audio_buffer before we check.
-        await asyncio.sleep(0)
+        # Wait for the pending on_audio_data background tasks (fired by
+        # stop_recording() or intermediate buffer flushes) to actually land
+        # their chunks in in_memory_audio_buffer.
+        #
+        # This was a single `await asyncio.sleep(0)`, and that is a RACE, not a
+        # flush. stop_recording() dispatches on_audio_data as a background
+        # task, and that task's InMemoryAudioBuffer.append() awaits an
+        # asyncio.Lock — so one yield is long enough for the task to START and
+        # not to finish. When it lost, the check below found an empty buffer,
+        # logged "Audio buffer is empty ... skipping recording upload", and the
+        # call ended up with no recording at all.
+        #
+        # Measured on production before this change: of fourteen consecutive
+        # runs on one workflow, only two had downloadable audio, with no
+        # pattern by duration, direction or caller — run 2500 (22s) had audio,
+        # run 2498 (22s) did not. Re-probed twenty minutes later the same runs
+        # returned identical 404s, so it was never an upload still in flight.
+        #
+        # Bounded so a call that genuinely captured no audio (an immediate
+        # hangup) still finishes promptly instead of hanging teardown.
+        for _ in range(AUDIO_FLUSH_POLL_ATTEMPTS):
+            if not in_memory_audio_buffer.is_empty:
+                break
+            await asyncio.sleep(AUDIO_FLUSH_POLL_INTERVAL_S)
 
         try:
             logger.info(

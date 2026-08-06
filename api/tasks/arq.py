@@ -3,6 +3,8 @@
 import ssl
 from urllib.parse import urlparse
 
+from loguru import logger
+
 from api.constants import REDIS_URL
 
 # Setup logging - this is now idempotent and safe to call multiple times
@@ -49,6 +51,9 @@ from api.tasks.s3_upload import (
     process_workflow_completion,
     upload_voicemail_audio_to_s3,
 )
+from api.tasks.wallet_reconciliation import reconcile_wallet_debits
+from api.tasks.memory_reconciliation import reconcile_memory
+from api.tasks.telephony_cost_reconciliation import reconcile_telephony_cost
 from api.services.api_usage_counter import flush_api_request_usage
 
 
@@ -61,10 +66,63 @@ class WorkerSettings:
         process_campaign_batch,
         process_knowledge_base_document,
     ]
-    # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
-    cron_jobs = [cron(flush_api_request_usage, minute=0)]
+    cron_jobs = [
+        # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
+        cron(flush_api_request_usage, minute=0),
+        # Every 10 min: re-fire post-call wallet debits that never settled (crash / lost
+        # job / transient webhook failure). Idempotent on workflow_run_id, so safe to retry.
+        cron(reconcile_wallet_debits, minute=set(range(0, 60, 10))),
+        # Every 10 min (offset by 5): re-fire post-call caller-memory extraction that never
+        # settled. Idempotent per run (dedupe + upsert), so safe to retry. See H4.
+        cron(reconcile_memory, minute=set(range(5, 60, 10))),
+        # Hourly: attach Twilio's carrier charge to completed calls. Twilio
+        # prices asynchronously, so this cannot be done at hang-up. Without it
+        # every cost figure understates the truth by ~a third on real telephony.
+        cron(reconcile_telephony_cost, minute={7}),
+    ]
     redis_settings = REDIS_SETTINGS
     max_jobs = 10
+
+    @staticmethod
+    async def on_startup(_ctx) -> None:
+        """Report at boot whether this worker can reach the api's temp directory.
+
+        `process_workflow_completion` receives call audio and transcripts as
+        FILESYSTEM PATHS written by the api container. That only works while both
+        containers mount the same volume at /tmp. When a dedicated worker service
+        was introduced on 2026-08-05 without `shared-tmp:/tmp`, every recording and
+        transcript was silently discarded for six hours — the only symptom was one
+        WARNING per call, and the UI simply showed an empty player.
+
+        Sharing cannot be proven from one side, so this checks what it can and says
+        what it sees. The hard alarm is the ARTIFACT LOST error in s3_upload.py;
+        this is the early warning at boot.
+        """
+        import os
+        import tempfile
+
+        tmp = tempfile.gettempdir()
+        try:
+            probe = os.path.join(tmp, ".arq_worker_tmp_probe")
+            with open(probe, "w") as fh:
+                fh.write("ok")
+            os.remove(probe)
+        except Exception as e:
+            logger.error(
+                f"Worker temp dir {tmp} is not writable ({e}). Call recordings and "
+                f"transcripts CANNOT be uploaded — check the shared-tmp volume mount."
+            )
+            return
+
+        try:
+            staged = [f for f in os.listdir(tmp) if f.endswith((".wav", ".txt"))]
+            logger.info(
+                f"ARQ worker temp dir {tmp}: writable, {len(staged)} staged artifact(s) visible. "
+                f"If this stays at 0 while calls complete and ARTIFACT LOST appears, the api "
+                f"and worker are NOT sharing /tmp and every recording is being discarded."
+            )
+        except Exception:
+            pass
 
 
 LOG_CONFIG = {

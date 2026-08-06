@@ -150,6 +150,27 @@ class CircuitBreakerConfigResponse(BaseModel):
     min_calls_in_window: int = 5
 
 
+class EnqueueRunRequest(BaseModel):
+    source_uuid: str
+    context_variables: dict
+    scheduled_for: Optional[datetime] = None
+    retry_reason: Optional[str] = None
+
+
+class UpdateQueuedRunRequest(BaseModel):
+    """SYSEVO_CALLBACK_PATCH: reschedule, or cancel, a queued callback.
+
+    `reschedule` is explicit rather than inferred from `scheduled_for is not
+    None`, because None is a meaningful value here: clearing the time sends the
+    row back to the review queue, and the dispatcher only claims rows whose time
+    is due, so an unscheduled row can never dial.
+    """
+
+    scheduled_for: Optional[datetime] = None
+    reschedule: bool = False
+    cancel: bool = False
+
+
 class CreateCampaignRequest(BaseModel):
     name: str = Field(..., min_length=1, max_length=255)
     workflow_id: int
@@ -218,6 +239,10 @@ class CampaignResponse(BaseModel):
     total_queued_count: int = 0
     parent_campaign_id: Optional[int] = None
     redialed_campaign_id: Optional[int] = None
+    # SYSEVO_IS_STANDING: a standing campaign is a dispatch queue (callbacks),
+    # not a user-facing campaign. Exposed so the UI can route it to /callbacks
+    # and keep it out of the campaign list.
+    is_standing: bool = False
     telephony_configuration_id: Optional[int] = None
     telephony_configuration_name: Optional[str] = None
     logs: List[CampaignLogEntryResponse] = Field(default_factory=list)
@@ -321,6 +346,7 @@ def _build_campaign_response(
         total_queued_count=total_queued_count,
         parent_campaign_id=parent_campaign_id,
         redialed_campaign_id=redialed_campaign_id,
+        is_standing=bool(getattr(campaign, "is_standing", False)),
         telephony_configuration_id=campaign.telephony_configuration_id,
         telephony_configuration_name=telephony_configuration_name,
         logs=[
@@ -705,6 +731,15 @@ async def update_campaign(
         update_kwargs["orchestrator_metadata"] = metadata
 
     if request.workflow_id is not None:
+        if not user.is_superuser:
+            # Unlike create_campaign (which validates via get_workflow_name),
+            # this write path had no ownership check at all — a client could
+            # repoint an existing campaign at another org's workflow/agent.
+            workflow_name = await db_client.get_workflow_name(
+                request.workflow_id, organization_id=user.selected_organization_id
+            )
+            if not workflow_name:
+                raise HTTPException(status_code=404, detail="Workflow not found")
         update_kwargs["workflow_id"] = request.workflow_id
 
     if request.telephony_configuration_id is not None:
@@ -717,10 +752,19 @@ async def update_campaign(
                 request.telephony_configuration_id, user.selected_organization_id
             )
             if not cfg:
-                # Cross-org fallback for admin configs used by client orgs.
-                cfg = await db_client.get_telephony_configuration(
-                    request.telephony_configuration_id
-                )
+                # Client orgs may also reference the platform admin's
+                # shared/managed telephony config (e.g. "Sysevo Managed") —
+                # same get_platform_organization_id() pattern already used by
+                # ai_providers.py/voice_library.py for other shared platform
+                # resources. This must stay org-scoped to the platform org
+                # specifically: the previous unscoped get_telephony_configuration(id)
+                # fallback let any org reference ANY other org's telephony
+                # config, including its encrypted provider credentials.
+                platform_org_id = await db_client.get_platform_organization_id()
+                if platform_org_id is not None:
+                    cfg = await db_client.get_telephony_configuration_for_org(
+                        request.telephony_configuration_id, platform_org_id
+                    )
         if not cfg:
             raise HTTPException(
                 status_code=400, detail="telephony_configuration_not_found"
@@ -1188,3 +1232,57 @@ async def enqueue_run(
         retry_reason=request.retry_reason,
     )
     return {"queued_run_id": queued_run.id, "already_enqueued": False}
+
+
+@router.patch("/{campaign_id}/queued-runs/{queued_run_id}")
+async def update_queued_run_endpoint(
+    campaign_id: int,
+    queued_run_id: int,
+    request: UpdateQueuedRunRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Reschedule or cancel a queued run. Exists for the callbacks surface."""
+    # Org-scope through the campaign, exactly as enqueue_run does: an id in the
+    # path never implies ownership.
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+
+    queued_run = await db_client.get_queued_run_by_id(queued_run_id)
+    # The run must belong to THIS campaign, or the check above is decorative and
+    # any org could modify any queued run by guessing an id.
+    if not queued_run or queued_run.campaign_id != campaign_id:
+        raise HTTPException(status_code=404, detail="Queued run not found")
+
+    if queued_run.state not in ("queued", "failed"):
+        # processing/processed means the call is in flight or already made:
+        # rescheduling would either double-dial or rewrite history.
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot modify a run in state '{queued_run.state}'",
+        )
+
+    updates: dict = {}
+    if request.cancel:
+        # queued_run_state has no 'cancelled' member, and adding one is a
+        # migration for a single UI affordance. 'failed' plus an explicit reason
+        # keeps it out of the dispatcher and readable in History.
+        updates["state"] = "failed"
+        updates["retry_reason"] = "cancelled_by_user"
+        updates["scheduled_for"] = None
+    elif request.reschedule:
+        updates["scheduled_for"] = request.scheduled_for
+        if queued_run.state == "failed":
+            # Re-opening a previously cancelled callback.
+            updates["state"] = "queued"
+    else:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    updated = await db_client.update_queued_run(queued_run_id, **updates)
+    return {
+        "id": updated.id,
+        "state": updated.state,
+        "scheduled_for": updated.scheduled_for.isoformat() if updated.scheduled_for else None,
+        "retry_reason": updated.retry_reason,
+    }

@@ -10,6 +10,7 @@ from api.services.configuration.registry import (
     REGISTRY,
     ServiceType,
 )
+from api.services.configuration.voice_settings import flatten_voice_settings
 
 # Maps override key → (UserConfiguration field, ServiceType for registry lookup)
 _SECTION_MAP: dict[str, ServiceType] = {
@@ -35,6 +36,18 @@ def _build_section_from_override(service_type: ServiceType, override: dict):
         # Construction can fail when api_key is absent; return None so that
         # validate_partial can surface a clear "API key is missing" message.
         return None
+
+
+def _with_provider(override: dict, base) -> dict:
+    """Ensure the override carries a plain-string `provider` for mapping lookup.
+
+    An override that doesn't switch providers may omit the field entirely, and
+    when present it can be a ServiceProviders enum rather than its value.
+    """
+    provider = override.get("provider") or getattr(base, "provider", None)
+    if provider is None:
+        return override
+    return {**override, "provider": getattr(provider, "value", provider)}
 
 
 _SECRET_FIELDS = ("api_key", "credentials", "aws_access_key", "aws_secret_key")
@@ -111,6 +124,13 @@ def resolve_effective_config(
 
         override = model_overrides[section_key]
         base = getattr(effective, section_key)
+
+        if section_key == "tts":
+            # The UI stores tuning under a canonical voice_settings block; map
+            # it onto the provider's own field names before applying it. The
+            # override may omit `provider` when it isn't changing, so fall back
+            # to the base config's provider to pick the right mapping.
+            override = flatten_voice_settings(_with_provider(override, base))
 
         if base is None:
             # No global config for this section — build from override

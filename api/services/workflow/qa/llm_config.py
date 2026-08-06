@@ -2,8 +2,15 @@
 
 import random
 
+from loguru import logger
+
 from api.db import db_client
 from api.db.models import WorkflowRunModel
+from api.services.configuration.org_provider_resolver import (
+    enrich_overrides_with_org_api_keys,
+    resolve_org_provider_config,
+)
+from api.services.configuration.resolve import resolve_effective_config
 from api.services.workflow.dto import QANodeData
 
 
@@ -40,10 +47,52 @@ async def resolve_llm_config(
     return provider, model, api_key, kwargs
 
 
+async def _apply_org_resolution(user_configuration, workflow_run: WorkflowRunModel):
+    """Layer org provider connections + run model_overrides onto the user config.
+
+    Never raises: QA analysis is a post-call job, so a provider-lookup failure
+    degrades to the personal config rather than losing the analysis entirely.
+    """
+    org_id = getattr(getattr(workflow_run, "workflow", None), "organization_id", None)
+    if not org_id:
+        return user_configuration
+
+    try:
+        user_configuration = await resolve_org_provider_config(
+            org_id, user_configuration
+        )
+
+        run_configs = (
+            getattr(getattr(workflow_run, "definition", None), "workflow_configurations", None)
+            or {}
+        )
+        raw_overrides = run_configs.get("model_overrides")
+        if raw_overrides:
+            raw_overrides = await enrich_overrides_with_org_api_keys(
+                raw_overrides, org_id
+            )
+            user_configuration = resolve_effective_config(
+                user_configuration, raw_overrides
+            )
+    except Exception as e:
+        logger.warning(
+            f"QA analysis: org LLM resolution failed ({e}); "
+            "falling back to personal configuration"
+        )
+
+    return user_configuration
+
+
 async def resolve_user_llm_config(
     workflow_run: WorkflowRunModel,
 ) -> tuple[str, str, str, dict]:
-    """Resolve the user's configured LLM (from UserConfiguration).
+    """Resolve the effective LLM for QA analysis.
+
+    Mirrors the live call pipeline's resolution so analysis sees the same
+    credentials the call itself used: personal UserConfiguration, then the
+    organisation's provider connection, then the run's model_overrides.
+    Reading only the personal config meant every analysed call on an
+    org-managed key failed with "no_api_key".
 
     Returns:
         (provider, model, api_key, service_kwargs) tuple
@@ -55,6 +104,9 @@ async def resolve_user_llm_config(
     llm_config: dict = {}
     if user_id:
         user_configuration = await db_client.get_user_configurations(user_id)
+        user_configuration = await _apply_org_resolution(
+            user_configuration, workflow_run
+        )
         llm_config = user_configuration.model_dump(exclude_none=True).get("llm", {})
 
     provider = llm_config.get("provider", "openai")

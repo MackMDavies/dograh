@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import delete, func, text, update
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
@@ -585,11 +586,23 @@ class CampaignClient(BaseDBClient):
 
     # QueuedRun methods
     async def bulk_create_queued_runs(self, queued_runs_data: list[dict]) -> None:
-        """Bulk create queued runs"""
+        """Bulk create queued runs.
+
+        Upserts on (campaign_id, source_uuid) and does nothing on conflict —
+        source_uuid is deterministic per row (e.g. CSV sync derives it from a
+        hash of the source file plus row index), so a retried sync task
+        (arq's default retry-on-failure) re-runs this with the exact same
+        rows instead of double-inserting every number in the campaign.
+        """
+        if not queued_runs_data:
+            return
         async with self.async_session() as session:
-            queued_runs = [QueuedRunModel(**data) for data in queued_runs_data]
-            session.add_all(queued_runs)
+            stmt = pg_insert(QueuedRunModel).values(queued_runs_data)
+            stmt = stmt.on_conflict_do_nothing(
+                index_elements=["campaign_id", "source_uuid"]
+            )
             try:
+                await session.execute(stmt)
                 await session.commit()
             except Exception as e:
                 await session.rollback()
@@ -702,6 +715,21 @@ class CampaignClient(BaseDBClient):
             )
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_campaign_run_logs(self, campaign_id: int) -> list[dict]:
+        """Just the ``logs`` JSON for every run in a campaign — for progress
+        computations (e.g. ``_count_failed_campaign_calls``) that only ever
+        inspect ``telephony_status_callbacks`` inside ``logs``. Avoids
+        pulling the full row (usage_info/cost_info/initial_context/
+        gathered_context) across the wire for every dialed number on every
+        poll of an active campaign, which is what
+        ``get_workflow_runs_by_campaign`` does."""
+        async with self.async_session() as session:
+            query = select(WorkflowRunModel.logs).where(
+                WorkflowRunModel.campaign_id == campaign_id
+            )
+            result = await session.execute(query)
+            return [logs or {} for logs in result.scalars().all()]
 
     async def get_completed_runs_for_report(
         self,
@@ -984,7 +1012,14 @@ class CampaignClient(BaseDBClient):
 
             remaining_slots = limit - len(scheduled_runs)
 
-            # Then get regular queued runs if we have remaining slots
+            # Then get regular queued runs if we have remaining slots.
+            # Ordered by id (insertion order) rather than random(): random()
+            # forces Postgres to materialize and sort every remaining
+            # 'queued' row for this campaign on every single claim call —
+            # cost that grows with the backlog and gets called repeatedly
+            # (every batch, every few seconds) for a campaign of thousands
+            # of numbers. No behavior depends on dial order being shuffled;
+            # id ordering is a plain indexed range scan instead.
             if remaining_slots > 0:
                 regular_query = (
                     select(QueuedRunModel)
@@ -993,7 +1028,7 @@ class CampaignClient(BaseDBClient):
                         QueuedRunModel.state == "queued",
                         QueuedRunModel.scheduled_for.is_(None),
                     )
-                    .order_by(func.random())
+                    .order_by(QueuedRunModel.id)
                     .limit(remaining_slots)
                     .with_for_update(skip_locked=True)
                 )

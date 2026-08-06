@@ -78,6 +78,7 @@ class ServiceProviders(str, Enum):
     AZURE_TTS = "azure_tts"
     PLAYHT = "playht"
     NEETS = "neets"
+    FISH = "fish"
     # ── New STT providers ─────────────────────────────────────────────────────
     AZURE_SPEECH = "azure_speech"
     AWS_TRANSCRIBE = "aws_transcribe"
@@ -116,6 +117,7 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.AZURE_TTS,
         ServiceProviders.PLAYHT,
         ServiceProviders.NEETS,
+        ServiceProviders.FISH,
         ServiceProviders.AZURE_SPEECH,
         ServiceProviders.AWS_TRANSCRIBE,
         # ServiceProviders.SARVAM,
@@ -326,6 +328,12 @@ OPENROUTER_MODELS = [
     "meta-llama/llama-3.3-70b-instruct",
     "deepseek/deepseek-chat-v3-0324",
 ]
+
+# OpenRouter escrows credits against the max_tokens a request declares, and
+# reserves the model's full context window when none is given -- which 402s
+# unless the account holds a balance covering tens of thousands of tokens.
+# A spoken turn never approaches this bound, so declaring it costs nothing.
+OPENROUTER_DEFAULT_MAX_TOKENS = 512
 AZURE_MODELS = ["gpt-4.1-mini"]
 DOGRAH_LLM_MODELS = ["default", "accurate", "fast", "lite", "zen"]
 AWS_BEDROCK_MODELS = [
@@ -548,6 +556,15 @@ NEETS_PROVIDER_MODEL_CONFIG = provider_model_config(
     "Neets.ai",
     description="Ultra-low-cost TTS — among the cheapest non-self-hosted providers.",
     provider_docs_url="https://neets.ai/docs",
+)
+FISH_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "Fish Audio",
+    description=(
+        "Fish Audio real-time streaming TTS with prosody, latency, and "
+        "sampling controls. Voices are synced from your connected account "
+        "and the public Fish Audio voice library."
+    ),
+    provider_docs_url="https://docs.fish.audio/api-reference/introduction",
 )
 AZURE_SPEECH_PROVIDER_MODEL_CONFIG = provider_model_config(
     "Azure Speech",
@@ -985,6 +1002,22 @@ class ElevenlabsTTSConfiguration(BaseServiceConfiguration):
         description="ElevenLabs voice ID from your Voice Library.",
     )
     speed: float = Field(default=1.0, ge=0.1, le=2.0, description="Speed of the voice.")
+    stability: float = Field(
+        default=0.8, ge=0.0, le=1.0,
+        description="Lower is more expressive and variable; higher is more consistent.",
+    )
+    similarity_boost: float = Field(
+        default=0.75, ge=0.0, le=1.0,
+        description="How closely the output adheres to the original voice.",
+    )
+    style: float = Field(
+        default=0.0, ge=0.0, le=1.0,
+        description="Style exaggeration. Raising this increases latency.",
+    )
+    use_speaker_boost: bool = Field(
+        default=False,
+        description="Boost similarity to the speaker at the cost of some latency.",
+    )
     model: str = Field(
         default="eleven_flash_v2_5",
         description="ElevenLabs TTS model.",
@@ -1073,6 +1106,9 @@ class OpenAITTSService(BaseTTSConfiguration):
     voice: str = Field(
         default="alloy",
         description="OpenAI TTS voice name.",
+    )
+    speed: float = Field(
+        default=1.0, ge=0.25, le=4.0, description="Speech speed multiplier."
     )
 
 
@@ -1447,6 +1483,66 @@ class NeetsTTSConfiguration(BaseTTSConfiguration):
     )
 
 
+FISH_TTS_MODELS = ["s1", "s2-pro"]
+FISH_TTS_LATENCY_MODES = ["normal", "balanced"]
+
+
+@register_tts
+class FishTTSConfiguration(BaseTTSConfiguration):
+    model_config = FISH_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.FISH] = ServiceProviders.FISH
+    model: str = Field(
+        default="s2-pro",
+        description="Fish Audio TTS model.",
+        json_schema_extra={"examples": FISH_TTS_MODELS, "allow_custom_input": True},
+    )
+    voice: str | None = Field(
+        default=None,
+        description=(
+            "Fish Audio voice reference ID. Sync voices from AI Models to "
+            "populate the picker — no default voice is assumed."
+        ),
+    )
+    latency: str = Field(
+        default="balanced",
+        description="Latency mode: 'balanced' favors quality, 'normal' favors speed.",
+        json_schema_extra={"examples": FISH_TTS_LATENCY_MODES},
+    )
+    normalize: bool = Field(
+        default=True,
+        description="Whether Fish Audio normalizes output audio loudness.",
+    )
+    temperature: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Sampling temperature. Leave blank for Fish Audio's default.",
+    )
+    top_p: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Nucleus sampling threshold. Leave blank for Fish Audio's default.",
+    )
+    prosody_speed: float = Field(
+        default=1.0,
+        ge=0.5,
+        le=2.0,
+        description="Speech speed multiplier.",
+    )
+    prosody_volume: int = Field(
+        default=0,
+        ge=-20,
+        le=20,
+        description="Volume adjustment in dB.",
+    )
+    output_format: str = Field(
+        default="pcm",
+        description="Audio output format Fish Audio streams back.",
+        json_schema_extra={"examples": ["pcm", "opus", "mp3", "wav"]},
+    )
+
+
 TTSConfig = Annotated[
     Union[
         DeepgramTTSConfiguration,
@@ -1465,6 +1561,7 @@ TTSConfig = Annotated[
         AzureTTSConfiguration,
         PlayHTTTSConfiguration,
         NeetsTTSConfiguration,
+        FishTTSConfiguration,
     ],
     Field(discriminator="provider"),
 ]

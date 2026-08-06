@@ -8,9 +8,15 @@ from api.services.workflow.node_data import BaseNodeData
 from api.services.workflow.node_specs import get_spec
 
 # Regex for matching {{ variable }} template placeholders.
-# Captures: group(1) = variable path, group(2) = filter name, group(3) = filter value.
+# Captures: group(1) = variable path, group(2) = the whole fallback expression.
+# The fallback is captured verbatim (colons included) and only split on ":" by
+# the renderer for the legacy {{var | fallback:default}} form — otherwise a
+# perfectly ordinary default like "Hi: friend" would be truncated at the colon.
 # Shared with api.utils.template_renderer via import.
-TEMPLATE_VAR_PATTERN = r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^:}]+)(?::([^}]+))?)?\s*\}\}"
+TEMPLATE_VAR_PATTERN = r"\{\{\s*([^|\s}]+)(?:\s*\|\s*([^}]+))?\s*\}\}"
+
+# Legacy fallback filter prefix: {{var | fallback:default}}
+LEGACY_FALLBACK_FILTER = "fallback"
 
 # Variables injected by the system at runtime, not from source data.
 # Variables the platform supplies at render time, so they must never be demanded
@@ -34,6 +40,19 @@ _SYSTEM_VARIABLES = {
     "time_now",
     "time_now_spoken",
     "upcoming_days",
+    # Inbound caller recognition, injected by the Sysevo memory pre-call fetch.
+    # Someone ringing our outbound number is usually ringing BACK, so the agent
+    # is told who they are before it speaks. These must be listed here or a
+    # template that greets by name is treated as having unfilled variables and
+    # blocks campaign launch.
+    "caller_name",
+    "caller_company",
+    "caller_email",
+    "caller_known",
+    "caller_known_from",
+    "caller_memory",
+    "is_callback",
+    "prior_outbound_attempts",
 }
 
 

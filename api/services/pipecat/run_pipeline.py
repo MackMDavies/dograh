@@ -19,6 +19,7 @@ from api.services.pipecat.event_handlers import (
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
 from api.services.pipecat.memory_pre_call import execute_memory_pre_call_fetch
+from api.services.call_live_webhook import fire_call_live
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -58,7 +59,11 @@ from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
-from api.services.workflow.variable_resolution import extract_variable_defaults
+from api.services.workflow.variable_resolution import (
+    build_call_context,
+    build_memory_attr_map,
+    pick_template_variables,
+)
 from api.services.workflow.workflow_graph import WorkflowGraph
 from pipecat.audio.turn.smart_turn.base_smart_turn import SmartTurnParams
 from pipecat.audio.turn.smart_turn.local_smart_turn_v3 import LocalSmartTurnAnalyzerV3
@@ -373,39 +378,50 @@ async def _run_pipeline(
     if workflow_run is None or workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
-    merged_call_context_vars = workflow_run.initial_context
-    # If there is some extra call_context_vars, fold them in. Persistence
-    # happens once below, after runtime_configuration is also resolved.
-    if call_context_vars:
-        merged_call_context_vars = {**merged_call_context_vars, **call_context_vars}
-
     # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
     # access is validated before the pipeline is invoked.
     workflow = await db_client.get_workflow_by_id(workflow_id)
     if not workflow:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
-    # Seed workflow-level variable defaults as the BASE layer for every call
-    # type (campaign, telephony, inbound). initial_context + telephony extras
-    # already merged above take precedence; caller memory (fill-if-absent later)
-    # fills only what remains. Uses extract_variable_defaults so canonical
-    # object-shaped variables ({default,source,...}) contribute only their
-    # default string, never the raw object.
-    workflow_defaults = extract_variable_defaults(workflow.template_context_variables)
-    if workflow_defaults:
-        merged_call_context_vars = {**workflow_defaults, **merged_call_context_vars}
-
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
     if run_definition is None:
         raise HTTPException(status_code=400, detail="Workflow run has no definition — save and publish the workflow first")
+
+    # The agent editor saves template variables on the DEFINITION, so read them
+    # from the run's pinned version; the workflow row is a legacy fallback only.
+    template_vars = pick_template_variables(
+        definition_vars=run_definition.template_context_variables,
+        workflow_vars=workflow.template_context_variables,
+    )
+
+    # Assemble the variable context for this call. Precedence (highest first):
+    # static-pinned vars > telephony/transport extras > initial_context
+    # (campaign contact row, or seeded defaults for a test call) > workflow
+    # defaults. Caller memory fills whatever is still empty, later at call start.
+    # Descriptor objects ({default,source,...}) are collapsed to their default
+    # so they can never reach the renderer and be spoken aloud as JSON.
+    merged_call_context_vars = build_call_context(
+        initial_context=workflow_run.initial_context,
+        extra_context_vars=call_context_vars,
+        template_context_variables=template_vars,
+    )
+
+    # Maps caller-memory attribute names onto the variables they're bound to.
+    memory_attr_map = build_memory_attr_map(template_vars)
     run_workflow_json = run_definition.workflow_json
     run_configs = run_definition.workflow_configurations or {}
 
     # Extract configurations from the version's workflow_configurations
     max_call_duration_seconds = 300  # Default 5 minutes
     max_user_idle_timeout = 10.0  # Default 10 seconds
-    smart_turn_stop_secs = 2.0  # Default 2 seconds for incomplete turn timeout
+    # Latency / responsiveness defaults — tuned "ultra-fast" so agents reply almost
+    # immediately after the caller stops, instead of the old 2s/3s waits. Per-agent
+    # overrides come from run_configs (set by the agent editor's Responsiveness control).
+    smart_turn_stop_secs = 0.6  # incomplete-turn timeout (was 2.0)
+    flux_eot_timeout_ms = 1000  # Flux end-of-turn fallback in ms (was 3000)
+    flux_eager_eot_threshold = 0.3  # eager (early) end-of-turn confidence (was 0.5)
     turn_stop_strategy = "transcription"  # Default to transcription-based detection
     keyterms = None  # Dictionary words for STT boosting
 
@@ -418,6 +434,12 @@ async def _run_pipeline(
 
         if "smart_turn_stop_secs" in run_configs:
             smart_turn_stop_secs = run_configs["smart_turn_stop_secs"]
+
+        if "flux_eot_timeout_ms" in run_configs:
+            flux_eot_timeout_ms = run_configs["flux_eot_timeout_ms"]
+
+        if "flux_eager_eot_threshold" in run_configs:
+            flux_eager_eot_threshold = run_configs["flux_eager_eot_threshold"]
 
         if "turn_stop_strategy" in run_configs:
             turn_stop_strategy = run_configs["turn_stop_strategy"]
@@ -515,7 +537,13 @@ async def _run_pipeline(
         # inference calls.
         inference_llm = create_llm_service(user_config)
     else:
-        stt = create_stt_service(user_config, audio_config, keyterms=keyterms)
+        stt = create_stt_service(
+            user_config,
+            audio_config,
+            keyterms=keyterms,
+            eot_timeout_ms=flux_eot_timeout_ms,
+            eager_eot_threshold=flux_eager_eot_threshold,
+        )
         tts = create_tts_service(user_config, audio_config)
         llm = create_llm_service(user_config)
         inference_llm = None
@@ -596,9 +624,25 @@ async def _run_pipeline(
                 secret=_sysevo_memory_secret,
                 call_context_vars=merged_call_context_vars,
                 workflow_id=workflow_id,
+                organization_id=workflow.organization_id,
             )
         )
         pre_call_fetch_is_memory = True
+
+    # Sysevo LIVE-call tracking — fire-and-forget for EVERY call type (inbound,
+    # outbound, campaign, web, widget) the moment the pipeline starts, so the call
+    # shows as live in the Sysevo client + admin dashboards. Keyed by run_id, so
+    # concurrent calls (e.g. a campaign dialer) each get their own live row. The row
+    # is removed by the matching "ended" signal at call completion. Non-fatal.
+    if os.getenv("SYSEVO_CALL_LIVE_URL"):
+        asyncio.create_task(
+            fire_call_live(
+                event="started",
+                workflow_run_id=workflow_run_id,
+                workflow_id=workflow_id,
+                caller_number=merged_call_context_vars.get("caller_number"),
+            )
+        )
 
     # Create in-memory logs buffer early so it can be used by engine callbacks
     in_memory_logs_buffer = InMemoryLogsBuffer(workflow_run_id)
@@ -949,6 +993,7 @@ async def _run_pipeline(
         audio_config=audio_config,
         pre_call_fetch_task=pre_call_fetch_task,
         pre_call_fetch_is_memory=pre_call_fetch_is_memory,
+        memory_attr_map=memory_attr_map,
         user_provider_id=user_provider_id,
         integration_runtime_sessions=integration_runtime_sessions,
     )

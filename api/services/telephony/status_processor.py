@@ -159,13 +159,17 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
             f"[run {workflow_run_id}] Call completed with duration: {status.duration}s"
         )
 
-        if workflow_run.campaign_id:
-            await campaign_call_dispatcher.release_call_slot(workflow_run_id)
-            await circuit_breaker.record_and_evaluate(
-                workflow_run.campaign_id, is_failure=False
-            )
-
+        # Guard the slot release / circuit-breaker record too, not just the
+        # terminal DB write below — a redelivered "completed" webhook would
+        # otherwise double-release an already-released slot and double-count
+        # a circuit-breaker success.
         if workflow_run.state != WorkflowRunState.COMPLETED.value:
+            if workflow_run.campaign_id:
+                await campaign_call_dispatcher.release_call_slot(workflow_run_id)
+                await circuit_breaker.record_and_evaluate(
+                    workflow_run.campaign_id, is_failure=False
+                )
+
             await db_client.update_workflow_run(
                 run_id=workflow_run_id,
                 is_completed=True,
@@ -177,38 +181,53 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
             f"[run {workflow_run_id}] Call failed with status: {status.status}"
         )
 
-        if workflow_run.campaign_id:
-            await campaign_call_dispatcher.release_call_slot(workflow_run_id)
-            is_failure = status.status in ("error", "failed")
-            await circuit_breaker.record_and_evaluate(
-                workflow_run.campaign_id,
-                is_failure=is_failure,
-                workflow_run_id=workflow_run_id if is_failure else None,
-                reason=status.status if is_failure else None,
+        # Same idempotency guard the "completed" branch applies to its own
+        # terminal write — but here it also gates the slot release, circuit
+        # breaker record, and (critically) the retry-needed publish. Telephony
+        # providers commonly redeliver a status webhook on timeout/non-2xx;
+        # without this guard a redelivered busy/no-answer would re-publish
+        # RetryNeededEvent for the same queued_run_id, and
+        # campaign_orchestrator._schedule_retry creates a new child queued_run
+        # every time it's invoked — so a duplicate webhook meant a duplicate
+        # dial of the same number.
+        if workflow_run.state != WorkflowRunState.COMPLETED.value:
+            if workflow_run.campaign_id:
+                await campaign_call_dispatcher.release_call_slot(workflow_run_id)
+                is_failure = status.status in ("error", "failed")
+                await circuit_breaker.record_and_evaluate(
+                    workflow_run.campaign_id,
+                    is_failure=is_failure,
+                    workflow_run_id=workflow_run_id if is_failure else None,
+                    reason=status.status if is_failure else None,
+                )
+
+            if status.status in ["busy", "no-answer"] and workflow_run.campaign_id:
+                publisher = await get_campaign_event_publisher()
+                await publisher.publish_retry_needed(
+                    workflow_run_id=workflow_run_id,
+                    reason=status.status.replace("-", "_"),
+                    campaign_id=workflow_run.campaign_id,
+                    queued_run_id=workflow_run.queued_run_id,
+                )
+
+            call_tags = (
+                workflow_run.gathered_context.get("call_tags", [])
+                if workflow_run.gathered_context
+                else []
             )
+            call_tags.extend(["not_connected", f"telephony_{status.status.lower()}"])
 
-        if status.status in ["busy", "no-answer"] and workflow_run.campaign_id:
-            publisher = await get_campaign_event_publisher()
-            await publisher.publish_retry_needed(
-                workflow_run_id=workflow_run_id,
-                reason=status.status.replace("-", "_"),
-                campaign_id=workflow_run.campaign_id,
-                queued_run_id=workflow_run.queued_run_id,
+            await db_client.update_workflow_run(
+                run_id=workflow_run_id,
+                is_completed=True,
+                state=WorkflowRunState.COMPLETED.value,
+                gathered_context={"call_tags": call_tags},
             )
-
-        call_tags = (
-            workflow_run.gathered_context.get("call_tags", [])
-            if workflow_run.gathered_context
-            else []
-        )
-        call_tags.extend(["not_connected", f"telephony_{status.status.lower()}"])
-
-        await db_client.update_workflow_run(
-            run_id=workflow_run_id,
-            is_completed=True,
-            state=WorkflowRunState.COMPLETED.value,
-            gathered_context={"call_tags": call_tags},
-        )
+        else:
+            logger.debug(
+                f"[run {workflow_run_id}] Ignoring redelivered '{status.status}' "
+                "status callback — run already terminal"
+            )
     elif status.status in ["in-progress", "initiated", "ringing"]:
         # No-op while the call is in flight.
         pass

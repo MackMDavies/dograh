@@ -27,14 +27,14 @@ from api.constants import REDIS_URL
 from api.db import db_client
 from api.enums import CallType, WorkflowRunMode
 from api.services.quota_service import check_dograh_quota_by_user_id
+from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
-from api.services.workflow_active_check import check_workflow_active
 from api.services.wallet_check import check_wallet_before_call
-from api.services.telephony.call_concurrency import acquire_call_slot, bind_slot
+from api.services.workflow_active_check import check_workflow_active
 
 # Redis key pattern and TTL for channel-to-run mapping
 _CHANNEL_KEY_PREFIX = "ari:channel:"

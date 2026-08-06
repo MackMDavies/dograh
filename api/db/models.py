@@ -551,6 +551,16 @@ class WorkflowRunModel(Base):
     # Set when the run was initiated via an API key (X-API-Key). Drives postpaid API
     # billing: the post-call hook forwards this so wallet-debit accrues instead of debiting.
     api_key_id = Column(Integer, ForeignKey("api_keys.id"), nullable=True)
+    # Post-call wallet debit reconciliation. NULL until the debit webhook reaches a
+    # terminal outcome (charged, accrued, or legitimately skipped). The
+    # reconcile_wallet_debits ARQ cron re-fires the debit for completed wallet runs
+    # (api_key_id IS NULL) still NULL after a grace window. See api/tasks/wallet_reconciliation.py.
+    wallet_debit_settled_at = Column(DateTime(timezone=True), nullable=True)
+    # Post-call caller-memory reconciliation (H4). NULL until the memory webhook reaches a
+    # terminal outcome (memory recorded, or legitimately skipped — no caller_number etc.).
+    # The reconcile_memory ARQ cron re-fires the memory extraction for completed runs still
+    # NULL after a grace window. See api/tasks/memory_reconciliation.py.
+    memory_settled_at = Column(DateTime(timezone=True), nullable=True)
     text_session = relationship(
         "WorkflowRunTextSessionModel",
         back_populates="workflow_run",
@@ -573,6 +583,18 @@ class WorkflowRunModel(Base):
         ),
         Index("idx_workflow_runs_workflow_id", "workflow_id"),
         Index("idx_workflow_runs_campaign_id", "campaign_id"),
+        # Keeps the reconcile_wallet_debits sweep cheap: only unsettled runs are indexed.
+        Index(
+            "idx_workflow_runs_wallet_unsettled",
+            "created_at",
+            postgresql_where=text("wallet_debit_settled_at IS NULL"),
+        ),
+        # Keeps the reconcile_memory sweep cheap: only unsettled runs are indexed.
+        Index(
+            "idx_workflow_runs_memory_unsettled",
+            "created_at",
+            postgresql_where=text("memory_settled_at IS NULL"),
+        ),
     )
 
 
@@ -799,6 +821,11 @@ class QueuedRunModel(Base):
         Index(
             "idx_queued_runs_scheduled", "scheduled_for"
         ),  # New index for scheduled retries
+        UniqueConstraint(
+            "campaign_id",
+            "source_uuid",
+            name="uq_queued_runs_campaign_source_uuid",
+        ),
         # Optimized index for checking queued runs efficiently
         Index(
             "idx_queued_runs_campaign_state_optimized",
