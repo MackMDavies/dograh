@@ -639,6 +639,16 @@ class CampaignOrchestrator:
 
     async def _try_complete_immediately(self, campaign: CampaignModel):
         """Complete a campaign immediately when all rows are dispatched and no work remains."""
+        # A standing campaign (callbacks) holds work scheduled for the future.
+        # _has_pending_work only counts runs due NOW, so completing here would
+        # strand every future callback: _check_stale_campaigns polls only
+        # `running` campaigns and would never look at this one again.
+        if getattr(campaign, "is_standing", False):
+            logger.debug(
+                f"campaign_id: {campaign.id} - standing campaign, not completing"
+            )
+            return
+
         campaign_id = campaign.id
         # A standing campaign (callbacks) holds work scheduled for the future.
         # _has_pending_work only counts runs due NOW, so completing here would
@@ -682,6 +692,16 @@ class CampaignOrchestrator:
 
     async def _complete_campaign(self, campaign: CampaignModel):
         """Mark campaign as complete or failed based on outcome."""
+        # A standing campaign (callbacks) holds work scheduled for the future.
+        # _has_pending_work only counts runs due NOW, so completing here would
+        # strand every future callback: _check_stale_campaigns polls only
+        # `running` campaigns and would never look at this one again.
+        if getattr(campaign, "is_standing", False):
+            logger.debug(
+                f"campaign_id: {campaign.id} - standing campaign, not completing"
+            )
+            return
+
         campaign_id = campaign.id
         # A standing campaign (callbacks) holds work scheduled for the future.
         # _has_pending_work only counts runs due NOW, so completing here would

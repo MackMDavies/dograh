@@ -186,6 +186,13 @@ class CreateCampaignRequest(BaseModel):
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
 
 
+class EnqueueRunRequest(BaseModel):
+    source_uuid: str
+    context_variables: dict
+    scheduled_for: Optional[datetime] = None
+    retry_reason: Optional[str] = None
+
+
 class UpdateCampaignRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     retry_config: Optional[RetryConfigRequest] = None
