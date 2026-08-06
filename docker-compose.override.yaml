@@ -15,6 +15,21 @@ services:
     command: ["python", "-m", "arq", "api.tasks.arq.WorkerSettings"]
     volumes:
       - ./api:/app/api:ro
+      # THE RECORDING MOUNT. Not optional, and the reason it is spelled out:
+      #
+      # The api container writes a call's audio and transcript to a temp file
+      # and enqueues process_workflow_completion with that PATH. The worker
+      # then opens the path. If the two containers do not share /tmp, the
+      # worker's os.path.exists() is False, the task logs "Audio temp file not
+      # found" at WARNING and returns, and the run's recording_url is never
+      # set — every recording and transcript silently discarded.
+      #
+      # `api` gets this mount from docker-compose.yaml. `worker` exists only in
+      # this override, so it inherits nothing and has to declare it. That is
+      # exactly what went wrong on 2026-08-05 when this worker service was
+      # added: recordings stopped, nothing errored, and the only evidence was a
+      # warning line.
+      - shared-tmp:/tmp
     environment:
       DATABASE_URL: "postgresql+asyncpg://dograh_app:${DOGRAH_APP_DB_PASSWORD}@postgres:5432/postgres"
       REDIS_URL: "redis://:${REDIS_PASSWORD}@redis:6379"
