@@ -45,11 +45,17 @@ async def lookup_prior_outbound_contact(
     phone_number: Optional[str],
     *,
     organization_id: Optional[int] = None,
+    exclude_run_id: Optional[int] = None,
 ) -> dict[str, Any]:
     """Return what we know about this number from previous outbound attempts.
 
     Returns {} when we have never dialled them, or on any error — recognition is
     an enhancement and must never stop a call from being answered.
+
+    `exclude_run_id` must be the run being set up. On an OUTBOUND call the
+    current run is already in workflow_runs carrying this very number, so
+    without it the call finds ITSELF: prior_attempts is inflated by one and a
+    first-ever dial looks like a callback.
 
     Keys: first_name, last_name, full_name, company, email, prior_attempts,
     last_attempt_at.
@@ -83,6 +89,7 @@ async def lookup_prior_outbound_contact(
                     r.initial_context::jsonb ->> 'phone_number'
                 ), '[^0-9]', '', 'g'), 10) = :key
         {org_clause}
+        {exclude_clause}
         ORDER BY r.created_at DESC
         LIMIT 1
         """
@@ -91,6 +98,11 @@ async def lookup_prior_outbound_contact(
     # SQLAlchemy's text() binder mis-reads the `::int` cast next to a bind param
     # and silently drops the parameter.
     params: dict[str, Any] = {"key": key}
+    # Built conditionally for the same reason as org_clause below.
+    exclude_clause = ""
+    if exclude_run_id is not None:
+        exclude_clause = "AND r.id <> :exclude_run_id"
+        params["exclude_run_id"] = exclude_run_id
     org_clause = ""
     if organization_id is not None:
         # organization_id lives on `workflows`, NOT `workflow_runs` — filtering
@@ -101,7 +113,9 @@ async def lookup_prior_outbound_contact(
             "WHERE w.id = r.workflow_id AND w.organization_id = :org_id)"
         )
         params["org_id"] = organization_id
-    sql = text(sql_template.format(org_clause=org_clause))
+    sql = text(
+        sql_template.format(org_clause=org_clause, exclude_clause=exclude_clause)
+    )
 
     try:
         async with db_client.async_session() as session:

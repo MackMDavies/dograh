@@ -20,6 +20,47 @@ from loguru import logger
 _MEMORY_FETCH_TIMEOUT = 8.0
 
 
+def lead_number_for_call(
+    ctx: dict[str, Any], call_type: str | None
+) -> str:
+    """The OTHER party's number — the one caller memory is filed under.
+
+    On an inbound call the lead is `caller_number`. On an OUTBOUND call
+    `caller_number` is our own outbound caller ID: at the time of writing
+    +16592127650 appears on 90 runs covering 60 different leads. Looking memory
+    up by it finds nothing, because the write path files memory under the lead's
+    number — so every redial opened cold on someone we had already spoken to.
+
+    Note the outbound branch deliberately has NO `caller_number` fallback. It is
+    better to return "" and skip memory than to look a caller up by a number
+    shared across every lead in the campaign: if a record ever gets filed under
+    it, EVERY outbound call loads that one stranger's memory and the agent
+    discusses a conversation it had with somebody else. Silence beats confident
+    fabrication.
+
+    Mirrors leadNumberForCall in supabase/functions/_shared/memory/campaign-identity.ts,
+    which the post-call write path already uses. Read and write must agree on the
+    key or memory is written where it is never looked for.
+    """
+    outbound = str(call_type or "").strip().lower() == "outbound"
+    keys = ("called_number", "phone_number") if outbound else (
+        "caller_number",
+        "called_number",
+        "phone_number",
+    )
+    for key in keys:
+        value = ctx.get(key)
+        if not isinstance(value, str):
+            continue
+        value = value.strip()
+        # Unrendered CSV placeholders ("[your phone number]") reach us as
+        # literal text and must never be treated as identity.
+        if not value or value[0] in "[{<":
+            continue
+        return value
+    return ""
+
+
 async def execute_memory_pre_call_fetch(
     *,
     url: str,
@@ -27,19 +68,37 @@ async def execute_memory_pre_call_fetch(
     call_context_vars: dict[str, Any],
     workflow_id: int,
     organization_id: int | None = None,
+    call_type: str | None = None,
+    workflow_run_id: int | None = None,
 ) -> dict[str, Any]:
     """POST caller context to the Sysevo memory hook and return dynamic_variables.
 
     Returns an empty dict on any error so the call always proceeds.
     """
+    lead_number = lead_number_for_call(call_context_vars, call_type)
+    our_number = (
+        call_context_vars.get("caller_number", "")
+        if str(call_type or "").strip().lower() == "outbound"
+        else call_context_vars.get("called_number", "")
+    )
     payload = {
         "event": "call_inbound",
+        # from_number is what the hook looks caller memory up by, so it must be
+        # the LEAD on both directions, not literally whoever placed the call.
         "call_inbound": {
             "agent_id": workflow_id,
-            "from_number": call_context_vars.get("caller_number", ""),
-            "to_number": call_context_vars.get("called_number", ""),
+            "from_number": lead_number,
+            "to_number": our_number,
         },
     }
+    if not lead_number:
+        logger.info(
+            "[memory-pre-call] no lead number resolvable "
+            f"(call_type={call_type!r}) — skipping memory lookup"
+        )
+        return await _augment_with_prior_contact(
+            {}, call_context_vars, organization_id, call_type, workflow_run_id
+        )
     headers: dict[str, str] = {
         "Content-Type": "application/json",
     }
@@ -74,21 +133,27 @@ async def execute_memory_pre_call_fetch(
             f"[memory-pre-call] caller_known={caller_known} name={caller_name!r}"
         )
         return await _augment_with_prior_contact(
-            dynamic_vars, call_context_vars, organization_id
+            dynamic_vars, call_context_vars, organization_id, call_type, workflow_run_id
         )
 
     except httpx.TimeoutException:
         logger.warning("[memory-pre-call] Timed out — proceeding without memory")
-        return await _augment_with_prior_contact({}, call_context_vars, organization_id)
+        return await _augment_with_prior_contact(
+            {}, call_context_vars, organization_id, call_type, workflow_run_id
+        )
     except Exception as e:
         logger.error(f"[memory-pre-call] Unexpected error: {e}")
-        return await _augment_with_prior_contact({}, call_context_vars, organization_id)
+        return await _augment_with_prior_contact(
+            {}, call_context_vars, organization_id, call_type, workflow_run_id
+        )
 
 
 async def _augment_with_prior_contact(
     dynamic_vars: dict[str, Any],
     call_context_vars: dict[str, Any],
     organization_id: int | None,
+    call_type: str | None = None,
+    workflow_run_id: int | None = None,
 ) -> dict[str, Any]:
     """Fill identity gaps from a previous OUTBOUND attempt to this number.
 
@@ -117,8 +182,9 @@ async def _augment_with_prior_contact(
         from api.services.pipecat.prior_contact import lookup_prior_outbound_contact
 
         prior = await lookup_prior_outbound_contact(
-            call_context_vars.get("caller_number"),
+            lead_number_for_call(call_context_vars, call_type),
             organization_id=organization_id,
+            exclude_run_id=workflow_run_id,
         )
     except Exception as e:  # noqa: BLE001 — recognition must never block a call
         logger.warning(f"[memory-pre-call] prior-contact lookup failed: {e}")
