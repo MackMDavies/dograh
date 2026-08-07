@@ -1298,6 +1298,22 @@ async def create_workflow_run(
                 api_key_id=getattr(user, "api_key_id", None),
             )
         else:
+            # Scope the workflow lookup by ORGANISATION, not by who created it.
+            #
+            # create_workflow_run() otherwise filters on
+            # WorkflowModel.user_id == user_id, so only the person who created an
+            # agent could start a run on it. Every other path - workflow/fetch,
+            # create-draft - is org-scoped, so a second member of an org could
+            # open an agent, edit it and save it, then got
+            # "Workflow with ID N not found" the moment they tried to call it.
+            # The UI reported that as "make sure the workflow is saved", which
+            # sent people to re-save an already-saved agent.
+            #
+            # Safe: on this branch effective_org_id is the CALLER's own
+            # selected_organization_id, so the query stays restricted to their
+            # organisation. Only bypass the creator check when we actually have
+            # an org to scope to - with organization_id None the lookup would be
+            # unfiltered and would reach any workflow by id.
             run = await db_client.create_workflow_run(
                 request.name,
                 workflow_id,
@@ -1305,6 +1321,7 @@ async def create_workflow_run(
                 user.id,
                 use_draft=True,
                 organization_id=effective_org_id,
+                bypass_user_check=effective_org_id is not None,
                 api_key_id=getattr(user, "api_key_id", None),
             )
     except Exception:

@@ -117,6 +117,7 @@ class SuperuserCampaignItem(BaseModel):
     total_rows: Optional[int]
     processed_rows: int
     failed_rows: int
+    suppressed_rows: int
     executed_count: int
     total_queued_count: int
     created_at: datetime
@@ -159,6 +160,7 @@ async def list_all_campaigns(
             total_rows=c.total_rows,
             processed_rows=c.processed_rows,
             failed_rows=c.failed_rows,
+            suppressed_rows=c.suppressed_rows,
             executed_count=stats_map.get(c.id, {}).get("executed", 0),
             total_queued_count=stats_map.get(c.id, {}).get("total", 0),
             created_at=c.created_at,

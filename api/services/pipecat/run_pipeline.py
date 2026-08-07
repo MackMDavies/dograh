@@ -18,7 +18,10 @@ from api.services.pipecat.event_handlers import (
     register_event_handlers,
 )
 from api.services.pipecat.in_memory_buffers import InMemoryLogsBuffer
-from api.services.pipecat.memory_pre_call import execute_memory_pre_call_fetch
+from api.services.pipecat.memory_pre_call import (
+    execute_memory_pre_call_fetch,
+    lead_number_for_call,
+)
 from api.services.call_live_webhook import fire_call_live
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
@@ -609,14 +612,15 @@ async def _run_pipeline(
     # workflow's start node hasn't already claimed the pre_call_fetch slot.
     _sysevo_memory_url = os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
     _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
-    if (
-        not pre_call_fetch_task
-        and _sysevo_memory_url
-        and merged_call_context_vars.get("caller_number")
-    ):
+    # Gate on the LEAD's number, not on caller_number. On an outbound run
+    # caller_number is our own outbound caller ID, and 13 telephony runs carry
+    # no caller_number at all — those skipped memory entirely.
+    _call_type = getattr(workflow_run, "call_type", None)
+    _lead_number = lead_number_for_call(merged_call_context_vars, _call_type)
+    if not pre_call_fetch_task and _sysevo_memory_url and _lead_number:
         logger.info(
             f"[memory] firing Sysevo memory pre-call fetch for run {workflow_run_id} "
-            f"caller={merged_call_context_vars['caller_number']}"
+            f"call_type={_call_type} lead=***{''.join(c for c in _lead_number if c.isdigit())[-4:]}"
         )
         pre_call_fetch_task = asyncio.create_task(
             execute_memory_pre_call_fetch(
@@ -625,6 +629,8 @@ async def _run_pipeline(
                 call_context_vars=merged_call_context_vars,
                 workflow_id=workflow_id,
                 organization_id=workflow.organization_id,
+                call_type=_call_type,
+                workflow_run_id=workflow_run_id,
             )
         )
         pre_call_fetch_is_memory = True

@@ -170,6 +170,7 @@ class CampaignCompletedEvent(BaseCampaignEvent):
     total_rows: int = 0
     processed_rows: int = 0
     failed_rows: int = 0
+    suppressed_rows: int = 0
     duration_seconds: Optional[float] = None
 
 

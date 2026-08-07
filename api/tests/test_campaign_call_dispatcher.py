@@ -26,6 +26,10 @@ from api.db.models import (
     WorkflowRunModel,
 )
 from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
+from api.services.campaign.errors import (
+    PhoneNumberPoolExhaustedError,
+    SuppressedNumberError,
+)
 
 # =============================================================================
 # Test-specific fixtures
@@ -793,3 +797,262 @@ class TestProcessBatchEdgeCases:
                     {"campaign_id": campaign_test_data.campaign_id},
                 )
                 await session.commit()
+
+
+class TestDispatchCallSuppression:
+    """
+    Dial-time suppression enforcement in dispatch_call.
+
+    Mirrors the bare-dispatcher, mocked-module-dependency style used by
+    TestProcessBatchCancellation above (no DB fixtures needed) since these
+    tests exercise dispatch_call directly rather than process_batch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_call_raises_before_acquiring_from_number_when_suppressed(
+        self,
+    ):
+        """A suppressed number must never reach acquire_from_number."""
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.workflow_id = 55
+        campaign.organization_id = 7
+        campaign.telephony_configuration_id = 170
+
+        queued_run = MagicMock()
+        queued_run.id = 101
+        queued_run.context_variables = {"phone_number": "+15551234567"}
+
+        workflow = MagicMock()
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.rate_limiter"
+            ) as mock_rl,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.is_number_suppressed",
+                AsyncMock(return_value=True),
+            ) as mock_is_suppressed,
+            patch.object(
+                dispatcher, "get_provider_for_campaign", AsyncMock()
+            ) as mock_get_provider,
+            patch.object(
+                dispatcher, "acquire_from_number", AsyncMock()
+            ) as mock_acquire_from_number,
+        ):
+            mock_db.get_workflow_by_id = AsyncMock(return_value=workflow)
+            mock_rl.release_concurrent_slot = AsyncMock(return_value=True)
+
+            with pytest.raises(SuppressedNumberError):
+                await dispatcher.dispatch_call(queued_run, campaign, "slot-abc")
+
+            mock_is_suppressed.assert_awaited_once_with(55, "+15551234567")
+            # The whole point of the check's placement: never get this far.
+            mock_get_provider.assert_not_awaited()
+            mock_acquire_from_number.assert_not_awaited()
+            # Slot must still be released so a suppressed contact doesn't
+            # leak a concurrency slot.
+            mock_rl.release_concurrent_slot.assert_awaited_once_with(7, "slot-abc")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_call_proceeds_to_acquire_from_number_when_not_suppressed(
+        self,
+    ):
+        """
+        Regression guard: a non-suppressed number must still proceed to
+        acquire_from_number as before. We stop the flow right at
+        acquire_from_number (by having it return None, which dispatch_call
+        already handles as pool-exhaustion) rather than mocking the entire
+        rest of dispatch_call's call-creation logic.
+        """
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.workflow_id = 55
+        campaign.organization_id = 7
+        campaign.telephony_configuration_id = 170
+
+        queued_run = MagicMock()
+        queued_run.id = 101
+        queued_run.context_variables = {"phone_number": "+15551234567"}
+
+        workflow = MagicMock()
+        provider = MagicMock()
+        provider.PROVIDER_NAME = "twilio"
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.rate_limiter"
+            ) as mock_rl,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.is_number_suppressed",
+                AsyncMock(return_value=False),
+            ) as mock_is_suppressed,
+            patch.object(
+                dispatcher,
+                "get_provider_for_campaign",
+                AsyncMock(return_value=provider),
+            ),
+            patch.object(
+                dispatcher, "acquire_from_number", AsyncMock(return_value=None)
+            ) as mock_acquire_from_number,
+        ):
+            mock_db.get_workflow_by_id = AsyncMock(return_value=workflow)
+            mock_rl.release_concurrent_slot = AsyncMock(return_value=True)
+
+            with pytest.raises(PhoneNumberPoolExhaustedError):
+                await dispatcher.dispatch_call(queued_run, campaign, "slot-abc")
+
+            mock_is_suppressed.assert_awaited_once_with(55, "+15551234567")
+            mock_acquire_from_number.assert_awaited_once_with(
+                7, telephony_configuration_id=170
+            )
+
+
+class TestProcessBatchSuppressionHandling:
+    """
+    process_batch's handling of SuppressedNumberError: skip-not-fail.
+
+    Mirrors the bare-dispatcher, mocked-module-dependency style used by
+    TestProcessBatchCancellation / TestDispatchCallSuppression above (no DB
+    fixtures needed) rather than the db_session_factory integration style
+    used by TestProcessBatchBasic/Concurrency/EdgeCases. Those integration
+    fixtures require a from-scratch alembic migration run against a local
+    Postgres instance, which errors out in this sandbox (pre-existing
+    "relation already exists" / pgvector setup gaps unrelated to this
+    feature) well before any of this file's tests get a chance to run their
+    own assertions. The bare-dispatcher style sidesteps that by never
+    touching a real database or running migrations at all.
+    """
+
+    @pytest.mark.asyncio
+    async def test_suppressed_run_is_skipped_and_batch_continues_to_next_run(
+        self,
+    ):
+        """
+        Two queued runs are claimed; dispatch_call raises SuppressedNumberError
+        for the first (suppressed) and succeeds normally for the second.
+
+        Asserts:
+        - The suppressed run is marked skipped_suppressed (not failed).
+        - increment_campaign_suppressed_rows is called for the campaign.
+        - append_campaign_log records a call_skipped_suppressed event.
+        - Critically, the loop does NOT abort: dispatch_call is still invoked
+          for the second run, and it is counted as processed. This is the
+          "skip not fail" behavior the commit title promises.
+        """
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.id = 42
+        campaign.state = "running"
+        campaign.organization_id = 7
+        campaign.workflow_id = 55
+        campaign.rate_limit_per_second = 100
+        campaign.telephony_configuration_id = 170
+
+        suppressed_run = MagicMock()
+        suppressed_run.id = 201
+        suppressed_run.context_variables = {"phone_number": "+15550001111"}
+
+        ok_run = MagicMock()
+        ok_run.id = 202
+        ok_run.context_variables = {"phone_number": "+15552223333"}
+
+        queued_runs = [suppressed_run, ok_run]
+
+        provider = MagicMock()
+        provider.from_numbers = []
+
+        dispatch_call_ids: list[int] = []
+
+        async def fake_dispatch_call(queued_run, campaign, slot_id):
+            dispatch_call_ids.append(queued_run.id)
+            if queued_run.id == suppressed_run.id:
+                raise SuppressedNumberError(
+                    campaign.workflow_id, queued_run.context_variables["phone_number"]
+                )
+            workflow_run = MagicMock()
+            workflow_run.id = 999
+            return workflow_run
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.workflow_active_check.check_workflow_active",
+                AsyncMock(return_value=(True, None)),
+            ),
+            patch(
+                "api.services.wallet_check.check_wallet_before_call",
+                AsyncMock(return_value=(True, "")),
+            ),
+            patch.object(
+                dispatcher,
+                "get_provider_for_campaign",
+                AsyncMock(return_value=provider),
+            ),
+            patch.object(
+                dispatcher, "apply_rate_limit", AsyncMock(return_value=None)
+            ),
+            patch.object(
+                dispatcher,
+                "acquire_concurrent_slot",
+                AsyncMock(return_value="slot-abc"),
+            ),
+            patch.object(
+                dispatcher, "dispatch_call", side_effect=fake_dispatch_call
+            ) as mock_dispatch_call,
+        ):
+            mock_db.get_campaign_by_id = AsyncMock(return_value=campaign)
+            mock_db.claim_queued_runs_for_processing = AsyncMock(
+                return_value=queued_runs
+            )
+            mock_db.update_queued_run = AsyncMock()
+            mock_db.increment_campaign_processed_rows = AsyncMock()
+            mock_db.increment_campaign_suppressed_rows = AsyncMock()
+            mock_db.append_campaign_log = AsyncMock()
+
+            processed_count = await dispatcher.process_batch(
+                campaign_id=42, batch_size=2
+            )
+
+        # The batch did not abort: dispatch_call was invoked for BOTH runs,
+        # in order, proving the loop continued past the suppressed run.
+        assert dispatch_call_ids == [201, 202]
+        assert mock_dispatch_call.await_count == 2
+
+        # Only the non-suppressed run counts as processed.
+        assert processed_count == 1
+
+        # The suppressed run was marked skipped_suppressed, not failed.
+        skipped_calls = [
+            call
+            for call in mock_db.update_queued_run.await_args_list
+            if call.kwargs.get("queued_run_id") == 201
+        ]
+        assert len(skipped_calls) == 1
+        assert skipped_calls[0].kwargs["state"] == "skipped_suppressed"
+
+        # The successful run was marked processed as usual.
+        processed_calls = [
+            call
+            for call in mock_db.update_queued_run.await_args_list
+            if call.kwargs.get("queued_run_id") == 202
+        ]
+        assert len(processed_calls) == 1
+        assert processed_calls[0].kwargs["state"] == "processed"
+
+        mock_db.increment_campaign_suppressed_rows.assert_awaited_once_with(42)
+        mock_db.increment_campaign_processed_rows.assert_awaited_once_with(42)
+
+        mock_db.append_campaign_log.assert_awaited_once()
+        log_call = mock_db.append_campaign_log.await_args
+        assert log_call.kwargs["event"] == "call_skipped_suppressed"
+        assert log_call.kwargs["campaign_id"] == 42
+        assert log_call.kwargs["details"]["queued_run_id"] == 201

@@ -280,6 +280,7 @@ class CampaignResponse(BaseModel):
     total_rows: Optional[int]
     processed_rows: int
     failed_rows: int
+    suppressed_rows: int
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -389,6 +390,7 @@ def _build_campaign_response(
         total_rows=campaign.total_rows,
         processed_rows=campaign.processed_rows,
         failed_rows=campaign.failed_rows,
+        suppressed_rows=campaign.suppressed_rows,
         created_at=campaign.created_at,
         started_at=campaign.started_at,
         completed_at=campaign.completed_at,
@@ -446,7 +448,21 @@ async def create_campaign(
     if user.is_superuser:
         workflow_name = await db_client.get_workflow_name(request.workflow_id)
     else:
-        workflow_name = await db_client.get_workflow_name(request.workflow_id, user.id)
+        # Scope by ORGANISATION, not by who created the agent.
+        #
+        # This passed user.id positionally, which lands on get_workflow_name's
+        # user_id parameter and filters WorkflowModel.user_id == user.id. So a
+        # campaign could only be built from an agent you personally created:
+        # anyone else in the org got 404 "Workflow not found" for an agent
+        # sitting right there in their list. That hit sales managers and client
+        # team members, the same way run creation did.
+        #
+        # update_campaign below already scopes this by organisation; this call
+        # was the odd one out, even though the comment there cites it as the
+        # example to follow.
+        workflow_name = await db_client.get_workflow_name(
+            request.workflow_id, organization_id=user.selected_organization_id
+        )
     if not workflow_name:
         raise HTTPException(status_code=404, detail="Workflow not found")
 

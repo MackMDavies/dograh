@@ -579,7 +579,23 @@ async def signaling_websocket(
     if user.is_superuser:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
     else:
-        workflow_run = await db_client.get_workflow_run(workflow_run_id, user.id)
+        # Scope by ORGANISATION, not by who created the agent.
+        #
+        # user.id was passed positionally, landing on get_workflow_run's user_id
+        # parameter, which filters WorkflowModel.user_id == user_id. The run
+        # itself had just been created successfully, so the browser opened this
+        # socket and was rejected with 400 "Bad workflow_run_id" - the call
+        # simply never started, with nothing shown to the user.
+        #
+        # This was the last link in the chain: run creation and campaign
+        # creation had the same creator-scoping and were fixed first, which
+        # moved the failure here.
+        #
+        # get_workflow_run prefers organization_id and falls back to user_id
+        # only for backwards compatibility, so this is the intended call.
+        workflow_run = await db_client.get_workflow_run(
+            workflow_run_id, organization_id=user.selected_organization_id
+        )
     if not workflow_run:
         logger.warning(f"workflow run {workflow_run_id} not found for user {user.id}")
         raise HTTPException(status_code=400, detail="Bad workflow_run_id")

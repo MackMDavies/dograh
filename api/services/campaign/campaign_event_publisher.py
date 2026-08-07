@@ -111,6 +111,7 @@ class CampaignEventPublisher:
         total_rows: int,
         processed_rows: int,
         failed_rows: int,
+        suppressed_rows: int,
         duration_seconds: Optional[float] = None,
     ):
         """Publish campaign completed event."""
@@ -119,6 +120,7 @@ class CampaignEventPublisher:
             total_rows=total_rows,
             processed_rows=processed_rows,
             failed_rows=failed_rows,
+            suppressed_rows=suppressed_rows,
             duration_seconds=duration_seconds,
         )
 

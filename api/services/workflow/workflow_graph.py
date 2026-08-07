@@ -53,6 +53,15 @@ _SYSTEM_VARIABLES = {
     "caller_memory",
     "is_callback",
     "prior_outbound_attempts",
+    # The rest of what dograh-memory-inbound-hook returns. These are supplied at
+    # runtime exactly like the ones above, but were never listed, so a prompt
+    # referencing one failed campaign launch as a missing CSV column —
+    # caller_last_call blocked a 58-row run. Every key the hook can return must
+    # appear here or it is a launch blocker waiting for someone to use it.
+    "caller_phone",
+    "caller_total_calls",
+    "caller_last_call",
+    "caller_last_sentiment",
 }
 
 
