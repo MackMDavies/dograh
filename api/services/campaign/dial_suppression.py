@@ -13,6 +13,7 @@ distribution runs with this integration off by default.
 """
 
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -24,6 +25,15 @@ from api.constants import REDIS_URL
 _TIMEOUT = 2.0
 
 _redis_client: Optional[aioredis.Redis] = None
+
+
+def _normalize_for_lookup(phone_number: str) -> str:
+    """Match Supabase's dial_suppression.phone_key format: digits only, no
+    leading '+'. Dograh's phone_number is E.164 (+15095551234); Supabase
+    strips everything but digits when writing phone_key. Both sides of this
+    comparison must agree on one canonical shape or suppression checks
+    silently never match."""
+    return re.sub(r"\D", "", phone_number)
 
 
 async def _get_redis() -> aioredis.Redis:
@@ -55,16 +65,18 @@ async def is_number_suppressed(workflow_id: int, phone_number: str) -> bool:
     if not os.getenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL"):
         return False
 
+    normalized = _normalize_for_lookup(phone_number)
+
     try:
         r = await _get_redis()
-        return bool(await r.sismember(f"suppress:{workflow_id}", phone_number))
+        return bool(await r.sismember(f"suppress:{workflow_id}", normalized))
     except Exception as redis_error:
         logger.warning(
             f"[dial-suppression] Redis unavailable for workflow {workflow_id}, "
             f"falling back to Supabase: {redis_error}"
         )
         try:
-            return await _check_via_supabase(workflow_id, phone_number)
+            return await _check_via_supabase(workflow_id, normalized)
         except Exception as supabase_error:
             logger.error(
                 f"[dial-suppression] Supabase fallback also failed for workflow "
