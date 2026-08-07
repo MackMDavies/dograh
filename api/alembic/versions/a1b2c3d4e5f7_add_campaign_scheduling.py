@@ -1,14 +1,23 @@
 """add campaign scheduling columns and 'scheduled' state
 
 Revision ID: a1b2c3d4e5f7
-Revises: a7c1e4b90d32
+Revises: c4a9b2d0e5f6
 Create Date: 2026-08-07 00:00:00.000000
+
+Re-parented from a7c1e4b90d32 onto c4a9b2d0e5f6 when this branch was ported
+into the dograh fork. It was authored against prod/live-2026-08-06, whose head
+was a7c1e4b90d32 — but the dial-suppression work landed on that same parent in
+the meantime, so keeping the original down_revision left the tree with TWO
+alembic heads. Boot runs `alembic upgrade head` under `set -e`, so two heads
+crash-loop the container (see project_dograh_prod_deploy gotcha #2). Neither
+scheduling migration has been applied anywhere yet, and the two features touch
+disjoint columns, so re-parenting is safe and simpler than a merge migration.
 """
 from alembic import op
 import sqlalchemy as sa
 
 revision = "a1b2c3d4e5f7"
-down_revision = "a7c1e4b90d32"
+down_revision = "c4a9b2d0e5f6"
 branch_labels = None
 depends_on = None
 
