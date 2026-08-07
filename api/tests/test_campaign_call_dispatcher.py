@@ -26,6 +26,10 @@ from api.db.models import (
     WorkflowRunModel,
 )
 from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
+from api.services.campaign.errors import (
+    PhoneNumberPoolExhaustedError,
+    SuppressedNumberError,
+)
 
 # =============================================================================
 # Test-specific fixtures
@@ -793,3 +797,118 @@ class TestProcessBatchEdgeCases:
                     {"campaign_id": campaign_test_data.campaign_id},
                 )
                 await session.commit()
+
+
+class TestDispatchCallSuppression:
+    """
+    Dial-time suppression enforcement in dispatch_call.
+
+    Mirrors the bare-dispatcher, mocked-module-dependency style used by
+    TestProcessBatchCancellation above (no DB fixtures needed) since these
+    tests exercise dispatch_call directly rather than process_batch.
+    """
+
+    @pytest.mark.asyncio
+    async def test_dispatch_call_raises_before_acquiring_from_number_when_suppressed(
+        self,
+    ):
+        """A suppressed number must never reach acquire_from_number."""
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.workflow_id = 55
+        campaign.organization_id = 7
+        campaign.telephony_configuration_id = 170
+
+        queued_run = MagicMock()
+        queued_run.id = 101
+        queued_run.context_variables = {"phone_number": "+15551234567"}
+
+        workflow = MagicMock()
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.rate_limiter"
+            ) as mock_rl,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.is_number_suppressed",
+                AsyncMock(return_value=True),
+            ) as mock_is_suppressed,
+            patch.object(
+                dispatcher, "get_provider_for_campaign", AsyncMock()
+            ) as mock_get_provider,
+            patch.object(
+                dispatcher, "acquire_from_number", AsyncMock()
+            ) as mock_acquire_from_number,
+        ):
+            mock_db.get_workflow_by_id = AsyncMock(return_value=workflow)
+            mock_rl.release_concurrent_slot = AsyncMock(return_value=True)
+
+            with pytest.raises(SuppressedNumberError):
+                await dispatcher.dispatch_call(queued_run, campaign, "slot-abc")
+
+            mock_is_suppressed.assert_awaited_once_with(55, "+15551234567")
+            # The whole point of the check's placement: never get this far.
+            mock_get_provider.assert_not_awaited()
+            mock_acquire_from_number.assert_not_awaited()
+            # Slot must still be released so a suppressed contact doesn't
+            # leak a concurrency slot.
+            mock_rl.release_concurrent_slot.assert_awaited_once_with(7, "slot-abc")
+
+    @pytest.mark.asyncio
+    async def test_dispatch_call_proceeds_to_acquire_from_number_when_not_suppressed(
+        self,
+    ):
+        """
+        Regression guard: a non-suppressed number must still proceed to
+        acquire_from_number as before. We stop the flow right at
+        acquire_from_number (by having it return None, which dispatch_call
+        already handles as pool-exhaustion) rather than mocking the entire
+        rest of dispatch_call's call-creation logic.
+        """
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.workflow_id = 55
+        campaign.organization_id = 7
+        campaign.telephony_configuration_id = 170
+
+        queued_run = MagicMock()
+        queued_run.id = 101
+        queued_run.context_variables = {"phone_number": "+15551234567"}
+
+        workflow = MagicMock()
+        provider = MagicMock()
+        provider.PROVIDER_NAME = "twilio"
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.rate_limiter"
+            ) as mock_rl,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.is_number_suppressed",
+                AsyncMock(return_value=False),
+            ) as mock_is_suppressed,
+            patch.object(
+                dispatcher,
+                "get_provider_for_campaign",
+                AsyncMock(return_value=provider),
+            ),
+            patch.object(
+                dispatcher, "acquire_from_number", AsyncMock(return_value=None)
+            ) as mock_acquire_from_number,
+        ):
+            mock_db.get_workflow_by_id = AsyncMock(return_value=workflow)
+            mock_rl.release_concurrent_slot = AsyncMock(return_value=True)
+
+            with pytest.raises(PhoneNumberPoolExhaustedError):
+                await dispatcher.dispatch_call(queued_run, campaign, "slot-abc")
+
+            mock_is_suppressed.assert_awaited_once_with(55, "+15551234567")
+            mock_acquire_from_number.assert_awaited_once_with(
+                7, telephony_configuration_id=170
+            )
