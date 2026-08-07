@@ -38,7 +38,7 @@ async def _check_via_supabase(workflow_id: int, phone_number: str) -> bool:
     raised — a normal negative Redis answer is trusted and never reaches here."""
     check_url = os.getenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL")
     secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
-    headers = {"x-sysevo-secret": secret} if secret else {}
+    headers = {"X-Sysevo-Secret": secret} if secret else {}
     async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
         response = await client.get(
             check_url,
