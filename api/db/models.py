@@ -717,6 +717,7 @@ class CampaignModel(Base):
     total_rows = Column(Integer, nullable=True)
     processed_rows = Column(Integer, nullable=False, default=0)
     failed_rows = Column(Integer, nullable=False, default=0)
+    suppressed_rows = Column(Integer, nullable=False, default=0)
 
     # Rate limiting and sync configuration
     rate_limit_per_second = Column(Integer, nullable=False, default=1)
@@ -796,7 +797,10 @@ class QueuedRunModel(Base):
     source_uuid = Column(String, nullable=False)
     context_variables = Column(JSON, nullable=False, default=dict)
     state = Column(
-        Enum("queued", "processed", "processing", "failed", name="queued_run_state"),
+        Enum(
+            "queued", "processed", "processing", "failed", "skipped_suppressed",
+            name="queued_run_state",
+        ),
         nullable=False,
         default="queued",
     )
