@@ -228,6 +228,7 @@ class CampaignResponse(BaseModel):
     total_rows: Optional[int]
     processed_rows: int
     failed_rows: int
+    suppressed_rows: int
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
@@ -335,6 +336,7 @@ def _build_campaign_response(
         total_rows=campaign.total_rows,
         processed_rows=campaign.processed_rows,
         failed_rows=campaign.failed_rows,
+        suppressed_rows=campaign.suppressed_rows,
         created_at=campaign.created_at,
         started_at=campaign.started_at,
         completed_at=campaign.completed_at,

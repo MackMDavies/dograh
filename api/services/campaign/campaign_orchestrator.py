@@ -727,11 +727,16 @@ class CampaignOrchestrator:
             if fresh:
                 campaign = fresh
 
-            # Determine final state: failed if no calls succeeded at all
+            # Determine final state: failed if no calls succeeded AND none were
+            # correctly skipped for suppression (a 100%-suppressed campaign is a
+            # successful run of the suppression feature, not a failure).
             total = campaign.total_rows or 0
             failed = campaign.failed_rows or 0
             processed = campaign.processed_rows or 0
-            final_state = "failed" if total > 0 and processed == 0 else "completed"
+            suppressed = campaign.suppressed_rows or 0
+            final_state = (
+                "failed" if total > 0 and processed == 0 and suppressed == 0 else "completed"
+            )
 
             await db_client.update_campaign(
                 campaign_id=campaign_id,
@@ -752,6 +757,7 @@ class CampaignOrchestrator:
                 total_rows=total,
                 processed_rows=processed,
                 failed_rows=failed,
+                suppressed_rows=suppressed,
                 duration_seconds=duration,
             )
 
