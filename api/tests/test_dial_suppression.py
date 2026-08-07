@@ -10,6 +10,7 @@
 import os
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 os.environ.setdefault("DATABASE_URL", "postgresql+asyncpg://test:test@localhost/test")
@@ -30,6 +31,14 @@ def _mock_httpx_response(json_body, status_code=200):
     response.status_code = status_code
     response.is_success = 200 <= status_code < 300
     response.json.return_value = json_body
+    if response.is_success:
+        response.raise_for_status = MagicMock(return_value=None)
+    else:
+        response.raise_for_status = MagicMock(
+            side_effect=httpx.HTTPStatusError(
+                f"{status_code} error", request=MagicMock(), response=response
+            )
+        )
     client = AsyncMock()
     client.get = AsyncMock(return_value=response)
     client.__aenter__ = AsyncMock(return_value=client)
@@ -79,6 +88,22 @@ async def test_falls_back_to_supabase_check_when_redis_errors(monkeypatch):
         result = await dial_suppression.is_number_suppressed(101, "+15095551234")
     assert result is True
     mock_client.get.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_treats_a_non_2xx_supabase_response_as_suppressed(monkeypatch):
+    """A 4xx/5xx from the fallback endpoint is a failure, not a clean answer —
+    must trigger the same fail-closed path as a connection error, not silently
+    resolve to 'not suppressed' via an unchecked response.json()."""
+    monkeypatch.setenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL", "https://example.test/sync")
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "shh")
+    mock_redis = AsyncMock()
+    mock_redis.sismember = AsyncMock(side_effect=ConnectionError("redis down"))
+    mock_client = _mock_httpx_response({"error": "internal"}, status_code=500)
+    with patch.object(dial_suppression, "_get_redis", AsyncMock(return_value=mock_redis)), \
+         patch("api.services.campaign.dial_suppression.httpx.AsyncClient", return_value=mock_client):
+        result = await dial_suppression.is_number_suppressed(101, "+15095551234")
+    assert result is True
 
 
 @pytest.mark.asyncio

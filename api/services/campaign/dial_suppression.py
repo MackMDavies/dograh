@@ -45,6 +45,7 @@ async def _check_via_supabase(workflow_id: int, phone_number: str) -> bool:
             params={"mode": "check", "workflow_id": workflow_id, "phone": phone_number},
             headers=headers,
         )
+    response.raise_for_status()
     data = response.json()
     return bool(data.get("suppressed", False))
 
