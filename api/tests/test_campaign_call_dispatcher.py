@@ -799,12 +799,56 @@ class TestProcessBatchEdgeCases:
                 await session.commit()
 
     @pytest.mark.asyncio
-    async def test_process_batch_skips_dialing_a_blocked_number(
+    async def test_process_batch_marks_needs_enrichment_as_failed(
         self, campaign_test_data, db_session_factory
     ):
-        """A number check_dial_permitted rejects must never reach dispatch_call,
-        acquire_concurrent_slot, or acquire_from_number — and its queued_run must
-        end up 'failed' with the block reason, not stuck 'processing'."""
+        """A number check_dial_permitted rejects for 'needs_enrichment' must never
+        reach dispatch_call, acquire_concurrent_slot, or acquire_from_number — and
+        its queued_run must end up 'failed' with the block reason, not stuck
+        'processing'. Distinct from the 'suppressed' reason (see the sibling test
+        below), which must NOT be counted as a failure."""
+        dispatcher = CampaignCallDispatcher()
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                new=AsyncMock(return_value=(False, "needs_enrichment")),
+            ) as mock_check,
+            patch.object(
+                dispatcher, "dispatch_call", new=AsyncMock()
+            ) as mock_dispatch_call,
+            patch.object(
+                dispatcher, "acquire_concurrent_slot", new=AsyncMock()
+            ) as mock_acquire_slot,
+        ):
+            processed_count = await dispatcher.process_batch(
+                campaign_id=campaign_test_data.campaign_id, batch_size=10
+            )
+
+        assert processed_count == 0
+        mock_check.assert_called()
+        mock_dispatch_call.assert_not_called()
+        mock_acquire_slot.assert_not_called()
+
+        async with db_session_factory() as session:
+            result = await session.execute(
+                text("SELECT state FROM queued_runs WHERE id = ANY(:ids)"),
+                {"ids": campaign_test_data.queued_run_ids},
+            )
+            states = [row[0] for row in result.fetchall()]
+            assert all(s == "failed" for s in states)
+
+    @pytest.mark.asyncio
+    async def test_process_batch_marks_suppressed_as_skipped_not_failed(
+        self, campaign_test_data, db_session_factory
+    ):
+        """A number check_dial_permitted rejects for 'suppressed' must route
+        through the same skipped_suppressed/suppressed_rows path dispatch_call's
+        own suppression check uses, NOT the generic failed/failed_rows path —
+        a suppressed contact is dial-time enforcement working as intended, and
+        must not be miscounted as a failure (the exact regression fixed in
+        campaign_orchestrator.py's completion-state logic elsewhere in this
+        feature; this check_dial_permitted path must not reintroduce it)."""
         dispatcher = CampaignCallDispatcher()
 
         with (
@@ -834,7 +878,18 @@ class TestProcessBatchEdgeCases:
                 {"ids": campaign_test_data.queued_run_ids},
             )
             states = [row[0] for row in result.fetchall()]
-            assert all(s == "failed" for s in states)
+            assert all(s == "skipped_suppressed" for s in states)
+
+            campaign_row = await session.execute(
+                text(
+                    "SELECT suppressed_rows, failed_rows FROM campaigns "
+                    "WHERE id = :campaign_id"
+                ),
+                {"campaign_id": campaign_test_data.campaign_id},
+            )
+            suppressed_rows, failed_rows = campaign_row.fetchone()
+            assert suppressed_rows == len(campaign_test_data.queued_run_ids)
+            assert failed_rows == 0
 
 
 class TestDispatchCallSuppression:

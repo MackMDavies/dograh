@@ -157,6 +157,18 @@ class CampaignCallDispatcher:
                         campaign.workflow_id, phone_number
                     )
                     if not dial_allowed:
+                        if dial_block_reason == "suppressed":
+                            # Route through the same skipped_suppressed/
+                            # suppressed_rows path dispatch_call's own
+                            # suppression check uses (see the "except
+                            # SuppressedNumberError" block below) — a
+                            # suppressed contact is dial-time enforcement
+                            # working as intended, not a failure, and must
+                            # not be miscounted as one.
+                            raise SuppressedNumberError(
+                                workflow_id=campaign.workflow_id,
+                                phone_number=phone_number,
+                            )
                         logger.info(
                             f"Queued run {queued_run.id} blocked before dialing: "
                             f"{dial_block_reason}"
