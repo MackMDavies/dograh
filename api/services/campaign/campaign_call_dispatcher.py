@@ -17,6 +17,7 @@ from api.services.campaign.errors import (
     SuppressedNumberError,
 )
 from api.services.campaign.rate_limiter import rate_limiter
+from api.services.dial_permission_check import check_dial_permitted
 from api.utils.common import get_backend_endpoints
 
 if TYPE_CHECKING:
@@ -146,6 +147,43 @@ class CampaignCallDispatcher:
         processed_run_ids: set[int] = set()
         for i, queued_run in enumerate(queued_runs):
             try:
+                # Pre-dial permission check — before rate limiting, before a
+                # concurrency slot or from-number is ever touched. A number
+                # under suppression or stuck on repeat machine-answers never
+                # reaches the telephony provider at all.
+                phone_number = queued_run.context_variables.get("phone_number")
+                if phone_number:
+                    dial_allowed, dial_block_reason = await check_dial_permitted(
+                        campaign.workflow_id, phone_number
+                    )
+                    if not dial_allowed:
+                        logger.info(
+                            f"Queued run {queued_run.id} blocked before dialing: "
+                            f"{dial_block_reason}"
+                        )
+                        await db_client.update_queued_run(
+                            queued_run_id=queued_run.id,
+                            state="failed",
+                            processed_at=datetime.now(UTC),
+                        )
+                        await db_client.increment_campaign_failed_rows(campaign_id)
+                        await db_client.append_campaign_log(
+                            campaign_id=campaign_id,
+                            level="info",
+                            event="call_dial_blocked",
+                            message=(
+                                f"Skipped dialing queued run {queued_run.id}: "
+                                f"{dial_block_reason}"
+                            ),
+                            details={
+                                "queued_run_id": queued_run.id,
+                                "phone_number": phone_number,
+                                "reason": dial_block_reason,
+                            },
+                        )
+                        processed_run_ids.add(queued_run.id)
+                        continue
+
                 # Apply rate limiting, i.e lets not initiate more than rate_limit_per_second
                 # calls per second. It is different than concurrency limit.
                 await self.apply_rate_limit(

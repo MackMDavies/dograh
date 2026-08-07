@@ -798,6 +798,44 @@ class TestProcessBatchEdgeCases:
                 )
                 await session.commit()
 
+    @pytest.mark.asyncio
+    async def test_process_batch_skips_dialing_a_blocked_number(
+        self, campaign_test_data, db_session_factory
+    ):
+        """A number check_dial_permitted rejects must never reach dispatch_call,
+        acquire_concurrent_slot, or acquire_from_number — and its queued_run must
+        end up 'failed' with the block reason, not stuck 'processing'."""
+        dispatcher = CampaignCallDispatcher()
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                new=AsyncMock(return_value=(False, "suppressed")),
+            ) as mock_check,
+            patch.object(
+                dispatcher, "dispatch_call", new=AsyncMock()
+            ) as mock_dispatch_call,
+            patch.object(
+                dispatcher, "acquire_concurrent_slot", new=AsyncMock()
+            ) as mock_acquire_slot,
+        ):
+            processed_count = await dispatcher.process_batch(
+                campaign_id=campaign_test_data.campaign_id, batch_size=10
+            )
+
+        assert processed_count == 0
+        mock_check.assert_called()
+        mock_dispatch_call.assert_not_called()
+        mock_acquire_slot.assert_not_called()
+
+        async with db_session_factory() as session:
+            result = await session.execute(
+                text("SELECT state FROM queued_runs WHERE id = ANY(:ids)"),
+                {"ids": campaign_test_data.queued_run_ids},
+            )
+            states = [row[0] for row in result.fetchall()]
+            assert all(s == "failed" for s in states)
+
 
 class TestDispatchCallSuppression:
     """
