@@ -60,8 +60,18 @@ async def test_rebuilds_one_set_per_workflow_via_scratch_key_rename(monkeypatch)
     sadd_calls = {c.args[0]: c.args[1:] for c in mock_redis.sadd.await_args_list}
     assert sadd_calls["suppress:101:building"] == ("15095551234", "15095555678")
     assert sadd_calls["suppress:202:building"] == ("15095559999",)
-    renamed_to = {c.args[1] for c in mock_redis.rename.await_args_list}
-    assert renamed_to == {"suppress:101", "suppress:202"}
+
+    # rename must pair each workflow's own scratch key with its own live key,
+    # not just produce the right *set* of destinations
+    renamed = {c.args[0]: c.args[1] for c in mock_redis.rename.await_args_list}
+    assert renamed == {
+        "suppress:101:building": "suppress:101",
+        "suppress:202:building": "suppress:202",
+    }
+
+    # the scratch key must be cleared before rebuilding, per workflow
+    deleted = {c.args[0] for c in mock_redis.delete.await_args_list}
+    assert deleted == {"suppress:101:building", "suppress:202:building"}
 
 
 @pytest.mark.asyncio
@@ -79,3 +89,111 @@ async def test_logs_and_returns_on_fetch_failure_without_raising(monkeypatch):
         await dial_suppression_sync.sync_dial_suppression(None)  # must not raise
 
     mock_redis.sadd.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_malformed_row_logged_and_returns_without_raising(monkeypatch):
+    """A response row missing an expected key must not raise KeyError out of
+    the task — it should be caught by the same error handling as an HTTP
+    fetch failure, logged, and the task should return cleanly."""
+    monkeypatch.setenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL", "https://example.test/sync")
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "shh")
+
+    response = MagicMock()
+    response.status_code = 200
+    response.is_success = True
+    response.json.return_value = {
+        "suppressions": [
+            {"dograh_workflow_id": 101},  # missing "phone_key"
+        ]
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    mock_redis = AsyncMock()
+    mock_logger_error = MagicMock()
+
+    with patch.object(dial_suppression_sync, "_get_redis", AsyncMock(return_value=mock_redis)), \
+         patch("api.tasks.dial_suppression_sync.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dial_suppression_sync.logger, "error", mock_logger_error):
+        await dial_suppression_sync.sync_dial_suppression(None)  # must not raise
+
+    mock_redis.sadd.assert_not_called()
+    mock_logger_error.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_redis_connection_failure_logged_and_returns_without_raising(monkeypatch):
+    """If _get_redis() itself raises (e.g. connection refused), the task must
+    log it and return cleanly instead of letting the exception escape."""
+    monkeypatch.setenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL", "https://example.test/sync")
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "shh")
+
+    response = MagicMock()
+    response.status_code = 200
+    response.is_success = True
+    response.json.return_value = {
+        "suppressions": [
+            {"dograh_workflow_id": 101, "phone_key": "15095551234"},
+        ]
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    mock_logger_error = MagicMock()
+
+    with patch.object(
+        dial_suppression_sync, "_get_redis", AsyncMock(side_effect=ConnectionError("refused"))
+    ), patch("api.tasks.dial_suppression_sync.httpx.AsyncClient", return_value=mock_client), \
+         patch.object(dial_suppression_sync.logger, "error", mock_logger_error):
+        await dial_suppression_sync.sync_dial_suppression(None)  # must not raise
+
+    mock_logger_error.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_one_workflow_rebuild_failure_does_not_abort_another(monkeypatch):
+    """The per-workflow try/except must isolate failures: one workflow's
+    rebuild blowing up must not prevent another workflow's rebuild from
+    completing in the same run."""
+    monkeypatch.setenv("SYSEVO_DIAL_SUPPRESSION_LIST_URL", "https://example.test/sync")
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "shh")
+
+    response = MagicMock()
+    response.status_code = 200
+    response.is_success = True
+    response.json.return_value = {
+        "suppressions": [
+            {"dograh_workflow_id": 101, "phone_key": "15095551234"},
+            {"dograh_workflow_id": 202, "phone_key": "15095559999"},
+        ]
+    }
+    mock_client = AsyncMock()
+    mock_client.get = AsyncMock(return_value=response)
+    mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+    mock_client.__aexit__ = AsyncMock(return_value=None)
+
+    mock_redis = AsyncMock()
+    mock_redis.delete = AsyncMock()
+    mock_redis.sadd = AsyncMock()
+
+    async def rename_side_effect(source, dest):
+        if source == "suppress:101:building":
+            raise Exception("boom")
+        return None
+
+    mock_redis.rename = AsyncMock(side_effect=rename_side_effect)
+
+    with patch.object(dial_suppression_sync, "_get_redis", AsyncMock(return_value=mock_redis)), \
+         patch("api.tasks.dial_suppression_sync.httpx.AsyncClient", return_value=mock_client):
+        await dial_suppression_sync.sync_dial_suppression(None)  # must not raise
+
+    renamed = {c.args[0]: c.args[1] for c in mock_redis.rename.await_args_list}
+    # workflow 101's rename was attempted (and failed) ...
+    assert "suppress:101:building" in renamed
+    # ... but workflow 202's rebuild still completed successfully
+    assert renamed["suppress:202:building"] == "suppress:202"

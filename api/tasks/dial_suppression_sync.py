@@ -46,15 +46,20 @@ async def sync_dial_suppression(_ctx) -> None:
             response = await client.get(list_url, params={"mode": "list"}, headers=headers)
         response.raise_for_status()
         rows = response.json().get("suppressions", [])
+
+        by_workflow: dict[int, list[str]] = defaultdict(list)
+        for row in rows:
+            by_workflow[row["dograh_workflow_id"]].append(row["phone_key"])
     except Exception as e:
-        logger.error(f"[dial-suppression-sync] failed to fetch suppression list: {e}")
+        logger.error(f"[dial-suppression-sync] failed to fetch/parse suppression list: {e}")
         return
 
-    by_workflow: dict[int, list[str]] = defaultdict(list)
-    for row in rows:
-        by_workflow[row["dograh_workflow_id"]].append(row["phone_key"])
+    try:
+        r = await _get_redis()
+    except Exception as e:
+        logger.error(f"[dial-suppression-sync] failed to connect to Redis: {e}")
+        return
 
-    r = await _get_redis()
     for workflow_id, phones in by_workflow.items():
         scratch_key = f"suppress:{workflow_id}:building"
         live_key = f"suppress:{workflow_id}"
