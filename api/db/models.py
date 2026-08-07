@@ -696,6 +696,7 @@ class CampaignModel(Base):
     state = Column(
         Enum(
             "created",
+            "scheduled",
             "syncing",
             "running",
             "paused",
@@ -706,6 +707,12 @@ class CampaignModel(Base):
         nullable=False,
         default="created",
     )
+
+    # The instant (UTC) a scheduled campaign should start dialling, and the
+    # IANA zone the user picked it in (display only — scheduled_start_at is
+    # the only field the orchestrator compares against "now").
+    scheduled_start_at = Column(DateTime(timezone=True), nullable=True)
+    scheduled_timezone = Column(String, nullable=True)
 
     # A standing campaign never auto-completes. Callbacks are scheduled into it
     # for a future time, and _has_pending_work() only counts runs due NOW — so a
@@ -782,6 +789,11 @@ class CampaignModel(Base):
             "idx_campaigns_active_status",
             "state",
             postgresql_where=text("state IN ('syncing', 'running', 'paused')"),
+        ),
+        Index(
+            "idx_campaigns_scheduled_start",
+            "scheduled_start_at",
+            postgresql_where=text("state = 'scheduled'"),
         ),
     )
 

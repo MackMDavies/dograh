@@ -4,12 +4,44 @@ from typing import Any, Dict
 from loguru import logger
 
 from api.db import db_client
+from api.db.models import CampaignModel, UserModel
 from api.services.campaign.campaign_event_publisher import (
     get_campaign_event_publisher,
 )
 from api.services.campaign.circuit_breaker import circuit_breaker
+from api.services.quota_service import check_dograh_quota
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
+
+
+class CampaignValidationError(Exception):
+    """Raised by validate_campaign_startable; carries an HTTP-shaped reason."""
+
+    def __init__(self, status_code: int, detail: str):
+        self.status_code = status_code
+        self.detail = detail
+        super().__init__(detail)
+
+
+async def validate_campaign_startable(campaign: CampaignModel, user: UserModel) -> None:
+    """Everything that must be true before a campaign is allowed to start.
+
+    Shared by the manual /start route and the scheduled-launch fire path in
+    the orchestrator — the two must never validate differently, or a
+    campaign that's fine to start by hand could silently start unchecked
+    when its schedule fires (or vice versa).
+    """
+    if not campaign.telephony_configuration_id:
+        configs = await db_client.list_telephony_configurations(campaign.organization_id)
+        if not configs:
+            raise CampaignValidationError(
+                401,
+                "You must configure telephony first by going to APP_URL/configure-telephony",
+            )
+
+    quota_result = await check_dograh_quota(user, workflow_id=campaign.workflow_id)
+    if not quota_result.has_quota:
+        raise CampaignValidationError(402, quota_result.error_message)
 
 
 class CampaignRunnerService:
@@ -62,6 +94,25 @@ class CampaignRunnerService:
         await enqueue_job(FunctionNames.SYNC_CAMPAIGN_SOURCE, campaign_id)
 
         logger.info(f"Campaign {campaign_id} started, syncing source data")
+
+    async def fire_scheduled_campaign(self, campaign_id: int) -> bool:
+        """Called by the orchestrator when a scheduled campaign is due.
+
+        Claims the campaign atomically (race-safe against a concurrent
+        cancel/edit), then does the sync-enqueue work start_campaign does
+        for the non-redial case (a scheduled campaign can never be a
+        redial — those are created via a separate path that never sets
+        scheduled_start_at). Returns False if the claim was lost to a
+        race — the caller should treat that as "nothing to do", not an
+        error.
+        """
+        claimed = await db_client.claim_scheduled_campaign(campaign_id)
+        if not claimed:
+            return False
+
+        await enqueue_job(FunctionNames.SYNC_CAMPAIGN_SOURCE, campaign_id)
+        logger.info(f"Scheduled campaign {campaign_id} fired, syncing source data")
+        return True
 
     async def pause_campaign(self, campaign_id: int) -> None:
         """Pauses active campaign processing"""
