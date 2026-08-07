@@ -14,13 +14,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 # api.services.campaign.campaign_orchestrator imports api.tasks.arq at module
-# load time, which in turn drags in the full pipecat pipeline/tracing stack.
-# In sandboxes where that optional stack isn't installed, stub it out so this
-# file can still exercise the orchestrator's own (pipecat-independent) logic;
-# where the real package is present, this is a no-op.
+# load time, which in turn drags in the full pipecat pipeline/tracing stack
+# and MinIO storage config. In sandboxes where that optional stack isn't
+# installed/configured (ModuleNotFoundError for a missing package, ValueError
+# for a missing required env var like MINIO_PUBLIC_ENDPOINT), stub it out so
+# this file can still exercise the orchestrator's own (dependency-independent)
+# logic; where the real environment is fully set up, this is a no-op.
 try:
     import api.tasks.arq  # noqa: F401
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ValueError):
     sys.modules["api.tasks.arq"] = MagicMock()
 
 from api.services.campaign.campaign_orchestrator import CampaignOrchestrator
