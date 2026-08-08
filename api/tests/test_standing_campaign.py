@@ -18,6 +18,10 @@ class _Campaign:
         self.total_rows = 1
         self.processed_rows = 0
         self.failed_rows = 0
+        # _complete_campaign reads these too and swallows AttributeError, so
+        # omitting them silently turned "did it complete?" into a no-op.
+        self.suppressed_rows = 0
+        self.started_at = None
 
 
 @pytest.mark.asyncio
