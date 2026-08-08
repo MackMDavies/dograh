@@ -12,6 +12,29 @@ from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
 from api.schemas.workflow import WorkflowRunResponseSchema
 
 
+def unscheduled_queued_conditions(campaign_id: int) -> list:
+    """The dispatcher's regular-queue claim branch, as reusable conditions.
+
+    Shared with the count below so the two can never drift: anything the
+    orchestrator counts as dispatchable must be something
+    claim_queued_runs_for_processing can actually claim. When they disagreed,
+    a run parked for the future read as work forever and the orchestrator
+    scheduled a batch every 30s that dispatched nothing.
+    """
+    return [
+        QueuedRunModel.campaign_id == campaign_id,
+        QueuedRunModel.state == "queued",
+        QueuedRunModel.scheduled_for.is_(None),
+    ]
+
+
+def build_unscheduled_queued_runs_count_query(campaign_id: int):
+    """Count of queued runs with no scheduled time — claimable immediately."""
+    return select(func.count(QueuedRunModel.id)).where(
+        *unscheduled_queued_conditions(campaign_id)
+    )
+
+
 class CampaignClient(BaseDBClient):
     async def create_campaign(
         self,
@@ -1066,6 +1089,14 @@ class CampaignClient(BaseDBClient):
             result = await session.execute(query)
             return result.scalar() or 0
 
+    async def get_unscheduled_queued_runs_count(self, campaign_id: int) -> int:
+        """Count queued runs with no scheduled time (dispatchable right now)."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                build_unscheduled_queued_runs_count_query(campaign_id)
+            )
+            return result.scalar() or 0
+
     async def get_scheduled_runs_count(
         self,
         campaign_id: int,
@@ -1144,11 +1175,7 @@ class CampaignClient(BaseDBClient):
             if remaining_slots > 0:
                 regular_query = (
                     select(QueuedRunModel)
-                    .where(
-                        QueuedRunModel.campaign_id == campaign_id,
-                        QueuedRunModel.state == "queued",
-                        QueuedRunModel.scheduled_for.is_(None),
-                    )
+                    .where(*unscheduled_queued_conditions(campaign_id))
                     .order_by(QueuedRunModel.id)
                     .limit(remaining_slots)
                     .with_for_update(skip_locked=True)
