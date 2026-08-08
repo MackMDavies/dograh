@@ -620,6 +620,11 @@ async def create_campaign(
     if request.circuit_breaker:
         circuit_breaker_config = request.circuit_breaker.model_dump()
 
+    # Build calling_hours dict if provided
+    calling_hours_config = None
+    if request.calling_hours:
+        calling_hours_config = request.calling_hours.model_dump()
+
     if request.scheduled_start_at is not None:
         _validate_schedule_lead_time(request.scheduled_start_at)
 
@@ -634,6 +639,7 @@ async def create_campaign(
         max_concurrency=request.max_concurrency,
         schedule_config=schedule_config,
         circuit_breaker=circuit_breaker_config,
+        calling_hours_config=calling_hours_config,
         telephony_configuration_id=telephony_configuration_id,
         scheduled_start_at=request.scheduled_start_at,
         scheduled_timezone=request.scheduled_timezone,
@@ -889,6 +895,7 @@ async def update_campaign(
         or request.max_concurrency is not None
         or request.schedule_config is not None
         or request.circuit_breaker is not None
+        or request.calling_hours is not None
     )
     if non_name_fields_requested and campaign.state == "completed":
         raise HTTPException(
@@ -924,6 +931,29 @@ async def update_campaign(
 
     if request.circuit_breaker is not None:
         metadata["circuit_breaker"] = request.circuit_breaker.model_dump()
+        metadata_changed = True
+
+    if request.calling_hours is not None:
+        # pop-when-absent keeps the three keys mutually consistent: switching
+        # from mode="custom" back to "inherit"/"off" must actually clear the
+        # stale start/end, not leave them where a later write could resurrect
+        # them. (The create path needs no equivalent — it starts empty.)
+        ch = request.calling_hours.model_dump()
+        metadata["calling_hours_mode"] = ch["mode"]
+        if ch.get("start"):
+            metadata["calling_hours_start"] = ch["start"]
+        else:
+            metadata.pop("calling_hours_start", None)
+        if ch.get("end"):
+            metadata["calling_hours_end"] = ch["end"]
+        else:
+            metadata.pop("calling_hours_end", None)
+        if ch.get("off_acknowledged_at"):
+            metadata["calling_hours_off_acknowledged_at"] = ch[
+                "off_acknowledged_at"
+            ].isoformat()
+        else:
+            metadata.pop("calling_hours_off_acknowledged_at", None)
         metadata_changed = True
 
     if metadata_changed:
