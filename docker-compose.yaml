@@ -196,6 +196,8 @@ services:
       # Format: https://<project>.supabase.co/functions/v1/wallet-debit
       # If unset, the URL is derived from SYSEVO_POST_CALL_MEMORY_URL (requires that to be set).
       SYSEVO_WALLET_DEBIT_URL: "${SYSEVO_WALLET_DEBIT_URL:-}"
+      SYSEVO_DIAL_SUPPRESSION_LIST_URL: "${SYSEVO_DIAL_SUPPRESSION_LIST_URL:-}"
+      SYSEVO_CAMPAIGN_NOTIFY_URL: "${SYSEVO_CAMPAIGN_NOTIFY_URL:-}"
       INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-}"
 
       # CORS / deployment

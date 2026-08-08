@@ -1,5 +1,5 @@
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
@@ -16,7 +16,11 @@ from api.db import db_client
 from api.db.models import UserModel
 from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
-from api.services.campaign.runner import campaign_runner_service
+from api.services.campaign.runner import (
+    CampaignValidationError,
+    campaign_runner_service,
+    validate_campaign_startable,
+)
 from api.services.campaign.source_sync import CampaignSourceSyncService
 from api.services.campaign.source_sync_factory import get_sync_service
 from api.services.quota_service import check_dograh_quota
@@ -76,6 +80,19 @@ async def _validate_max_concurrency(max_concurrency: int, organization_id: int) 
         raise HTTPException(
             status_code=400,
             detail=f"max_concurrency ({max_concurrency}) cannot exceed organization limit ({effective_limit})",
+        )
+
+
+def _validate_schedule_lead_time(scheduled_start_at: datetime) -> None:
+    """Raise HTTPException(400) unless scheduled_start_at is tz-aware and at
+    least 2 minutes in the future. Shared by campaign creation and schedule
+    editing so both enforce the identical minimum lead time."""
+    if scheduled_start_at.tzinfo is None:
+        raise HTTPException(status_code=400, detail="scheduled_start_at must include a UTC offset")
+    min_lead = datetime.now(timezone.utc) + timedelta(minutes=2)
+    if scheduled_start_at < min_lead:
+        raise HTTPException(
+            status_code=400, detail="scheduled_start_at must be at least 2 minutes in the future"
         )
 
 
@@ -184,6 +201,27 @@ class CreateCampaignRequest(BaseModel):
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
+    # A future launch instant. When set, the campaign is created in
+    # 'scheduled' state and NOT auto-started — the orchestrator fires it.
+    scheduled_start_at: Optional[datetime] = None
+    scheduled_timezone: Optional[str] = None
+
+    @field_validator("scheduled_timezone")
+    @classmethod
+    def validate_scheduled_timezone(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        try:
+            ZoneInfo(v)
+        except (KeyError, Exception):
+            raise ValueError(f"Invalid timezone: {v}")
+        return v
+
+    @model_validator(mode="after")
+    def validate_schedule_fields_together(self) -> "CreateCampaignRequest":
+        if (self.scheduled_start_at is None) != (self.scheduled_timezone is None):
+            raise ValueError("scheduled_start_at and scheduled_timezone must be set together")
+        return self
 
 
 class EnqueueRunRequest(BaseModel):
@@ -201,6 +239,20 @@ class UpdateCampaignRequest(BaseModel):
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
     workflow_id: Optional[int] = None
     telephony_configuration_id: Optional[int] = None
+
+
+class UpdateCampaignScheduleRequest(BaseModel):
+    scheduled_start_at: datetime
+    scheduled_timezone: str = Field(..., min_length=1)
+
+    @field_validator("scheduled_timezone")
+    @classmethod
+    def validate_scheduled_timezone(cls, v: str) -> str:
+        try:
+            ZoneInfo(v)
+        except (KeyError, Exception):
+            raise ValueError(f"Invalid timezone: {v}")
+        return v
 
 
 class CampaignLogEntryResponse(BaseModel):
@@ -232,6 +284,8 @@ class CampaignResponse(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    scheduled_start_at: Optional[datetime] = None
+    scheduled_timezone: Optional[str] = None
     retry_config: RetryConfigResponse
     max_concurrency: Optional[int] = None
     schedule_config: Optional[ScheduleConfigResponse] = None
@@ -340,6 +394,8 @@ def _build_campaign_response(
         created_at=campaign.created_at,
         started_at=campaign.started_at,
         completed_at=campaign.completed_at,
+        scheduled_start_at=campaign.scheduled_start_at,
+        scheduled_timezone=campaign.scheduled_timezone,
         retry_config=RetryConfigResponse(**retry_config),
         max_concurrency=max_concurrency,
         schedule_config=schedule_config,
@@ -499,6 +555,9 @@ async def create_campaign(
     if request.circuit_breaker:
         circuit_breaker_config = request.circuit_breaker.model_dump()
 
+    if request.scheduled_start_at is not None:
+        _validate_schedule_lead_time(request.scheduled_start_at)
+
     campaign = await db_client.create_campaign(
         name=request.name,
         workflow_id=request.workflow_id,
@@ -511,6 +570,8 @@ async def create_campaign(
         schedule_config=schedule_config,
         circuit_breaker=circuit_breaker_config,
         telephony_configuration_id=telephony_configuration_id,
+        scheduled_start_at=request.scheduled_start_at,
+        scheduled_timezone=request.scheduled_timezone,
     )
 
     cfg_name = await _get_telephony_configuration_name(
@@ -605,23 +666,10 @@ async def start_campaign(
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
 
-    # Block start if there is no usable telephony configuration.
-    # If the campaign already has a specific config pinned (validated at create
-    # time), that is sufficient — skip the org-level availability check which
-    # would fail when the config belongs to a different org (superuser case).
-    if not campaign.telephony_configuration_id:
-        configs = await db_client.list_telephony_configurations(campaign.organization_id)
-        if not configs:
-            raise HTTPException(
-                status_code=401,
-                detail="You must configure telephony first by going to APP_URL/configure-telephony",
-            )
-
-    # Check Dograh quota before starting campaign (apply per-workflow
-    # model_overrides so we evaluate the keys this campaign will use).
-    quota_result = await check_dograh_quota(user, workflow_id=campaign.workflow_id)
-    if not quota_result.has_quota:
-        raise HTTPException(status_code=402, detail=quota_result.error_message)
+    try:
+        await validate_campaign_startable(campaign, user)
+    except CampaignValidationError as e:
+        raise HTTPException(status_code=e.status_code, detail=e.detail)
 
     # Start the campaign using the runner service
     try:
@@ -645,6 +693,76 @@ async def start_campaign(
         executed,
         total,
         telephony_configuration_name=cfg_name,
+    )
+
+
+@router.patch("/{campaign_id}/schedule")
+async def update_campaign_schedule(
+    campaign_id: int,
+    request: UpdateCampaignScheduleRequest,
+    user: UserModel = Depends(get_user),
+) -> CampaignResponse:
+    """Edit a still-pending scheduled launch time."""
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.state != "scheduled":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Campaign must be 'scheduled' to edit its launch time, current state: {campaign.state}",
+        )
+
+    _validate_schedule_lead_time(request.scheduled_start_at)
+
+    updated = await db_client.update_campaign_schedule(
+        campaign_id, request.scheduled_start_at, request.scheduled_timezone
+    )
+    if not updated:
+        # Lost a race with the orchestrator firing it in the same instant.
+        raise HTTPException(status_code=409, detail="Campaign is no longer scheduled")
+
+    workflow_name = await db_client.get_workflow_name(
+        updated.workflow_id, organization_id=updated.organization_id
+    )
+    executed, total = await _get_campaign_stats(updated.id)
+    cfg_name = await _get_telephony_configuration_name(
+        updated.telephony_configuration_id, updated.organization_id
+    )
+    return _build_campaign_response(
+        updated, workflow_name or "Unknown", executed, total, telephony_configuration_name=cfg_name
+    )
+
+
+@router.post("/{campaign_id}/cancel-schedule")
+async def cancel_campaign_schedule(
+    campaign_id: int,
+    user: UserModel = Depends(get_user),
+) -> CampaignResponse:
+    """Cancel a pending schedule, reverting to 'created' (manual Start available)."""
+    org_id = None if user.is_superuser else user.selected_organization_id
+    campaign = await db_client.get_campaign(campaign_id, org_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if campaign.state != "scheduled":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Campaign must be 'scheduled' to cancel its launch, current state: {campaign.state}",
+        )
+
+    updated = await db_client.cancel_campaign_schedule(campaign_id)
+    if not updated:
+        raise HTTPException(status_code=409, detail="Campaign is no longer scheduled")
+
+    workflow_name = await db_client.get_workflow_name(
+        updated.workflow_id, organization_id=updated.organization_id
+    )
+    executed, total = await _get_campaign_stats(updated.id)
+    cfg_name = await _get_telephony_configuration_name(
+        updated.telephony_configuration_id, updated.organization_id
+    )
+    return _build_campaign_response(
+        updated, workflow_name or "Unknown", executed, total, telephony_configuration_name=cfg_name
     )
 
 

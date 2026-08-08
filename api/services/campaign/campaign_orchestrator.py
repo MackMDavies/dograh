@@ -33,6 +33,12 @@ from api.services.campaign.campaign_event_protocol import (
 )
 from api.services.campaign.campaign_event_publisher import CampaignEventPublisher
 from api.services.campaign.circuit_breaker import circuit_breaker
+from api.services.campaign.runner import (
+    CampaignValidationError,
+    campaign_runner_service,
+    validate_campaign_startable,
+)
+from api.services.campaign_notify import notify_campaign_scheduled_started
 from api.tasks.arq import enqueue_job
 from api.tasks.function_names import FunctionNames
 
@@ -471,6 +477,11 @@ class CampaignOrchestrator:
             except Exception as e:
                 logger.error(f"Completion monitoring failed: {e}")
 
+            try:
+                await self._check_due_scheduled_campaigns()
+            except Exception as e:
+                logger.error(f"Scheduled-launch monitoring failed: {e}")
+
             await asyncio.sleep(self.completion_check_interval)
 
     async def _check_stale_campaigns(self):
@@ -533,6 +544,50 @@ class CampaignOrchestrator:
                 logger.error(
                     f"campaign_id: {campaign.id} - Completion check failed: {e}"
                 )
+
+    async def _check_due_scheduled_campaigns(self):
+        """Fire any campaign whose scheduled_start_at has arrived.
+
+        Separate from _check_stale_campaigns on purpose: that method only
+        looks at 'running' campaigns and is about batch/completion
+        monitoring, a different concern from "has this one's launch time
+        come yet".
+
+        Validates telephony config and quota BEFORE claiming — mirrors how
+        the manual /start route validates before calling
+        runner.start_campaign(). A campaign that fails validation here stays
+        in 'scheduled' state (not claimed) and will be retried on the next
+        tick — e.g. if telephony config was deleted after scheduling but
+        before the launch time arrived, it just waits until that's fixed,
+        exactly like a manually-startable campaign the user hasn't clicked
+        Start on yet would.
+        """
+        due = await db_client.get_due_scheduled_campaigns(now=datetime.now(UTC))
+        for campaign in due:
+            try:
+                user = await db_client.get_user_by_id(campaign.created_by)
+                if not user:
+                    logger.warning(
+                        f"Scheduled campaign {campaign.id}: creator user "
+                        f"{campaign.created_by} not found, skipping this tick"
+                    )
+                    continue
+
+                try:
+                    await validate_campaign_startable(campaign, user)
+                except CampaignValidationError as e:
+                    logger.warning(
+                        f"Scheduled campaign {campaign.id} not ready to fire "
+                        f"({e.status_code}: {e.detail}), will retry next tick"
+                    )
+                    continue
+
+                fired = await campaign_runner_service.fire_scheduled_campaign(campaign.id)
+                if fired:
+                    await notify_campaign_scheduled_started(campaign.id)
+            except Exception:
+                logger.exception(f"Failed to fire scheduled campaign {campaign.id}")
+                # Per-campaign failure must never break the loop for the rest.
 
     async def _recover_stuck_runs(self, campaign_id: int) -> None:
         """Mark workflow runs that have been in_progress for > 15 min as failed."""

@@ -26,6 +26,8 @@ class CampaignClient(BaseDBClient):
         schedule_config: Optional[dict] = None,
         circuit_breaker: Optional[dict] = None,
         telephony_configuration_id: Optional[int] = None,
+        scheduled_start_at: Optional[datetime] = None,
+        scheduled_timezone: Optional[str] = None,
     ) -> CampaignModel:
         """Create a new campaign"""
         async with self.async_session() as session:
@@ -50,6 +52,9 @@ class CampaignClient(BaseDBClient):
                 else CampaignModel.retry_config.default.arg,
                 orchestrator_metadata=orchestrator_metadata,
                 telephony_configuration_id=telephony_configuration_id,
+                state="scheduled" if scheduled_start_at else "created",
+                scheduled_start_at=scheduled_start_at,
+                scheduled_timezone=scheduled_timezone,
             )
             session.add(campaign)
             try:
@@ -450,6 +455,89 @@ class CampaignClient(BaseDBClient):
                 raise e
             await session.refresh(campaign)
             return campaign
+
+    async def get_due_scheduled_campaigns(self, now: datetime) -> list[CampaignModel]:
+        """Campaigns waiting to launch whose time has come."""
+        async with self.async_session() as session:
+            query = select(CampaignModel).where(
+                CampaignModel.state == "scheduled",
+                CampaignModel.scheduled_start_at <= now,
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def claim_scheduled_campaign(self, campaign_id: int) -> bool:
+        """Atomically transition a due scheduled campaign to 'syncing'.
+
+        Race-safe against a concurrent "Cancel schedule": the UPDATE only
+        matches a row still in 'scheduled', so a simultaneous cancel either
+        wins cleanly (this returns False, caller does nothing) or loses
+        cleanly (already claimed, the cancel call will 404 / see 'syncing').
+        Returns True only if THIS call performed the transition.
+        """
+        async with self.async_session() as session:
+            stmt = (
+                update(CampaignModel)
+                .where(
+                    CampaignModel.id == campaign_id,
+                    CampaignModel.state == "scheduled",
+                )
+                .values(
+                    state="syncing",
+                    started_at=datetime.now(UTC),
+                    source_sync_status="in_progress",
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            return result.rowcount == 1
+
+    async def update_campaign_schedule(
+        self, campaign_id: int, scheduled_start_at: datetime, scheduled_timezone: str
+    ) -> Optional[CampaignModel]:
+        """Edit a still-pending schedule. Only valid while state == 'scheduled'."""
+        async with self.async_session() as session:
+            stmt = (
+                update(CampaignModel)
+                .where(
+                    CampaignModel.id == campaign_id,
+                    CampaignModel.state == "scheduled",
+                )
+                .values(
+                    scheduled_start_at=scheduled_start_at,
+                    scheduled_timezone=scheduled_timezone,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount != 1:
+                return None
+            return await self.get_campaign_by_id(campaign_id)
+
+    async def cancel_campaign_schedule(self, campaign_id: int) -> Optional[CampaignModel]:
+        """Revert a scheduled campaign to 'created' — the manual Start button
+        becomes available again, exactly as for any other 'created' campaign."""
+        async with self.async_session() as session:
+            stmt = (
+                update(CampaignModel)
+                .where(
+                    CampaignModel.id == campaign_id,
+                    CampaignModel.state == "scheduled",
+                )
+                .values(
+                    state="created",
+                    scheduled_start_at=None,
+                    scheduled_timezone=None,
+                    updated_at=datetime.now(UTC),
+                )
+            )
+            result = await session.execute(stmt)
+            await session.commit()
+            if result.rowcount != 1:
+                return None
+            return await self.get_campaign_by_id(campaign_id)
 
     async def append_campaign_log(
         self,
