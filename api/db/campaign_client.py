@@ -25,6 +25,7 @@ class CampaignClient(BaseDBClient):
         max_concurrency: Optional[int] = None,
         schedule_config: Optional[dict] = None,
         circuit_breaker: Optional[dict] = None,
+        calling_hours_config: Optional[dict] = None,
         telephony_configuration_id: Optional[int] = None,
         scheduled_start_at: Optional[datetime] = None,
         scheduled_timezone: Optional[str] = None,
@@ -39,6 +40,16 @@ class CampaignClient(BaseDBClient):
                 orchestrator_metadata["schedule_config"] = schedule_config
             if circuit_breaker is not None:
                 orchestrator_metadata["circuit_breaker"] = circuit_breaker
+            if calling_hours_config is not None:
+                orchestrator_metadata["calling_hours_mode"] = calling_hours_config["mode"]
+                if calling_hours_config.get("start"):
+                    orchestrator_metadata["calling_hours_start"] = calling_hours_config["start"]
+                if calling_hours_config.get("end"):
+                    orchestrator_metadata["calling_hours_end"] = calling_hours_config["end"]
+                if calling_hours_config.get("off_acknowledged_at"):
+                    orchestrator_metadata["calling_hours_off_acknowledged_at"] = (
+                        calling_hours_config["off_acknowledged_at"].isoformat()
+                    )
 
             campaign = CampaignModel(
                 name=name,
