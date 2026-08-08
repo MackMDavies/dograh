@@ -321,6 +321,38 @@ class CampaignCallDispatcher:
                 # Re-raise to propagate to process_campaign_batch
                 raise
 
+            except TimeoutError as e:
+                # apply_rate_limit gives up after 1s of pacing pressure. That is
+                # a transient "try again shortly", NOT a failed call, and the
+                # contact was never dialled.
+                #
+                # Deliberately neither failed nor re-raised:
+                #   - falling through to the generic handler below would mark
+                #     the lead permanently failed and count it against the
+                #     campaign, losing a perfectly good contact to pacing;
+                #   - re-raising would reach process_campaign_batch's generic
+                #     `except Exception`, which sets the whole campaign to
+                #     "failed" — the two exhaustion paths above only survive
+                #     that because they have dedicated retry-counter handlers.
+                # So: hand the untouched claims back and end this batch early.
+                # The orchestrator schedules the next one and they redial.
+                #
+                # This path barely fired while concurrency was effectively 1.
+                # With MAX_SYSTEM_CONCURRENCY reachable, the dispatcher fills
+                # slots far faster than rate_limit_per_second (DB default: 1)
+                # permits, so it is now routine.
+                logger.warning(
+                    f"Rate limit timeout for campaign {campaign_id} after "
+                    f"{processed_count} dispatched; returning the remaining "
+                    f"claimed queued runs to the queue: {e}"
+                )
+                await self._return_unprocessed_claims(
+                    queued_runs,
+                    processed_run_ids,
+                    reason="rate_limit_timeout",
+                )
+                break
+
             except SuppressedNumberError as e:
                 logger.info(
                     f"Skipping queued run {queued_run.id} for campaign {campaign_id}: "
