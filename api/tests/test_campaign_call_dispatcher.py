@@ -812,7 +812,7 @@ class TestProcessBatchEdgeCases:
         with (
             patch(
                 "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
-                new=AsyncMock(return_value=(False, "needs_enrichment")),
+                new=AsyncMock(return_value=(False, "needs_enrichment", None)),
             ) as mock_check,
             patch.object(
                 dispatcher, "dispatch_call", new=AsyncMock()
@@ -854,7 +854,7 @@ class TestProcessBatchEdgeCases:
         with (
             patch(
                 "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
-                new=AsyncMock(return_value=(False, "suppressed")),
+                new=AsyncMock(return_value=(False, "suppressed", None)),
             ) as mock_check,
             patch.object(
                 dispatcher, "dispatch_call", new=AsyncMock()
@@ -890,6 +890,75 @@ class TestProcessBatchEdgeCases:
             suppressed_rows, failed_rows = campaign_row.fetchone()
             assert suppressed_rows == len(campaign_test_data.queued_run_ids)
             assert failed_rows == 0
+
+    @pytest.mark.asyncio
+    async def test_process_batch_defers_a_run_blocked_for_calling_hours(
+        self, campaign_test_data, db_session_factory
+    ):
+        """A run blocked for outside_calling_hours must stay 'queued' with
+        scheduled_for pushed to retry_at — never 'failed', never dialed."""
+        dispatcher = CampaignCallDispatcher()
+        retry_at = "2026-08-09T13:00:00+00:00"
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                new=AsyncMock(return_value=(False, "outside_calling_hours", retry_at)),
+            ),
+            patch.object(dispatcher, "dispatch_call", new=AsyncMock()) as mock_dispatch_call,
+            patch.object(dispatcher, "acquire_concurrent_slot", new=AsyncMock()) as mock_acquire_slot,
+        ):
+            processed_count = await dispatcher.process_batch(
+                campaign_id=campaign_test_data.campaign_id, batch_size=10
+            )
+
+        assert processed_count == 0
+        mock_dispatch_call.assert_not_called()
+        mock_acquire_slot.assert_not_called()
+
+        async with db_session_factory() as session:
+            result = await session.execute(
+                text("SELECT state, scheduled_for FROM queued_runs WHERE id = ANY(:ids)"),
+                {"ids": campaign_test_data.queued_run_ids},
+            )
+            rows = result.fetchall()
+            assert all(r[0] == "queued" for r in rows)
+            assert all(r[1] is not None for r in rows)
+
+    @pytest.mark.asyncio
+    async def test_process_batch_passes_calling_hours_off_for_scheduled_callbacks(
+        self, campaign_test_data, db_session_factory
+    ):
+        """A queued run flagged is_scheduled_callback must pass mode='off' to
+        check_dial_permitted (bypassing calling-hours) — but must still CALL it,
+        since suppression/IVR-blocked checks are not bypassed by a callback
+        request, only the calling-hours window is."""
+        async with db_session_factory() as session:
+            await session.execute(
+                text(
+                    "UPDATE queued_runs SET context_variables = context_variables || '{\"is_scheduled_callback\": true}'::jsonb "
+                    "WHERE campaign_id = :campaign_id"
+                ),
+                {"campaign_id": campaign_test_data.campaign_id},
+            )
+            await session.commit()
+
+        dispatcher = CampaignCallDispatcher()
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                new=AsyncMock(return_value=(True, "", None)),
+            ) as mock_check,
+            patch.object(dispatcher, "dispatch_call", new=AsyncMock(side_effect=lambda qr, c, s: MagicMock(id=1))),
+            patch.object(dispatcher, "acquire_concurrent_slot", new=AsyncMock(return_value="slot-1")),
+            patch.object(dispatcher, "apply_rate_limit", new=AsyncMock()),
+        ):
+            await dispatcher.process_batch(campaign_id=campaign_test_data.campaign_id, batch_size=10)
+
+        mock_check.assert_called()
+        for call in mock_check.await_args_list:
+            assert call.args[2] == {"mode": "off"}
 
 
 class TestDispatchCallSuppression:

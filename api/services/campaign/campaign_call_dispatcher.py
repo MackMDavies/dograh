@@ -149,13 +149,41 @@ class CampaignCallDispatcher:
             try:
                 # Pre-dial permission check — before rate limiting, before a
                 # concurrency slot or from-number is ever touched. A number
-                # under suppression or stuck on repeat machine-answers never
-                # reaches the telephony provider at all.
+                # under suppression, stuck on repeat machine-answers, or
+                # outside its effective calling-hours window never reaches
+                # the telephony provider at all.
                 phone_number = queued_run.context_variables.get("phone_number")
                 if phone_number:
-                    dial_allowed, dial_block_reason = await check_dial_permitted(
-                        campaign.workflow_id, phone_number
+                    is_scheduled_callback = bool(
+                        queued_run.context_variables.get("is_scheduled_callback")
                     )
+                    if is_scheduled_callback:
+                        # Explicit callback requests (the contact said "call
+                        # me back at X") bypass the calling-hours window
+                        # only — they gave real-time consent for that
+                        # specific time, whatever hour it lands on.
+                        # Suppression/IVR-blocked checks below still run
+                        # normally: mode="off" only tells the edge function
+                        # to skip its calling-hours computation, it does not
+                        # skip the call to check_dial_permitted itself.
+                        campaign_calling_hours = {"mode": "off"}
+                    else:
+                        metadata = campaign.orchestrator_metadata or {}
+                        calling_hours_meta = metadata.get("calling_hours_mode")
+                        campaign_calling_hours = (
+                            {
+                                "mode": calling_hours_meta,
+                                "start": metadata.get("calling_hours_start"),
+                                "end": metadata.get("calling_hours_end"),
+                            }
+                            if calling_hours_meta
+                            else None
+                        )
+
+                    dial_allowed, dial_block_reason, retry_at = await check_dial_permitted(
+                        campaign.workflow_id, phone_number, campaign_calling_hours
+                    )
+
                     if not dial_allowed:
                         if dial_block_reason == "suppressed":
                             # Route through the same skipped_suppressed/
@@ -169,6 +197,42 @@ class CampaignCallDispatcher:
                                 workflow_id=campaign.workflow_id,
                                 phone_number=phone_number,
                             )
+                        if dial_block_reason == "outside_calling_hours":
+                            # Defer, don't fail — the same row waits and gets
+                            # naturally re-claimed once the window opens
+                            # (claim_queued_runs_for_processing's
+                            # scheduled_before filter), no new scheduling
+                            # infrastructure needed. Distinct from the
+                            # post-call-outcome retry mechanism
+                            # (_schedule_retry's child-row pattern) — this
+                            # call was never attempted at all, so there's no
+                            # outcome to retry from, just a wait before the
+                            # first attempt.
+                            logger.info(
+                                f"Queued run {queued_run.id} deferred until {retry_at}: "
+                                f"outside calling hours"
+                            )
+                            await db_client.update_queued_run(
+                                queued_run_id=queued_run.id,
+                                state="queued",
+                                scheduled_for=datetime.fromisoformat(retry_at),
+                            )
+                            await db_client.append_campaign_log(
+                                campaign_id=campaign_id,
+                                level="info",
+                                event="call_deferred_calling_hours",
+                                message=(
+                                    f"Deferred queued run {queued_run.id} until {retry_at}: "
+                                    f"outside calling hours"
+                                ),
+                                details={
+                                    "queued_run_id": queued_run.id,
+                                    "phone_number": phone_number,
+                                    "retry_at": retry_at,
+                                },
+                            )
+                            processed_run_ids.add(queued_run.id)
+                            continue
                         logger.info(
                             f"Queued run {queued_run.id} blocked before dialing: "
                             f"{dial_block_reason}"
