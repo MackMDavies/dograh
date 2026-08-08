@@ -31,7 +31,7 @@ class TestClampToSystemMax:
         assert clamp_to_system_max(MAX_SYSTEM_CONCURRENCY) == MAX_SYSTEM_CONCURRENCY
 
     def test_values_below_the_cap_pass_through(self):
-        assert clamp_to_system_max(20) == 20
+        assert clamp_to_system_max(5) == 5
 
     def test_zero_and_negative_floor_at_one(self):
         assert clamp_to_system_max(0) == 1
@@ -41,9 +41,28 @@ class TestClampToSystemMax:
         assert 1 <= clamp_to_system_max("not-a-number") <= MAX_SYSTEM_CONCURRENCY
         assert 1 <= clamp_to_system_max(None) <= MAX_SYSTEM_CONCURRENCY
 
-    def test_the_cap_is_fifty(self):
-        """The agreed system-wide maximum. Raising it is a capacity decision."""
-        assert MAX_SYSTEM_CONCURRENCY == 50
+    def test_the_cap_matches_measured_host_capacity(self):
+        """20 = measured capacity of the current box, not an arbitrary number.
+
+        4 cores shared with ari_manager/orchestrator/arq/nginx/postgres/redis,
+        FASTAPI_WORKERS=2 (so 2 event loops carry every voice pipeline), and
+        ~2,096 MiB of container headroom above a 1,371 MiB idle footprint. At 20
+        that is 10 pipelines per loop and ~105 MiB per call; at 50 it would be 25
+        per loop and ~42 MiB, which is where jitter and OOM risk begin.
+
+        Raising this is a hardware decision (~8 cores / 12-16 GB for 50) — see
+        the note in api/constants.py and verify with scripts/ramp_probe.sh.
+        """
+        assert MAX_SYSTEM_CONCURRENCY == 20
+
+    def test_the_growth_tier_is_clamped_by_this_cap(self):
+        """Deliberate, and the one client-visible effect of the 50 -> 20 move.
+
+        plan_limits.max_concurrent_calls is 25 for 'growth', above the cap, so
+        growth accounts resolve to 20 rather than 25. Pinned here so the
+        trade-off is explicit rather than discovered by a customer.
+        """
+        assert clamp_to_system_max(25) == 20
 
 
 class TestOrgLimitResolution:
@@ -66,10 +85,23 @@ class TestOrgLimitResolution:
         with patch.object(
             org_concurrency,
             "db_client",
+            AsyncMock(get_configuration=AsyncMock(return_value=_Config(10))),
+        ):
+            limit = await org_concurrency.get_org_concurrency_limit(1)
+        assert limit == 10
+
+    @pytest.mark.asyncio
+    async def test_configured_value_above_the_cap_is_clamped(self):
+        """A stored 25 (growth tier) resolves to the cap, not to 25."""
+        from api.services import org_concurrency
+
+        with patch.object(
+            org_concurrency,
+            "db_client",
             AsyncMock(get_configuration=AsyncMock(return_value=_Config(25))),
         ):
             limit = await org_concurrency.get_org_concurrency_limit(1)
-        assert limit == 25
+        assert limit == MAX_SYSTEM_CONCURRENCY
 
     @pytest.mark.asyncio
     async def test_lookup_failure_falls_back_instead_of_raising(self):

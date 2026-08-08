@@ -117,13 +117,27 @@ COUNTRY_CODES = {
 
 DEFAULT_ORG_CONCURRENCY_LIMIT = os.getenv("DEFAULT_ORG_CONCURRENCY_LIMIT", 2)
 
-# Hard ceiling on simultaneous calls anywhere in the system, per organisation.
-# No plan tier, org configuration, or campaign setting may exceed it — Sysevo
-# pushes a large sentinel for "unlimited" tiers, and this is what stops that
-# authorising more concurrent pipelines than the host can actually run.
-# Raising this is a capacity decision (RAM per pipeline, CPU for VAD/framing),
-# not just a config change.
-MAX_SYSTEM_CONCURRENCY = int(os.getenv("MAX_SYSTEM_CONCURRENCY", 50))
+# Hard ceiling on simultaneous calls PER ORGANISATION. No plan tier, org
+# configuration, or campaign setting may exceed it — Sysevo pushes a large
+# sentinel for "unlimited" tiers, and this is what stops that authorising more
+# concurrent pipelines than the host can actually run.
+#
+# Set to 20 to match measured capacity of the current box (2026-08-08):
+# 4 cores shared with ari_manager/orchestrator/arq/nginx/postgres/redis,
+# FASTAPI_WORKERS=2 (so 2 event loops carry every voice pipeline), and ~2,096
+# MiB of container headroom above a 1,371 MiB idle footprint. At 20 that is
+# 10 pipelines per event loop and ~105 MiB per call. At 50 it would be 25 per
+# loop and ~42 MiB per call, which is where audio jitter and OOM risk start.
+#
+# Raising this is a HARDWARE decision, not a config change: ~8 cores and
+# 12-16 GB would be needed for 50. Verify with scripts/ramp_probe.sh before
+# moving it, and remember the mirrors — dograh/ui/src/constants/concurrency.ts,
+# and on the Sysevo side src/lib/voice/concurrency.ts plus
+# supabase/functions/_shared/orgConcurrency.ts (whose test enforces the match).
+#
+# NOTE this is per-org, not a global cap on the box: N organisations may each
+# run up to this many calls concurrently.
+MAX_SYSTEM_CONCURRENCY = int(os.getenv("MAX_SYSTEM_CONCURRENCY", 20))
 
 # How many simultaneous calls may share ONE caller ID (CLI).
 # 0 (the default) means "no per-CLI cap" — total concurrency is bounded by the
