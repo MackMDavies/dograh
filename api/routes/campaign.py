@@ -1,6 +1,6 @@
 import json
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -153,6 +153,58 @@ class ScheduleConfigResponse(BaseModel):
     slots: List[TimeSlotResponse]
 
 
+class CallingHoursConfigRequest(BaseModel):
+    """A campaign's override of the account's default calling-hours
+    compliance window (see checkDialPermission / dograh-pre-call-check on
+    the Sysevo side, and check_dial_permitted/campaign_call_dispatcher.py
+    here). NOT the same thing as ScheduleConfigRequest above — that gates
+    whether the campaign dials AT ALL right now (one fixed timezone,
+    day-of-week slots); this gates each individual contact's dial against
+    their own local time, intersected with a legal-floor minimum.
+
+    mode="inherit"  -> use the account's own default (client_accounts.
+                        outbound_calling_hours_*)
+    mode="custom"   -> start/end below, still intersected with the legal floor
+    mode="off"      -> no restriction at all, INCLUDING the legal floor —
+                        off_acknowledged_at must be set (the caller has
+                        already surfaced the compliance warning and required
+                        an explicit checkbox before sending this); this is
+                        the audit-trail record the design spec requires,
+                        surfaced read-only on the Compliance page.
+    """
+
+    mode: Literal["inherit", "custom", "off"]
+    start: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    end: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
+    off_acknowledged_at: Optional[datetime] = None
+
+    @model_validator(mode="after")
+    def validate_custom_has_both_times(self) -> "CallingHoursConfigRequest":
+        if self.mode == "custom":
+            if not self.start or not self.end:
+                raise ValueError("mode='custom' requires both start and end")
+            # Overnight windows (e.g. 22:00-06:00) aren't supported — same
+            # limitation as the sibling TimeSlotRequest.validate_times above.
+            if self.start >= self.end:
+                raise ValueError("start must be before end")
+        return self
+
+    @model_validator(mode="after")
+    def validate_off_has_acknowledgment(self) -> "CallingHoursConfigRequest":
+        if self.mode == "off" and self.off_acknowledged_at is None:
+            raise ValueError("mode='off' requires off_acknowledged_at")
+        return self
+
+
+class CallingHoursConfigResponse(BaseModel):
+    # str, not Literal — this reads back JSONB metadata written before/outside
+    # model validation (mirrors ScheduleConfigResponse.timezone: str above).
+    mode: str
+    start: Optional[str] = None
+    end: Optional[str] = None
+    off_acknowledged_at: Optional[datetime] = None
+
+
 class CircuitBreakerConfigRequest(BaseModel):
     enabled: bool = True
     failure_threshold: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -201,6 +253,7 @@ class CreateCampaignRequest(BaseModel):
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
+    calling_hours: Optional[CallingHoursConfigRequest] = None
     # A future launch instant. When set, the campaign is created in
     # 'scheduled' state and NOT auto-started — the orchestrator fires it.
     scheduled_start_at: Optional[datetime] = None
@@ -237,6 +290,7 @@ class UpdateCampaignRequest(BaseModel):
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
+    calling_hours: Optional[CallingHoursConfigRequest] = None
     workflow_id: Optional[int] = None
     telephony_configuration_id: Optional[int] = None
 
@@ -290,6 +344,7 @@ class CampaignResponse(BaseModel):
     max_concurrency: Optional[int] = None
     schedule_config: Optional[ScheduleConfigResponse] = None
     circuit_breaker: Optional[CircuitBreakerConfigResponse] = None
+    calling_hours: Optional[CallingHoursConfigResponse] = None
     executed_count: int = 0
     total_queued_count: int = 0
     parent_campaign_id: Optional[int] = None
@@ -360,6 +415,7 @@ def _build_campaign_response(
     max_concurrency = None
     schedule_config = None
     circuit_breaker_config = CircuitBreakerConfigResponse()
+    calling_hours_config = None
     parent_campaign_id = None
     redialed_campaign_id = None
     if campaign.orchestrator_metadata:
@@ -374,6 +430,14 @@ def _build_campaign_response(
         cb = campaign.orchestrator_metadata.get("circuit_breaker")
         if cb:
             circuit_breaker_config = CircuitBreakerConfigResponse(**cb)
+        ch_mode = campaign.orchestrator_metadata.get("calling_hours_mode")
+        if ch_mode:
+            calling_hours_config = CallingHoursConfigResponse(
+                mode=ch_mode,
+                start=campaign.orchestrator_metadata.get("calling_hours_start"),
+                end=campaign.orchestrator_metadata.get("calling_hours_end"),
+                off_acknowledged_at=campaign.orchestrator_metadata.get("calling_hours_off_acknowledged_at"),
+            )
         parent_campaign_id = campaign.orchestrator_metadata.get("parent_campaign_id")
         redialed_campaign_id = campaign.orchestrator_metadata.get(
             "redialed_campaign_id"
@@ -400,6 +464,7 @@ def _build_campaign_response(
         max_concurrency=max_concurrency,
         schedule_config=schedule_config,
         circuit_breaker=circuit_breaker_config,
+        calling_hours=calling_hours_config,
         executed_count=executed_count,
         total_queued_count=total_queued_count,
         parent_campaign_id=parent_campaign_id,
