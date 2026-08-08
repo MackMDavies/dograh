@@ -28,6 +28,10 @@ from api.schemas.telephony_phone_number import (
     ProviderSyncStatus,
 )
 from api.services.auth.depends import get_user
+from api.services.campaign.caller_id_capacity import (
+    effective_concurrency_limit,
+    get_calls_per_number,
+)
 from api.services.configuration.masking import is_mask_of, mask_key
 from api.services.posthog_client import capture_event
 from api.services.telephony import registry as telephony_registry
@@ -909,6 +913,12 @@ class LastCampaignSettingsResponse(BaseModel):
 class CampaignDefaultsResponse(BaseModel):
     concurrent_call_limit: int
     from_numbers_count: int
+    # Simultaneous calls allowed per caller ID. None = unlimited (the default),
+    # meaning from_numbers_count does NOT bound concurrency.
+    calls_per_number: Optional[int] = None
+    # The highest max_concurrency this org may set, already accounting for both
+    # of the above. Clients should use this rather than recomputing it.
+    max_allowed_concurrency: int
     default_retry_config: RetryConfigResponse
     last_campaign_settings: Optional[LastCampaignSettingsResponse] = None
 
@@ -922,19 +932,8 @@ async def get_campaign_defaults(user: UserModel = Depends(get_user)):
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    # Get concurrent call limit
-    concurrent_limit = DEFAULT_ORG_CONCURRENCY_LIMIT
-    try:
-        config = await db_client.get_configuration(
-            user.selected_organization_id,
-            OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
-        )
-        if config and config.value:
-            concurrent_limit = int(
-                config.value.get("value", DEFAULT_ORG_CONCURRENCY_LIMIT)
-            )
-    except Exception:
-        pass
+    # Concurrent call limit, already clamped to the system-wide ceiling.
+    concurrent_limit = await get_org_concurrency_limit(user.selected_organization_id)
 
     # Phone-number count from the org's default telephony config (used by the
     # campaign UI to validate max_concurrency against caller-id supply).
@@ -950,6 +949,12 @@ async def get_campaign_defaults(user: UserModel = Depends(get_user)):
             from_numbers_count = len(addresses)
     except Exception:
         pass
+
+    # Per-CLI cap (None = unlimited) and the ceiling the two of them imply.
+    calls_per_number = await get_calls_per_number(user.selected_organization_id)
+    max_allowed_concurrency = effective_concurrency_limit(
+        int(concurrent_limit), from_numbers_count, calls_per_number
+    )
 
     # Get last campaign settings for pre-population
     last_campaign_settings = None
@@ -994,6 +999,8 @@ async def get_campaign_defaults(user: UserModel = Depends(get_user)):
     return CampaignDefaultsResponse(
         concurrent_call_limit=concurrent_limit,
         from_numbers_count=from_numbers_count,
+        calls_per_number=calls_per_number,
+        max_allowed_concurrency=max_allowed_concurrency,
         default_retry_config=RetryConfigResponse(**DEFAULT_CAMPAIGN_RETRY_CONFIG),
         last_campaign_settings=last_campaign_settings,
     )

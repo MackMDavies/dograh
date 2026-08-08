@@ -19,10 +19,8 @@ can never permanently block an account.
 
 from loguru import logger
 
-from api.constants import DEFAULT_ORG_CONCURRENCY_LIMIT
-from api.db import db_client
-from api.enums import OrganizationConfigurationKey
 from api.services.campaign.rate_limiter import rate_limiter
+from api.services.org_concurrency import get_org_concurrency_limit
 
 # Live-audio run modes that occupy a concurrent-call slot. Excludes TEXTCHAT and the
 # historical STASIS/VOICE/CHAT modes.
@@ -37,15 +35,9 @@ def is_live_call_mode(mode) -> bool:
 
 
 async def _org_limit(organization_id: int) -> int:
-    try:
-        cfg = await db_client.get_configuration(
-            organization_id, OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value
-        )
-        if cfg and cfg.value:
-            return int(cfg.value["value"])
-    except Exception as e:  # pragma: no cover - defensive
-        logger.warning(f"[call-concurrency] limit lookup failed for org {organization_id}: {e}")
-    return int(DEFAULT_ORG_CONCURRENCY_LIMIT)
+    """Delegates to the shared resolver so live calls honour the same
+    system-wide ceiling as campaigns (see api/services/org_concurrency.py)."""
+    return await get_org_concurrency_limit(organization_id)
 
 
 async def acquire_call_slot(organization_id: int) -> tuple[bool, str | None]:

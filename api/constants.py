@@ -116,6 +116,24 @@ COUNTRY_CODES = {
 }
 
 DEFAULT_ORG_CONCURRENCY_LIMIT = os.getenv("DEFAULT_ORG_CONCURRENCY_LIMIT", 2)
+
+# Hard ceiling on simultaneous calls anywhere in the system, per organisation.
+# No plan tier, org configuration, or campaign setting may exceed it — Sysevo
+# pushes a large sentinel for "unlimited" tiers, and this is what stops that
+# authorising more concurrent pipelines than the host can actually run.
+# Raising this is a capacity decision (RAM per pipeline, CPU for VAD/framing),
+# not just a config change.
+MAX_SYSTEM_CONCURRENCY = int(os.getenv("MAX_SYSTEM_CONCURRENCY", 50))
+
+# How many simultaneous calls may share ONE caller ID (CLI).
+# 0 (the default) means "no per-CLI cap" — total concurrency is bounded by the
+# organisation's CONCURRENT_CALL_LIMIT alone, so a single configured number can
+# carry the whole limit. Carriers do not restrict concurrent originations per
+# DID; the old one-call-per-number pool was a caller-ID *rotation* strategy that
+# silently became a hard concurrency ceiling for orgs with a single number.
+# Set a positive value (env, or the per-org CALLS_PER_NUMBER configuration) to
+# deliberately spread calls across DIDs.
+DEFAULT_CALLS_PER_NUMBER = os.getenv("DEFAULT_CALLS_PER_NUMBER", 0)
 DEFAULT_CAMPAIGN_RETRY_CONFIG = {
     "enabled": True,
     "max_retries": 1,

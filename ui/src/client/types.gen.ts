@@ -334,6 +334,14 @@ export type CampaignDefaultsResponse = {
      * From Numbers Count
      */
     from_numbers_count: number;
+    /**
+     * Calls Per Number
+     */
+    calls_per_number?: number | null;
+    /**
+     * Max Allowed Concurrency
+     */
+    max_allowed_concurrency: number;
     default_retry_config: RetryConfigResponse;
     last_campaign_settings?: LastCampaignSettingsResponse | null;
 };

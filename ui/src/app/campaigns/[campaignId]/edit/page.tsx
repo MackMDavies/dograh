@@ -17,6 +17,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/com
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Separator } from '@/components/ui/separator';
+import { MAX_SYSTEM_CONCURRENCY } from '@/constants/concurrency';
 import { useAuth } from '@/lib/auth';
 
 import CampaignAdvancedSettings, { getTimezoneValue, type TimeSlot } from '../../CampaignAdvancedSettings';
@@ -40,6 +41,8 @@ export default function EditCampaignPage() {
     // Limits state
     const [orgConcurrentLimit, setOrgConcurrentLimit] = useState<number>(2);
     const [fromNumbersCount, setFromNumbersCount] = useState<number>(0);
+    // null = no per-CLI cap (the default): caller-ID count does not bound concurrency.
+    const [callsPerNumber, setCallsPerNumber] = useState<number | null>(null);
 
     // Retry config state
     const [retryEnabled, setRetryEnabled] = useState(true);
@@ -140,6 +143,7 @@ export default function EditCampaignPage() {
             if (response.data) {
                 setOrgConcurrentLimit(response.data.concurrent_call_limit);
                 setFromNumbersCount(response.data.from_numbers_count);
+                setCallsPerNumber(response.data.calls_per_number ?? null);
             }
         } catch (error) {
             console.error('Failed to fetch campaign limits:', error);
@@ -154,9 +158,10 @@ export default function EditCampaignPage() {
         }
     }, [fetchCampaign, fetchCampaignDefaults, user]);
 
-    // Effective concurrency limit
-    const effectiveLimit = fromNumbersCount > 0
-        ? Math.min(orgConcurrentLimit, fromNumbersCount)
+    // Caller-ID supply only bounds concurrency when a per-CLI cap is configured.
+    // With no cap (the default) one number carries the org's whole limit.
+    const effectiveLimit = callsPerNumber !== null && fromNumbersCount > 0
+        ? Math.min(orgConcurrentLimit, fromNumbersCount * callsPerNumber)
         : orgConcurrentLimit;
 
     // Handle form submission
@@ -172,13 +177,13 @@ export default function EditCampaignPage() {
         // Validate max_concurrency if provided
         const maxConcurrencyValue = maxConcurrency ? parseInt(maxConcurrency) : null;
         if (maxConcurrencyValue !== null) {
-            if (isNaN(maxConcurrencyValue) || maxConcurrencyValue < 1 || maxConcurrencyValue > 100) {
-                toast.error('Max concurrent calls must be between 1 and 100');
+            if (isNaN(maxConcurrencyValue) || maxConcurrencyValue < 1 || maxConcurrencyValue > MAX_SYSTEM_CONCURRENCY) {
+                toast.error(`Max concurrent calls must be between 1 and ${MAX_SYSTEM_CONCURRENCY}`);
                 return;
             }
             if (maxConcurrencyValue > effectiveLimit) {
-                if (fromNumbersCount > 0 && fromNumbersCount < orgConcurrentLimit) {
-                    toast.error(`Max concurrent calls cannot exceed ${effectiveLimit}. You have ${fromNumbersCount} phone number(s) configured - add more CLIs to increase concurrency.`);
+                if (callsPerNumber !== null && effectiveLimit < orgConcurrentLimit) {
+                    toast.error(`Max concurrent calls cannot exceed ${effectiveLimit}. You have ${fromNumbersCount} phone number(s) at ${callsPerNumber} call(s) each - add more CLIs, or raise calls-per-number, to increase concurrency.`);
                 } else {
                     toast.error(`Max concurrent calls cannot exceed organization limit (${effectiveLimit})`);
                 }
@@ -337,6 +342,7 @@ export default function EditCampaignPage() {
                             effectiveLimit={effectiveLimit}
                             orgConcurrentLimit={orgConcurrentLimit}
                             fromNumbersCount={fromNumbersCount}
+                            callsPerNumber={callsPerNumber}
                             retryEnabled={retryEnabled}
                             onRetryEnabledChange={setRetryEnabled}
                             maxRetries={maxRetries}

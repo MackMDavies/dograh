@@ -27,6 +27,9 @@ export interface CampaignAdvancedSettingsProps {
     effectiveLimit: number;
     orgConcurrentLimit: number;
     fromNumbersCount: number;
+    /** Simultaneous calls allowed per caller ID. null = unlimited (the default),
+     *  in which case the number of CLIs does not bound concurrency at all. */
+    callsPerNumber: number | null;
     // Retry config
     retryEnabled: boolean;
     onRetryEnabledChange: (value: boolean) => void;
@@ -105,6 +108,7 @@ const timezoneSelectStyles = {
 
 export default function CampaignAdvancedSettings({
     maxConcurrency, onMaxConcurrencyChange, effectiveLimit, orgConcurrentLimit, fromNumbersCount,
+    callsPerNumber,
     retryEnabled, onRetryEnabledChange, maxRetries, onMaxRetriesChange,
     retryDelaySeconds, onRetryDelaySecondsChange,
     retryOnBusy, onRetryOnBusyChange, retryOnNoAnswer, onRetryOnNoAnswerChange,
@@ -135,10 +139,14 @@ export default function CampaignAdvancedSettings({
                 <p className="text-sm text-muted-foreground">
                     Maximum number of simultaneous calls. Leave empty to use {effectiveLimit}.
                     {fromNumbersCount > 0 && ` You have ${fromNumbersCount} CLI${fromNumbersCount !== 1 ? 's' : ''} and an org limit of ${orgConcurrentLimit}.`}
+                    {callsPerNumber === null && fromNumbersCount > 0 && ' A caller ID can carry several calls at once, so one number is enough to reach the full org limit.'}
                 </p>
-                {fromNumbersCount > 0 && fromNumbersCount < orgConcurrentLimit && (
+                {/* Only a configured per-CLI cap can make caller-ID supply the
+                    binding constraint. By default it never is, so this no
+                    longer tells people to buy numbers they don't need. */}
+                {callsPerNumber !== null && fromNumbersCount > 0 && effectiveLimit < orgConcurrentLimit && (
                     <p className="text-sm text-amber-600 dark:text-amber-400">
-                        Concurrency is limited to {fromNumbersCount} by your configured phone numbers. To use the full org limit of {orgConcurrentLimit}, add more CLIs in <Link href="/telephony-configurations" className="underline font-medium">Telephony Configuration</Link>.
+                        Concurrency is limited to {effectiveLimit} because this organization allows {callsPerNumber} simultaneous call{callsPerNumber !== 1 ? 's' : ''} per number across {fromNumbersCount} CLI{fromNumbersCount !== 1 ? 's' : ''}. To use the full org limit of {orgConcurrentLimit}, add more CLIs in <Link href="/telephony-configurations" className="underline font-medium">Telephony Configuration</Link> or raise the calls-per-number setting.
                     </p>
                 )}
                 {fromNumbersCount === 0 && (

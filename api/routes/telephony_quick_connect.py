@@ -18,6 +18,7 @@ from api.db import db_client
 from api.db.models import UserModel
 from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
+from api.services.org_concurrency import clamp_to_system_max
 from api.services.telephony.managed_provisioner import get_managed_provisioner
 from api.utils.common import get_backend_endpoints
 
@@ -380,13 +381,18 @@ async def set_org_concurrency(
     if workflow is None:
         raise HTTPException(status_code=404, detail="Workflow not found")
 
+    # Sysevo pushes a large sentinel for "unlimited" plan tiers, so clamp on the
+    # way in as well as on read — the stored value should never claim more
+    # concurrency than the system can actually run.
+    max_concurrent = clamp_to_system_max(body.max_concurrent)
+
     await db_client.upsert_configuration(
         workflow.organization_id,
         OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
-        {"value": int(body.max_concurrent)},
+        {"value": max_concurrent},
     )
     return {
         "ok": True,
         "organization_id": workflow.organization_id,
-        "max_concurrent": int(body.max_concurrent),
+        "max_concurrent": max_concurrent,
     }

@@ -30,6 +30,7 @@ from api.services.campaign.errors import (
     PhoneNumberPoolExhaustedError,
     SuppressedNumberError,
 )
+from api.services.campaign.rate_limiter import FromNumberLease
 
 # =============================================================================
 # Test-specific fixtures
@@ -233,7 +234,7 @@ def mock_rate_limiter():
         return True
 
     async def mock_acquire_from_number(*args, **kwargs):
-        return "+15551234567"
+        return FromNumberLease(number="+15551234567", lease_id="lease-test")
 
     async def mock_release_from_number(*args, **kwargs):
         return True

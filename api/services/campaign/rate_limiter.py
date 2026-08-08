@@ -1,5 +1,6 @@
 import time
 import uuid
+from dataclasses import dataclass
 from typing import Optional
 
 import redis.asyncio as aioredis
@@ -8,12 +9,27 @@ from loguru import logger
 from api.constants import REDIS_URL
 
 
+@dataclass(frozen=True)
+class FromNumberLease:
+    """One live call's hold on a caller ID.
+
+    A caller ID may back several simultaneous calls, so the number alone no
+    longer identifies what to release — the lease id does.
+    """
+
+    number: str
+    lease_id: str
+
+
 class RateLimiter:
     """Sliding window rate limiter to enforce strict per-second limits and concurrent call limits"""
 
     def __init__(self):
         self.redis_client: Optional[aioredis.Redis] = None
         self.stale_call_timeout = 1200  # 20 minutes in seconds
+        # Leases outlive the stale sweep so a busy pool's key is never dropped
+        # mid-call; each acquire refreshes it.
+        self._lease_ttl = 3600
 
     async def _get_redis(self) -> aioredis.Redis:
         """Get or create Redis connection"""
@@ -253,6 +269,19 @@ class RateLimiter:
     ) -> str:
         return f"from_number_pool:{organization_id}:{telephony_configuration_id}"
 
+    @staticmethod
+    def _from_number_leases_key(
+        organization_id: int, telephony_configuration_id: int | None
+    ) -> str:
+        """Key of the ZSET holding one member per live call on this pool.
+
+        Members are ``"<number>|<lease_id>"`` scored by acquire time, so
+        abandoned leases fall out by score. Counting per caller ID is a prefix
+        scan of the members, NOT a lex range — scores differ per lease, and
+        Redis lex ranges are only meaningful when every score is equal.
+        """
+        return f"from_number_leases:{organization_id}:{telephony_configuration_id}"
+
     async def initialize_from_number_pool(
         self,
         organization_id: int,
@@ -266,6 +295,9 @@ class RateLimiter:
         Pools are scoped per (organization_id, telephony_configuration_id) so
         that orgs with multiple telephony configurations do not leak caller IDs
         across configs.
+
+        The pool ZSET is a *registry* of usable caller IDs. Live usage lives in
+        the companion leases ZSET, so scores here carry no meaning.
         """
         if not from_numbers:
             return False
@@ -284,51 +316,120 @@ class RateLimiter:
             return False
 
     async def acquire_from_number(
-        self, organization_id: int, telephony_configuration_id: int | None
-    ) -> Optional[str]:
+        self,
+        organization_id: int,
+        telephony_configuration_id: int | None,
+        calls_per_number: int | None = None,
+    ) -> Optional["FromNumberLease"]:
         """
-        Atomically acquire an available from_number from the pool for the given
-        (organization_id, telephony_configuration_id).
-        Cleans stale entries (score > 0 and older than 30 min) before acquiring.
+        Atomically take a lease on a caller ID from the
+        (organization_id, telephony_configuration_id) pool.
 
-        Returns the phone number if available, None if all numbers are in use.
+        ``calls_per_number`` is how many simultaneous calls one caller ID may
+        carry. None (the default) means unlimited — concurrency is then bounded
+        only by the org's concurrent-call limit, so a single configured number
+        can serve every slot. A positive value caps per-number usage, in which
+        case the least-loaded number is chosen so calls spread across DIDs.
+
+        Leases older than ``stale_call_timeout`` are reclaimed first, so a call
+        that never released its number can never permanently consume capacity.
+
+        Returns a (number, lease_id) lease, or None when every number is at
+        capacity (or the pool is empty).
         """
         redis_client = await self._get_redis()
-        key = self._from_number_pool_key(organization_id, telephony_configuration_id)
+        pool_key = self._from_number_pool_key(
+            organization_id, telephony_configuration_id
+        )
+        leases_key = self._from_number_leases_key(
+            organization_id, telephony_configuration_id
+        )
         now = time.time()
         stale_cutoff = now - self.stale_call_timeout
+        capacity = calls_per_number if calls_per_number and calls_per_number > 0 else -1
+        lease_id = uuid.uuid4().hex
+        # Redis seeds Lua's math.random deterministically per call, so rotation
+        # has to be driven from outside the script.
+        tie_breaker = uuid.uuid4().int % (1 << 31)
 
         lua_script = """
-        local key = KEYS[1]
+        local pool_key = KEYS[1]
+        local leases_key = KEYS[2]
         local now = tonumber(ARGV[1])
         local stale_cutoff = tonumber(ARGV[2])
+        local capacity = tonumber(ARGV[3])
+        local lease_id = ARGV[4]
+        local tie_breaker = tonumber(ARGV[5])
+        local lease_ttl = tonumber(ARGV[6])
 
-        -- Clean stale entries: members with score > 0 and score < stale_cutoff
-        local stale = redis.call('ZRANGEBYSCORE', key, 1, stale_cutoff)
-        for i, member in ipairs(stale) do
-            redis.call('ZADD', key, 0, member)
-        end
+        -- Reclaim leases from calls that never released (crash, missed webhook)
+        redis.call('ZREMRANGEBYSCORE', leases_key, 0, stale_cutoff)
 
-        -- Find all available numbers (score == 0)
-        local available = redis.call('ZRANGEBYSCORE', key, 0, 0)
-        if #available == 0 then
+        local numbers = redis.call('ZRANGE', pool_key, 0, -1)
+        if #numbers == 0 then
             return nil
         end
 
-        -- Pick a random number from the available pool for uniform distribution
-        local idx = math.random(#available)
-        local chosen = available[idx]
+        -- Tally live leases per caller ID. Members are '<number>|<lease_id>'
+        -- and scores are acquire timestamps, so this must be a prefix scan --
+        -- a lex range would be undefined across differing scores.
+        local counts = {}
+        if capacity >= 0 then
+            local members = redis.call('ZRANGE', leases_key, 0, -1)
+            for i = 1, #members do
+                local sep = string.find(members[i], '|', 1, true)
+                if sep then
+                    local num = string.sub(members[i], 1, sep - 1)
+                    counts[num] = (counts[num] or 0) + 1
+                end
+            end
+        end
 
-        -- Mark as in-use with current timestamp
-        redis.call('ZADD', key, now, chosen)
+        -- Pick the least-loaded number that is still under capacity
+        local best = {}
+        local best_count = -1
+        for i = 1, #numbers do
+            local num = numbers[i]
+            local in_use = counts[num] or 0
+            if capacity < 0 or in_use < capacity then
+                if best_count < 0 or in_use < best_count then
+                    best_count = in_use
+                    best = {num}
+                elseif in_use == best_count then
+                    table.insert(best, num)
+                end
+            end
+        end
+
+        if #best == 0 then
+            return nil
+        end
+
+        local chosen = best[(tie_breaker % #best) + 1]
+        redis.call('ZADD', leases_key, now, chosen .. '|' .. lease_id)
+        redis.call('EXPIRE', leases_key, lease_ttl)
+        -- Clear any in-use score left by the pre-lease pool format
+        redis.call('ZADD', pool_key, 'XX', 0, chosen)
         return chosen
         """
 
         try:
-            result = await redis_client.eval(lua_script, 1, key, now, stale_cutoff)
-            if result:
-                logger.debug(f"Acquired from_number {result} for org {organization_id}")
-            return result
+            result = await redis_client.eval(
+                lua_script,
+                2,
+                pool_key,
+                leases_key,
+                now,
+                stale_cutoff,
+                capacity,
+                lease_id,
+                tie_breaker,
+                self._lease_ttl,
+            )
+            if not result:
+                return None
+            logger.debug(f"Acquired from_number {result} for org {organization_id}")
+            return FromNumberLease(number=result, lease_id=lease_id)
         except Exception as e:
             logger.error(f"Error acquiring from_number: {e}")
             return None
@@ -338,31 +439,73 @@ class RateLimiter:
         organization_id: int,
         from_number: str,
         telephony_configuration_id: int | None,
+        lease_id: str | None = None,
     ) -> bool:
         """
-        Release a from_number back to its (org, telephony config) pool by
-        setting its score to 0. Harmless if already released (score already 0).
+        Release one lease on ``from_number`` back to its (org, telephony config)
+        pool. Idempotent: releasing an already-released lease returns False.
+
+        ``lease_id`` identifies the exact call's lease. When it is missing — a
+        run dispatched before leases existed, or a mapping that lost the field —
+        the oldest outstanding lease for that number is dropped instead, so
+        capacity is still returned rather than leaked until the stale sweep.
         """
         if not from_number:
             return False
 
         redis_client = await self._get_redis()
-        key = self._from_number_pool_key(organization_id, telephony_configuration_id)
+        leases_key = self._from_number_leases_key(
+            organization_id, telephony_configuration_id
+        )
+        pool_key = self._from_number_pool_key(
+            organization_id, telephony_configuration_id
+        )
 
         lua_script = """
-        local key = KEYS[1]
+        local leases_key = KEYS[1]
+        local pool_key = KEYS[2]
         local from_number = ARGV[1]
+        local lease_id = ARGV[2]
 
-        local score = redis.call('ZSCORE', key, from_number)
-        if score then
-            redis.call('ZADD', key, 0, from_number)
+        if lease_id ~= '' then
+            -- A known lease id releases exactly its own hold. If it is already
+            -- gone this is a duplicate release (webhooks retry): report "not
+            -- released" rather than falling through, or a retry would steal a
+            -- DIFFERENT live call's lease and over-subscribe the caller ID.
+            return redis.call('ZREM', leases_key, from_number .. '|' .. lease_id)
+        end
+
+        -- No lease id at all: a mapping written before leases existed. Drop
+        -- this number's oldest outstanding lease so capacity is still returned.
+        -- ZRANGE is score-ordered (oldest first); prefix-match rather than
+        -- lex-range because scores differ per lease.
+        local prefix = from_number .. '|'
+        local members = redis.call('ZRANGE', leases_key, 0, -1)
+        for i = 1, #members do
+            if string.sub(members[i], 1, #prefix) == prefix then
+                redis.call('ZREM', leases_key, members[i])
+                return 1
+            end
+        end
+
+        -- Legacy pool format: the number itself carried an in-use score
+        local score = redis.call('ZSCORE', pool_key, from_number)
+        if score and tonumber(score) > 0 then
+            redis.call('ZADD', pool_key, 0, from_number)
             return 1
         end
         return 0
         """
 
         try:
-            result = await redis_client.eval(lua_script, 1, key, from_number)
+            result = await redis_client.eval(
+                lua_script,
+                2,
+                leases_key,
+                pool_key,
+                from_number,
+                lease_id or "",
+            )
             if result:
                 logger.debug(
                     f"Released from_number {from_number} for org {organization_id}"
@@ -372,17 +515,42 @@ class RateLimiter:
             logger.error(f"Error releasing from_number: {e}")
             return False
 
+    async def count_from_number_leases(
+        self,
+        organization_id: int,
+        telephony_configuration_id: int | None,
+        from_number: str | None = None,
+    ) -> int:
+        """Live leases on this pool, or on one caller ID within it.
+
+        Diagnostics and tests only — the dispatcher never needs this.
+        """
+        redis_client = await self._get_redis()
+        leases_key = self._from_number_leases_key(
+            organization_id, telephony_configuration_id
+        )
+        try:
+            if from_number is None:
+                return int(await redis_client.zcard(leases_key))
+            prefix = f"{from_number}|"
+            members = await redis_client.zrange(leases_key, 0, -1)
+            return sum(1 for member in members if member.startswith(prefix))
+        except Exception as e:
+            logger.error(f"Error counting from_number leases: {e}")
+            return 0
+
     async def store_workflow_from_number_mapping(
         self,
         workflow_run_id: int,
         organization_id: int,
         from_number: str,
         telephony_configuration_id: int | None,
+        lease_id: str | None = None,
     ) -> bool:
         """
         Store the mapping between workflow_run_id and its from_number, plus
         the telephony_configuration_id so cleanup can release back to the
-        correct pool.
+        correct pool and the lease_id identifying this call's specific hold.
         """
         redis_client = await self._get_redis()
         mapping_key = f"workflow_from_number:{workflow_run_id}"
@@ -399,9 +567,12 @@ class RateLimiter:
                     "org_id": organization_id,
                     "from_number": from_number,
                     "telephony_configuration_id": tcid_value,
+                    "lease_id": lease_id or "",
                 },
             )
-            await redis_client.expire(mapping_key, 1800)  # 30 min TTL
+            # Must outlive the longest call, or release finds no mapping and the
+            # lease lingers until the stale sweep.
+            await redis_client.expire(mapping_key, self._lease_ttl)
             return True
         except Exception as e:
             logger.error(f"Error storing workflow from_number mapping: {e}")
@@ -409,11 +580,12 @@ class RateLimiter:
 
     async def get_workflow_from_number_mapping(
         self, workflow_run_id: int
-    ) -> Optional[tuple[int, str, int | None]]:
+    ) -> Optional[tuple[int, str, int | None, str | None]]:
         """
         Get the from_number mapping for a workflow run.
-        Returns (organization_id, from_number, telephony_configuration_id) or
-        None if not found. telephony_configuration_id is None for legacy entries.
+        Returns (organization_id, from_number, telephony_configuration_id,
+        lease_id) or None if not found. The last two are None for entries
+        written before they existed.
         """
         redis_client = await self._get_redis()
         mapping_key = f"workflow_from_number:{workflow_run_id}"
@@ -423,7 +595,13 @@ class RateLimiter:
             if mapping and "org_id" in mapping and "from_number" in mapping:
                 raw_tcid = mapping.get("telephony_configuration_id", "")
                 tcid = int(raw_tcid) if raw_tcid not in (None, "") else None
-                return (int(mapping["org_id"]), mapping["from_number"], tcid)
+                lease_id = mapping.get("lease_id") or None
+                return (
+                    int(mapping["org_id"]),
+                    mapping["from_number"],
+                    tcid,
+                    lease_id,
+                )
             return None
         except Exception as e:
             logger.error(f"Error getting workflow from_number mapping: {e}")

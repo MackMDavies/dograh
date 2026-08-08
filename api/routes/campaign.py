@@ -10,38 +10,28 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from api.constants import (
     DEFAULT_CAMPAIGN_RETRY_CONFIG,
-    DEFAULT_ORG_CONCURRENCY_LIMIT,
+    MAX_SYSTEM_CONCURRENCY,
 )
 from api.db import db_client
 from api.db.models import UserModel
-from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
+from api.services.campaign.caller_id_capacity import (
+    effective_concurrency_limit,
+    get_calls_per_number,
+)
 from api.services.campaign.runner import (
     CampaignValidationError,
     campaign_runner_service,
     validate_campaign_startable,
 )
 from api.services.campaign.source_sync import CampaignSourceSyncService
+from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.campaign.source_sync_factory import get_sync_service
 from api.services.quota_service import check_dograh_quota
 from api.services.reports import generate_campaign_report_csv
 from api.services.storage import storage_fs
 
 router = APIRouter(prefix="/campaign")
-
-
-async def _get_org_concurrent_limit(organization_id: int) -> int:
-    """Get the concurrent call limit for an organization."""
-    try:
-        config = await db_client.get_configuration(
-            organization_id,
-            OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
-        )
-        if config and config.value:
-            return int(config.value.get("value", DEFAULT_ORG_CONCURRENCY_LIMIT))
-    except Exception:
-        pass
-    return DEFAULT_ORG_CONCURRENCY_LIMIT
 
 
 async def _get_from_numbers_count(organization_id: int) -> int:
@@ -62,20 +52,33 @@ async def _get_from_numbers_count(organization_id: int) -> int:
 
 
 async def _validate_max_concurrency(max_concurrency: int, organization_id: int) -> None:
-    """Validate max_concurrency against org limit and configured phone numbers.
+    """Validate max_concurrency against the org limit and caller-ID capacity.
+
+    Caller-ID supply only bounds concurrency when the org has opted into a
+    per-CLI cap (``CALLS_PER_NUMBER``); by default one number can carry the
+    org's whole limit, so a single configured DID no longer pins a campaign to
+    a concurrency of 1.
 
     Raises HTTPException(400) if the value exceeds the effective limit.
     """
-    org_limit = await _get_org_concurrent_limit(organization_id)
+    org_limit = await get_org_concurrency_limit(organization_id)
+    calls_per_number = await get_calls_per_number(organization_id)
     from_numbers_count = await _get_from_numbers_count(organization_id)
-    effective_limit = (
-        min(org_limit, from_numbers_count) if from_numbers_count > 0 else org_limit
+    effective_limit = effective_concurrency_limit(
+        org_limit, from_numbers_count, calls_per_number
     )
     if max_concurrency > effective_limit:
-        if from_numbers_count > 0 and from_numbers_count < org_limit:
+        if effective_limit < org_limit:
             raise HTTPException(
                 status_code=400,
-                detail=f"max_concurrency ({max_concurrency}) cannot exceed {effective_limit}. You have {from_numbers_count} phone number(s) configured. Add more CLIs in telephony configuration to increase concurrency.",
+                detail=(
+                    f"max_concurrency ({max_concurrency}) cannot exceed "
+                    f"{effective_limit}. You have {from_numbers_count} phone "
+                    f"number(s) configured and this organization allows "
+                    f"{calls_per_number} simultaneous call(s) per number. Add "
+                    "more CLIs in telephony configuration, or raise the "
+                    "calls-per-number setting, to increase concurrency."
+                ),
             )
         raise HTTPException(
             status_code=400,
@@ -250,7 +253,7 @@ class CreateCampaignRequest(BaseModel):
     # default config.
     telephony_configuration_id: Optional[int] = None
     retry_config: Optional[RetryConfigRequest] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
+    max_concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_SYSTEM_CONCURRENCY)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
     calling_hours: Optional[CallingHoursConfigRequest] = None
@@ -287,7 +290,7 @@ class EnqueueRunRequest(BaseModel):
 class UpdateCampaignRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     retry_config: Optional[RetryConfigRequest] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
+    max_concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_SYSTEM_CONCURRENCY)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
     calling_hours: Optional[CallingHoursConfigRequest] = None

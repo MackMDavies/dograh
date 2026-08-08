@@ -21,7 +21,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
-from api.services.campaign.rate_limiter import RateLimiter
+from api.services.campaign.rate_limiter import FromNumberLease, RateLimiter
 
 
 def _unique_id() -> int:
@@ -92,16 +92,22 @@ class TestRateLimiterFromNumberPoolIsolation:
         )
 
         # Drain and cycle config_a's pool many times; the acquire should never
-        # hand out a config_b number.
+        # hand out a config_b number. calls_per_number=1 keeps this exclusive so
+        # every number must be handed out before any repeats.
         seen: set[str] = set()
         for _ in range(20):
-            n = await rl.acquire_from_number(
-                org_id, telephony_configuration_id=config_a
+            lease = await rl.acquire_from_number(
+                org_id, telephony_configuration_id=config_a, calls_per_number=1
             )
-            if n is None:
+            if lease is None:
                 break
-            seen.add(n)
-            await rl.release_from_number(org_id, n, telephony_configuration_id=config_a)
+            seen.add(lease.number)
+            await rl.release_from_number(
+                org_id,
+                lease.number,
+                telephony_configuration_id=config_a,
+                lease_id=lease.lease_id,
+            )
 
         assert seen == set(numbers_a), (
             f"Expected only config_a numbers, but acquire returned: {seen}. "
@@ -130,19 +136,20 @@ class TestRateLimiterFromNumberPoolIsolation:
             org_id, numbers_b, telephony_configuration_id=config_b
         )
 
-        # Acquire all of config_a's numbers (none released).
+        # Acquire all of config_a's numbers (none released). calls_per_number=1
+        # makes the pool exhaustible, which is what this test needs to observe.
         first = await rl.acquire_from_number(
-            org_id, telephony_configuration_id=config_a
+            org_id, telephony_configuration_id=config_a, calls_per_number=1
         )
         second = await rl.acquire_from_number(
-            org_id, telephony_configuration_id=config_a
+            org_id, telephony_configuration_id=config_a, calls_per_number=1
         )
-        assert {first, second} == set(numbers_a)
+        assert {first.number, second.number} == set(numbers_a)
 
         # config_a is now exhausted — config_b is fully untouched.
         # Acquiring for config_a must return None, NOT spill into config_b.
         none_for_a = await rl.acquire_from_number(
-            org_id, telephony_configuration_id=config_a
+            org_id, telephony_configuration_id=config_a, calls_per_number=1
         )
         assert none_for_a is None, (
             f"Pool for config_a is exhausted but acquire returned {none_for_a} — "
@@ -152,11 +159,11 @@ class TestRateLimiterFromNumberPoolIsolation:
         # config_b's pool is fully available.
         b_acquired = []
         for _ in range(2):
-            n = await rl.acquire_from_number(
-                org_id, telephony_configuration_id=config_b
+            lease = await rl.acquire_from_number(
+                org_id, telephony_configuration_id=config_b, calls_per_number=1
             )
-            assert n is not None
-            b_acquired.append(n)
+            assert lease is not None
+            b_acquired.append(lease.number)
         assert set(b_acquired) == set(numbers_b)
 
     @pytest.mark.skipif(
@@ -180,15 +187,17 @@ class TestRateLimiterFromNumberPoolIsolation:
             org_id,
             from_number,
             telephony_configuration_id=config_id,
+            lease_id="lease-abc",
         )
 
         mapping = await rl.get_workflow_from_number_mapping(workflow_run_id)
         assert mapping is not None
-        # Tuple shape: (org_id, from_number, telephony_configuration_id)
-        assert len(mapping) == 3, (
-            f"mapping must include telephony_configuration_id, got: {mapping}"
+        # Tuple shape: (org_id, from_number, telephony_configuration_id, lease_id)
+        assert len(mapping) == 4, (
+            "mapping must include telephony_configuration_id and lease_id, "
+            f"got: {mapping}"
         )
-        assert mapping == (org_id, from_number, config_id)
+        assert mapping == (org_id, from_number, config_id, "lease-abc")
 
         await rl.delete_workflow_from_number_mapping(workflow_run_id)
 
@@ -275,7 +284,11 @@ class TestDispatcherThreadsTelephonyConfig:
             mock_db.create_workflow_run = AsyncMock(return_value=workflow_run)
             mock_db.update_workflow_run = AsyncMock()
 
-            mock_rl.acquire_from_number = AsyncMock(return_value="+15551110001")
+            mock_rl.acquire_from_number = AsyncMock(
+                return_value=FromNumberLease(
+                    number="+15551110001", lease_id="lease-1"
+                )
+            )
             mock_rl.release_from_number = AsyncMock()
             mock_rl.release_concurrent_slot = AsyncMock()
             mock_rl.store_workflow_slot_mapping = AsyncMock()
@@ -336,7 +349,7 @@ class TestDispatcherThreadsTelephonyConfig:
         ) as mock_rl:
             mock_rl.get_workflow_slot_mapping = AsyncMock(return_value=None)
             mock_rl.get_workflow_from_number_mapping = AsyncMock(
-                return_value=(org_id, from_number, config_id)
+                return_value=(org_id, from_number, config_id, "lease-1")
             )
             mock_rl.release_from_number = AsyncMock(return_value=True)
             mock_rl.delete_workflow_from_number_mapping = AsyncMock(return_value=True)
