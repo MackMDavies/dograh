@@ -146,12 +146,14 @@ class CampaignOrchestrator:
                 self._clear_campaign_state(campaign_id)
                 return
 
-            # Schedule next batch or complete immediately if no work remains
-            has_work = await self._has_pending_work(campaign_id)
-            if has_work:
+            # Schedule next batch or complete immediately if no work remains.
+            # Three cases, not two: work claimable now (dispatch), nothing left
+            # at all (complete), or only future work such as a parked callback
+            # or a backoff retry — which must neither dispatch nor complete.
+            if await self._has_dispatchable_work(campaign_id):
                 await self._schedule_next_batch(campaign_id)
                 self._last_activity[campaign_id] = datetime.now(UTC)
-            else:
+            elif not await self._has_pending_work(campaign_id):
                 # All queued work is dispatched — complete immediately if all rows accounted for
                 await self._try_complete_immediately(campaign)
 
@@ -419,8 +421,8 @@ class CampaignOrchestrator:
                 self._clear_campaign_state(campaign_id)
                 return
 
-            # Check for available work (queued runs + due retries)
-            has_work = await self._has_pending_work(campaign_id)
+            # Check for available work (unscheduled queued runs + due retries)
+            has_work = await self._has_dispatchable_work(campaign_id)
 
             if has_work:
                 # Schedule batch immediately
@@ -509,7 +511,7 @@ class CampaignOrchestrator:
                         del self._batch_in_progress[campaign_id]
 
                         # Check if there's work to be done
-                        if await self._has_pending_work(campaign_id):
+                        if await self._has_dispatchable_work(campaign_id):
                             logger.info(
                                 f"campaign_id: {campaign_id} - Found pending work after stuck batch, "
                                 f"scheduling new batch"
@@ -517,9 +519,12 @@ class CampaignOrchestrator:
                             await self._schedule_next_batch(campaign_id)
                             continue
 
-                # Check for orphaned work (e.g., newly created retries with no batch in progress)
+                # Check for orphaned work (e.g., newly created retries with no batch in progress).
+                # Must be dispatchable-now: a run parked for the future is pending but
+                # unclaimable, and scheduling for it spins a no-op batch every 30s and
+                # `continue`s past stuck-run recovery and the completion check below.
                 if campaign_id not in self._batch_in_progress:
-                    has_work = await self._has_pending_work(campaign_id)
+                    has_work = await self._has_dispatchable_work(campaign_id)
                     if has_work:
                         if not self._is_within_schedule(campaign):
                             logger.info(
@@ -663,8 +668,48 @@ class CampaignOrchestrator:
         )
         return True
 
+    async def _has_dispatchable_work(self, campaign_id: int) -> bool:
+        """Is there work the dispatcher can claim RIGHT NOW?
+
+        Deliberately narrower than _has_pending_work, which counts everything
+        outstanding including runs parked for the future. Use this before
+        scheduling a batch; use _has_pending_work to decide completion.
+
+        The two branches mirror claim_queued_runs_for_processing exactly —
+        scheduled-and-due, then unscheduled — so anything counted here is
+        something a batch can actually pick up. A callback parked at
+        2999-01-01 awaiting human review matches neither, which is the point:
+        counting it made the orchestrator schedule a no-op batch every 30s
+        forever, and skip stuck-run recovery and completion on the way past.
+        """
+        due_count = await db_client.get_scheduled_runs_count(
+            campaign_id=campaign_id, scheduled_before=datetime.now(UTC)
+        )
+        if due_count > 0:
+            logger.debug(
+                f"campaign_id: {campaign_id} - Has {due_count} scheduled runs due"
+            )
+            return True
+
+        unscheduled_count = await db_client.get_unscheduled_queued_runs_count(
+            campaign_id=campaign_id
+        )
+        if unscheduled_count > 0:
+            logger.debug(
+                f"campaign_id: {campaign_id} - Has {unscheduled_count} unscheduled queued runs"
+            )
+            return True
+
+        return False
+
     async def _has_pending_work(self, campaign_id: int) -> bool:
-        """Check if campaign has any work to do."""
+        """Is anything outstanding at all, including work parked for later?
+
+        Used for completion decisions, where future work must keep a campaign
+        alive — a backoff retry scheduled for tomorrow means this campaign is
+        not finished. For "should I schedule a batch?" use
+        _has_dispatchable_work instead.
+        """
         # Check queued runs
         # SYSEVO_PENDING_INCLUDES_PROCESSING: count "processing" as pending
         # work, not just "queued". Runs claimed by a batch that dies (an API
@@ -694,10 +739,10 @@ class CampaignOrchestrator:
 
     async def _try_complete_immediately(self, campaign: CampaignModel):
         """Complete a campaign immediately when all rows are dispatched and no work remains."""
-        # A standing campaign (callbacks) holds work scheduled for the future.
-        # _has_pending_work only counts runs due NOW, so completing here would
-        # strand every future callback: _check_stale_campaigns polls only
-        # `running` campaigns and would never look at this one again.
+        # A standing campaign (callbacks) holds work scheduled for the future
+        # and must never be completed: _check_stale_campaigns polls only
+        # `running` campaigns, so once completed it is never looked at again
+        # and every future callback is stranded.
         if getattr(campaign, "is_standing", False):
             logger.debug(
                 f"campaign_id: {campaign.id} - standing campaign, not completing"
@@ -705,16 +750,6 @@ class CampaignOrchestrator:
             return
 
         campaign_id = campaign.id
-        # A standing campaign (callbacks) holds work scheduled for the future.
-        # _has_pending_work only counts runs due NOW, so completing here would
-        # strand every future callback: _check_stale_campaigns polls only
-        # `running` campaigns and would never look at this one again.
-        if getattr(campaign, "is_standing", False):
-            logger.debug(
-                f"campaign_id: {campaign.id} - standing campaign, not completing"
-            )
-            return
-
 
         # Refresh from DB to get latest counters
         fresh = await db_client.get_campaign_by_id(campaign_id)
@@ -747,10 +782,10 @@ class CampaignOrchestrator:
 
     async def _complete_campaign(self, campaign: CampaignModel):
         """Mark campaign as complete or failed based on outcome."""
-        # A standing campaign (callbacks) holds work scheduled for the future.
-        # _has_pending_work only counts runs due NOW, so completing here would
-        # strand every future callback: _check_stale_campaigns polls only
-        # `running` campaigns and would never look at this one again.
+        # A standing campaign (callbacks) holds work scheduled for the future
+        # and must never be completed: _check_stale_campaigns polls only
+        # `running` campaigns, so once completed it is never looked at again
+        # and every future callback is stranded.
         if getattr(campaign, "is_standing", False):
             logger.debug(
                 f"campaign_id: {campaign.id} - standing campaign, not completing"
@@ -758,16 +793,6 @@ class CampaignOrchestrator:
             return
 
         campaign_id = campaign.id
-        # A standing campaign (callbacks) holds work scheduled for the future.
-        # _has_pending_work only counts runs due NOW, so completing here would
-        # strand every future callback: _check_stale_campaigns polls only
-        # `running` campaigns and would never look at this one again.
-        if getattr(campaign, "is_standing", False):
-            logger.debug(
-                f"campaign_id: {campaign.id} - standing campaign, not completing"
-            )
-            return
-
 
         try:
             # Double-check no pending work

@@ -715,9 +715,10 @@ class CampaignModel(Base):
     scheduled_timezone = Column(String, nullable=True)
 
     # A standing campaign never auto-completes. Callbacks are scheduled into it
-    # for a future time, and _has_pending_work() only counts runs due NOW — so a
-    # normal campaign holding only a 2pm callback looks finished at 10am, marks
-    # itself completed, and never fires it. See campaign_orchestrator.
+    # for a future time, and an ordinary campaign that hit its activity timeout
+    # would mark itself completed and never fire them — after which
+    # _check_stale_campaigns, which polls only `running` campaigns, would never
+    # look at it again. See campaign_orchestrator._complete_campaign.
     is_standing = Column(Boolean, nullable=False, server_default="false")
 
     # Progress tracking

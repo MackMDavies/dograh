@@ -37,9 +37,12 @@ def _campaign(*, org_id=3, workflow_id=100, telephony_configuration_id=None) -> 
         total_rows=10,
         processed_rows=0,
         failed_rows=0,
+        suppressed_rows=0,
         created_at=datetime(2026, 1, 1, tzinfo=UTC),
         started_at=None,
         completed_at=None,
+        scheduled_start_at=None,
+        scheduled_timezone=None,
         retry_config=None,
         orchestrator_metadata={},
         telephony_configuration_id=telephony_configuration_id,
@@ -184,3 +187,111 @@ class TestTelephonyConfigurationCrossOrgFallback:
 
             mock_db.get_telephony_configuration_for_org.assert_not_called()
             mock_db.update_campaign.assert_awaited_once()
+
+
+class TestCallingHoursUpdate:
+    """calling_hours is flattened into orchestrator_metadata as three top-level
+    keys (not a nested dict) because campaign_call_dispatcher.py reads it that
+    way: .get("calling_hours_mode") / .get("calling_hours_start") / etc.
+    """
+
+    @pytest.mark.asyncio
+    async def test_setting_custom_calling_hours_merges_into_metadata(self):
+        campaign = _campaign(org_id=3)
+        with patch("api.routes.campaign.db_client") as mock_db:
+            mock_db.get_campaign = AsyncMock(return_value=campaign)
+            mock_db.get_workflow_name = AsyncMock(return_value="Some Workflow")
+            mock_db.update_campaign = AsyncMock()
+            mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
+
+            await update_campaign(
+                41,
+                UpdateCampaignRequest(
+                    calling_hours={"mode": "custom", "start": "09:00", "end": "18:00"}
+                ),
+                user=_user(is_superuser=True, org_id=3),
+            )
+
+            metadata = mock_db.update_campaign.call_args.kwargs["orchestrator_metadata"]
+            assert metadata["calling_hours_mode"] == "custom"
+            assert metadata["calling_hours_start"] == "09:00"
+            assert metadata["calling_hours_end"] == "18:00"
+
+    @pytest.mark.asyncio
+    async def test_switching_back_to_inherit_clears_stale_times(self):
+        campaign = _campaign(org_id=3)
+        campaign.orchestrator_metadata = {
+            "calling_hours_mode": "custom",
+            "calling_hours_start": "09:00",
+            "calling_hours_end": "18:00",
+        }
+        with patch("api.routes.campaign.db_client") as mock_db:
+            mock_db.get_campaign = AsyncMock(return_value=campaign)
+            mock_db.get_workflow_name = AsyncMock(return_value="Some Workflow")
+            mock_db.update_campaign = AsyncMock()
+            mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
+
+            await update_campaign(
+                41,
+                UpdateCampaignRequest(calling_hours={"mode": "inherit"}),
+                user=_user(is_superuser=True, org_id=3),
+            )
+
+            metadata = mock_db.update_campaign.call_args.kwargs["orchestrator_metadata"]
+            assert metadata["calling_hours_mode"] == "inherit"
+            assert "calling_hours_start" not in metadata
+            assert "calling_hours_end" not in metadata
+
+    @pytest.mark.asyncio
+    async def test_rejects_calling_hours_update_on_completed_campaign(self):
+        campaign = _campaign(org_id=3)
+        campaign.state = "completed"
+        with patch("api.routes.campaign.db_client") as mock_db:
+            mock_db.get_campaign = AsyncMock(return_value=campaign)
+
+            with pytest.raises(HTTPException) as exc_info:
+                await update_campaign(
+                    41,
+                    UpdateCampaignRequest(
+                        calling_hours={
+                            "mode": "off",
+                            "off_acknowledged_at": "2026-08-08T14:00:00Z",
+                        }
+                    ),
+                    user=_user(is_superuser=True, org_id=3),
+                )
+            assert exc_info.value.status_code == 400
+
+    def test_off_mode_without_acknowledgment_is_rejected_by_the_model(self):
+        """Pydantic-level validation, not the route — mode='off' with no
+        off_acknowledged_at must never construct a valid request at all,
+        the same way mode='custom' with a missing start/end already can't."""
+        with pytest.raises(ValueError, match="off_acknowledged_at"):
+            UpdateCampaignRequest(calling_hours={"mode": "off"})
+
+    @pytest.mark.asyncio
+    async def test_off_mode_with_acknowledgment_flattens_the_timestamp(self):
+        campaign = _campaign(org_id=3)
+        with patch("api.routes.campaign.db_client") as mock_db:
+            mock_db.get_campaign = AsyncMock(return_value=campaign)
+            mock_db.get_workflow_name = AsyncMock(return_value="Some Workflow")
+            mock_db.update_campaign = AsyncMock()
+            mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
+
+            await update_campaign(
+                41,
+                UpdateCampaignRequest(
+                    calling_hours={
+                        "mode": "off",
+                        "off_acknowledged_at": "2026-08-08T14:00:00Z",
+                    }
+                ),
+                user=_user(is_superuser=True, org_id=3),
+            )
+
+            metadata = mock_db.update_campaign.call_args.kwargs["orchestrator_metadata"]
+            assert metadata["calling_hours_mode"] == "off"
+            assert (
+                metadata["calling_hours_off_acknowledged_at"]
+                == "2026-08-08T14:00:00+00:00"
+            )

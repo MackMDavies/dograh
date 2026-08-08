@@ -35,6 +35,11 @@ def _campaign(*, total_rows=10, processed_rows=5, failed_rows=0, state="running"
     campaign.total_rows = total_rows
     campaign.processed_rows = processed_rows
     campaign.failed_rows = failed_rows
+    # Must be explicit: on a bare MagicMock this attribute is a truthy mock, so
+    # the standing-campaign guard would return early and the assertions below
+    # would pass vacuously (or fail) without ever reaching the logic under test.
+    campaign.is_standing = False
+    campaign.suppressed_rows = 0
     return campaign
 
 
