@@ -25,3 +25,14 @@ class PhoneNumberPoolExhaustedError(Exception):
             f"All phone numbers are in use for org {organization_id}. "
             f"No available from_number in pool."
         )
+
+
+class SuppressedNumberError(Exception):
+    """Raised when a queued run's phone number is on the do-not-dial register."""
+
+    def __init__(self, workflow_id: int, phone_number: str):
+        self.workflow_id = workflow_id
+        self.phone_number = phone_number
+        super().__init__(
+            f"Phone number is suppressed for workflow {workflow_id}; refusing to dial."
+        )

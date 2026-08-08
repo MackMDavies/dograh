@@ -527,6 +527,28 @@ class CampaignClient(BaseDBClient):
                 await session.rollback()
                 raise
 
+    async def increment_campaign_suppressed_rows(self, campaign_id: int) -> None:
+        """Atomically increment suppressed_rows by 1.
+
+        Distinct from failed_rows: a suppressed contact is dial-time
+        enforcement working as intended, not an error, and must not inflate
+        the campaign's reported failure rate.
+        """
+        async with self.async_session() as session:
+            await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET suppressed_rows = suppressed_rows + 1, updated_at = :now "
+                    "WHERE id = :campaign_id"
+                ),
+                {"campaign_id": campaign_id, "now": datetime.now(UTC)},
+            )
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+
     async def increment_campaign_metadata_counter(
         self, campaign_id: int, key: str
     ) -> int:

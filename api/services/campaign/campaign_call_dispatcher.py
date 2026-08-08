@@ -10,11 +10,14 @@ from api.db import db_client
 from api.db.models import QueuedRunModel, WorkflowRunModel
 from api.enums import OrganizationConfigurationKey, WorkflowRunState
 from api.services.campaign.circuit_breaker import circuit_breaker
+from api.services.campaign.dial_suppression import is_number_suppressed
 from api.services.campaign.errors import (
     ConcurrentSlotAcquisitionError,
     PhoneNumberPoolExhaustedError,
+    SuppressedNumberError,
 )
 from api.services.campaign.rate_limiter import rate_limiter
+from api.services.dial_permission_check import check_dial_permitted
 from api.utils.common import get_backend_endpoints
 
 if TYPE_CHECKING:
@@ -144,6 +147,55 @@ class CampaignCallDispatcher:
         processed_run_ids: set[int] = set()
         for i, queued_run in enumerate(queued_runs):
             try:
+                # Pre-dial permission check — before rate limiting, before a
+                # concurrency slot or from-number is ever touched. A number
+                # under suppression or stuck on repeat machine-answers never
+                # reaches the telephony provider at all.
+                phone_number = queued_run.context_variables.get("phone_number")
+                if phone_number:
+                    dial_allowed, dial_block_reason = await check_dial_permitted(
+                        campaign.workflow_id, phone_number
+                    )
+                    if not dial_allowed:
+                        if dial_block_reason == "suppressed":
+                            # Route through the same skipped_suppressed/
+                            # suppressed_rows path dispatch_call's own
+                            # suppression check uses (see the "except
+                            # SuppressedNumberError" block below) — a
+                            # suppressed contact is dial-time enforcement
+                            # working as intended, not a failure, and must
+                            # not be miscounted as one.
+                            raise SuppressedNumberError(
+                                workflow_id=campaign.workflow_id,
+                                phone_number=phone_number,
+                            )
+                        logger.info(
+                            f"Queued run {queued_run.id} blocked before dialing: "
+                            f"{dial_block_reason}"
+                        )
+                        await db_client.update_queued_run(
+                            queued_run_id=queued_run.id,
+                            state="failed",
+                            processed_at=datetime.now(UTC),
+                        )
+                        await db_client.increment_campaign_failed_rows(campaign_id)
+                        await db_client.append_campaign_log(
+                            campaign_id=campaign_id,
+                            level="info",
+                            event="call_dial_blocked",
+                            message=(
+                                f"Skipped dialing queued run {queued_run.id}: "
+                                f"{dial_block_reason}"
+                            ),
+                            details={
+                                "queued_run_id": queued_run.id,
+                                "phone_number": phone_number,
+                                "reason": dial_block_reason,
+                            },
+                        )
+                        processed_run_ids.add(queued_run.id)
+                        continue
+
                 # Apply rate limiting, i.e lets not initiate more than rate_limit_per_second
                 # calls per second. It is different than concurrency limit.
                 await self.apply_rate_limit(
@@ -209,6 +261,37 @@ class CampaignCallDispatcher:
                 )
                 # Re-raise to propagate to process_campaign_batch
                 raise
+
+            except SuppressedNumberError as e:
+                logger.info(
+                    f"Skipping queued run {queued_run.id} for campaign {campaign_id}: "
+                    f"number is on the do-not-dial register ({e})"
+                )
+                try:
+                    await db_client.update_queued_run(
+                        queued_run_id=queued_run.id,
+                        state="skipped_suppressed",
+                        processed_at=datetime.now(UTC),
+                    )
+                    await db_client.increment_campaign_suppressed_rows(campaign_id)
+                    await db_client.append_campaign_log(
+                        campaign_id=campaign_id,
+                        level="info",
+                        event="call_skipped_suppressed",
+                        message=f"Skipped queued run {queued_run.id}: number is suppressed",
+                        details={
+                            "queued_run_id": queued_run.id,
+                            "phone_number": queued_run.context_variables.get("phone_number"),
+                        },
+                    )
+                except Exception as update_error:
+                    logger.error(
+                        f"Failed to mark queued run {queued_run.id} as "
+                        f"skipped_suppressed: {update_error}"
+                    )
+                # Deliberately NOT re-raised: unlike a pool-exhausted or
+                # slot-acquisition failure, a suppressed contact is a
+                # per-row outcome and must not abort the rest of the batch.
 
             except Exception as e:
                 logger.warning(f"Error processing queued run {queued_run.id}: {e}")
@@ -297,6 +380,18 @@ class CampaignCallDispatcher:
                 campaign.organization_id, slot_id
             )
             raise ValueError(f"No phone number in queued run {queued_run.id}")
+
+        # Dial-time suppression check. Placed BEFORE acquire_from_number so a
+        # suppressed contact never consumes a phone-pool slot for a call that
+        # will not happen. See /voice/dispositions' Suppress action and
+        # docs/superpowers/specs/2026-08-07-dial-time-suppression-enforcement-design.md.
+        if await is_number_suppressed(campaign.workflow_id, phone_number):
+            await rate_limiter.release_concurrent_slot(
+                campaign.organization_id, slot_id
+            )
+            raise SuppressedNumberError(
+                workflow_id=campaign.workflow_id, phone_number=phone_number
+            )
 
         # Get provider for this campaign's pinned telephony config.
         provider = await self.get_provider_for_campaign(campaign)

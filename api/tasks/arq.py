@@ -54,6 +54,7 @@ from api.tasks.s3_upload import (
 from api.tasks.wallet_reconciliation import reconcile_wallet_debits
 from api.tasks.memory_reconciliation import reconcile_memory
 from api.tasks.telephony_cost_reconciliation import reconcile_telephony_cost
+from api.tasks.dial_suppression_sync import sync_dial_suppression
 from api.services.api_usage_counter import flush_api_request_usage
 
 
@@ -79,6 +80,10 @@ class WorkerSettings:
         # prices asynchronously, so this cannot be done at hang-up. Without it
         # every cost figure understates the truth by ~a third on real telephony.
         cron(reconcile_telephony_cost, minute={7}),
+        # Every ~30s: rebuild the Redis mirror of Supabase's dial_suppression
+        # register. No-ops if the integration isn't configured. Runs at
+        # startup too, so a restarted worker isn't briefly unprotected.
+        cron(sync_dial_suppression, second={0, 30}, run_at_startup=True),
     ]
     redis_settings = REDIS_SETTINGS
     max_jobs = 10
