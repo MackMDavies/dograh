@@ -123,6 +123,15 @@ class SuperuserCampaignItem(BaseModel):
     created_at: datetime
     started_at: Optional[datetime]
     completed_at: Optional[datetime]
+    # A scheduled campaign's launch time. Omitting these made the admin campaign
+    # list render "no start time set" for every scheduled campaign, because the
+    # UI reads campaign.scheduled_start_at and got undefined — while the column
+    # held a perfectly good instant and the orchestrator fired on it correctly.
+    # CampaignResponse (the client-facing serializer) has always returned both;
+    # this one is a separate model and simply never got them. Same shape of miss
+    # as suppressed_rows above, which was added here for the same reason.
+    scheduled_start_at: Optional[datetime] = None
+    scheduled_timezone: Optional[str] = None
     # SYSEVO_IS_STANDING: dispatch queue (callbacks), not a user-facing campaign.
     is_standing: bool = False
 
@@ -166,6 +175,8 @@ async def list_all_campaigns(
             created_at=c.created_at,
             started_at=c.started_at,
             completed_at=c.completed_at,
+            scheduled_start_at=c.scheduled_start_at,
+            scheduled_timezone=c.scheduled_timezone,
             is_standing=bool(getattr(c, "is_standing", False)),
         )
         for c in campaigns

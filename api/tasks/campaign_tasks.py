@@ -117,12 +117,35 @@ async def process_campaign_batch(
     """
     logger.info(f"Processing batch for campaign {campaign_id}, batch_size={batch_size}")
 
+    # failed_count used to be initialised to 0 here and never assigned again, so
+    # BOTH the log line below and the batch_completed event always reported
+    # failed=0 — even when every call in the batch failed. A batch of 10 dials
+    # that all 403'd logged exactly like a batch that did nothing at all, which
+    # is the worst possible failure mode for a system whose dial gates are
+    # already hard to observe.
+    #
+    # process_batch() returns only the processed count and increments
+    # campaign.failed_rows/suppressed_rows internally, so the honest per-batch
+    # numbers are the deltas on those counters. Deliberately measured here
+    # rather than by changing process_batch's signature: campaign_call_dispatcher
+    # is concurrently being modified for calling-hours enforcement, and widening
+    # its contract now would collide with that work.
+    before = await db_client.get_campaign_by_id(campaign_id)
+    failed_before = (before.failed_rows or 0) if before else 0
+    suppressed_before = (before.suppressed_rows or 0) if before else 0
+
     failed_count = 0
+    suppressed_count = 0
     try:
         # Process the batch
         processed_count = await campaign_call_dispatcher.process_batch(
             campaign_id=campaign_id, batch_size=batch_size
         )
+
+        after = await db_client.get_campaign_by_id(campaign_id)
+        if after:
+            failed_count = max(0, (after.failed_rows or 0) - failed_before)
+            suppressed_count = max(0, (after.suppressed_rows or 0) - suppressed_before)
 
         if processed_count > 0:
             await db_client.reset_campaign_metadata_counter(
@@ -145,7 +168,7 @@ async def process_campaign_batch(
 
         logger.info(
             f"Campaign {campaign_id} batch completed: processed={processed_count}, "
-            f"failed={failed_count}"
+            f"failed={failed_count}, suppressed={suppressed_count}"
         )
 
     except ConcurrentSlotAcquisitionError as e:
