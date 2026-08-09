@@ -38,13 +38,18 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
         ),
         # Current generation, added 2026-08-09. Absent before that, so any run
         # on a GPT-5 model recorded a cost of exactly zero.
+        # OpenAI includes cached tokens INSIDE prompt_tokens, and its cached
+        # rate is 10% of input on the GPT-5 family — not the 50% the default
+        # multiplier assumes, which is a GPT-4o-era figure.
         "gpt-5": TokenPricingModel(
             prompt_token_price=Decimal("1.25") / 1000000,  # $1.25 per 1M tokens
             completion_token_price=Decimal("10.00") / 1000000,  # $10.00 per 1M tokens
+            cached_prompt_token_price=Decimal("0.125") / 1000000,  # $0.125 per 1M
         ),
         "gpt-5-mini": TokenPricingModel(
             prompt_token_price=Decimal("0.25") / 1000000,  # $0.25 per 1M tokens
             completion_token_price=Decimal("2.00") / 1000000,  # $2.00 per 1M tokens
+            cached_prompt_token_price=Decimal("0.025") / 1000000,  # $0.025 per 1M
         ),
         "gpt-5.4": TokenPricingModel(
             prompt_token_price=Decimal("2.50") / 1000000,  # $2.50 per 1M tokens
@@ -83,9 +88,24 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
             prompt_token_price=Decimal("2.50") / 1000000,  # $2.50 per 1M tokens
             completion_token_price=Decimal("10.00") / 1000000,  # $10.00 per 1M tokens
         ),
+        # REALTIME MODELS ARE PRICED AS AUDIO, NOT TEXT.
+        #
+        # Every token through a realtime model is an audio token, and audio
+        # bills at $32/$64 per 1M against $5/$20 for this model's text rates.
+        # The usage metrics carry no audio/text split (LLMTokenUsage has only
+        # prompt/completion/cache counts), so the model identity is the only
+        # signal there is — which makes registering the text rate here a silent
+        # ~6x understatement of the voice path, on the single line of spend a
+        # voice product most needs to be right.
         "gpt-4o-realtime-preview": TokenPricingModel(
-            prompt_token_price=Decimal("5.00") / 1000000,  # $5.00 per 1M tokens
-            completion_token_price=Decimal("20.00") / 1000000,  # $20.00 per 1M tokens
+            prompt_token_price=Decimal("32.00") / 1000000,  # $32.00 per 1M audio in
+            completion_token_price=Decimal("64.00") / 1000000,  # $64.00 per 1M audio out
+            cached_prompt_token_price=Decimal("0.40") / 1000000,  # $0.40 per 1M cached
+        ),
+        "gpt-realtime": TokenPricingModel(
+            prompt_token_price=Decimal("32.00") / 1000000,  # $32.00 per 1M audio in
+            completion_token_price=Decimal("64.00") / 1000000,  # $64.00 per 1M audio out
+            cached_prompt_token_price=Decimal("0.40") / 1000000,  # $0.40 per 1M cached
         ),
         "gpt-4o-mini": TokenPricingModel(
             prompt_token_price=Decimal("0.15") / 1000000,  # $0.15 per 1M tokens
@@ -95,9 +115,15 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
             prompt_token_price=Decimal("0.15") / 1000000,  # $0.15 per 1M tokens
             completion_token_price=Decimal("0.60") / 1000000,  # $0.60 per 1M tokens
         ),
+        # Audio rates, for the reason above. OpenAI does not publish a separate
+        # mini-realtime audio price on the current page; these are the realtime
+        # audio rates and are the closest defensible figure. Flagged rather than
+        # left looking authoritative: if this model is used in volume, check it
+        # against an invoice.
         "gpt-4o-mini-realtime-preview": TokenPricingModel(
-            prompt_token_price=Decimal("0.60") / 1000000,  # $0.60 per 1M tokens
-            completion_token_price=Decimal("2.40") / 1000000,  # $2.40 per 1M tokens
+            prompt_token_price=Decimal("32.00") / 1000000,  # $32.00 per 1M audio in
+            completion_token_price=Decimal("64.00") / 1000000,  # $64.00 per 1M audio out
+            cached_prompt_token_price=Decimal("0.40") / 1000000,  # $0.40 per 1M cached
         ),
         "gpt-4o-search-preview": TokenPricingModel(
             prompt_token_price=Decimal("2.50") / 1000000,  # $2.50 per 1M tokens
@@ -163,13 +189,21 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
     # Absent entirely until 2026-08-09, so every Claude call cost zero.
     # platform.claude.com/docs/en/about-claude/pricing
     ServiceProviders.ANTHROPIC: {
+        # Anthropic reports cache reads OUTSIDE prompt_tokens and publishes the
+        # exact cached rate (0.1x input). Both TokenPricingModel defaults were
+        # wrong for Claude: the 50% discount was a GPT-4o-era figure, and
+        # subtracting it deducted a saving for tokens never charged.
         "claude-opus-5": TokenPricingModel(
             prompt_token_price=Decimal("5.00") / 1000000,  # $5 / MTok
             completion_token_price=Decimal("25.00") / 1000000,  # $25 / MTok
+            cached_prompt_token_price=Decimal("0.50") / 1000000,  # $0.50 / MTok
+            cached_tokens_included_in_prompt=False,
         ),
         "claude-opus-4-5": TokenPricingModel(
             prompt_token_price=Decimal("5.00") / 1000000,
             completion_token_price=Decimal("25.00") / 1000000,
+            cached_prompt_token_price=Decimal("0.50") / 1000000,
+            cached_tokens_included_in_prompt=False,
         ),
         # Introductory pricing, $2/$10, ENDS 2026-08-31 — reverts to $3/$15.
         # Left at the introductory rate deliberately: it is correct today, and a
@@ -177,14 +211,20 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
         "claude-sonnet-5": TokenPricingModel(
             prompt_token_price=Decimal("2.00") / 1000000,  # $2 / MTok (intro)
             completion_token_price=Decimal("10.00") / 1000000,  # $10 / MTok (intro)
+            cached_prompt_token_price=Decimal("0.20") / 1000000,  # $0.20 / MTok
+            cached_tokens_included_in_prompt=False,
         ),
         "claude-sonnet-4-5": TokenPricingModel(
             prompt_token_price=Decimal("3.00") / 1000000,  # $3 / MTok
             completion_token_price=Decimal("15.00") / 1000000,  # $15 / MTok
+            cached_prompt_token_price=Decimal("0.30") / 1000000,  # $0.30 / MTok
+            cached_tokens_included_in_prompt=False,
         ),
         "claude-haiku-4-5": TokenPricingModel(
             prompt_token_price=Decimal("1.00") / 1000000,  # $1 / MTok
             completion_token_price=Decimal("5.00") / 1000000,  # $5 / MTok
+            cached_prompt_token_price=Decimal("0.10") / 1000000,  # $0.10 / MTok
+            cached_tokens_included_in_prompt=False,
         ),
     },
     # ── Google Gemini ──────────────────────────────────────────────────────
