@@ -3,7 +3,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -14,6 +14,11 @@ from api.constants import (
 )
 from api.db import db_client
 from api.db.models import UserModel
+from api.services.compliance_statements import (
+    ACK_CALLING_HOURS_OFF,
+    CALLING_HOURS_OFF_STATEMENT,
+    CALLING_HOURS_OFF_VERSION,
+)
 from api.services.auth.depends import get_user
 from api.services.campaign.caller_id_capacity import (
     effective_concurrency_limit,
@@ -180,6 +185,10 @@ class CallingHoursConfigRequest(BaseModel):
     start: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     end: Optional[str] = Field(default=None, pattern=r"^\d{2}:\d{2}$")
     off_acknowledged_at: Optional[datetime] = None
+    # The wording the client actually displayed. Recorded alongside the
+    # server's canonical text so the two can be compared later; the server
+    # never trusts this as the statement, only as a report of what was shown.
+    off_acknowledged_statement: Optional[str] = Field(default=None, max_length=2000)
 
     @model_validator(mode="after")
     def validate_custom_has_both_times(self) -> "CallingHoursConfigRequest":
@@ -513,6 +522,7 @@ async def _get_telephony_configuration_name(
 @router.post("/create")
 async def create_campaign(
     request: CreateCampaignRequest,
+    http_request: Request,
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Create a new campaign"""
@@ -674,11 +684,65 @@ async def create_campaign(
         scheduled_timezone=request.scheduled_timezone,
     )
 
+    # Evidence, kept separate from enforcement. The validator above already
+    # refused mode='off' without an acknowledgement; this records WHO accepted
+    # WHAT, append-only, so it survives the campaign being edited or deleted.
+    await _record_calling_hours_acknowledgement(
+        request.calling_hours, campaign, user, http_request
+    )
+
     cfg_name = await _get_telephony_configuration_name(
         campaign.telephony_configuration_id, user.selected_organization_id
     )
     return _build_campaign_response(
         campaign, workflow_name, telephony_configuration_name=cfg_name
+    )
+
+
+async def _record_calling_hours_acknowledgement(
+    calling_hours,
+    campaign,
+    user: UserModel,
+    http_request: Optional[Request] = None,
+) -> None:
+    """Append an audit row when a campaign waives calling-hours enforcement.
+
+    Only mode='off' is recorded: 'inherit' and 'custom' both stay inside the
+    legal floor, so there is no risk being accepted and nothing to evidence.
+
+    Never raises. Enforcement already happened in the validator, so failing the
+    campaign because the evidence write failed would trade a real outcome for a
+    bookkeeping one. The client logs the failure loudly instead, so a gap is
+    visible rather than silent.
+    """
+    if not calling_hours or getattr(calling_hours, "mode", None) != "off":
+        return
+
+    context = {
+        "calling_hours_mode": "off",
+        "campaign_state": getattr(campaign, "state", None),
+    }
+    if http_request is not None:
+        # X-Forwarded-For first: the app sits behind nginx + a cloudflared
+        # tunnel, so request.client.host is the proxy, never the caller.
+        fwd = http_request.headers.get("x-forwarded-for", "")
+        context["ip"] = (
+            fwd.split(",")[0].strip()
+            or (http_request.client.host if http_request.client else None)
+        )
+        context["user_agent"] = http_request.headers.get("user-agent")
+
+    await db_client.record_acknowledgement(
+        organization_id=campaign.organization_id,
+        user_id=user.id,
+        campaign_id=campaign.id,
+        campaign_name=getattr(campaign, "name", None),
+        acknowledgement_type=ACK_CALLING_HOURS_OFF,
+        statement_text=CALLING_HOURS_OFF_STATEMENT,
+        statement_version=CALLING_HOURS_OFF_VERSION,
+        client_statement_text=getattr(calling_hours, "off_acknowledged_statement", None),
+        acknowledged_at=getattr(calling_hours, "off_acknowledged_at", None),
+        context=context,
     )
 
 
@@ -907,6 +971,7 @@ async def pause_campaign(
 async def update_campaign(
     campaign_id: int,
     request: UpdateCampaignRequest,
+    http_request: Request,
     user: UserModel = Depends(get_user),
 ) -> CampaignResponse:
     """Update campaign settings (name, retry config, max concurrency, schedule)"""
@@ -1040,6 +1105,14 @@ async def update_campaign(
     campaign = await db_client.get_campaign(campaign_id, org_id)
     workflow_name = await db_client.get_workflow_name(
         campaign.workflow_id, organization_id=campaign.organization_id
+    )
+
+    # An edit that switches an existing campaign to mode='off' is a NEW
+    # acceptance by whoever made the edit — not the creator, who may be someone
+    # else entirely. Appending here is what makes the table a history rather
+    # than a single overwritten timestamp.
+    await _record_calling_hours_acknowledgement(
+        request.calling_hours, campaign, user, http_request
     )
 
     executed, total = await _get_campaign_stats(campaign.id)
@@ -1544,3 +1617,69 @@ async def update_queued_run_endpoint(
         "scheduled_for": updated.scheduled_for.isoformat() if updated.scheduled_for else None,
         "retry_reason": updated.retry_reason,
     }
+
+
+class ComplianceAcknowledgementResponse(BaseModel):
+    id: int
+    organization_id: int
+    user_id: int
+    campaign_id: Optional[int] = None
+    campaign_name: Optional[str] = None
+    acknowledgement_type: str
+    statement_text: Optional[str] = None
+    statement_version: Optional[str] = None
+    client_statement_text: Optional[str] = None
+    acknowledged_at: datetime
+    context: Dict[str, Any] = Field(default_factory=dict)
+    # True when what the client displayed differs from the server's canonical
+    # wording. Surfaced rather than hidden: it means the two drifted, and which
+    # one the user actually saw becomes a question worth answering.
+    statement_mismatch: bool = False
+
+
+@router.get(
+    "/compliance/acknowledgements",
+    response_model=List[ComplianceAcknowledgementResponse],
+)
+async def list_compliance_acknowledgements(
+    campaign_id: Optional[int] = Query(default=None),
+    acknowledgement_type: Optional[str] = Query(default=None),
+    limit: int = Query(default=200, ge=1, le=1000),
+    user: UserModel = Depends(get_user),
+):
+    """Acknowledgement history for the org, newest first.
+
+    Read-only by construction — there is no write or delete endpoint, and the
+    table has no update path. Rows outlive the campaigns they refer to.
+    """
+    org_id = user.selected_organization_id
+    if not org_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+
+    rows = await db_client.list_acknowledgements(
+        organization_id=org_id,
+        campaign_id=campaign_id,
+        acknowledgement_type=acknowledgement_type,
+        limit=limit,
+    )
+    return [
+        ComplianceAcknowledgementResponse(
+            id=r.id,
+            organization_id=r.organization_id,
+            user_id=r.user_id,
+            campaign_id=r.campaign_id,
+            campaign_name=r.campaign_name,
+            acknowledgement_type=r.acknowledgement_type,
+            statement_text=r.statement_text,
+            statement_version=r.statement_version,
+            client_statement_text=r.client_statement_text,
+            acknowledged_at=r.acknowledged_at,
+            context=r.context or {},
+            statement_mismatch=bool(
+                r.client_statement_text
+                and r.statement_text
+                and r.client_statement_text.strip() != r.statement_text.strip()
+            ),
+        )
+        for r in rows
+    ]

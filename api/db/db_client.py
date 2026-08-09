@@ -1,5 +1,6 @@
 from api.db.agent_trigger_client import AgentTriggerClient
 from api.db.api_key_client import APIKeyClient
+from api.db.compliance_client import ComplianceDBClient
 from api.db.campaign_client import CampaignClient
 from api.db.embed_token_client import EmbedTokenClient
 from api.db.folder_client import FolderClient
@@ -49,6 +50,7 @@ class DBClient(
     VoiceLibraryClient,
     ProviderConnectionClient,
     PlatformSettingsClient,
+    ComplianceDBClient,
 ):
     """
     Unified database client that combines all specialized database operations.

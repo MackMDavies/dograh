@@ -19,6 +19,7 @@ from sqlalchemy import (
     and_,
     text,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import declarative_base, relationship
 
 from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG
@@ -1570,5 +1571,65 @@ class OrgAvailableModelModel(Base):
             "organization_id",
             "service_type",
             "is_client_available",
+        ),
+    )
+
+
+class ComplianceAcknowledgementModel(Base):
+    """Append-only evidence that a user accepted a stated compliance risk.
+
+    Nothing updates a row. A change of mind is a new row, so the sequence of
+    rows IS the history — which is the property `campaigns.orchestrator_metadata`
+    could not offer, since an update overwrote the previous timestamp.
+
+    `campaign_id` is ON DELETE SET NULL, not CASCADE: deleting a campaign must
+    not delete the proof that someone accepted the risk of running it.
+    `campaign_name` is denormalised so the record still names its subject
+    afterwards.
+    """
+
+    __tablename__ = "compliance_acknowledgements"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id"), nullable=False
+    )
+    # The actor. Never null: an acknowledgement nobody made is not one, and a
+    # NULL would be indistinguishable from an unattributed system write.
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    campaign_id = Column(
+        Integer, ForeignKey("campaigns.id", ondelete="SET NULL"), nullable=True
+    )
+    campaign_name = Column(String(255), nullable=True)
+
+    # String rather than an enum: adding a type must never need an
+    # `ALTER TYPE ... ADD VALUE`, which requires type ownership and has
+    # crash-looped this deployment before.
+    acknowledgement_type = Column(String(64), nullable=False)
+
+    # What the server believes was shown, and what the client says it showed.
+    # They should match; a mismatch is itself worth recording rather than
+    # silently trusting either one.
+    statement_text = Column(Text, nullable=True)
+    statement_version = Column(String(64), nullable=True)
+    client_statement_text = Column(Text, nullable=True)
+
+    acknowledged_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+    context = Column(
+        JSONB, nullable=False, default=dict, server_default=text("'{}'::jsonb")
+    )
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
+    )
+
+    __table_args__ = (
+        Index("idx_compliance_ack_org_time", "organization_id", "acknowledged_at"),
+        Index("idx_compliance_ack_campaign", "campaign_id"),
+        Index(
+            "idx_compliance_ack_type_time",
+            "acknowledgement_type",
+            "acknowledged_at",
         ),
     )
