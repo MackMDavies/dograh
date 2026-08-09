@@ -74,7 +74,7 @@ export const DEFAULT_WORKFLOW_CONFIGURATIONS: WorkflowConfigurations = {
     },
     max_call_duration: 600,  // 10 minutes
     max_user_idle_timeout: 10,  // 10 seconds
-    smart_turn_stop_secs: 2,  // 2 seconds
+    smart_turn_stop_secs: 0.6,  // matches the backend's "ultra-fast" default (run_pipeline.py)
     turn_stop_strategy: 'transcription',  // Default to transcription-based detection
     dictionary: ''
 };
