@@ -33,6 +33,7 @@ from api.services.campaign.caller_id_capacity import (
     effective_concurrency_limit,
     get_calls_per_number,
 )
+from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.configuration.masking import is_mask_of, mask_key
 from api.services.posthog_client import capture_event
 from api.services.telephony import registry as telephony_registry
