@@ -252,6 +252,10 @@ class CreateCampaignRequest(BaseModel):
     # a follow-up. When omitted, the dispatcher falls back to the org's
     # default config.
     telephony_configuration_id: Optional[int] = None
+    # The specific number to dial from. Must be assigned to this campaign's
+    # agent for outbound. Null leases across the config's whole outbound pool,
+    # which is what campaigns created before this field still do.
+    from_phone_number_id: Optional[int] = None
     retry_config: Optional[RetryConfigRequest] = None
     max_concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_SYSTEM_CONCURRENCY)
     schedule_config: Optional[ScheduleConfigRequest] = None
@@ -608,6 +612,27 @@ async def create_campaign(
         if default_cfg:
             telephony_configuration_id = default_cfg.id
 
+    # A pinned caller ID must be assigned to this campaign's agent for outbound.
+    # Without that check a campaign could dial as a number belonging to another
+    # agent, or as a number reserved to answer a published inbound line.
+    from_phone_number_id = request.from_phone_number_id
+    if from_phone_number_id:
+        pinned = await db_client.get_phone_number(from_phone_number_id)
+        if not pinned:
+            raise HTTPException(status_code=400, detail="phone_number_not_found")
+        if not user.is_superuser and pinned.organization_id != user.selected_organization_id:
+            raise HTTPException(status_code=404, detail="phone_number_not_found")
+        if pinned.outbound_workflow_id != request.workflow_id:
+            raise HTTPException(
+                status_code=400, detail="phone_number_not_assigned_to_agent_for_outbound"
+            )
+        if not pinned.is_active:
+            raise HTTPException(status_code=400, detail="phone_number_inactive")
+        # The number's own config wins. A campaign pointing at config A while
+        # dialling a number owned by config B would silently fall back to A's
+        # pool at dispatch time.
+        telephony_configuration_id = pinned.telephony_configuration_id
+
     # Build retry_config dict if provided
     retry_config = None
     if request.retry_config:
@@ -644,6 +669,7 @@ async def create_campaign(
         circuit_breaker=circuit_breaker_config,
         calling_hours_config=calling_hours_config,
         telephony_configuration_id=telephony_configuration_id,
+        from_phone_number_id=from_phone_number_id,
         scheduled_start_at=request.scheduled_start_at,
         scheduled_timezone=request.scheduled_timezone,
     )

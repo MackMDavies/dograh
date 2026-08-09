@@ -50,6 +50,7 @@ class CampaignClient(BaseDBClient):
         circuit_breaker: Optional[dict] = None,
         calling_hours_config: Optional[dict] = None,
         telephony_configuration_id: Optional[int] = None,
+        from_phone_number_id: Optional[int] = None,
         scheduled_start_at: Optional[datetime] = None,
         scheduled_timezone: Optional[str] = None,
     ) -> CampaignModel:
@@ -86,6 +87,7 @@ class CampaignClient(BaseDBClient):
                 else CampaignModel.retry_config.default.arg,
                 orchestrator_metadata=orchestrator_metadata,
                 telephony_configuration_id=telephony_configuration_id,
+                from_phone_number_id=from_phone_number_id,
                 state="scheduled" if scheduled_start_at else "created",
                 scheduled_start_at=scheduled_start_at,
                 scheduled_timezone=scheduled_timezone,

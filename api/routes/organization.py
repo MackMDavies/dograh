@@ -25,6 +25,7 @@ from api.schemas.telephony_phone_number import (
     PhoneNumberListResponse,
     PhoneNumberResponse,
     PhoneNumberUpdateRequest,
+    PhoneNumberUsageResponse,
     ProviderSyncStatus,
 )
 from api.services.auth.depends import get_user
@@ -189,10 +190,13 @@ async def _run_preprocess_hook(provider: str, credentials: dict) -> dict:
 
 
 def _phone_number_to_response(
-    row, inbound_workflow_name: Optional[str] = None
+    row,
+    inbound_workflow_name: Optional[str] = None,
+    outbound_workflow_name: Optional[str] = None,
 ) -> PhoneNumberResponse:
     response = PhoneNumberResponse.model_validate(row)
     response.inbound_workflow_name = inbound_workflow_name
+    response.outbound_workflow_name = outbound_workflow_name
     return response
 
 
@@ -485,7 +489,10 @@ async def list_phone_numbers(config_id: int, user: UserModel = Depends(get_user)
 
     rows = await db_client.list_phone_numbers_with_workflow_name_for_config(config_id)
     return PhoneNumberListResponse(
-        phone_numbers=[_phone_number_to_response(r, name) for r, name in rows]
+        phone_numbers=[
+            _phone_number_to_response(r, inbound_name, outbound_name)
+            for r, inbound_name, outbound_name in rows
+        ]
     )
 
 
@@ -610,16 +617,25 @@ async def update_phone_number(
         await _ensure_workflow_belongs_to_org(
             request.inbound_workflow_id, effective_org_id
         )
+    # Same ownership gate for outbound — assigning a number to dial out as an
+    # agent from another org would let one tenant place calls under another's
+    # identity.
+    if request.outbound_workflow_id is not None and not user.is_superuser:
+        await _ensure_workflow_belongs_to_org(
+            request.outbound_workflow_id, effective_org_id
+        )
 
     row = await db_client.update_phone_number(
         phone_number_id=phone_number_id,
         telephony_configuration_id=config_id,
         label=request.label,
         inbound_workflow_id=request.inbound_workflow_id,
+        outbound_workflow_id=request.outbound_workflow_id,
         is_active=request.is_active,
         country_code=request.country_code,
         extra_metadata=request.extra_metadata,
         clear_inbound_workflow=request.clear_inbound_workflow,
+        clear_outbound_workflow=request.clear_outbound_workflow,
     )
     if not row:
         raise HTTPException(status_code=404, detail="Phone number not found")
@@ -632,6 +648,58 @@ async def update_phone_number(
         config_id, effective_org_id, row.address
     )
     return response
+
+
+@router.get(
+    "/telephony-configs/{config_id}/phone-numbers/{phone_number_id}/usage",
+    response_model=PhoneNumberUsageResponse,
+)
+async def get_phone_number_usage(
+    config_id: int,
+    phone_number_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """Lifetime usage for one number: calls, campaigns, minutes, last used."""
+    effective_org_id = await _resolve_config_org_id(config_id, user)
+
+    row = await db_client.get_phone_number_for_config(phone_number_id, config_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Phone number not found")
+
+    usage = await db_client.get_phone_number_usage(
+        row.address_normalized, effective_org_id
+    )
+    return PhoneNumberUsageResponse(**usage)
+
+
+@router.get(
+    "/workflows/{workflow_id}/outbound-numbers",
+    response_model=PhoneNumberListResponse,
+)
+async def list_outbound_numbers_for_workflow(
+    workflow_id: int,
+    user: UserModel = Depends(get_user),
+):
+    """Numbers this agent may dial out as — the campaign wizard's caller list.
+
+    Inbound-only numbers are absent by construction: a number appears here only
+    when it carries this agent's ``outbound_workflow_id``.
+    """
+    org_id = user.selected_organization_id
+    if not org_id:
+        if not user.is_superuser:
+            raise HTTPException(status_code=400, detail="No organization selected")
+        wf = await db_client.get_workflow(workflow_id)
+        if not wf:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+        org_id = wf.organization_id
+    elif not user.is_superuser:
+        await _ensure_workflow_belongs_to_org(workflow_id, org_id)
+
+    rows = await db_client.list_outbound_numbers_for_workflow(workflow_id, org_id)
+    return PhoneNumberListResponse(
+        phone_numbers=[_phone_number_to_response(r) for r in rows]
+    )
 
 
 @router.post(

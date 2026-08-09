@@ -127,12 +127,41 @@ class CampaignCallDispatcher:
             return 0
 
         # Initialize from_number pool for this campaign's telephony config.
+        #
+        # A campaign pinned to one number narrows the pool to that number alone,
+        # rather than special-casing the lease path: leases, per-CLI caps and
+        # release all keep working unchanged. Safe only because a caller ID can
+        # now carry many simultaneous calls — under the old one-call-per-DID
+        # rule a pinned number would have capped the campaign at 1.
         try:
             provider = await self.get_provider_for_campaign(campaign)
-            if provider.from_numbers:
+            from_numbers = provider.from_numbers
+
+            pinned_id = getattr(campaign, "from_phone_number_id", None)
+            if pinned_id:
+                pinned = await db_client.get_phone_number_for_config(
+                    pinned_id, campaign.telephony_configuration_id
+                )
+                if pinned and pinned.is_active:
+                    from_numbers = [pinned.address_normalized]
+                    logger.info(
+                        f"Campaign {campaign_id} pinned to caller ID "
+                        f"{pinned.address_normalized}"
+                    )
+                else:
+                    # Released, deactivated, or moved to another config. Falling
+                    # back to the pool keeps the campaign dialling; failing here
+                    # would strand it with no obvious cause.
+                    logger.warning(
+                        f"Campaign {campaign_id} pins phone number {pinned_id}, "
+                        f"which is missing or inactive — falling back to the "
+                        f"config's outbound pool"
+                    )
+
+            if from_numbers:
                 await rate_limiter.initialize_from_number_pool(
                     campaign.organization_id,
-                    provider.from_numbers,
+                    from_numbers,
                     telephony_configuration_id=campaign.telephony_configuration_id,
                 )
         except Exception as e:
