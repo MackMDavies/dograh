@@ -122,8 +122,15 @@ class CostCalculator:
         llm_usage = usage_info.get("llm", {})
         for key, usage in llm_usage.items():
             processor, model = self._parse_key(key)
-            # Try to determine provider from processor name or model
-            provider = self._infer_provider_from_model(model, "llm")
+            # Processor first, model second. Azure resells OpenAI models under
+            # identical names, so `gpt-4.1-mini` is undecidable from the model
+            # alone and would always be priced as OpenAI. The processor is the
+            # only signal that separates them; it is used only when it actually
+            # identifies a provider, so a generic processor still falls through
+            # to the model name.
+            provider = self._infer_provider_from_processor(processor, "llm")
+            if provider == "unknown":
+                provider = self._infer_provider_from_model(model, "llm")
             _note_if_unpriced("llm", provider, model)
             cost = self.calculate_llm_cost(provider, model, usage)
             llm_cost_total += cost
@@ -196,30 +203,65 @@ class CostCalculator:
 
         model_lower = model.lower()
 
-        # OpenAI models
-        if any(keyword in model_lower for keyword in ["gpt", "whisper", "openai"]):
+        # Anthropic models. Absent until 2026-08-09, which made the Claude rates
+        # added that day UNREACHABLE: `claude-opus-5` fell through to the
+        # first-provider default below, was looked up under OPENAI, found
+        # nothing, and cost zero. The rates existed; the lookup never saw them.
+        if any(keyword in model_lower for keyword in ["claude", "anthropic"]):
+            return ServiceProviders.ANTHROPIC
+
+        # Google models — same story as Anthropic.
+        if any(keyword in model_lower for keyword in ["gemini", "google", "palm"]):
+            return ServiceProviders.GOOGLE
+
+        # OpenAI models. The o-series carries no "gpt" in its name, so it must be
+        # matched explicitly — it used to reach OpenAI only by accident of the
+        # first-provider default, which is now removed.
+        if any(
+            keyword in model_lower
+            for keyword in [
+                "gpt", "whisper", "openai", "codex", "davinci", "tts-1",
+                "computer-use",
+            ]
+        ):
+            return ServiceProviders.OPENAI
+        if model_lower.startswith(("o1", "o3", "o4")):
             return ServiceProviders.OPENAI
 
         # Groq models
-        if any(keyword in model_lower for keyword in ["groq"]):
+        if any(
+            keyword in model_lower
+            for keyword in ["groq", "llama", "deepseek", "mixtral"]
+        ):
             return ServiceProviders.GROQ
 
         # Elevenlabs models
         if any(keyword in model_lower for keyword in ["eleven"]):
             return ServiceProviders.ELEVENLABS
 
-        # Deepgram models
+        # Cartesia models
+        if any(keyword in model_lower for keyword in ["cartesia", "sonic"]):
+            return ServiceProviders.CARTESIA
+
+        # Deepgram models. "aura" is their TTS voice family.
         if any(
             keyword in model_lower
-            for keyword in ["deepgram", "nova", "phonecall", "general"]
+            for keyword in ["deepgram", "nova", "phonecall", "general", "aura", "flux"]
         ):
             return ServiceProviders.DEEPGRAM
 
-        # Default to first available provider for the service type
-        service_providers = self.pricing_registry.get(service_type, {})
-        if service_providers:
-            return list(service_providers.keys())[0]
-
+        # NO DEFAULT PROVIDER.
+        #
+        # This used to return the first provider registered for the service type
+        # — in practice always OPENAI — which meant an unrecognised model was
+        # silently attributed to the wrong provider, missed, and priced at zero.
+        # That is how Anthropic and Google rates could be added, verified present
+        # by grep, and still never used.
+        #
+        # Returning "unknown" makes the miss explicit: the lookup fails, the
+        # model is reported through cost_info.unpriced, and someone can add the
+        # keyword. A wrong provider is worse than no provider, because a wrong
+        # provider can silently find a same-named model and price against it.
         return "unknown"
 
     def _infer_provider_from_processor(self, processor: str, service_type: str) -> str:
@@ -228,6 +270,26 @@ class CostCalculator:
             return "unknown"
 
         processor_lower = processor.lower()
+
+        # Azure FIRST. It resells OpenAI models under identical names, so
+        # `gpt-4.1-mini` is ambiguous by model name alone and always resolves to
+        # OpenAI — the processor is the only thing that can tell them apart.
+        # Checked before the OpenAI branch because an Azure processor name may
+        # also contain "gpt".
+        if "azure" in processor_lower:
+            return ServiceProviders.AZURE
+
+        if "anthropic" in processor_lower or "claude" in processor_lower:
+            return ServiceProviders.ANTHROPIC
+
+        if any(keyword in processor_lower for keyword in ["google", "gemini"]):
+            return ServiceProviders.GOOGLE
+
+        if "cartesia" in processor_lower:
+            return ServiceProviders.CARTESIA
+
+        if "eleven" in processor_lower:
+            return ServiceProviders.ELEVENLABS
 
         # OpenAI processors
         if any(keyword in processor_lower for keyword in ["openai", "gpt"]):
@@ -241,10 +303,9 @@ class CostCalculator:
         if any(keyword in processor_lower for keyword in ["deepgram"]):
             return ServiceProviders.DEEPGRAM
 
-        # Default to first available provider for the service type
-        service_providers = self.pricing_registry.get(service_type, {})
-        if service_providers:
-            return list(service_providers.keys())[0]
+        # No default provider, for the same reason as _infer_provider_from_model:
+        # guessing one silently prices usage against the wrong supplier's rates.
+        return "unknown"
 
         return "unknown"
 

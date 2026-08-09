@@ -117,6 +117,108 @@ class TestProvidersThatUsedToCostNothing:
         ) == Decimal("12.00")  # $2 in + $10 out
 
 
+class TestEveryRegisteredModelIsReachable:
+    """
+    A rate that exists but cannot be looked up is worth exactly nothing.
+
+    This is the test that was missing. Anthropic and Google rates were added,
+    confirmed present with grep, and still priced every call at zero — because
+    `_infer_provider_from_model` knew nothing about "claude" or "gemini" and the
+    old first-provider default sent them to OPENAI, where they were not found.
+    Presence in the table is not reachability through the lookup.
+    """
+
+    PROCESSORS = {
+        "openai": "OpenAILLMService#0",
+        "azure": "AzureLLMService#0",
+        "anthropic": "AnthropicLLMService#0",
+        "google": "GoogleLLMService#0",
+        "groq": "GroqLLMService#0",
+        "elevenlabs": "ElevenLabsTTSService#0",
+        "deepgram": "DeepgramSTTService#0",
+        "cartesia": "CartesiaTTSService#0",
+    }
+
+    def _resolve(self, provider_value, model, service):
+        proc = self.PROCESSORS.get(provider_value, "")
+        got = cost_calculator._infer_provider_from_processor(proc, service)
+        if got == "unknown":
+            got = cost_calculator._infer_provider_from_model(model, service)
+        return got
+
+    def test_every_priced_model_resolves_to_its_own_provider(self):
+        from api.services.pricing.stt import STT_PRICING
+        from api.services.pricing.tts import TTS_PRICING
+
+        unreachable = []
+        for service, registry in (
+            ("llm", LLM_PRICING), ("tts", TTS_PRICING), ("stt", STT_PRICING)
+        ):
+            for provider, models in registry.items():
+                pv = getattr(provider, "value", provider)
+                for model in models:
+                    if model == "default":
+                        continue
+                    if self._resolve(pv, model, service) != provider:
+                        unreachable.append(f"{service}:{pv}/{model}")
+
+        assert not unreachable, (
+            "these models have a rate that the lookup can never reach, so they "
+            f"cost zero: {unreachable}"
+        )
+
+    def test_an_unknown_model_resolves_to_unknown_not_to_openai(self):
+        # The old default returned the first registered provider — always
+        # OPENAI — so an unrecognised model was silently attributed to the wrong
+        # supplier instead of being reported as unpriced.
+        assert cost_calculator._infer_provider_from_model(
+            "some-model-nobody-registered", "llm"
+        ) == "unknown"
+
+
+class TestModelsArePricedDifferently:
+    """Opus 5 and gpt-4o-mini must not cost the same for the same tokens."""
+
+    USAGE = {"prompt_tokens": 100_000, "completion_tokens": 20_000}
+
+    def _cost(self, processor, model):
+        return cost_calculator.calculate_total_cost(
+            {"llm": {f"{processor}|||{model}": self.USAGE}}
+        )["total"]
+
+    def test_opus_costs_far_more_than_mini(self):
+        opus = self._cost("AnthropicLLMService#0", "claude-opus-5")
+        mini = self._cost("OpenAILLMService#0", "gpt-4o-mini")
+        assert opus > mini * 10, f"opus={opus} mini={mini}"
+
+    def test_the_claude_tiers_are_ordered(self):
+        opus = self._cost("AnthropicLLMService#0", "claude-opus-5")
+        sonnet = self._cost("AnthropicLLMService#0", "claude-sonnet-5")
+        haiku = self._cost("AnthropicLLMService#0", "claude-haiku-4-5")
+        assert opus > sonnet > haiku > 0
+
+    def test_azure_is_distinguished_from_openai(self):
+        # Identical model name on both; only the processor can separate them.
+        assert cost_calculator._infer_provider_from_processor(
+            "AzureLLMService#0", "llm"
+        ) != cost_calculator._infer_provider_from_processor(
+            "OpenAILLMService#0", "llm"
+        )
+
+    def test_nothing_in_this_comparison_is_silently_unpriced(self):
+        for processor, model in [
+            ("AnthropicLLMService#0", "claude-opus-5"),
+            ("OpenAILLMService#0", "gpt-5"),
+            ("GoogleLLMService#0", "gemini-2.5-flash"),
+            ("OpenAILLMService#0", "gpt-4o-realtime-preview"),
+        ]:
+            result = cost_calculator.calculate_total_cost(
+                {"llm": {f"{processor}|||{model}": self.USAGE}}
+            )
+            assert "unpriced" not in result, f"{model} is unpriced"
+            assert result["total"] > 0, f"{model} costs nothing"
+
+
 class TestAudioSplitWhenReported:
     """If a provider ever does report an audio split, price it at the audio rate."""
 
