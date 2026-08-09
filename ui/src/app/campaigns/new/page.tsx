@@ -26,6 +26,7 @@ import {
     SelectTrigger,
     SelectValue,
 } from '@/components/ui/select';
+import { MAX_SYSTEM_CONCURRENCY } from '@/constants/concurrency';
 import { useAuth } from '@/lib/auth';
 
 import CampaignAdvancedSettings, { getTimezoneValue, type TimeSlot } from '../CampaignAdvancedSettings';
@@ -57,6 +58,8 @@ export default function NewCampaignPage() {
     const [showAdvancedSettings, setShowAdvancedSettings] = useState(false);
     const [orgConcurrentLimit, setOrgConcurrentLimit] = useState<number>(2);
     const [fromNumbersCount, setFromNumbersCount] = useState<number>(0);
+    // null = no per-CLI cap (the default): caller-ID count does not bound concurrency.
+    const [callsPerNumber, setCallsPerNumber] = useState<number | null>(null);
     const [maxConcurrency, setMaxConcurrency] = useState<string>('');
     // Retry config state
     const [retryEnabled, setRetryEnabled] = useState(true);
@@ -156,6 +159,7 @@ export default function NewCampaignPage() {
             if (response.data) {
                 setOrgConcurrentLimit(response.data.concurrent_call_limit);
                 setFromNumbersCount(response.data.from_numbers_count);
+                setCallsPerNumber(response.data.calls_per_number ?? null);
 
                 const last = (response.data as { last_campaign_settings?: {
                     retry_config?: { enabled: boolean; max_retries: number; retry_delay_seconds: number; retry_on_busy: boolean; retry_on_no_answer: boolean; retry_on_voicemail: boolean };
@@ -229,9 +233,11 @@ export default function NewCampaignPage() {
     );
     const availableFromNumbersCount = selectedTelephonyConfig?.phone_number_count ?? fromNumbersCount;
 
-    // Effective concurrency limit considering both org limit and available CLIs
-    const effectiveLimit = availableFromNumbersCount > 0
-        ? Math.min(orgConcurrentLimit, availableFromNumbersCount)
+    // Caller-ID supply only bounds concurrency when a per-CLI cap is configured.
+    // With no cap (the default) one number carries the org's whole limit, so a
+    // single configured DID must not pin the campaign to a concurrency of 1.
+    const effectiveLimit = callsPerNumber !== null && availableFromNumbersCount > 0
+        ? Math.min(orgConcurrentLimit, availableFromNumbersCount * callsPerNumber)
         : orgConcurrentLimit;
 
     // Handle form submission
@@ -247,13 +253,13 @@ export default function NewCampaignPage() {
         // Validate max_concurrency if provided
         const maxConcurrencyValue = maxConcurrency ? parseInt(maxConcurrency) : null;
         if (maxConcurrencyValue !== null) {
-            if (isNaN(maxConcurrencyValue) || maxConcurrencyValue < 1 || maxConcurrencyValue > 100) {
-                toast.error('Max concurrent calls must be between 1 and 100');
+            if (isNaN(maxConcurrencyValue) || maxConcurrencyValue < 1 || maxConcurrencyValue > MAX_SYSTEM_CONCURRENCY) {
+                toast.error(`Max concurrent calls must be between 1 and ${MAX_SYSTEM_CONCURRENCY}`);
                 return;
             }
             if (maxConcurrencyValue > effectiveLimit) {
-                if (availableFromNumbersCount > 0 && availableFromNumbersCount < orgConcurrentLimit) {
-                    toast.error(`Max concurrent calls cannot exceed ${effectiveLimit}. The selected configuration has ${availableFromNumbersCount} phone number(s) — add more CLIs to increase concurrency.`);
+                if (callsPerNumber !== null && effectiveLimit < orgConcurrentLimit) {
+                    toast.error(`Max concurrent calls cannot exceed ${effectiveLimit}. The selected configuration has ${availableFromNumbersCount} phone number(s) at ${callsPerNumber} call(s) each — add more CLIs, or raise calls-per-number, to increase concurrency.`);
                 } else {
                     toast.error(`Max concurrent calls cannot exceed organization limit (${effectiveLimit})`);
                 }
@@ -515,7 +521,8 @@ export default function NewCampaignPage() {
                                         onMaxConcurrencyChange={setMaxConcurrency}
                                         effectiveLimit={effectiveLimit}
                                         orgConcurrentLimit={orgConcurrentLimit}
-                                        fromNumbersCount={fromNumbersCount}
+                                        fromNumbersCount={availableFromNumbersCount}
+                                        callsPerNumber={callsPerNumber}
                                         retryEnabled={retryEnabled}
                                         onRetryEnabledChange={setRetryEnabled}
                                         maxRetries={maxRetries}

@@ -10,38 +10,28 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from api.constants import (
     DEFAULT_CAMPAIGN_RETRY_CONFIG,
-    DEFAULT_ORG_CONCURRENCY_LIMIT,
+    MAX_SYSTEM_CONCURRENCY,
 )
 from api.db import db_client
 from api.db.models import UserModel
-from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
+from api.services.campaign.caller_id_capacity import (
+    effective_concurrency_limit,
+    get_calls_per_number,
+)
 from api.services.campaign.runner import (
     CampaignValidationError,
     campaign_runner_service,
     validate_campaign_startable,
 )
 from api.services.campaign.source_sync import CampaignSourceSyncService
+from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.campaign.source_sync_factory import get_sync_service
 from api.services.quota_service import check_dograh_quota
 from api.services.reports import generate_campaign_report_csv
 from api.services.storage import storage_fs
 
 router = APIRouter(prefix="/campaign")
-
-
-async def _get_org_concurrent_limit(organization_id: int) -> int:
-    """Get the concurrent call limit for an organization."""
-    try:
-        config = await db_client.get_configuration(
-            organization_id,
-            OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
-        )
-        if config and config.value:
-            return int(config.value.get("value", DEFAULT_ORG_CONCURRENCY_LIMIT))
-    except Exception:
-        pass
-    return DEFAULT_ORG_CONCURRENCY_LIMIT
 
 
 async def _get_from_numbers_count(organization_id: int) -> int:
@@ -62,20 +52,33 @@ async def _get_from_numbers_count(organization_id: int) -> int:
 
 
 async def _validate_max_concurrency(max_concurrency: int, organization_id: int) -> None:
-    """Validate max_concurrency against org limit and configured phone numbers.
+    """Validate max_concurrency against the org limit and caller-ID capacity.
+
+    Caller-ID supply only bounds concurrency when the org has opted into a
+    per-CLI cap (``CALLS_PER_NUMBER``); by default one number can carry the
+    org's whole limit, so a single configured DID no longer pins a campaign to
+    a concurrency of 1.
 
     Raises HTTPException(400) if the value exceeds the effective limit.
     """
-    org_limit = await _get_org_concurrent_limit(organization_id)
+    org_limit = await get_org_concurrency_limit(organization_id)
+    calls_per_number = await get_calls_per_number(organization_id)
     from_numbers_count = await _get_from_numbers_count(organization_id)
-    effective_limit = (
-        min(org_limit, from_numbers_count) if from_numbers_count > 0 else org_limit
+    effective_limit = effective_concurrency_limit(
+        org_limit, from_numbers_count, calls_per_number
     )
     if max_concurrency > effective_limit:
-        if from_numbers_count > 0 and from_numbers_count < org_limit:
+        if effective_limit < org_limit:
             raise HTTPException(
                 status_code=400,
-                detail=f"max_concurrency ({max_concurrency}) cannot exceed {effective_limit}. You have {from_numbers_count} phone number(s) configured. Add more CLIs in telephony configuration to increase concurrency.",
+                detail=(
+                    f"max_concurrency ({max_concurrency}) cannot exceed "
+                    f"{effective_limit}. You have {from_numbers_count} phone "
+                    f"number(s) configured and this organization allows "
+                    f"{calls_per_number} simultaneous call(s) per number. Add "
+                    "more CLIs in telephony configuration, or raise the "
+                    "calls-per-number setting, to increase concurrency."
+                ),
             )
         raise HTTPException(
             status_code=400,
@@ -249,8 +252,12 @@ class CreateCampaignRequest(BaseModel):
     # a follow-up. When omitted, the dispatcher falls back to the org's
     # default config.
     telephony_configuration_id: Optional[int] = None
+    # The specific number to dial from. Must be assigned to this campaign's
+    # agent for outbound. Null leases across the config's whole outbound pool,
+    # which is what campaigns created before this field still do.
+    from_phone_number_id: Optional[int] = None
     retry_config: Optional[RetryConfigRequest] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
+    max_concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_SYSTEM_CONCURRENCY)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
     calling_hours: Optional[CallingHoursConfigRequest] = None
@@ -287,7 +294,7 @@ class EnqueueRunRequest(BaseModel):
 class UpdateCampaignRequest(BaseModel):
     name: Optional[str] = Field(None, min_length=1, max_length=255)
     retry_config: Optional[RetryConfigRequest] = None
-    max_concurrency: Optional[int] = Field(default=None, ge=1, le=100)
+    max_concurrency: Optional[int] = Field(default=None, ge=1, le=MAX_SYSTEM_CONCURRENCY)
     schedule_config: Optional[ScheduleConfigRequest] = None
     circuit_breaker: Optional[CircuitBreakerConfigRequest] = None
     calling_hours: Optional[CallingHoursConfigRequest] = None
@@ -605,6 +612,27 @@ async def create_campaign(
         if default_cfg:
             telephony_configuration_id = default_cfg.id
 
+    # A pinned caller ID must be assigned to this campaign's agent for outbound.
+    # Without that check a campaign could dial as a number belonging to another
+    # agent, or as a number reserved to answer a published inbound line.
+    from_phone_number_id = request.from_phone_number_id
+    if from_phone_number_id:
+        pinned = await db_client.get_phone_number(from_phone_number_id)
+        if not pinned:
+            raise HTTPException(status_code=400, detail="phone_number_not_found")
+        if not user.is_superuser and pinned.organization_id != user.selected_organization_id:
+            raise HTTPException(status_code=404, detail="phone_number_not_found")
+        if pinned.outbound_workflow_id != request.workflow_id:
+            raise HTTPException(
+                status_code=400, detail="phone_number_not_assigned_to_agent_for_outbound"
+            )
+        if not pinned.is_active:
+            raise HTTPException(status_code=400, detail="phone_number_inactive")
+        # The number's own config wins. A campaign pointing at config A while
+        # dialling a number owned by config B would silently fall back to A's
+        # pool at dispatch time.
+        telephony_configuration_id = pinned.telephony_configuration_id
+
     # Build retry_config dict if provided
     retry_config = None
     if request.retry_config:
@@ -641,6 +669,7 @@ async def create_campaign(
         circuit_breaker=circuit_breaker_config,
         calling_hours_config=calling_hours_config,
         telephony_configuration_id=telephony_configuration_id,
+        from_phone_number_id=from_phone_number_id,
         scheduled_start_at=request.scheduled_start_at,
         scheduled_timezone=request.scheduled_timezone,
     )

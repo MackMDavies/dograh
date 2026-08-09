@@ -241,6 +241,14 @@ class TelephonyPhoneNumberModel(Base):
         ForeignKey("workflows.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # The agent this number dials OUT as. Independent of inbound: a number
+    # carrying only inbound_workflow_id is inbound-only and is never dialled
+    # from, which is what makes a dedicated published inbound line possible.
+    outbound_workflow_id = Column(
+        Integer,
+        ForeignKey("workflows.id", ondelete="SET NULL"),
+        nullable=True,
+    )
     is_active = Column(
         Boolean, nullable=False, default=True, server_default=text("true")
     )
@@ -260,7 +268,16 @@ class TelephonyPhoneNumberModel(Base):
     configuration = relationship(
         "TelephonyConfigurationModel", back_populates="phone_numbers"
     )
-    inbound_workflow = relationship("WorkflowModel")
+    # foreign_keys is required on both: this table now has two FKs to workflows
+    # (inbound and outbound), so SQLAlchemy cannot infer either join on its own
+    # and raises AmbiguousForeignKeysError when the mappers configure — which
+    # happens on first query, not at import.
+    inbound_workflow = relationship(
+        "WorkflowModel", foreign_keys=[inbound_workflow_id]
+    )
+    outbound_workflow = relationship(
+        "WorkflowModel", foreign_keys=[outbound_workflow_id]
+    )
 
     __table_args__ = (
         UniqueConstraint(
@@ -686,6 +703,14 @@ class CampaignModel(Base):
     # org's default config by the migration; will become NOT NULL in a follow-up.
     telephony_configuration_id = Column(
         Integer, ForeignKey("telephony_configurations.id"), nullable=True
+    )
+    # The specific number this campaign dials from. Null falls back to leasing
+    # across the config's whole outbound pool, which is the pre-existing
+    # behaviour and what campaigns created before this column still do.
+    from_phone_number_id = Column(
+        Integer,
+        ForeignKey("telephony_phone_numbers.id", ondelete="SET NULL"),
+        nullable=True,
     )
 
     # Source configuration

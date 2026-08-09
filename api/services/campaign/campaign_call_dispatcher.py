@@ -16,7 +16,9 @@ from api.services.campaign.errors import (
     PhoneNumberPoolExhaustedError,
     SuppressedNumberError,
 )
-from api.services.campaign.rate_limiter import rate_limiter
+from api.services.campaign.caller_id_capacity import get_calls_per_number
+from api.services.campaign.rate_limiter import FromNumberLease, rate_limiter
+from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.dial_permission_check import check_dial_permitted
 from api.utils.common import get_backend_endpoints
 
@@ -63,19 +65,12 @@ class CampaignCallDispatcher:
         return await get_default_telephony_provider(campaign.organization_id)
 
     async def get_org_concurrent_limit(self, organization_id: int) -> int:
-        """Get the concurrent call limit for an organization."""
-        try:
-            config = await db_client.get_configuration(
-                organization_id,
-                OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
-            )
-            if config and config.value:
-                return int(config.value["value"])
-        except Exception as e:
-            logger.warning(
-                f"Error getting concurrent limit for org {organization_id}: {e}"
-            )
-        return self.default_concurrent_limit
+        """Get the concurrent call limit for an organization.
+
+        Delegates to the shared resolver so the system-wide ceiling applies
+        here too (see api/services/org_concurrency.py).
+        """
+        return await get_org_concurrency_limit(organization_id)
 
     async def process_batch(self, campaign_id: int, batch_size: int = 10) -> int:
         """
@@ -132,12 +127,41 @@ class CampaignCallDispatcher:
             return 0
 
         # Initialize from_number pool for this campaign's telephony config.
+        #
+        # A campaign pinned to one number narrows the pool to that number alone,
+        # rather than special-casing the lease path: leases, per-CLI caps and
+        # release all keep working unchanged. Safe only because a caller ID can
+        # now carry many simultaneous calls — under the old one-call-per-DID
+        # rule a pinned number would have capped the campaign at 1.
         try:
             provider = await self.get_provider_for_campaign(campaign)
-            if provider.from_numbers:
+            from_numbers = provider.from_numbers
+
+            pinned_id = getattr(campaign, "from_phone_number_id", None)
+            if pinned_id:
+                pinned = await db_client.get_phone_number_for_config(
+                    pinned_id, campaign.telephony_configuration_id
+                )
+                if pinned and pinned.is_active:
+                    from_numbers = [pinned.address_normalized]
+                    logger.info(
+                        f"Campaign {campaign_id} pinned to caller ID "
+                        f"{pinned.address_normalized}"
+                    )
+                else:
+                    # Released, deactivated, or moved to another config. Falling
+                    # back to the pool keeps the campaign dialling; failing here
+                    # would strand it with no obvious cause.
+                    logger.warning(
+                        f"Campaign {campaign_id} pins phone number {pinned_id}, "
+                        f"which is missing or inactive — falling back to the "
+                        f"config's outbound pool"
+                    )
+
+            if from_numbers:
                 await rate_limiter.initialize_from_number_pool(
                     campaign.organization_id,
-                    provider.from_numbers,
+                    from_numbers,
                     telephony_configuration_id=campaign.telephony_configuration_id,
                 )
         except Exception as e:
@@ -326,6 +350,38 @@ class CampaignCallDispatcher:
                 # Re-raise to propagate to process_campaign_batch
                 raise
 
+            except TimeoutError as e:
+                # apply_rate_limit gives up after 1s of pacing pressure. That is
+                # a transient "try again shortly", NOT a failed call, and the
+                # contact was never dialled.
+                #
+                # Deliberately neither failed nor re-raised:
+                #   - falling through to the generic handler below would mark
+                #     the lead permanently failed and count it against the
+                #     campaign, losing a perfectly good contact to pacing;
+                #   - re-raising would reach process_campaign_batch's generic
+                #     `except Exception`, which sets the whole campaign to
+                #     "failed" — the two exhaustion paths above only survive
+                #     that because they have dedicated retry-counter handlers.
+                # So: hand the untouched claims back and end this batch early.
+                # The orchestrator schedules the next one and they redial.
+                #
+                # This path barely fired while concurrency was effectively 1.
+                # With MAX_SYSTEM_CONCURRENCY reachable, the dispatcher fills
+                # slots far faster than rate_limit_per_second (DB default: 1)
+                # permits, so it is now routine.
+                logger.warning(
+                    f"Rate limit timeout for campaign {campaign_id} after "
+                    f"{processed_count} dispatched; returning the remaining "
+                    f"claimed queued runs to the queue: {e}"
+                )
+                await self._return_unprocessed_claims(
+                    queued_runs,
+                    processed_run_ids,
+                    reason="rate_limit_timeout",
+                )
+                break
+
             except SuppressedNumberError as e:
                 logger.info(
                     f"Skipping queued run {queued_run.id} for campaign {campaign_id}: "
@@ -464,11 +520,11 @@ class CampaignCallDispatcher:
         # Acquire a unique from_number from the pool scoped to this campaign's
         # telephony configuration so orgs with multiple configs don't leak
         # caller IDs across configs.
-        from_number = await self.acquire_from_number(
+        lease = await self.acquire_from_number(
             campaign.organization_id,
             telephony_configuration_id=campaign.telephony_configuration_id,
         )
-        if from_number is None:
+        if lease is None:
             # Release concurrent slot before raising
             await rate_limiter.release_concurrent_slot(
                 campaign.organization_id, slot_id
@@ -476,6 +532,7 @@ class CampaignCallDispatcher:
             raise PhoneNumberPoolExhaustedError(
                 organization_id=campaign.organization_id
             )
+        from_number = lease.number
 
         logger.info(f"Provider name: {provider.PROVIDER_NAME}")
         logger.info(f"Queued run context: {queued_run.context_variables}")
@@ -517,6 +574,7 @@ class CampaignCallDispatcher:
                 campaign.organization_id,
                 from_number,
                 telephony_configuration_id=campaign.telephony_configuration_id,
+                lease_id=lease.lease_id,
             )
         except Exception as e:
             # Release slot and from_number on error
@@ -528,6 +586,7 @@ class CampaignCallDispatcher:
                     campaign.organization_id,
                     from_number,
                     telephony_configuration_id=campaign.telephony_configuration_id,
+                    lease_id=lease.lease_id,
                 )
             raise
 
@@ -642,9 +701,12 @@ class CampaignCallDispatcher:
                 workflow_run.id
             )
             if from_number_mapping:
-                fn_org_id, fn_number, fn_tcid = from_number_mapping
+                fn_org_id, fn_number, fn_tcid, fn_lease = from_number_mapping
                 await rate_limiter.release_from_number(
-                    fn_org_id, fn_number, telephony_configuration_id=fn_tcid
+                    fn_org_id,
+                    fn_number,
+                    telephony_configuration_id=fn_tcid,
+                    lease_id=fn_lease,
                 )
                 await rate_limiter.delete_workflow_from_number_mapping(workflow_run.id)
 
@@ -748,22 +810,28 @@ class CampaignCallDispatcher:
         organization_id: int,
         telephony_configuration_id: int | None,
         timeout: float = 600,
-    ) -> Optional[str]:
+    ) -> Optional["FromNumberLease"]:
         """
-        Acquire a from_number from the (org, telephony config) pool with retry.
+        Take a caller-ID lease from the (org, telephony config) pool with retry.
         Waits up to timeout seconds, polling every 1s.
 
+        By default a caller ID may back unlimited simultaneous calls, so this
+        only blocks when the org has explicitly configured a per-CLI cap.
+
         Returns:
-            The acquired phone number as a string, or None if timeout is exceeded.
+            A FromNumberLease, or None if timeout is exceeded.
         """
         wait_start = time.time()
+        calls_per_number = await get_calls_per_number(organization_id)
 
         while True:
-            from_number = await rate_limiter.acquire_from_number(
-                organization_id, telephony_configuration_id
+            lease = await rate_limiter.acquire_from_number(
+                organization_id,
+                telephony_configuration_id,
+                calls_per_number=calls_per_number,
             )
-            if from_number:
-                return from_number
+            if lease:
+                return lease
 
             wait_time = time.time() - wait_start
             if wait_time > timeout:
@@ -803,9 +871,12 @@ class CampaignCallDispatcher:
             workflow_run_id
         )
         if from_number_mapping:
-            fn_org_id, fn_number, fn_tcid = from_number_mapping
+            fn_org_id, fn_number, fn_tcid, fn_lease = from_number_mapping
             fn_success = await rate_limiter.release_from_number(
-                fn_org_id, fn_number, telephony_configuration_id=fn_tcid
+                fn_org_id,
+                fn_number,
+                telephony_configuration_id=fn_tcid,
+                lease_id=fn_lease,
             )
             if fn_success:
                 await rate_limiter.delete_workflow_from_number_mapping(workflow_run_id)

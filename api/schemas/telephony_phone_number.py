@@ -70,6 +70,12 @@ class PhoneNumberUpdateRequest(BaseModel):
     # Set to true to clear inbound_workflow_id (FK is otherwise non-nullable
     # via the partial-update pattern).
     clear_inbound_workflow: bool = False
+    # The agent this number dials out as. Independent of inbound: clearing one
+    # direction never touches the other, so a number can be made inbound-only
+    # (and thus dropped from the outbound caller-ID pool) without losing the
+    # agent that answers it.
+    outbound_workflow_id: Optional[int] = None
+    clear_outbound_workflow: bool = False
     is_active: Optional[bool] = None
     country_code: Optional[str] = Field(default=None, min_length=2, max_length=2)
     extra_metadata: Optional[Dict[str, Any]] = None
@@ -99,6 +105,8 @@ class PhoneNumberResponse(BaseModel):
     label: Optional[str] = None
     inbound_workflow_id: Optional[int] = None
     inbound_workflow_name: Optional[str] = None
+    outbound_workflow_id: Optional[int] = None
+    outbound_workflow_name: Optional[str] = None
     is_active: bool
     is_default_caller_id: bool
     extra_metadata: Dict[str, Any]
@@ -111,3 +119,20 @@ class PhoneNumberResponse(BaseModel):
 
 class PhoneNumberListResponse(BaseModel):
     phone_numbers: list[PhoneNumberResponse]
+
+
+class PhoneNumberUsageResponse(BaseModel):
+    """Lifetime usage for one number — the expandable row on the numbers page.
+
+    Derived from ``workflow_runs``, which record the number they actually
+    dialled rather than a foreign key, so figures survive the number being
+    reassigned between agents.
+    """
+
+    total_calls: int
+    campaign_count: int
+    total_minutes: float
+    last_used_at: Optional[datetime] = None
+    first_used_at: Optional[datetime] = None
+    # call_type -> count, e.g. {"outbound": 412, "inbound": 37}
+    by_direction: Dict[str, int] = Field(default_factory=dict)

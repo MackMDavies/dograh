@@ -30,6 +30,7 @@ from api.services.campaign.errors import (
     PhoneNumberPoolExhaustedError,
     SuppressedNumberError,
 )
+from api.services.campaign.rate_limiter import FromNumberLease
 
 # =============================================================================
 # Test-specific fixtures
@@ -233,7 +234,7 @@ def mock_rate_limiter():
         return True
 
     async def mock_acquire_from_number(*args, **kwargs):
-        return "+15551234567"
+        return FromNumberLease(number="+15551234567", lease_id="lease-test")
 
     async def mock_release_from_number(*args, **kwargs):
         return True
@@ -731,6 +732,98 @@ class TestProcessBatchCancellation:
             mock_db.return_processing_queued_runs_without_workflow.assert_awaited_once_with(
                 [101, 102, 103]
             )
+
+
+class TestProcessBatchRateLimitTimeout:
+    """Pacing pressure must cost time, never leads.
+
+    apply_rate_limit raises TimeoutError when it cannot get a token within 1s.
+    rate_limit_per_second defaults to 1 in the DB and no route or UI sets it, so
+    once concurrency can actually reach MAX_SYSTEM_CONCURRENCY the dispatcher
+    asks for slots far faster than pacing allows and this path becomes routine
+    rather than theoretical.
+
+    Two wrong outcomes it must avoid:
+      - the generic handler marking the contact permanently 'failed' (a lead
+        lost to pacing, counted against the campaign);
+      - propagating out to process_campaign_batch, whose generic
+        `except Exception` sets the whole campaign to 'failed'.
+    """
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_timeout_requeues_instead_of_failing(self):
+        dispatcher = CampaignCallDispatcher()
+        campaign = MagicMock()
+        campaign.id = 42
+        campaign.state = "running"
+        campaign.organization_id = 7
+        campaign.rate_limit_per_second = 1
+        campaign.telephony_configuration_id = 170
+        campaign.orchestrator_metadata = {}
+
+        queued_runs = [
+            MagicMock(id=101, context_variables={"phone_number": "+15551110001"}),
+            MagicMock(id=102, context_variables={"phone_number": "+15551110002"}),
+            MagicMock(id=103, context_variables={"phone_number": "+15551110003"}),
+        ]
+        provider = MagicMock()
+        provider.from_numbers = []
+
+        with (
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.workflow_active_check.check_workflow_active",
+                AsyncMock(return_value=(True, None)),
+            ),
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                AsyncMock(return_value=(True, None, None)),
+            ),
+            patch.object(
+                dispatcher,
+                "get_provider_for_campaign",
+                AsyncMock(return_value=provider),
+            ),
+            patch.object(
+                dispatcher,
+                "apply_rate_limit",
+                AsyncMock(side_effect=TimeoutError("Rate limit timeout")),
+            ),
+        ):
+            mock_db.get_campaign_by_id = AsyncMock(return_value=campaign)
+            mock_db.claim_queued_runs_for_processing = AsyncMock(
+                return_value=queued_runs
+            )
+            mock_db.return_processing_queued_runs_without_workflow = AsyncMock(
+                return_value=3
+            )
+            mock_db.update_queued_run = AsyncMock()
+            mock_db.increment_campaign_failed_rows = AsyncMock()
+            mock_db.append_campaign_log = AsyncMock()
+
+            # Must not raise: a raise here reaches process_campaign_batch's
+            # generic handler and fails the entire campaign.
+            processed = await dispatcher.process_batch(campaign_id=42, batch_size=3)
+
+        assert processed == 0
+
+        # Every claimed run goes back to queued, untouched.
+        mock_db.return_processing_queued_runs_without_workflow.assert_awaited_once_with(
+            [101, 102, 103]
+        )
+
+        # And none of them is recorded as a failure.
+        mock_db.increment_campaign_failed_rows.assert_not_awaited()
+        failed_states = [
+            call.kwargs.get("state")
+            for call in mock_db.update_queued_run.await_args_list
+        ]
+        assert "failed" not in failed_states, (
+            "a pacing timeout must never mark a contact failed — it was never "
+            f"dialled; got update_queued_run states {failed_states}"
+        )
 
 
 class TestProcessBatchEdgeCases:
