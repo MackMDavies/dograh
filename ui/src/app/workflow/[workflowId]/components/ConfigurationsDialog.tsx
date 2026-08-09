@@ -39,7 +39,7 @@ export const ConfigurationsDialog = ({
         workflowConfigurations?.max_user_idle_timeout || 10  // Default 10 seconds
     );
     const [smartTurnStopSecs, setSmartTurnStopSecs] = useState<number>(
-        workflowConfigurations?.smart_turn_stop_secs || 2  // Default 2 seconds
+        workflowConfigurations?.smart_turn_stop_secs || 0.6  // matches the backend's "ultra-fast" default
     );
     const [turnStopStrategy, setTurnStopStrategy] = useState<TurnStopStrategy>(
         workflowConfigurations?.turn_stop_strategy || 'transcription'
@@ -75,7 +75,7 @@ export const ConfigurationsDialog = ({
             setAmbientNoiseConfig(workflowConfigurations?.ambient_noise_configuration || DEFAULT_AMBIENT_NOISE_CONFIG);
             setMaxCallDuration(workflowConfigurations?.max_call_duration || 600);
             setMaxUserIdleTimeout(workflowConfigurations?.max_user_idle_timeout || 10);
-            setSmartTurnStopSecs(workflowConfigurations?.smart_turn_stop_secs || 2);
+            setSmartTurnStopSecs(workflowConfigurations?.smart_turn_stop_secs || 0.6);
             setTurnStopStrategy(workflowConfigurations?.turn_stop_strategy || 'transcription');
             setContextCompactionEnabled(workflowConfigurations?.context_compaction_enabled ?? false);
         }
@@ -214,7 +214,7 @@ export const ConfigurationsDialog = ({
                                     }}
                                 />
                                 <p className="text-xs text-muted-foreground">
-                                    Max silence duration before ending an incomplete turn. Default: 2 seconds
+                                    Max silence duration before ending an incomplete turn. Default: 0.6 seconds
                                 </p>
                             </div>
                         )}

@@ -264,7 +264,7 @@ function GeneralSection({
     );
     const [maxCallDuration, setMaxCallDuration] = useState(workflowConfigurations.max_call_duration || 600);
     const [maxUserIdleTimeout, setMaxUserIdleTimeout] = useState(workflowConfigurations.max_user_idle_timeout || 10);
-    const [smartTurnStopSecs, setSmartTurnStopSecs] = useState(workflowConfigurations.smart_turn_stop_secs || 2);
+    const [smartTurnStopSecs, setSmartTurnStopSecs] = useState(workflowConfigurations.smart_turn_stop_secs || 0.6);
     const [turnStopStrategy, setTurnStopStrategy] = useState<TurnStopStrategy>(
         workflowConfigurations.turn_stop_strategy || "transcription",
     );
@@ -284,7 +284,7 @@ function GeneralSection({
             JSON.stringify(ambientNoiseConfig) !== JSON.stringify(initAmbient) ||
             maxCallDuration !== (workflowConfigurations.max_call_duration || 600) ||
             maxUserIdleTimeout !== (workflowConfigurations.max_user_idle_timeout || 10) ||
-            smartTurnStopSecs !== (workflowConfigurations.smart_turn_stop_secs || 2) ||
+            smartTurnStopSecs !== (workflowConfigurations.smart_turn_stop_secs || 0.6) ||
             turnStopStrategy !== (workflowConfigurations.turn_stop_strategy || "transcription") ||
             contextCompactionEnabled !== (workflowConfigurations.context_compaction_enabled ?? false)
         );
@@ -570,7 +570,7 @@ function GeneralSection({
                                 }}
                             />
                             <p className="text-xs text-muted-foreground">
-                                Max silence duration before ending an incomplete turn. Default: 2 seconds
+                                Max silence duration before ending an incomplete turn. Default: 0.6 seconds
                             </p>
                         </div>
                     )}
