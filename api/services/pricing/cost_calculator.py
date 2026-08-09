@@ -38,6 +38,8 @@ Usage:
 from decimal import Decimal
 from typing import Any, Dict, Optional, Tuple
 
+from loguru import logger
+
 from api.services.configuration.registry import ServiceProviders
 from api.services.pricing import PRICING_REGISTRY
 from api.services.pricing.models import (
@@ -106,12 +108,23 @@ class CostCalculator:
         tts_cost_total = Decimal("0")
         stt_cost_total = Decimal("0")
 
+        # Models we had no rate for. Their usage is REAL and its cost is UNKNOWN,
+        # not zero — see the note on `unpriced` in the returned dict.
+        unpriced: list[str] = []
+
+        def _note_if_unpriced(service: str, provider: str, model: str) -> None:
+            if not self.get_pricing_model(service, provider, model):
+                entry = f"{service}:{provider}/{model}"
+                if entry not in unpriced:
+                    unpriced.append(entry)
+
         # Calculate LLM costs
         llm_usage = usage_info.get("llm", {})
         for key, usage in llm_usage.items():
             processor, model = self._parse_key(key)
             # Try to determine provider from processor name or model
             provider = self._infer_provider_from_model(model, "llm")
+            _note_if_unpriced("llm", provider, model)
             cost = self.calculate_llm_cost(provider, model, usage)
             llm_cost_total += cost
 
@@ -125,6 +138,7 @@ class CostCalculator:
                 model = "default"  # Use default model for the provider
             else:
                 provider = self._infer_provider_from_model(model, "tts")
+            _note_if_unpriced("tts", provider, model)
             cost = self.calculate_tts_cost(provider, model, character_count)
             tts_cost_total += cost
 
@@ -133,17 +147,38 @@ class CostCalculator:
         for key, seconds in stt_usage.items():
             processor, model = self._parse_key(key)
             provider = self._infer_provider_from_model(model, "stt")
+            _note_if_unpriced("stt", provider, model)
             cost = self.calculate_stt_cost(provider, model, seconds)
             stt_cost_total += cost
 
+        if unpriced:
+            logger.warning(
+                f"[pricing] no rate for {', '.join(unpriced)} — their usage is "
+                f"costed at 0 and the run total is understated"
+            )
+
         total_cost = llm_cost_total + tts_cost_total + stt_cost_total
 
-        return {
+        result = {
             "llm_cost": float(llm_cost_total),
             "tts_cost": float(tts_cost_total),
             "stt_cost": float(stt_cost_total),
             "total": float(total_cost),
         }
+
+        # A model with no rate contributes 0 to the totals above, and that zero
+        # is indistinguishable from "this call genuinely cost nothing". It is
+        # not the same claim at all, and the difference has been expensive:
+        # LLM_PRICING carried no Anthropic rates whatsoever and nothing newer
+        # than GPT-4o, so every Claude call and every current-generation model
+        # priced at exactly nothing and the run total said so with a straight
+        # face. Recording the gap here carries it into cost_info, so a total
+        # that is missing components can say which ones rather than simply
+        # reading low.
+        if unpriced:
+            result["unpriced"] = unpriced
+
+        return result
 
     def _parse_key(self, key) -> Tuple[str, str]:
         """Parse key which is in format 'processor|||model'"""
