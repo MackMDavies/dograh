@@ -5,20 +5,76 @@ provider registry — see ProviderSpec.router.
 """
 
 import json
+import os
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
+from pydantic import BaseModel
 from starlette.responses import HTMLResponse
+from twilio.request_validator import RequestValidator
 
 from api.db import db_client
+from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.providers.twilio.voice_sdk import (
+    VoiceSdkNotConfigured,
+    generate_voice_access_token,
+)
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
     _process_status_update,
 )
 
 router = APIRouter()
+
+
+class VoiceTokenResponse(BaseModel):
+    token: str
+    identity: str
+
+
+@router.get("/voice-token")
+async def get_voice_token(
+    user=Depends(require_sales_dialer_role),
+) -> VoiceTokenResponse:
+    identity = f"rep-{user.id}"
+    try:
+        token = generate_voice_access_token(identity)
+    except VoiceSdkNotConfigured as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return VoiceTokenResponse(token=token, identity=identity)
+
+
+async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
+    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+    signature = request.headers.get("x-twilio-signature", "")
+    if not auth_token or not signature:
+        return False
+    validator = RequestValidator(auth_token)
+    return validator.validate(str(request.url), form_data, signature)
+
+
+@router.post("/voice-connect", include_in_schema=False)
+async def handle_voice_connect(request: Request):
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on voice-connect webhook")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    to_number = form_data.get("To", "").strip()
+    caller_id = os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "")
+    if not to_number or not caller_id:
+        logger.error("voice-connect missing To number or SYSEVO_TWILIO_DEFAULT_CALLER_ID")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<Response><Dial callerId="{caller_id}"><Number>{to_number}</Number></Dial></Response>'
+    )
+    return HTMLResponse(content=twiml, media_type="application/xml")
 
 
 @router.post("/twiml", include_in_schema=False)
