@@ -8,8 +8,9 @@ rep's assigned number means a server-to-server Supabase REST call.
 Unlike sysevo_roles.get_sysevo_roles, this fails OPEN, not closed: a
 Supabase outage or a rep with no assignment must never block a call, only
 fall back to the shared default caller ID (see routes.py's
-_resolve_dialer_caller_id). This function guards a display/attribution
-concern, not access control.
+handle_voice_connect, which tries this function first and falls back to
+its own inline SYSEVO_TWILIO_DEFAULT_CALLER_ID resolution). This function
+guards a display/attribution concern, not access control.
 """
 
 import httpx
