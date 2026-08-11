@@ -339,3 +339,63 @@ def test_dialer_call_status_ignores_missing_parent_call_sid(monkeypatch):
 
     assert response.status_code == 200
     mock_update.assert_not_awaited()
+
+
+def test_dialer_recording_callback_updates_on_valid_signature(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"CallSid": "CA111", "RecordingSid": "RE999", "RecordingStatus": "completed"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_awaited_once_with(parent_call_sid="CA111", recording_sid="RE999")
+
+
+def test_dialer_recording_callback_rejects_invalid_signature(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=False,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"CallSid": "CA111", "RecordingSid": "RE999"},
+            headers={"X-Twilio-Signature": "bad-signature"},
+        )
+
+    assert response.status_code == 401
+    mock_update.assert_not_awaited()
+
+
+def test_dialer_recording_callback_handles_missing_fields(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"CallSid": "CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_not_awaited()

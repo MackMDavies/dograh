@@ -19,6 +19,7 @@ from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    update_dialer_call_recording,
     update_dialer_call_status,
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
@@ -155,6 +156,27 @@ async def handle_dialer_call_status(request: Request, parent_call_sid: str = "")
         status=call_status,
         duration_seconds=duration_seconds,
     )
+    return {"status": "success"}
+
+
+@router.post("/dialer-recording-callback", include_in_schema=False)
+async def handle_dialer_recording_callback(request: Request):
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-recording-callback webhook")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    # For a <Dial record>, Twilio's RecordingStatusCallback reports CallSid
+    # as the parent call - the leg that executed the Dial verb - which is
+    # exactly our parent_call_sid correlation key.
+    parent_call_sid = form_data.get("CallSid", "")
+    recording_sid = form_data.get("RecordingSid", "")
+    if not parent_call_sid or not recording_sid:
+        logger.warning("dialer-recording-callback missing CallSid or RecordingSid")
+        return {"status": "ignored", "reason": "missing_fields"}
+
+    await update_dialer_call_recording(parent_call_sid=parent_call_sid, recording_sid=recording_sid)
     return {"status": "success"}
 
 
