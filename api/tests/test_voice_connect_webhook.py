@@ -279,7 +279,7 @@ def test_dialer_call_status_updates_on_valid_signature(monkeypatch):
     )
 
 
-def test_dialer_call_status_ignores_invalid_signature(monkeypatch):
+def test_dialer_call_status_rejects_invalid_signature(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     client = TestClient(_make_test_app())
 
@@ -295,7 +295,7 @@ def test_dialer_call_status_ignores_invalid_signature(monkeypatch):
             headers={"X-Twilio-Signature": "bad-signature"},
         )
 
-    assert response.status_code == 200
+    assert response.status_code == 401
     mock_update.assert_not_awaited()
 
 

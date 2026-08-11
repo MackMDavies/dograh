@@ -138,7 +138,7 @@ async def handle_dialer_call_status(request: Request, parent_call_sid: str = "")
 
     if not await _verify_twilio_signature(request, form_data):
         logger.warning("Invalid Twilio signature on dialer-call-status webhook")
-        return {"status": "ignored", "reason": "invalid_signature"}
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
     if not parent_call_sid:
         logger.warning("dialer-call-status webhook missing parent_call_sid query param")
