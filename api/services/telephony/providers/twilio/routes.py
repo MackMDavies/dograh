@@ -172,9 +172,19 @@ async def handle_dialer_recording_callback(request: Request):
     # exactly our parent_call_sid correlation key.
     parent_call_sid = form_data.get("CallSid", "")
     recording_sid = form_data.get("RecordingSid", "")
+    recording_status = form_data.get("RecordingStatus", "")
     if not parent_call_sid or not recording_sid:
         logger.warning("dialer-recording-callback missing CallSid or RecordingSid")
         return {"status": "ignored", "reason": "missing_fields"}
+
+    # Twilio's default <Dial> config (no recordingStatusCallbackEvent set)
+    # only fires this webhook once, on completion - but that's the TwiML's
+    # behavior, not this handler's guarantee. If recordingStatusCallbackEvent
+    # is ever expanded to include in-progress/absent events (e.g. for live
+    # call monitoring), this guard stops a premature/failed recording from
+    # ever getting written as if it were a playable completed one.
+    if recording_status != "completed":
+        return {"status": "ignored", "reason": "recording_not_completed"}
 
     await update_dialer_call_recording(parent_call_sid=parent_call_sid, recording_sid=recording_sid)
     return {"status": "success"}
