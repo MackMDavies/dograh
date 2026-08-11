@@ -36,6 +36,10 @@ MPS_API_URL = os.getenv("MPS_API_URL", "https://services.dograh.com")
 # Supabase auth (used when AUTH_PROVIDER=supabase)
 SUPABASE_URL = os.getenv("SUPABASE_URL", "")
 SUPABASE_ANON_KEY = os.getenv("SUPABASE_ANON_KEY", "")
+# Service-role key for server-to-server Supabase reads with no end-user
+# session in flight (e.g. resolving a rep's assigned dialer caller ID from
+# inside a Twilio webhook) - never forward this to a client.
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
 
 # Storage Configuration
 ENABLE_AWS_S3 = os.getenv("ENABLE_AWS_S3", "false").lower() == "true"

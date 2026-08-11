@@ -17,6 +17,9 @@ from twilio.request_validator import RequestValidator
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.providers.twilio.dialer_number_assignment import (
+    resolve_assigned_caller_id,
+)
 from api.services.telephony.providers.twilio.voice_sdk import (
     VoiceSdkNotConfigured,
     generate_voice_access_token,
@@ -65,7 +68,10 @@ async def handle_voice_connect(request: Request):
         return HTMLResponse(content=hangup, media_type="application/xml")
 
     to_number = form_data.get("To", "").strip()
-    caller_id = os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "")
+    caller_id = (
+        await resolve_assigned_caller_id(form_data.get("From", ""))
+        or os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "")
+    )
     if not to_number or not caller_id:
         logger.error("voice-connect missing To number or SYSEVO_TWILIO_DEFAULT_CALLER_ID")
         return HTMLResponse(content=hangup, media_type="application/xml")
