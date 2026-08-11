@@ -180,6 +180,7 @@ services:
       AUTH_PROVIDER: "${AUTH_PROVIDER:-local}"
       SUPABASE_URL: "${SUPABASE_URL:-}"
       SUPABASE_ANON_KEY: "${SUPABASE_ANON_KEY:-}"
+      SUPABASE_SERVICE_ROLE_KEY: "${SUPABASE_SERVICE_ROLE_KEY:-}"
 
       # Sysevo caller memory integration
       # Set SYSEVO_MEMORY_PRE_CALL_URL to enable automatic caller memory injection
