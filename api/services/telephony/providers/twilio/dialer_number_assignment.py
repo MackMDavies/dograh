@@ -33,13 +33,11 @@ def _parse_rep_id_from_identity(raw_from: str) -> int | None:
 async def resolve_assigned_caller_id(raw_from: str) -> str | None:
     """Return the calling rep's assigned Twilio number, or None to fall
     back to the platform default (unassigned rep, unrecognized caller, or a
-    Supabase error)."""
+    Supabase/DB error). Every failure path here returns None rather than
+    raising - this function must never break call setup, only degrade to
+    the shared default caller ID."""
     rep_id = _parse_rep_id_from_identity(raw_from)
     if rep_id is None:
-        return None
-
-    user = await db_client.get_user_by_id(rep_id)
-    if not user or not user.provider_id:
         return None
 
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
@@ -47,6 +45,10 @@ async def resolve_assigned_caller_id(raw_from: str) -> str | None:
         return None
 
     try:
+        user = await db_client.get_user_by_id(rep_id)
+        if not user or not user.provider_id:
+            return None
+
         async with httpx.AsyncClient() as client:
             response = await client.get(
                 f"{SUPABASE_URL}/rest/v1/dialer_phone_numbers",
@@ -64,8 +66,11 @@ async def resolve_assigned_caller_id(raw_from: str) -> str | None:
             )
             response.raise_for_status()
             rows = response.json()
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError, KeyError, IndexError) as exc:
         logger.error(f"Failed to resolve assigned caller id for rep {rep_id}: {exc}")
+        return None
+    except Exception as exc:  # noqa: BLE001 - deliberate: this function's whole contract is "never raise"
+        logger.error(f"Unexpected error resolving assigned caller id for rep {rep_id}: {exc}")
         return None
 
     return rows[0]["phone_number"] if rows else None

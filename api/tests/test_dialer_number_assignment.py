@@ -1,6 +1,8 @@
 """Unit tests for dialer_number_assignment.py - per-rep caller ID resolution."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
+
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     resolve_assigned_caller_id,
@@ -68,3 +70,31 @@ async def test_resolve_assigned_caller_id_returns_phone_number_on_match(monkeypa
         result = await resolve_assigned_caller_id("client:rep-42")
 
     assert result == "+15559998888"
+
+
+async def test_resolve_assigned_caller_id_returns_none_on_http_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000001")
+
+    fake_http_client = AsyncMock()
+    fake_http_client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+    fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.db_client.get_user_by_id",
+        AsyncMock(return_value=fake_user),
+    ), patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.httpx.AsyncClient",
+        return_value=fake_http_client,
+    ):
+        result = await resolve_assigned_caller_id("client:rep-42")
+
+    assert result is None
