@@ -40,13 +40,13 @@ async def resolve_assigned_caller_id(raw_from: str) -> str | None:
     if rep_id is None:
         return None
 
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot resolve per-rep caller id")
-        return None
-
     try:
         user = await db_client.get_user_by_id(rep_id)
         if not user or not user.provider_id:
+            return None
+
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot resolve per-rep caller id")
             return None
 
         async with httpx.AsyncClient() as client:
