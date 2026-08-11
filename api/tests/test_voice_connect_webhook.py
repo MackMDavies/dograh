@@ -222,3 +222,33 @@ def test_voice_connect_creates_dialer_call_for_recognized_rep(monkeypatch):
         from_number="+15551234567",
         to_number="+15559876543",
     )
+
+
+def test_voice_connect_still_dials_when_get_backend_endpoints_raises(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        AsyncMock(side_effect=Exception("backend unreachable")),
+    ):
+        response = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert 'callerId="+15551234567"' in response.text
+    assert 'record="record-from-answer"' in response.text
