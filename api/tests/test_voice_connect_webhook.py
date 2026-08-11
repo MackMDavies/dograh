@@ -252,3 +252,90 @@ def test_voice_connect_still_dials_when_get_backend_endpoints_raises(monkeypatch
     assert response.status_code == 200
     assert 'callerId="+15551234567"' in response.text
     assert 'record="record-from-answer"' in response.text
+
+
+def test_dialer_call_status_updates_on_valid_signature(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_status",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-call-status?parent_call_sid=CA111",
+            data={"CallSid": "CA222", "CallStatus": "completed", "CallDuration": "42"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_awaited_once_with(
+        parent_call_sid="CA111",
+        child_call_sid="CA222",
+        status="completed",
+        duration_seconds=42,
+    )
+
+
+def test_dialer_call_status_ignores_invalid_signature(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=False,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_status",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-call-status?parent_call_sid=CA111",
+            data={"CallSid": "CA222", "CallStatus": "completed"},
+            headers={"X-Twilio-Signature": "bad-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_not_awaited()
+
+
+def test_dialer_call_status_handles_missing_duration(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_status",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-call-status?parent_call_sid=CA111",
+            data={"CallSid": "CA222", "CallStatus": "ringing"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_awaited_once_with(
+        parent_call_sid="CA111", child_call_sid="CA222", status="ringing", duration_seconds=None
+    )
+
+
+def test_dialer_call_status_ignores_missing_parent_call_sid(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_status",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-call-status",
+            data={"CallSid": "CA222", "CallStatus": "ringing"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_update.assert_not_awaited()

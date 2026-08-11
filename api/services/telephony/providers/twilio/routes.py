@@ -17,7 +17,10 @@ from twilio.request_validator import RequestValidator
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
-from api.services.telephony.providers.twilio.dialer_call_log import create_dialer_call
+from api.services.telephony.providers.twilio.dialer_call_log import (
+    create_dialer_call,
+    update_dialer_call_status,
+)
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     resolve_assigned_caller_id,
@@ -127,6 +130,32 @@ async def handle_voice_connect(request: Request):
         "</Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
+
+
+@router.post("/dialer-call-status", include_in_schema=False)
+async def handle_dialer_call_status(request: Request, parent_call_sid: str = ""):
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-call-status webhook")
+        return {"status": "ignored", "reason": "invalid_signature"}
+
+    if not parent_call_sid:
+        logger.warning("dialer-call-status webhook missing parent_call_sid query param")
+        return {"status": "ignored", "reason": "missing_parent_call_sid"}
+
+    child_call_sid = form_data.get("CallSid") or None
+    call_status = form_data.get("CallStatus", "").strip().lower() or "initiated"
+    raw_duration = form_data.get("CallDuration")
+    duration_seconds = int(raw_duration) if raw_duration and raw_duration.isdigit() else None
+
+    await update_dialer_call_status(
+        parent_call_sid=parent_call_sid,
+        child_call_sid=child_call_sid,
+        status=call_status,
+        duration_seconds=duration_seconds,
+    )
+    return {"status": "success"}
 
 
 @router.post("/twiml", include_in_schema=False)
