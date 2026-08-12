@@ -5,6 +5,7 @@ import httpx
 
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
+    is_manager_or_admin,
     resolve_assigned_caller_id,
 )
 
@@ -98,3 +99,78 @@ async def test_resolve_assigned_caller_id_returns_none_on_http_error(monkeypatch
         result = await resolve_assigned_caller_id("client:rep-42")
 
     assert result is None
+
+
+async def test_is_manager_or_admin_returns_true_for_manager(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = [{"role": "sales_manager"}]
+    fake_http_client = AsyncMock()
+    fake_http_client.get = AsyncMock(return_value=fake_response)
+    fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+    fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.httpx.AsyncClient",
+        return_value=fake_http_client,
+    ):
+        result = await is_manager_or_admin("00000000-0000-0000-0000-000000000001")
+
+    assert result is True
+
+
+async def test_is_manager_or_admin_returns_false_for_no_matching_role(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = []
+    fake_http_client = AsyncMock()
+    fake_http_client.get = AsyncMock(return_value=fake_response)
+    fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+    fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.httpx.AsyncClient",
+        return_value=fake_http_client,
+    ):
+        result = await is_manager_or_admin("00000000-0000-0000-0000-000000000001")
+
+    assert result is False
+
+
+async def test_is_manager_or_admin_fails_closed_on_error(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_http_client = AsyncMock()
+    fake_http_client.get = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+    fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.httpx.AsyncClient",
+        return_value=fake_http_client,
+    ):
+        result = await is_manager_or_admin("00000000-0000-0000-0000-000000000001")
+
+    assert result is False
