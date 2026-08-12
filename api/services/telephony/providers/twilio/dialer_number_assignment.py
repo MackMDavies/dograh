@@ -21,7 +21,17 @@ from api.db import db_client
 
 
 def _parse_rep_id_from_identity(raw_from: str) -> int | None:
-    """Twilio Device-originated calls send From as "client:rep-{id}"."""
+    """Twilio Device-originated calls send From as "client:rep-{id}".
+
+    The "rep-" prefix is the token FORMAT, not a role claim: routes.py's
+    /voice-token issues identity=f"rep-{user.id}" to everyone holding any of
+    SALES_DIALER_ROLES (sales_rep, sales_manager, super_admin), so a manager's
+    listen-in leg arrives with this exact shape too. That is why
+    _serve_listen_in_twiml reuses this parser despite the rep-flavoured name -
+    and why changing the identity format would silently break listen-in as
+    well as dialling. Authorization is always a separate is_manager_or_admin
+    check; this function grants nothing.
+    """
     identity = raw_from.removeprefix("client:")
     if not identity.startswith("rep-"):
         return None
@@ -75,3 +85,37 @@ async def resolve_assigned_caller_id(raw_from: str) -> str | None:
         return None
 
     return rows[0]["phone_number"] if rows else None
+
+
+async def is_manager_or_admin(provider_id: str) -> bool:
+    """Checks whether a Supabase user has the sales_manager or super_admin
+    role, via the service-role key. Used to gate listen-in from inside a
+    Twilio-signature-authenticated webhook (no end-user bearer token is
+    available there to check roles against RLS the normal way).
+
+    Unlike resolve_assigned_caller_id, this fails CLOSED: an error here
+    means NOT authorized, since this gates access to a live call's audio,
+    not a display/attribution concern - the asymmetry with this module's
+    other function is deliberate, not an inconsistency."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_roles",
+                params={
+                    "select": "role",
+                    "user_id": f"eq.{provider_id}",
+                    "role": "in.(super_admin,sales_manager)",
+                },
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+    except Exception:  # noqa: BLE001 - deliberate: fail closed, this gates live-call audio access
+        return False
+    return len(rows) > 0
