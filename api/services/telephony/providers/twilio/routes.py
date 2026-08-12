@@ -19,6 +19,9 @@ from twilio.request_validator import RequestValidator
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.providers.twilio.dialer_call_listeners import (
+    create_dialer_call_listener,
+)
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
     get_dialer_call_child_leg,
@@ -35,6 +38,7 @@ from api.services.telephony.providers.twilio.dialer_conference import (
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
+    is_manager_or_admin,
     resolve_assigned_caller_id,
 )
 from api.services.telephony.providers.twilio.voice_sdk import (
@@ -435,7 +439,9 @@ async def handle_dialer_conference_events(request: Request):
 
     # An event table, not a pipeline. participant-join/leave arrive here too
     # (statusCallbackEvent is "start end join leave") and are deliberately
-    # unhandled for now - Task 9 will want them for participant presence.
+    # unhandled: dialer-listen-connect records a manager's listen session
+    # itself, so nothing on this branch needs participant presence. They stay
+    # subscribed for whenever something does.
     if event_type == "conference-start" and conference_sid and parent_call_sid:
         await update_dialer_call_conference_sid(
             parent_call_sid=parent_call_sid, conference_sid=conference_sid
@@ -444,6 +450,103 @@ async def handle_dialer_conference_events(request: Request):
         await _cancel_orphaned_lead_leg(parent_call_sid)
 
     return {"status": "success"}
+
+
+@router.post("/dialer-listen-connect", include_in_schema=False)
+async def handle_dialer_listen_connect(request: Request):
+    """Place a manager/admin into a live call's conference as a MUTED listener.
+
+    The manager's browser Voice SDK Device dials out with a
+    ListenParentCallSid param; Twilio then asks this endpoint what to do with
+    that leg. Everything about the returned TwiML is chosen so the two people
+    already on the call cannot tell anyone joined:
+
+    - muted="true"                  - the manager can never be heard.
+    - beep="false"                  - Twilio's DEFAULT is beep="true", which
+      would play a join tone to BOTH the rep and the lead and announce the
+      silent monitor out loud. This attribute is the whole feature.
+    - startConferenceOnEnter="false" - joining a conference that has already
+      ended must not resurrect it.
+    - endConferenceOnExit="false"   - the manager hanging up must not end the
+      call they were monitoring.
+
+    Unlike the pure status-callback endpoints (dialer-conference-events,
+    dialer-call-status, dialer-recording-callback) every failure path here
+    returns hangup TwiML rather than raising 401/500: there is a live call
+    leg waiting on this response, and a non-200 makes Twilio read out its own
+    error message - to the manager, on a leg that is about to join a call
+    they are supposed to be monitoring silently.
+
+    No _conference_telemetry_attributes here, deliberately. Those exist so
+    whichever of the rep/lead legs creates the conference makes it recorded
+    and reporting; the manager joins an already-created conference, so their
+    copy would be discarded anyway - and resolving them costs a
+    get_backend_endpoints() call (which can block on a cloudflared lookup) on
+    a path where a human is waiting to hear a live call.
+    """
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-listen-connect webhook")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    # Blanket try, on this handler's own terms rather than by delegation.
+    # create_dialer_call_listener and is_manager_or_admin each swallow their
+    # own errors, but db_client.get_user_by_id does NOT (a DB blip raises)
+    # and neither does the string handling around them - and code BETWEEN two
+    # individually-protected calls is not itself protected. An escape here
+    # becomes a 500, which Twilio both reads aloud and retries.
+    try:
+        raw_from = form_data.get("From", "")
+        parent_call_sid = str(form_data.get("ListenParentCallSid", "")).strip()
+        if not parent_call_sid:
+            logger.error("dialer-listen-connect missing ListenParentCallSid")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        # Same "client:rep-{id}" Voice SDK identity a rep gets: /voice-token
+        # issues that shape to everyone holding a sales dialer role, managers
+        # and admins included. The helper only extracts a user id - the
+        # "rep-" prefix is the token format, not a role claim - and the
+        # actual authorization is is_manager_or_admin below.
+        manager_id = _parse_rep_id_from_identity(raw_from)
+        if manager_id is None:
+            logger.warning("dialer-listen-connect: unrecognized identity")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        user = await db_client.get_user_by_id(manager_id)
+        if not user or not user.provider_id:
+            logger.warning(f"dialer-listen-connect: no Supabase user for dograh id {manager_id}")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        # Authorize BEFORE recording anything and before returning any
+        # conference TwiML: an unauthorized caller must leave no
+        # dialer_call_listeners row claiming they listened, and must never
+        # reach the audio. is_manager_or_admin fails CLOSED, so an error
+        # reaching Supabase lands here too.
+        if not await is_manager_or_admin(user.provider_id):
+            logger.warning(f"dialer-listen-connect: {user.provider_id} is not a manager/admin")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        await create_dialer_call_listener(
+            parent_call_sid=parent_call_sid, manager_user_id=user.provider_id
+        )
+    except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
+        logger.error(f"dialer-listen-connect failed: {exc}")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    # parent_call_sid is caller-supplied, so the conference name derived from
+    # it is too - escape it exactly as the other conference nouns do.
+    conference_name = conference_name_for(parent_call_sid)
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response><Dial>"
+        '<Conference muted="true" startConferenceOnEnter="false" '
+        'endConferenceOnExit="false" beep="false">'
+        f"{escape(conference_name)}</Conference>"
+        "</Dial></Response>"
+    )
+    return HTMLResponse(content=twiml, media_type="application/xml")
 
 
 @router.post("/dialer-call-status", include_in_schema=False)
