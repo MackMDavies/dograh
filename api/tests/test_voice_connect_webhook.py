@@ -1,5 +1,6 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
@@ -642,7 +643,7 @@ def test_dialer_conference_events_updates_conference_sid_on_start(monkeypatch):
     mock_update.assert_awaited_once_with(parent_call_sid="CA111", conference_sid="CF999")
 
 
-def test_dialer_conference_events_ignores_non_start_events(monkeypatch):
+def test_dialer_conference_events_does_not_write_conference_sid_on_end(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     client = TestClient(_make_test_app())
 
@@ -746,9 +747,40 @@ def test_dialer_conference_events_cancels_orphaned_ringing_lead_leg(monkeypatch)
     mock_cancel.assert_awaited_once_with(call_sid="CA222")
 
 
-def test_dialer_conference_events_cancels_lead_leg_with_unknown_status(monkeypatch):
-    """A row whose status never got written (or is null) is treated as
-    "never answered" - cancelling is a no-op on Twilio's side if it did."""
+@pytest.mark.parametrize(
+    "status,should_cancel",
+    [
+        # Pre-answer: the leg is still in flight and was never a conference
+        # participant, so nothing else will ever end it.
+        ("queued", True),
+        ("initiated", True),
+        ("ringing", True),
+        # Unknown/missing status fails TOWARD cancelling - the polarity that
+        # matters when the thing being prevented is an abandoned call.
+        ("", True),
+        (None, True),
+        # Answered: a real participant, ended by Twilio's own conference
+        # teardown.
+        ("in-progress", False),
+        ("answered", False),
+        ("completed", False),
+        # Terminal-but-unanswered. Ring-out (no-answer) is the routine one on
+        # a power dialer: the lead's leg times out while the rep is still in
+        # the conference, and only then does the rep hang up. Cancelling here
+        # would be rejected by Twilio and log an error on a normal call -
+        # burying the one signal that says orphan protection actually failed.
+        ("busy", False),
+        ("no-answer", False),
+        ("canceled", False),
+        ("failed", False),
+    ],
+)
+def test_dialer_conference_events_cancels_only_unsettled_lead_legs(
+    monkeypatch, status, should_cancel
+):
+    """Pinned against Twilio's real CallStatus vocabulary, not against the
+    constant itself - a test that only loops over values already in the set
+    asserts nothing."""
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     client = TestClient(_make_test_app())
 
@@ -757,7 +789,7 @@ def test_dialer_conference_events_cancels_lead_leg_with_unknown_status(monkeypat
         return_value=True,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
-        return_value={"child_call_sid": "CA222", "status": None},
+        return_value={"child_call_sid": "CA222", "status": status},
     ), patch(
         "api.services.telephony.providers.twilio.routes.cancel_call",
     ) as mock_cancel:
@@ -768,33 +800,9 @@ def test_dialer_conference_events_cancels_lead_leg_with_unknown_status(monkeypat
         )
 
     assert response.status_code == 200
-    mock_cancel.assert_awaited_once_with(call_sid="CA222")
-
-
-def test_dialer_conference_events_does_not_cancel_answered_lead_leg(monkeypatch):
-    """A lead who answered IS a conference participant, so Twilio's own
-    teardown ends their leg - issuing a cancel would just be a rejected
-    Twilio call and an error log on every normal call."""
-    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    client = TestClient(_make_test_app())
-
-    for status in ("in-progress", "completed", "answered"):
-        with patch(
-            "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
-            return_value=True,
-        ), patch(
-            "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
-            return_value={"child_call_sid": "CA222", "status": status},
-        ), patch(
-            "api.services.telephony.providers.twilio.routes.cancel_call",
-        ) as mock_cancel:
-            response = client.post(
-                "/dialer-conference-events",
-                data={"StatusCallbackEvent": "conference-end", "FriendlyName": "call-CA111"},
-                headers={"X-Twilio-Signature": "fake-signature"},
-            )
-
-        assert response.status_code == 200, status
+    if should_cancel:
+        mock_cancel.assert_awaited_once_with(call_sid="CA222")
+    else:
         mock_cancel.assert_not_awaited()
 
 
@@ -956,3 +964,78 @@ def test_voice_connect_does_not_mark_failed_on_success(monkeypatch):
     assert response.status_code == 200
     assert "<Conference" in response.text
     mock_update.assert_not_awaited()
+
+
+def test_voice_connect_persists_child_call_sid_immediately(monkeypatch):
+    """The orphan cleanup on conference-end needs the lead leg's SID to end
+    it. Waiting for the lead's own status callback to write it leaves a race
+    a fast rep hang-up can win, so voice-connect persists it on the spot."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_child_sid",
+    ) as mock_child_sid:
+        response = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "CallSid": "CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Conference" in response.text
+    mock_child_sid.assert_awaited_once_with(parent_call_sid="CA111", child_call_sid="CA222")
+
+
+def test_voice_connect_does_not_persist_child_call_sid_when_dial_fails(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_status",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_child_sid",
+    ) as mock_child_sid:
+        response = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "CallSid": "CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    mock_child_sid.assert_not_awaited()

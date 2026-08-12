@@ -116,6 +116,32 @@ async def update_dialer_call_conference_sid(*, parent_call_sid: str, conference_
         logger.error(f"Failed to update dialer_calls conference_sid for {parent_call_sid}: {exc}")
 
 
+async def update_dialer_call_child_sid(*, parent_call_sid: str, child_call_sid: str) -> None:
+    """Record the lead leg's SID as soon as the outbound dial returns.
+
+    update_dialer_call_status also writes this column, but only when the
+    lead's own status callback arrives - which the conference-end orphan
+    cleanup can outrace, leaving it with no SID to end the leg by. This
+    patches child_call_sid alone, deliberately NOT status, so it can never
+    walk the row's status backwards past a callback that already landed.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls child_call_sid")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                json={"child_call_sid": child_call_sid},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to update dialer_calls child_call_sid for {parent_call_sid}: {exc}")
+
+
 async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     """Read back the lead leg's SID and last-known status.
 
@@ -147,10 +173,13 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to read dialer_calls row for {parent_call_sid}: {exc}")
         return None
-    # PostgREST returns a JSON *object* (not a list) for some error shapes,
-    # so this is shape-checked rather than blindly indexed - the contract is
-    # "never raises", and that has to hold for a malformed body too.
-    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+    # A 200 from a PostgREST table GET is always a JSON array (error bodies
+    # are objects, but raise_for_status has already rejected those, and we
+    # don't send the vnd.pgrst.object+json Accept header). The shape check is
+    # for what sits BETWEEN us and PostgREST - a proxy or captive portal
+    # answering 200 with an HTML/JSON error page - since "never raises" has
+    # to hold for a body that isn't ours at all.
+    if isinstance(rows, list) and rows:
         return rows[0]
     return None
 

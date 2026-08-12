@@ -21,6 +21,7 @@ from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
     get_dialer_call_child_leg,
+    update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
     update_dialer_call_recording,
     update_dialer_call_status,
@@ -47,12 +48,23 @@ from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
 
-# Twilio call statuses that mean the lead actually answered. Past these the
-# lead's leg is a real conference participant, so Twilio's own conference
-# teardown ends it. Anything earlier (queued/initiated/ringing) means the
-# leg is still in flight and has to be cancelled explicitly - see
-# dialer_conference.cancel_call.
-_LEAD_ANSWERED_STATUSES = frozenset({"in-progress", "answered", "completed"})
+# Statuses at which issuing a cancel on the lead's leg is pointless: the leg
+# either joined the conference (Twilio's own teardown ends it) or is already
+# terminal. Anything else - including an unknown/missing status - is treated
+# as "possibly still ringing" and cancelled; see dialer_conference.cancel_call.
+#
+# Deliberately a NEGATIVE set. A positive "is cancellable" set would make an
+# unknown or missing status SKIP the cancel, which is the wrong way to fail
+# for something that exists to prevent abandoned calls.
+#
+# Overlaps api.routes.telephony._TERMINAL_CALL_STATUSES - same Twilio
+# vocabulary, different question ("can we stop polling?" vs "is a cancel
+# pointless?"), so they are not identical and are kept separate rather than
+# imported across the routes <-> provider boundary. If you edit one, read the
+# other.
+_LEAD_LEG_SETTLED_STATUSES = frozenset(
+    {"in-progress", "answered", "completed", "busy", "no-answer", "canceled", "failed"}
+)
 
 
 class VoiceTokenResponse(BaseModel):
@@ -192,6 +204,14 @@ async def handle_voice_connect(request: Request):
             media_type="application/xml",
         )
 
+    # Persist the lead leg's SID now, while we're holding it, rather than
+    # waiting for the lead's own "initiated" status callback to write it.
+    # The conference-end orphan cleanup needs this SID to end a still-ringing
+    # lead, and a rep who hangs up immediately can beat that callback.
+    await update_dialer_call_child_sid(
+        parent_call_sid=parent_call_sid, child_call_sid=child_call_sid
+    )
+
     # No <Say> on the rep's leg: the disclosure belongs on the lead's leg
     # (see handle_dialer_conference_join), both so the called party actually
     # hears it and so the rep joins sub-second instead of missing a fast
@@ -258,6 +278,46 @@ async def handle_dialer_conference_join(
     return HTMLResponse(content=twiml, media_type="application/xml")
 
 
+async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
+    """End the lead's leg if the conference ended before they ever joined it.
+
+    The rep's leg carries endConferenceOnExit="true", so a rep hanging up (or
+    skipping on to the next lead) ends the conference - but that only drops
+    its *participants*. A lead whose phone is still ringing has not joined
+    yet, so their leg survives, they answer, dialer-conference-join drops
+    them into a freshly-recreated empty conference, and they hear silence:
+    an abandoned call placed from our own caller ID. The old <Dial><Number>
+    bridge cancelled that leg for us. See dialer_conference.cancel_call.
+
+    Fail-soft throughout - both helpers swallow their own errors, so no
+    Supabase or Twilio failure can turn this status callback into a 500 that
+    Twilio then retries.
+    """
+    leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+    child_call_sid = (leg or {}).get("child_call_sid")
+    lead_status = ((leg or {}).get("status") or "").strip().lower()
+
+    if not child_call_sid:
+        # voice-connect persists child_call_sid the moment the dial returns,
+        # so by the time a conference can end it should always be there.
+        # Reaching this means the row is missing or the write failed, and the
+        # lead's leg is now unreachable by SID - a real anomaly, not a race.
+        logger.error(
+            f"dialer-conference-events: no child_call_sid recorded for {parent_call_sid}, "
+            "cannot end a possibly-orphaned lead leg"
+        )
+        return
+
+    if lead_status in _LEAD_LEG_SETTLED_STATUSES:
+        return
+
+    logger.info(
+        f"dialer-conference-events: conference ended with lead leg {child_call_sid} "
+        f"at status '{lead_status or 'unknown'}' - ending orphaned leg"
+    )
+    await cancel_call(call_sid=child_call_sid)
+
+
 @router.post("/dialer-conference-events", include_in_schema=False)
 async def handle_dialer_conference_events(request: Request):
     """Conference lifecycle callback. Unlike the TwiML-serving endpoints this
@@ -272,39 +332,17 @@ async def handle_dialer_conference_events(request: Request):
 
     event_type = form_data.get("StatusCallbackEvent", "")
     conference_sid = form_data.get("ConferenceSid", "")
-    friendly_name = form_data.get("FriendlyName", "")
-    parent_call_sid = parent_call_sid_from_conference_name(friendly_name) if friendly_name else None
+    parent_call_sid = parent_call_sid_from_conference_name(form_data.get("FriendlyName", ""))
 
+    # An event table, not a pipeline. participant-join/leave arrive here too
+    # (statusCallbackEvent is "start end join leave") and are deliberately
+    # unhandled for now - Task 9 will want them for participant presence.
     if event_type == "conference-start" and conference_sid and parent_call_sid:
         await update_dialer_call_conference_sid(
             parent_call_sid=parent_call_sid, conference_sid=conference_sid
         )
     elif event_type == "conference-end" and parent_call_sid:
-        # Orphaned-lead-leg cleanup. The rep's leg carries
-        # endConferenceOnExit="true", so a rep hanging up (or skipping to the
-        # next lead) ends the conference - but that only drops *participants*.
-        # A lead still ringing has not joined yet, so their leg survives, they
-        # answer, dialer-conference-join drops them into a freshly-recreated
-        # empty conference, and they hear silence: an abandoned call from our
-        # own caller ID. See dialer_conference.cancel_call.
-        leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
-        child_call_sid = (leg or {}).get("child_call_sid")
-        lead_status = ((leg or {}).get("status") or "").strip().lower()
-        if not child_call_sid:
-            # child_call_sid is written by the lead's own status callback, so
-            # a conference ending in the first moments of a call can race it.
-            # Nothing to cancel by SID - log and move on rather than failing
-            # the webhook (which Twilio would then retry pointlessly).
-            logger.warning(
-                f"dialer-conference-events: no child_call_sid recorded for {parent_call_sid}, "
-                "cannot cancel a possibly-orphaned lead leg"
-            )
-        elif lead_status not in _LEAD_ANSWERED_STATUSES:
-            logger.info(
-                f"dialer-conference-events: conference ended with lead leg {child_call_sid} "
-                f"at status '{lead_status or 'unknown'}' - cancelling orphaned leg"
-            )
-            await cancel_call(call_sid=child_call_sid)
+        await _cancel_orphaned_lead_leg(parent_call_sid)
 
     return {"status": "success"}
 

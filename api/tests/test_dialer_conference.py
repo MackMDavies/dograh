@@ -88,7 +88,11 @@ async def test_dial_lead_into_conference_returns_none_on_exception(monkeypatch):
     assert result is None
 
 
-async def test_cancel_call_updates_status_to_canceled(monkeypatch):
+async def test_cancel_call_completes_the_call(monkeypatch):
+    """status="completed", not "canceled": "canceled" is only valid for a
+    queued/ringing call, and a lead who answers in the window between the rep
+    hanging up and this landing would be in-progress - the exact case where
+    failing to end the leg produces the abandoned call this prevents."""
     monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")
 
@@ -104,7 +108,7 @@ async def test_cancel_call_updates_status_to_canceled(monkeypatch):
 
     assert result is True
     fake_client.calls.assert_called_once_with("CA222")
-    fake_call_context.update.assert_called_once_with(status="canceled")
+    fake_call_context.update.assert_called_once_with(status="completed")
 
 
 async def test_cancel_call_returns_false_without_credentials(monkeypatch):
@@ -114,8 +118,8 @@ async def test_cancel_call_returns_false_without_credentials(monkeypatch):
 
 
 async def test_cancel_call_returns_false_on_exception(monkeypatch):
-    """Twilio rejects a cancel on a call that already answered or completed;
-    that must never surface as a 500 from the webhook that called this."""
+    """A Twilio rejection (e.g. the leg is already terminal) must never
+    surface as a 500 from the webhook that called this."""
     monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")
 

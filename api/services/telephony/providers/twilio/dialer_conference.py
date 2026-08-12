@@ -12,6 +12,7 @@ import asyncio
 import os
 
 from loguru import logger
+from twilio.http.http_client import TwilioHttpClient
 from twilio.rest import Client
 
 
@@ -30,7 +31,16 @@ def _twilio_client() -> Client | None:
     auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
     if not account_sid or not auth_token:
         return None
-    return Client(account_sid, auth_token)
+    # An explicit timeout is required, not tidiness: twilio-python's default
+    # http client passes timeout=None to requests, i.e. wait forever. Both
+    # callers here run inside a Twilio webhook handler and inside an
+    # asyncio.to_thread worker, so a stalled Twilio API call would blow past
+    # Twilio's own 15s webhook timeout (earning a retry, and a duplicate
+    # side effect with it) while pinning a thread from a pool that is only
+    # ~8 threads wide on the 4-core prod box - starving dial_lead_into_
+    # conference, which is on the critical path of every single dial.
+    # 5s matches the timeout every Supabase call in dialer_call_log.py uses.
+    return Client(account_sid, auth_token, http_client=TwilioHttpClient(timeout=5))
 
 
 async def dial_lead_into_conference(
@@ -75,7 +85,8 @@ async def dial_lead_into_conference(
 
 
 async def cancel_call(*, call_sid: str) -> bool:
-    """Cancel an outbound call that is still queued or ringing.
+    """End an outbound call we no longer want connected, whatever
+    non-terminal state it's in.
 
     The rep's leg carries endConferenceOnExit="true", so the rep hanging up
     (or skipping on to the next lead) ends the conference - but ending a
@@ -87,9 +98,18 @@ async def cancel_call(*, call_sid: str) -> bool:
     just bad UX. The old <Dial><Number> bridge cancelled that leg for us;
     with Conference we have to do it ourselves.
 
-    Returns True if Twilio accepted the cancel. Fails soft like everything
-    else here: Twilio rejects a cancel on a call that already answered or
-    completed, and neither that nor an outage may turn a status-callback
+    Sends Status=completed rather than Status=canceled even though this is
+    semantically a cancel: "canceled" is only valid for a queued or ringing
+    call, and there is an irreducible window between the rep hanging up and
+    this landing (conference-end delivery latency + a Supabase read + this
+    REST call). A lead who answers inside that window is in-progress, a
+    "canceled" would be rejected, and they'd be left alone in a silent
+    recreated conference - precisely the abandoned call this exists to
+    prevent, on the timing where it's most likely. "completed" terminates a
+    call in any non-terminal state, ringing and in-progress alike.
+
+    Returns True if Twilio accepted it. Fails soft like everything else
+    here - neither a rejection nor an outage may turn a status-callback
     webhook into a 500 that Twilio then retries.
 
     Twilio's Python SDK is synchronous, so this is wrapped in
@@ -100,7 +120,7 @@ async def cancel_call(*, call_sid: str) -> bool:
         logger.error("cancel_call: Twilio credentials not configured")
         return False
     try:
-        await asyncio.to_thread(client.calls(call_sid).update, status="canceled")
+        await asyncio.to_thread(client.calls(call_sid).update, status="completed")
         return True
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
         logger.error(f"Failed to cancel call {call_sid}: {exc}")

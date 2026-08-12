@@ -6,6 +6,7 @@ import httpx
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
     get_dialer_call_child_leg,
+    update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
     update_dialer_call_recording,
     update_dialer_call_status,
@@ -316,3 +317,39 @@ async def test_get_dialer_call_child_leg_returns_none_without_service_role_key(m
         "",
     )
     assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
+
+
+async def test_update_dialer_call_child_sid_patches_only_child_call_sid(monkeypatch):
+    """Deliberately does NOT write status - this races the lead's own status
+    callback, and writing "initiated" over a "ringing" that already landed
+    would walk the row backwards."""
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_child_sid(parent_call_sid="CA111", child_call_sid="CA222")
+
+    fake_client.patch.assert_awaited_once()
+    call = fake_client.patch.await_args
+    assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
+    assert call.kwargs["params"] == {"parent_call_sid": "eq.CA111"}
+    assert call.kwargs["json"] == {"child_call_sid": "CA222"}
+
+
+async def test_update_dialer_call_child_sid_swallows_errors(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = AsyncMock()
+    fake_client.patch = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_child_sid(parent_call_sid="CA111", child_call_sid="CA222")
