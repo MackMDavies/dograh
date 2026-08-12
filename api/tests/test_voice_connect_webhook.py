@@ -419,3 +419,76 @@ def test_dialer_recording_callback_handles_missing_fields(monkeypatch):
 
     assert response.status_code == 200
     mock_update.assert_not_awaited()
+
+
+def test_dialer_conference_join_returns_conference_twiml(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Conference" in response.text
+    assert "call-CA111</Conference>" in response.text
+    assert 'muted="false"' in response.text
+    assert 'endConferenceOnExit="false"' in response.text
+    assert 'startConferenceOnEnter="true"' in response.text
+
+
+def test_dialer_conference_join_respects_muted_param(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111&muted=true",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert 'muted="true"' in response.text
+
+
+def test_dialer_conference_join_hangs_up_on_invalid_signature(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=False,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111",
+            data={},
+            headers={"X-Twilio-Signature": "bad-signature"},
+        )
+
+    assert "<Hangup/>" in response.text
+
+
+def test_dialer_conference_join_hangs_up_when_conference_name_missing(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert "<Hangup/>" in response.text

@@ -22,6 +22,11 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     update_dialer_call_recording,
     update_dialer_call_status,
 )
+from api.services.telephony.providers.twilio.dialer_conference import (
+    conference_name_for,
+    dial_lead_into_conference,
+    parent_call_sid_from_conference_name,
+)
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     resolve_assigned_caller_id,
@@ -129,6 +134,35 @@ async def handle_voice_connect(request: Request):
         f"{to_number}</Number>"
         "</Dial>"
         "</Response>"
+    )
+    return HTMLResponse(content=twiml, media_type="application/xml")
+
+
+@router.post("/dialer-conference-join", include_in_schema=False)
+async def handle_dialer_conference_join(
+    request: Request,
+    conference_name: str = "",
+    muted: str = "false",
+    end_on_exit: str = "false",
+    start_on_enter: str = "true",
+):
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-conference-join webhook")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    if not conference_name:
+        logger.error("dialer-conference-join missing conference_name")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    twiml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response><Dial>"
+        f'<Conference muted="{muted}" endConferenceOnExit="{end_on_exit}" '
+        f'startConferenceOnEnter="{start_on_enter}">{conference_name}</Conference>'
+        "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
 
