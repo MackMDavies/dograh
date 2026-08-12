@@ -5,15 +5,29 @@ import httpx
 
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    get_dialer_call_child_leg,
+    update_dialer_call_conference_sid,
     update_dialer_call_recording,
     update_dialer_call_status,
 )
+
+
+def _configure_supabase(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
 
 
 def _fake_client(response: MagicMock) -> AsyncMock:
     fake_client = AsyncMock()
     fake_client.post = AsyncMock(return_value=response)
     fake_client.patch = AsyncMock(return_value=response)
+    fake_client.get = AsyncMock(return_value=response)
     fake_client.__aenter__ = AsyncMock(return_value=fake_client)
     fake_client.__aexit__ = AsyncMock(return_value=False)
     return fake_client
@@ -192,3 +206,113 @@ async def test_update_dialer_call_recording_patches_by_parent_call_sid(monkeypat
     assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
     assert call.kwargs["params"] == {"parent_call_sid": "eq.CA111"}
     assert call.kwargs["json"] == {"recording_sid": "RE999"}
+
+
+async def test_update_dialer_call_conference_sid_patches_by_parent_call_sid(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_conference_sid(parent_call_sid="CA111", conference_sid="CF999")
+
+    fake_client.patch.assert_awaited_once()
+    call = fake_client.patch.await_args
+    assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
+    assert call.kwargs["params"] == {"parent_call_sid": "eq.CA111"}
+    assert call.kwargs["json"] == {"conference_sid": "CF999"}
+
+
+async def test_update_dialer_call_conference_sid_swallows_errors(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = AsyncMock()
+    fake_client.patch = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_conference_sid(parent_call_sid="CA111", conference_sid="CF999")
+
+
+async def test_get_dialer_call_child_leg_returns_row(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(
+        return_value=[{"child_call_sid": "CA222", "status": "ringing"}]
+    )
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        row = await get_dialer_call_child_leg(parent_call_sid="CA111")
+
+    assert row == {"child_call_sid": "CA222", "status": "ringing"}
+    call = fake_client.get.await_args
+    assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
+    assert call.kwargs["params"] == {
+        "select": "child_call_sid,status",
+        "parent_call_sid": "eq.CA111",
+        "limit": "1",
+    }
+
+
+async def test_get_dialer_call_child_leg_returns_none_for_no_rows(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value=[])
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
+
+
+async def test_get_dialer_call_child_leg_returns_none_for_error_body(monkeypatch):
+    """PostgREST returns a JSON object, not a list, for some errors - the
+    "never raises" contract has to hold for a malformed body too."""
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value={"message": "nope"})
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
+
+
+async def test_get_dialer_call_child_leg_swallows_errors(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = AsyncMock()
+    fake_client.get = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
+
+
+async def test_get_dialer_call_child_leg_returns_none_without_service_role_key(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_SERVICE_ROLE_KEY",
+        "",
+    )
+    assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None

@@ -20,10 +20,13 @@ from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    get_dialer_call_child_leg,
+    update_dialer_call_conference_sid,
     update_dialer_call_recording,
     update_dialer_call_status,
 )
 from api.services.telephony.providers.twilio.dialer_conference import (
+    cancel_call,
     conference_name_for,
     dial_lead_into_conference,
     parent_call_sid_from_conference_name,
@@ -43,6 +46,13 @@ from api.services.telephony.status_processor import (
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
+
+# Twilio call statuses that mean the lead actually answered. Past these the
+# lead's leg is a real conference participant, so Twilio's own conference
+# teardown ends it. Anything earlier (queued/initiated/ringing) means the
+# leg is still in flight and has to be cancelled explicitly - see
+# dialer_conference.cancel_call.
+_LEAD_ANSWERED_STATUSES = frozenset({"in-progress", "answered", "completed"})
 
 
 class VoiceTokenResponse(BaseModel):
@@ -161,6 +171,18 @@ async def handle_voice_connect(request: Request):
     )
     if not child_call_sid:
         logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
+        # create_dialer_call already inserted this row as "initiated" above,
+        # and the ONLY thing that ever moves it on is the dialer-call-status
+        # webhook - whose URL is attached solely to the lead's leg, which was
+        # never created. Without this the row is stranded at "initiated"
+        # forever. (A no-op PATCH matching zero rows is fine on the path
+        # where no row was created because the rep wasn't recognized.)
+        await update_dialer_call_status(
+            parent_call_sid=parent_call_sid,
+            child_call_sid=None,
+            status="failed",
+            duration_seconds=0,
+        )
         return HTMLResponse(
             content=(
                 '<?xml version="1.0" encoding="UTF-8"?><Response>'
@@ -197,9 +219,16 @@ async def handle_dialer_conference_join(
     request: Request,
     conference_name: str = "",
     muted: str = "false",
-    end_on_exit: str = "false",
+    end_on_exit: str = "true",
     start_on_enter: str = "true",
 ):
+    """Default end_on_exit="true" is deliberately the fail-SAFE default, even
+    though voice-connect (its only caller) always passes it explicitly. If
+    that param were ever dropped in transit, "false" would resurrect a nasty
+    bug: the lead hangs up, the conference stays alive with the rep alone,
+    the Voice SDK never fires `disconnect`, and the rep's UI sits there with
+    a running timer and no disposition prompt. A listen-in leg that must NOT
+    end the conference has to pass end_on_exit=false explicitly."""
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
     form_data = dict(await request.form())
 
@@ -227,6 +256,57 @@ async def handle_dialer_conference_join(
         "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
+
+
+@router.post("/dialer-conference-events", include_in_schema=False)
+async def handle_dialer_conference_events(request: Request):
+    """Conference lifecycle callback. Unlike the TwiML-serving endpoints this
+    raises 401 on a bad signature rather than returning hangup TwiML - same
+    as dialer-call-status and dialer-recording-callback, which are likewise
+    pure status callbacks with no live call leg waiting on a response."""
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-conference-events webhook")
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+
+    event_type = form_data.get("StatusCallbackEvent", "")
+    conference_sid = form_data.get("ConferenceSid", "")
+    friendly_name = form_data.get("FriendlyName", "")
+    parent_call_sid = parent_call_sid_from_conference_name(friendly_name) if friendly_name else None
+
+    if event_type == "conference-start" and conference_sid and parent_call_sid:
+        await update_dialer_call_conference_sid(
+            parent_call_sid=parent_call_sid, conference_sid=conference_sid
+        )
+    elif event_type == "conference-end" and parent_call_sid:
+        # Orphaned-lead-leg cleanup. The rep's leg carries
+        # endConferenceOnExit="true", so a rep hanging up (or skipping to the
+        # next lead) ends the conference - but that only drops *participants*.
+        # A lead still ringing has not joined yet, so their leg survives, they
+        # answer, dialer-conference-join drops them into a freshly-recreated
+        # empty conference, and they hear silence: an abandoned call from our
+        # own caller ID. See dialer_conference.cancel_call.
+        leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        child_call_sid = (leg or {}).get("child_call_sid")
+        lead_status = ((leg or {}).get("status") or "").strip().lower()
+        if not child_call_sid:
+            # child_call_sid is written by the lead's own status callback, so
+            # a conference ending in the first moments of a call can race it.
+            # Nothing to cancel by SID - log and move on rather than failing
+            # the webhook (which Twilio would then retry pointlessly).
+            logger.warning(
+                f"dialer-conference-events: no child_call_sid recorded for {parent_call_sid}, "
+                "cannot cancel a possibly-orphaned lead leg"
+            )
+        elif lead_status not in _LEAD_ANSWERED_STATUSES:
+            logger.info(
+                f"dialer-conference-events: conference ended with lead leg {child_call_sid} "
+                f"at status '{lead_status or 'unknown'}' - cancelling orphaned leg"
+            )
+            await cancel_call(call_sid=child_call_sid)
+
+    return {"status": "success"}
 
 
 @router.post("/dialer-call-status", include_in_schema=False)

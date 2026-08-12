@@ -2,6 +2,7 @@
 from unittest.mock import MagicMock, patch
 
 from api.services.telephony.providers.twilio.dialer_conference import (
+    cancel_call,
     conference_name_for,
     dial_lead_into_conference,
     parent_call_sid_from_conference_name,
@@ -85,3 +86,46 @@ async def test_dial_lead_into_conference_returns_none_on_exception(monkeypatch):
         )
 
     assert result is None
+
+
+async def test_cancel_call_updates_status_to_canceled(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")
+
+    fake_call_context = MagicMock()
+    fake_client = MagicMock()
+    fake_client.calls.return_value = fake_call_context
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_conference.Client",
+        return_value=fake_client,
+    ):
+        result = await cancel_call(call_sid="CA222")
+
+    assert result is True
+    fake_client.calls.assert_called_once_with("CA222")
+    fake_call_context.update.assert_called_once_with(status="canceled")
+
+
+async def test_cancel_call_returns_false_without_credentials(monkeypatch):
+    monkeypatch.delenv("SYSEVO_TWILIO_ACCOUNT_SID", raising=False)
+    monkeypatch.delenv("SYSEVO_TWILIO_AUTH_TOKEN", raising=False)
+    assert await cancel_call(call_sid="CA222") is False
+
+
+async def test_cancel_call_returns_false_on_exception(monkeypatch):
+    """Twilio rejects a cancel on a call that already answered or completed;
+    that must never surface as a 500 from the webhook that called this."""
+    monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")
+
+    fake_call_context = MagicMock()
+    fake_call_context.update.side_effect = Exception("Call is not in-progress")
+    fake_client = MagicMock()
+    fake_client.calls.return_value = fake_call_context
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_conference.Client",
+        return_value=fake_client,
+    ):
+        assert await cancel_call(call_sid="CA222") is False

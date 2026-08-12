@@ -94,6 +94,67 @@ async def update_dialer_call_status(
         logger.error(f"Failed to update dialer_calls status for {parent_call_sid}: {exc}")
 
 
+async def update_dialer_call_conference_sid(*, parent_call_sid: str, conference_sid: str) -> None:
+    """Populates conference_sid once the Conference actually starts (the
+    rep has joined) - this is later used to correlate the Conference's own
+    recording callback, which identifies via ConferenceSid rather than any
+    participant's CallSid."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls conference_sid")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                json={"conference_sid": conference_sid},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to update dialer_calls conference_sid for {parent_call_sid}: {exc}")
+
+
+async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
+    """Read back the lead leg's SID and last-known status.
+
+    The only read in this module. dialer-conference-events uses it to decide
+    whether the lead's outbound leg was left orphaned (still ringing, never
+    a conference participant) when the conference ended.
+
+    Returns None - never raises, never partially reports - when the row is
+    missing or unreadable for any reason, so callers treat "don't know" and
+    "nothing there" identically.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot read dialer_calls row")
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={
+                    "select": "child_call_sid,status",
+                    "parent_call_sid": f"eq.{parent_call_sid}",
+                    "limit": "1",
+                },
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to read dialer_calls row for {parent_call_sid}: {exc}")
+        return None
+    # PostgREST returns a JSON *object* (not a list) for some error shapes,
+    # so this is shape-checked rather than blindly indexed - the contract is
+    # "never raises", and that has to hold for a malformed body too.
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        return rows[0]
+    return None
+
+
 async def update_dialer_call_recording(*, parent_call_sid: str, recording_sid: str) -> None:
     """Update recording_sid from the <Dial>'s recordingStatusCallback."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:

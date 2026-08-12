@@ -72,3 +72,36 @@ async def dial_lead_into_conference(
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into voice-connect
         logger.error(f"Failed to dial lead into conference for {parent_call_sid}: {exc}")
         return None
+
+
+async def cancel_call(*, call_sid: str) -> bool:
+    """Cancel an outbound call that is still queued or ringing.
+
+    The rep's leg carries endConferenceOnExit="true", so the rep hanging up
+    (or skipping on to the next lead) ends the conference - but ending a
+    conference only drops its *participants*. A lead whose phone is still
+    ringing has not joined yet: their call is an independent in-flight leg
+    whose TwiML hasn't run, so it survives, they answer, and they land in a
+    freshly-recreated empty conference and hear silence. That is an
+    abandoned call placed from our own caller ID - FCC/FTC territory, not
+    just bad UX. The old <Dial><Number> bridge cancelled that leg for us;
+    with Conference we have to do it ourselves.
+
+    Returns True if Twilio accepted the cancel. Fails soft like everything
+    else here: Twilio rejects a cancel on a call that already answered or
+    completed, and neither that nor an outage may turn a status-callback
+    webhook into a 500 that Twilio then retries.
+
+    Twilio's Python SDK is synchronous, so this is wrapped in
+    asyncio.to_thread() for the same reason dial_lead_into_conference is.
+    """
+    client = _twilio_client()
+    if not client:
+        logger.error("cancel_call: Twilio credentials not configured")
+        return False
+    try:
+        await asyncio.to_thread(client.calls(call_sid).update, status="canceled")
+        return True
+    except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
+        logger.error(f"Failed to cancel call {call_sid}: {exc}")
+        return False
