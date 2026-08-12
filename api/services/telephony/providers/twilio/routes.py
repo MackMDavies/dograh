@@ -6,6 +6,7 @@ provider registry — see ProviderSpec.router.
 
 import json
 import os
+import re
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
@@ -70,6 +71,11 @@ router = APIRouter()
 _LEAD_LEG_SETTLED_STATUSES = frozenset(
     {"in-progress", "answered", "completed", "busy", "no-answer", "canceled", "failed"}
 )
+
+# Twilio Call SID grammar: literal "CA" + 32 lowercase hex. Used to validate
+# the one caller-supplied value that becomes a conference name - see
+# _serve_listen_in_twiml.
+_TWILIO_CALL_SID_PATTERN = re.compile(r"^CA[0-9a-f]{32}$")
 
 
 class VoiceTokenResponse(BaseModel):
@@ -146,6 +152,28 @@ async def handle_voice_connect(request: Request):
     if not await _verify_twilio_signature(request, form_data):
         logger.warning("Invalid Twilio signature on voice-connect webhook")
         return HTMLResponse(content=hangup, media_type="application/xml")
+
+    # Listen-in arrives HERE, not at /dialer-listen-connect, and this branch
+    # is the only reason the feature works at all.
+    #
+    # generate_voice_access_token grants a VoiceGrant over one
+    # TWILIO_TWIML_APP_SID, a TwiML App has exactly one Voice URL, and that
+    # URL is this endpoint. device.connect() can pass arbitrary custom params
+    # but cannot pick a different URL - so a manager's listen-in leg lands on
+    # voice-connect with a ListenParentCallSid and no To, and would otherwise
+    # fall straight through to the "missing To number" hangup below.
+    #
+    # Routing only, never an authorization shortcut: _serve_listen_in_twiml
+    # runs its own full is_manager_or_admin check, so a sales_rep who adds
+    # this param to their own dial is rejected there. The signature has
+    # already been verified once, above, and the parsed form is handed over
+    # rather than re-read - the body is consumed and cannot be read twice.
+    #
+    # Placed before every other field read so the rep dial path - the hot
+    # path on every sales call - is untouched when the param is absent: one
+    # dict lookup against a falsy default.
+    if str(form_data.get("ListenParentCallSid", "")).strip():
+        return await _serve_listen_in_twiml(form_data)
 
     to_number = form_data.get("To", "").strip()
     raw_from = form_data.get("From", "")
@@ -452,14 +480,17 @@ async def handle_dialer_conference_events(request: Request):
     return {"status": "success"}
 
 
-@router.post("/dialer-listen-connect", include_in_schema=False)
-async def handle_dialer_listen_connect(request: Request):
+async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
     """Place a manager/admin into a live call's conference as a MUTED listener.
 
-    The manager's browser Voice SDK Device dials out with a
-    ListenParentCallSid param; Twilio then asks this endpoint what to do with
-    that leg. Everything about the returned TwiML is chosen so the two people
-    already on the call cannot tell anyone joined:
+    Takes already-parsed, already-signature-verified form data, because it has
+    TWO entry points (see handle_voice_connect's delegation and
+    handle_dialer_listen_connect below) and re-reading `request.form()` after
+    the body has been consumed once would yield nothing. Verifying the
+    signature is the caller's job, done exactly once, at the route.
+
+    Everything about the returned TwiML is chosen so the two people already on
+    the call cannot tell anyone joined:
 
     - muted="true"                  - the manager can never be heard.
     - beep="false"                  - Twilio's DEFAULT is beep="true", which
@@ -482,16 +513,14 @@ async def handle_dialer_listen_connect(request: Request):
     and reporting; the manager joins an already-created conference, so their
     copy would be discarded anyway - and resolving them costs a
     get_backend_endpoints() call (which can block on a cloudflared lookup) on
-    a path where a human is waiting to hear a live call.
+    a path where a human is waiting to hear a live call. The residual race -
+    a manager whose leg somehow creates the conference first, costing the
+    recording - is accepted knowingly and is on the deployment checklist to
+    confirm.
     """
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
-    form_data = dict(await request.form())
 
-    if not await _verify_twilio_signature(request, form_data):
-        logger.warning("Invalid Twilio signature on dialer-listen-connect webhook")
-        return HTMLResponse(content=hangup, media_type="application/xml")
-
-    # Blanket try, on this handler's own terms rather than by delegation.
+    # Blanket try, on this function's own terms rather than by delegation.
     # create_dialer_call_listener and is_manager_or_admin each swallow their
     # own errors, but db_client.get_user_by_id does NOT (a DB blip raises)
     # and neither does the string handling around them - and code BETWEEN two
@@ -501,7 +530,18 @@ async def handle_dialer_listen_connect(request: Request):
         raw_from = form_data.get("From", "")
         parent_call_sid = str(form_data.get("ListenParentCallSid", "")).strip()
         if not parent_call_sid:
-            logger.error("dialer-listen-connect missing ListenParentCallSid")
+            logger.error("listen-in missing ListenParentCallSid")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        # Constrain the SID to Twilio's own grammar before it becomes a
+        # conference name. There is no FK on dialer_call_listeners.
+        # parent_call_sid and no lookup here (a fail-closed existence check in
+        # front of live audio is a worse trade - see the design notes), so
+        # this shape guard is what stops an authenticated manager naming an
+        # arbitrary conference, and it demotes the XML escaping below from
+        # sole defense to belt-and-braces. Free: a regex, no I/O.
+        if not _TWILIO_CALL_SID_PATTERN.match(parent_call_sid):
+            logger.warning("listen-in rejected malformed ListenParentCallSid")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
         # Same "client:rep-{id}" Voice SDK identity a rep gets: /voice-token
@@ -511,12 +551,12 @@ async def handle_dialer_listen_connect(request: Request):
         # actual authorization is is_manager_or_admin below.
         manager_id = _parse_rep_id_from_identity(raw_from)
         if manager_id is None:
-            logger.warning("dialer-listen-connect: unrecognized identity")
+            logger.warning("listen-in: unrecognized identity")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
         user = await db_client.get_user_by_id(manager_id)
         if not user or not user.provider_id:
-            logger.warning(f"dialer-listen-connect: no Supabase user for dograh id {manager_id}")
+            logger.warning(f"listen-in: no Supabase user for dograh id {manager_id}")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
         # Authorize BEFORE recording anything and before returning any
@@ -524,19 +564,24 @@ async def handle_dialer_listen_connect(request: Request):
         # dialer_call_listeners row claiming they listened, and must never
         # reach the audio. is_manager_or_admin fails CLOSED, so an error
         # reaching Supabase lands here too.
+        #
+        # This check is why delegation from voice-connect is routing and not
+        # a bypass: BOTH entry points land here, so a sales_rep who hand-
+        # crafts a ListenParentCallSid param is rejected on exactly this line.
         if not await is_manager_or_admin(user.provider_id):
-            logger.warning(f"dialer-listen-connect: {user.provider_id} is not a manager/admin")
+            logger.warning(f"listen-in: {user.provider_id} is not a manager/admin")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
         await create_dialer_call_listener(
             parent_call_sid=parent_call_sid, manager_user_id=user.provider_id
         )
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
-        logger.error(f"dialer-listen-connect failed: {exc}")
+        logger.error(f"listen-in failed: {exc}")
         return HTMLResponse(content=hangup, media_type="application/xml")
 
-    # parent_call_sid is caller-supplied, so the conference name derived from
-    # it is too - escape it exactly as the other conference nouns do.
+    # escape() is belt-and-braces now that the SID shape is validated above,
+    # and stays for exactly that reason - it must not be the only thing
+    # standing between a caller-supplied string and the TwiML document.
     conference_name = conference_name_for(parent_call_sid)
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -547,6 +592,29 @@ async def handle_dialer_listen_connect(request: Request):
         "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
+
+
+@router.post("/dialer-listen-connect", include_in_schema=False)
+async def handle_dialer_listen_connect(request: Request):
+    """Dedicated listen-in answer URL.
+
+    Currently UNREACHABLE from the browser and kept deliberately: the Voice
+    SDK can only dial the single Voice URL configured on the one
+    TWILIO_TWIML_APP_SID that generate_voice_access_token grants, which is
+    /voice-connect. A Device can pass custom params but cannot choose a
+    different URL, so listen-in actually arrives via voice-connect's
+    delegation. This route costs nothing, keeps the listen path directly
+    addressable and testable, and means pointing a second TwiML App here
+    later is a console change with no code change.
+    """
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    form_data = dict(await request.form())
+
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-listen-connect webhook")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    return await _serve_listen_in_twiml(form_data)
 
 
 @router.post("/dialer-call-status", include_in_schema=False)

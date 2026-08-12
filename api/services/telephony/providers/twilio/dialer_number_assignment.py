@@ -21,7 +21,17 @@ from api.db import db_client
 
 
 def _parse_rep_id_from_identity(raw_from: str) -> int | None:
-    """Twilio Device-originated calls send From as "client:rep-{id}"."""
+    """Twilio Device-originated calls send From as "client:rep-{id}".
+
+    The "rep-" prefix is the token FORMAT, not a role claim: routes.py's
+    /voice-token issues identity=f"rep-{user.id}" to everyone holding any of
+    SALES_DIALER_ROLES (sales_rep, sales_manager, super_admin), so a manager's
+    listen-in leg arrives with this exact shape too. That is why
+    _serve_listen_in_twiml reuses this parser despite the rep-flavoured name -
+    and why changing the identity format would silently break listen-in as
+    well as dialling. Authorization is always a separate is_manager_or_admin
+    check; this function grants nothing.
+    """
     identity = raw_from.removeprefix("client:")
     if not identity.startswith("rep-"):
         return None

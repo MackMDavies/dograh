@@ -1,3 +1,4 @@
+import xml.dom.minidom
 from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +10,12 @@ from loguru import logger
 from api.services.telephony.providers.twilio.routes import router
 
 _DISCLOSURE = "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+
+# A real-shaped Twilio Call SID ("CA" + 32 lowercase hex). Listen-in
+# validates this shape before the value becomes a conference name, so the
+# short "CA111" placeholder the other tests use is deliberately rejected
+# there - see test_dialer_listen_connect_rejects_malformed_parent_call_sid.
+_LISTEN_SID = "CA" + "abcdef0123456789" * 2
 
 
 def _make_test_app() -> FastAPI:
@@ -1301,14 +1308,14 @@ def test_dialer_listen_connect_allows_manager(monkeypatch):
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": "CA111"},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
     assert "<Conference" in response.text
     assert 'muted="true"' in response.text
-    assert "call-CA111</Conference>" in response.text
+    assert f"call-{_LISTEN_SID}</Conference>" in response.text
     # beep="false" is the whole point of a SILENT monitor: Twilio defaults to
     # beep="true", which would play a join tone to the rep AND the lead.
     assert 'beep="false"' in response.text
@@ -1320,9 +1327,13 @@ def test_dialer_listen_connect_allows_manager(monkeypatch):
     # into a live call by someone joining to listen.
     assert _DISCLOSURE not in response.text
     mock_create_listener.assert_awaited_once_with(
-        parent_call_sid="CA111",
+        parent_call_sid=_LISTEN_SID,
         manager_user_id="00000000-0000-0000-0000-000000000001",
     )
+    # Well-formedness is asserted, not eyeballed: parse the document rather
+    # than trusting substring matches against an f-string.
+    doc = xml.dom.minidom.parseString(response.text)
+    assert len(doc.getElementsByTagName("Conference")) == 1
 
 
 def test_dialer_listen_connect_rejects_non_manager(monkeypatch):
@@ -1344,7 +1355,7 @@ def test_dialer_listen_connect_rejects_non_manager(monkeypatch):
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": "CA111"},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1367,7 +1378,7 @@ def test_dialer_listen_connect_hangs_up_on_invalid_signature(monkeypatch):
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": "CA111"},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
             headers={"X-Twilio-Signature": "bad-signature"},
         )
 
@@ -1411,7 +1422,7 @@ def test_dialer_listen_connect_hangs_up_for_unrecognized_identity(monkeypatch):
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:not-a-rep", "ListenParentCallSid": "CA111"},
+            data={"From": "client:not-a-rep", "ListenParentCallSid": _LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1439,11 +1450,244 @@ def test_dialer_listen_connect_hangs_up_when_user_has_no_provider_id(monkeypatch
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": "CA111"},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
     assert "<Hangup/>" in response.text
     assert "<Conference" not in response.text
+    mock_create_listener.assert_not_awaited()
+
+
+def test_dialer_listen_connect_rejects_malformed_parent_call_sid(monkeypatch):
+    """The SID becomes a conference name, so it is constrained to Twilio's own
+    grammar ("CA" + 32 hex) before it gets there. Without this an
+    authenticated manager could name an arbitrary conference and write a
+    dialer_call_listeners row for a call that never existed - there is no FK
+    on that column."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=MagicMock(provider_id="00000000-0000-0000-0000-000000000001"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+    ) as mock_create_listener:
+        response = client.post(
+            "/dialer-listen-connect",
+            data={"From": "client:rep-7", "ListenParentCallSid": "not-a-sid"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    assert "<Conference" not in response.text
+    mock_create_listener.assert_not_awaited()
+
+
+def test_dialer_listen_connect_survives_a_raising_user_lookup(monkeypatch):
+    """Pins the blanket try/except: db_client.get_user_by_id is the one call
+    on this path that does NOT swallow its own errors, and it sits between two
+    that do. An escape becomes a 500, which Twilio reads aloud to the manager
+    and then retries. Deleting the except must fail this test."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        side_effect=RuntimeError("database is on fire"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+    ) as mock_create_listener:
+        response = client.post(
+            "/dialer-listen-connect",
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    assert "<Conference" not in response.text
+    mock_create_listener.assert_not_awaited()
+
+
+def test_dialer_conference_join_twiml_is_well_formed_under_injection(monkeypatch):
+    """Parses the document instead of substring-matching it.
+
+    Aimed at dialer-conference-join rather than dialer-listen-connect on
+    purpose: listen-in now validates its SID shape, so the conference name
+    there can no longer be arbitrary and its escape() is belt-and-braces.
+    THIS endpoint still takes a free-form conference_name, so escaping is the
+    only defense here - which makes this the layer worth pinning. Deleting
+    escape() must fail this test."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+    malicious_name = "call-CA111</Conference></Dial><Dial><Number>+19005551234</Number></Dial>"
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join",
+            params={"conference_name": malicious_name},
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    doc = xml.dom.minidom.parseString(response.text)
+    conferences = doc.getElementsByTagName("Conference")
+    assert len(conferences) == 1
+    assert len(doc.getElementsByTagName("Number")) == 0
+    # The payload survives intact as TEXT - it is the conference name, escaped,
+    # not markup.
+    assert conferences[0].firstChild.data == malicious_name
+
+
+def test_voice_connect_delegates_to_listen_in_for_manager(monkeypatch):
+    """The Voice SDK cannot choose a URL - one TwiML App, one Voice URL, and
+    it points here - so a manager's listen-in leg arrives at voice-connect
+    with a ListenParentCallSid and no To. Without this delegation the endpoint
+    is unreachable from a browser."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000001")
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=fake_user,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+    ) as mock_create_listener, patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+    ) as mock_dial, patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call",
+    ) as mock_create_call:
+        response = client.post(
+            "/voice-connect",
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert 'muted="true"' in response.text
+    assert 'beep="false"' in response.text
+    assert 'endConferenceOnExit="false"' in response.text
+    assert 'startConferenceOnEnter="false"' in response.text
+    assert f"call-{_LISTEN_SID}</Conference>" in response.text
+    mock_create_listener.assert_awaited_once_with(
+        parent_call_sid=_LISTEN_SID,
+        manager_user_id="00000000-0000-0000-0000-000000000001",
+    )
+    # Listening must never place an outbound call or log a dial.
+    mock_dial.assert_not_awaited()
+    mock_create_call.assert_not_awaited()
+
+
+def test_voice_connect_delegation_still_rejects_a_non_manager(monkeypatch):
+    """Delegation is routing, not an authorization bypass: a sales_rep who
+    hand-crafts a ListenParentCallSid onto their own dial gets nothing."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000002")
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=fake_user,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
+        return_value=False,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+    ) as mock_create_listener, patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+    ) as mock_dial:
+        response = client.post(
+            "/voice-connect",
+            data={
+                "To": "+15559876543",
+                "From": "client:rep-7",
+                "CallSid": "CA111",
+                "ListenParentCallSid": _LISTEN_SID,
+            },
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    assert "<Conference" not in response.text
+    mock_create_listener.assert_not_awaited()
+    # Nor may the rejected listen attempt fall through into a normal dial -
+    # the To/CallSid here would otherwise be a perfectly valid outbound call.
+    mock_dial.assert_not_awaited()
+
+
+def test_voice_connect_rep_dial_is_untouched_without_listen_param(monkeypatch):
+    """The hot path on every sales call. Delegation must be invisible to it."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000003")
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=fake_user,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
+    ) as mock_dial, patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_child_sid",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
+    ) as mock_is_manager, patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+    ) as mock_create_listener:
+        response = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "From": "client:rep-7", "CallSid": "CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    # A normal rep dial: unmuted, it starts and ends the conference.
+    assert 'startConferenceOnEnter="true"' in response.text
+    assert 'endConferenceOnExit="true"' in response.text
+    assert "call-CA111</Conference>" in response.text
+    mock_dial.assert_awaited_once()
+    # Not so much as a role lookup on the dial path.
+    mock_is_manager.assert_not_awaited()
     mock_create_listener.assert_not_awaited()
