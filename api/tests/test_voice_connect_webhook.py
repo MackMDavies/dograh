@@ -14,7 +14,7 @@ def _make_test_app() -> FastAPI:
     return app
 
 
-def test_voice_connect_returns_dial_twiml_for_valid_signature(monkeypatch):
+def test_voice_connect_returns_conference_twiml_for_valid_signature(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
 
@@ -24,23 +24,32 @@ def test_voice_connect_returns_dial_twiml_for_valid_signature(monkeypatch):
         "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
         return_value=True,
     ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        _BACKEND_ENDPOINTS,
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543"},
+            data={"To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
-    assert 'callerId="+15551234567"' in response.text
-    assert 'record="record-from-answer"' in response.text
-    assert "<Number statusCallback=" in response.text
-    assert "+15559876543</Number>" in response.text
+    assert "<Conference" in response.text
+    assert "call-CA111</Conference>" in response.text
+    assert 'record="record-from-start"' in response.text
+    assert (
+        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+        in response.text
+    )
 
 
 def test_voice_connect_hangs_up_on_invalid_signature(monkeypatch):
@@ -55,8 +64,48 @@ def test_voice_connect_hangs_up_on_invalid_signature(monkeypatch):
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543"},
+            data={"To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "bad-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+
+
+def test_voice_connect_hangs_up_when_to_number_missing(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/voice-connect",
+            data={"CallSid": "CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+
+
+def test_voice_connect_hangs_up_when_call_sid_missing(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543"},
+            headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
@@ -80,17 +129,29 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        _BACKEND_ENDPOINTS,
-    ):
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+    ) as mock_dial:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "From": "client:rep-42"},
+            data={"To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
-    assert 'callerId="+15559998888"' in response.text
-    assert 'record="record-from-answer"' in response.text
+    mock_dial.assert_awaited_once_with(
+        parent_call_sid="CA111",
+        lead_number="+15559876543",
+        caller_id="+15559998888",
+        join_conference_url=(
+            "https://api.example.com/api/v1/telephony/dialer-conference-join"
+            "?conference_name=call-CA111&muted=false&end_on_exit=false&start_on_enter=true"
+        ),
+        status_callback_url=(
+            "https://api.example.com/api/v1/telephony/dialer-call-status?parent_call_sid=CA111"
+        ),
+    )
 
 
 def test_voice_connect_falls_back_to_default_when_no_assignment(monkeypatch):
@@ -110,58 +171,10 @@ def test_voice_connect_falls_back_to_default_when_no_assignment(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        _BACKEND_ENDPOINTS,
-    ):
-        response = client.post(
-            "/voice-connect",
-            data={"To": "+15559876543", "From": "client:rep-99"},
-            headers={"X-Twilio-Signature": "fake-signature"},
-        )
-
-    assert response.status_code == 200
-    assert 'callerId="+15551234567"' in response.text
-    assert 'record="record-from-answer"' in response.text
-
-
-def test_voice_connect_hangs_up_when_to_number_missing(monkeypatch):
-    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
-
-    client = TestClient(_make_test_app())
-
-    with patch(
-        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
-        return_value=True,
-    ):
-        response = client.post(
-            "/voice-connect",
-            data={},
-            headers={"X-Twilio-Signature": "fake-signature"},
-        )
-
-    assert response.status_code == 200
-    assert "<Hangup/>" in response.text
-
-
-def test_voice_connect_includes_disclosure_and_recording_attributes(monkeypatch):
-    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
-
-    client = TestClient(_make_test_app())
-
-    with patch(
-        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
-        return_value=True,
+        return_value=("https://api.example.com", "wss://api.example.com"),
     ), patch(
-        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
-        return_value=None,
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        _BACKEND_ENDPOINTS,
-    ):
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+    ) as mock_dial:
         response = client.post(
             "/voice-connect",
             data={"To": "+15559876543", "CallSid": "CA111"},
@@ -169,16 +182,8 @@ def test_voice_connect_includes_disclosure_and_recording_attributes(monkeypatch)
         )
 
     assert response.status_code == 200
-    assert "<Say>This call may be recorded for quality assurance.</Say>" in response.text
-    assert 'record="record-from-answer"' in response.text
-    assert (
-        'recordingStatusCallback="https://api.example.com/api/v1/telephony/dialer-recording-callback"'
-        in response.text
-    )
-    assert (
-        'statusCallback="https://api.example.com/api/v1/telephony/dialer-call-status?parent_call_sid=CA111"'
-        in response.text
-    )
+    mock_dial.assert_awaited_once()
+    assert mock_dial.await_args.kwargs["caller_id"] == "+15551234567"
 
 
 def test_voice_connect_creates_dialer_call_for_recognized_rep(monkeypatch):
@@ -199,7 +204,10 @@ def test_voice_connect_creates_dialer_call_for_recognized_rep(monkeypatch):
         return_value=fake_user,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        _BACKEND_ENDPOINTS,
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
     ), patch(
         "api.services.telephony.providers.twilio.routes.create_dialer_call",
     ) as mock_create:
@@ -241,17 +249,19 @@ def test_voice_connect_still_dials_when_get_backend_endpoints_raises(monkeypatch
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
-        AsyncMock(side_effect=Exception("backend unreachable")),
+        side_effect=Exception("backend unreachable"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543"},
+            data={"To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
     assert response.status_code == 200
-    assert 'callerId="+15551234567"' in response.text
-    assert 'record="record-from-answer"' in response.text
+    assert "<Conference" in response.text
 
 
 def test_dialer_call_status_updates_on_valid_signature(monkeypatch):

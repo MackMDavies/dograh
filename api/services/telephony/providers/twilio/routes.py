@@ -88,12 +88,14 @@ async def handle_voice_connect(request: Request):
         await resolve_assigned_caller_id(raw_from)
         or os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "")
     )
-    if not to_number or not caller_id:
-        logger.error("voice-connect missing To number or SYSEVO_TWILIO_DEFAULT_CALLER_ID")
+    if not to_number or not caller_id or not parent_call_sid:
+        logger.error(
+            "voice-connect missing To number, SYSEVO_TWILIO_DEFAULT_CALLER_ID, or CallSid"
+        )
         return HTMLResponse(content=hangup, media_type="application/xml")
 
     rep_id = _parse_rep_id_from_identity(raw_from)
-    if rep_id is not None and parent_call_sid:
+    if rep_id is not None:
         user = await db_client.get_user_by_id(rep_id)
         if user and user.provider_id:
             await create_dialer_call(
@@ -118,21 +120,47 @@ async def handle_voice_connect(request: Request):
         logger.error(f"voice-connect could not resolve backend endpoint for callbacks: {exc}")
         backend_endpoint = ""
 
-    status_callback_url = (
+    conference_name = conference_name_for(parent_call_sid)
+    conference_events_url = f"{backend_endpoint}/api/v1/telephony/dialer-conference-events"
+    recording_callback_url = f"{backend_endpoint}/api/v1/telephony/dialer-recording-callback"
+    # Plain URL query string, passed to Twilio's REST API as a function
+    # argument rather than embedded in XML - the "&" separators are correct
+    # as-is here and must NOT be XML-escaped.
+    lead_join_url = (
+        f"{backend_endpoint}/api/v1/telephony/dialer-conference-join"
+        f"?conference_name={conference_name}&muted=false&end_on_exit=false&start_on_enter=true"
+    )
+    lead_status_callback_url = (
         f"{backend_endpoint}/api/v1/telephony/dialer-call-status"
         f"?parent_call_sid={parent_call_sid}"
     )
-    recording_callback_url = f"{backend_endpoint}/api/v1/telephony/dialer-recording-callback"
+
+    # Dial the lead into the same conference the rep is about to join.
+    # dial_lead_into_conference already fails soft (logs, returns None)
+    # rather than raising, so a Twilio API hiccup here never breaks the
+    # rep's own TwiML response below - the rep still connects, they just
+    # end up alone in the conference if this fails.
+    child_call_sid = await dial_lead_into_conference(
+        parent_call_sid=parent_call_sid,
+        lead_number=to_number,
+        caller_id=caller_id,
+        join_conference_url=lead_join_url,
+        status_callback_url=lead_status_callback_url,
+    )
+    if not child_call_sid:
+        logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
 
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>This call may be recorded for quality assurance.</Say>"
-        f'<Dial callerId="{caller_id}" record="record-from-answer" '
-        f'recordingStatusCallback="{recording_callback_url}">'
-        f'<Number statusCallback="{status_callback_url}" '
-        'statusCallbackEvent="initiated ringing answered completed">'
-        f"{to_number}</Number>"
+        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+        "<Dial>"
+        f"<Conference statusCallback={quoteattr(conference_events_url)} "
+        'statusCallbackEvent="start end join leave" '
+        'startConferenceOnEnter="true" endConferenceOnExit="true" '
+        'record="record-from-start" '
+        f"recordingStatusCallback={quoteattr(recording_callback_url)}>"
+        f"{escape(conference_name)}</Conference>"
         "</Dial>"
         "</Response>"
     )
