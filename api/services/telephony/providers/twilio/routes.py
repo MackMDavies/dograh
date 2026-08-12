@@ -109,11 +109,15 @@ async def handle_voice_connect(request: Request):
     # Reuse the same publicly-reachable backend URL resolution every other
     # telephony provider webhook in this codebase uses (env var, falling
     # back to a cloudflared tunnel URL for local dev) rather than adding a
-    # second, parallel "public base URL" concept. This call is deliberately
-    # NOT allowed to break the call: if it fails, callback URLs degrade to a
-    # malformed empty-host string, so Twilio simply won't be able to reach
-    # them - status/recording tracking is lost for this call, but the call
-    # itself still connects.
+    # second, parallel "public base URL" concept.
+    #
+    # This is caught rather than propagated so the failure is a clean,
+    # explained hangup instead of a 500 - but it IS fatal to the call now.
+    # Under the old <Dial><Number> shape an empty endpoint only cost us
+    # status/recording callbacks; with Conference the lead's join URL is
+    # handed to Twilio's REST API, which rejects a non-absolute `url`, so
+    # calls.create raises, dial_lead_into_conference returns None, and the
+    # rep gets the "could not connect" message below.
     try:
         backend_endpoint, _ = await get_backend_endpoints()
     except Exception as exc:  # noqa: BLE001 - deliberate: must never break call setup
@@ -126,9 +130,16 @@ async def handle_voice_connect(request: Request):
     # Plain URL query string, passed to Twilio's REST API as a function
     # argument rather than embedded in XML - the "&" separators are correct
     # as-is here and must NOT be XML-escaped.
+    #
+    # end_on_exit=true is load-bearing: the lead hanging up first is the
+    # majority outcome on a cold-call dialer, and it must tear the whole
+    # conference down so the rep's leg ends too. That's what fires the Voice
+    # SDK's `disconnect` event, which is what makes the frontend show the
+    # disposition panel. With end_on_exit=false the rep would be left alone
+    # in a live conference, in silence, with a running timer and no prompt.
     lead_join_url = (
         f"{backend_endpoint}/api/v1/telephony/dialer-conference-join"
-        f"?conference_name={conference_name}&muted=false&end_on_exit=false&start_on_enter=true"
+        f"?conference_name={conference_name}&muted=false&end_on_exit=true&start_on_enter=true"
     )
     lead_status_callback_url = (
         f"{backend_endpoint}/api/v1/telephony/dialer-call-status"
@@ -136,10 +147,11 @@ async def handle_voice_connect(request: Request):
     )
 
     # Dial the lead into the same conference the rep is about to join.
-    # dial_lead_into_conference already fails soft (logs, returns None)
-    # rather than raising, so a Twilio API hiccup here never breaks the
-    # rep's own TwiML response below - the rep still connects, they just
-    # end up alone in the conference if this fails.
+    # dial_lead_into_conference fails soft (logs, returns None) rather than
+    # raising - but None means no lead leg exists at all (missing creds or a
+    # rejected/failed calls.create), never a partial success. Putting the rep
+    # into a conference nobody will ever join would just be silence and a
+    # running timer, so say what happened and hang up instead.
     child_call_sid = await dial_lead_into_conference(
         parent_call_sid=parent_call_sid,
         lead_number=to_number,
@@ -149,15 +161,28 @@ async def handle_voice_connect(request: Request):
     )
     if not child_call_sid:
         logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
+        return HTMLResponse(
+            content=(
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                "<Say>We could not connect that call. Please try again.</Say>"
+                "<Hangup/></Response>"
+            ),
+            media_type="application/xml",
+        )
 
+    # No <Say> on the rep's leg: the disclosure belongs on the lead's leg
+    # (see handle_dialer_conference_join), both so the called party actually
+    # hears it and so the rep joins sub-second instead of missing a fast
+    # answerer's "Hello?" behind ~4s of speech.
+    # beep="false" everywhere - the old <Dial><Number> bridge had no join
+    # tones, and a later task has a manager joining silently to listen.
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
         "<Dial>"
         f"<Conference statusCallback={quoteattr(conference_events_url)} "
         'statusCallbackEvent="start end join leave" '
-        'startConferenceOnEnter="true" endConferenceOnExit="true" '
+        'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false" '
         'record="record-from-start" '
         f"recordingStatusCallback={quoteattr(recording_callback_url)}>"
         f"{escape(conference_name)}</Conference>"
@@ -186,11 +211,19 @@ async def handle_dialer_conference_join(
         logger.error("dialer-conference-join missing conference_name")
         return HTMLResponse(content=hangup, media_type="application/xml")
 
+    # The recording/monitoring disclosure lives here, on the lead's own leg,
+    # rather than on the rep's leg in voice-connect - this is the leg the
+    # called party is actually listening to. A manager's listen-in leg does
+    # NOT come through here (it has its own dialer-listen-connect endpoint),
+    # so this never announces a silent monitor.
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
-        "<Response><Dial>"
+        "<Response>"
+        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+        "<Dial>"
         f"<Conference muted={quoteattr(muted)} endConferenceOnExit={quoteattr(end_on_exit)} "
-        f"startConferenceOnEnter={quoteattr(start_on_enter)}>{escape(conference_name)}</Conference>"
+        f'startConferenceOnEnter={quoteattr(start_on_enter)} beep="false">'
+        f"{escape(conference_name)}</Conference>"
         "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
