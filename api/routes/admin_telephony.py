@@ -52,6 +52,10 @@ class PlatformTwilioAccountItem(BaseModel):
     last_validated_at: Optional[str]
     created_at: Optional[str]
     dialer_configured: bool
+    # Identifiers, not secrets — included so the edit form can pre-fill them.
+    dialer_api_key_sid: Optional[str] = None
+    dialer_twiml_app_sid: Optional[str] = None
+    dialer_default_caller_id: Optional[str] = None
 
 
 class PlatformTwilioAccountsResponse(BaseModel):
@@ -77,6 +81,25 @@ class AddTwilioAccountResponse(BaseModel):
     friendly_name: Optional[str] = None
 
 
+class UpdateTwilioAccountRequest(BaseModel):
+    """
+    All fields optional — only fields the client actually sets are applied
+    (see ``BaseModel.model_dump(exclude_unset=True)`` in the handler), so a
+    partial edit (e.g. "just fix the TwiML App SID") never touches anything
+    else. Send "" to clear a nullable field; omit a field entirely to leave
+    it untouched. account_sid/auth_token are re-validated against Twilio only
+    when both are present in the same request (changing just one would leave
+    a mismatched pair, so we require them together).
+    """
+    label: Optional[str] = None
+    account_sid: Optional[str] = None
+    auth_token: Optional[str] = None
+    dialer_api_key_sid: Optional[str] = None
+    dialer_api_key_secret: Optional[str] = None
+    dialer_twiml_app_sid: Optional[str] = None
+    dialer_default_caller_id: Optional[str] = None
+
+
 class ManagedNumberItem(BaseModel):
     phone_number_id: int
     address: str
@@ -91,6 +114,11 @@ class ManagedNumberItem(BaseModel):
     created_at: Optional[str]
     monthly_cost_cents: int  # estimated Twilio rental cost (USD cents)
     call_count: int          # calls run through the number (runs of its inbound workflow)
+    # Which platform Twilio account this number was bought under — label if the
+    # account still has one and exists, else a masked SID, else None (the
+    # number's org-level config has no readable account_sid, e.g. legacy row).
+    platform_account_label: Optional[str] = None
+    platform_account_sid_preview: Optional[str] = None
 
 
 class ManagedNumbersResponse(BaseModel):
@@ -155,6 +183,9 @@ async def list_twilio_accounts(_user: UserModel = Depends(get_superuser)):
                 ),
                 created_at=r["created_at"].isoformat() if r["created_at"] else None,
                 dialer_configured=r["dialer_configured"],
+                dialer_api_key_sid=r["dialer_api_key_sid"],
+                dialer_twiml_app_sid=r["dialer_twiml_app_sid"],
+                dialer_default_caller_id=r["dialer_default_caller_id"],
             )
             for r in rows
         ],
@@ -217,6 +248,55 @@ async def add_twilio_account(
     return AddTwilioAccountResponse(id=account_id, friendly_name=friendly_name)
 
 
+@router.put("/accounts/{account_id}", response_model=PlatformTwilioAccountsResponse)
+async def update_twilio_account(
+    account_id: int,
+    body: UpdateTwilioAccountRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    """
+    Partially update a stored account — label, credentials, and/or dialer
+    fields. Only fields present in the request body are touched.
+    """
+    updates = body.model_dump(exclude_unset=True)
+    if not updates:
+        raise HTTPException(status_code=422, detail="No fields to update.")
+
+    if "account_sid" in updates or "auth_token" in updates:
+        if not (updates.get("account_sid") and updates.get("auth_token")):
+            raise HTTPException(
+                status_code=422,
+                detail="account_sid and auth_token must be updated together.",
+            )
+        account_sid = updates["account_sid"].strip()
+        auth_token = updates["auth_token"].strip()
+        if not account_sid.startswith("AC"):
+            raise HTTPException(status_code=422, detail="account_sid should start with 'AC'.")
+        try:
+            await asyncio.to_thread(_validate_twilio_credentials, account_sid, auth_token)
+        except TwilioRestException as exc:
+            raise HTTPException(
+                status_code=400, detail=f"Twilio rejected these credentials: {exc.msg}"
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(f"[admin_telephony] Credential validation failed: {exc}")
+            raise HTTPException(status_code=400, detail="Could not validate credentials with Twilio.")
+        updates["account_sid"] = account_sid
+        updates["auth_token"] = auth_token
+
+    for key in ("label", "dialer_api_key_sid", "dialer_twiml_app_sid", "dialer_default_caller_id"):
+        if key in updates and updates[key] is not None:
+            updates[key] = updates[key].strip()
+    if updates.get("dialer_api_key_secret"):
+        updates["dialer_api_key_secret"] = updates["dialer_api_key_secret"].strip()
+
+    error = await db_client.update_platform_twilio_account(account_id, updates)
+    if error:
+        raise HTTPException(status_code=404, detail=error)
+    logger.info(f"[admin_telephony] Platform Twilio account {account_id} updated: {sorted(updates.keys())}")
+    return await list_twilio_accounts(_user)
+
+
 @router.post("/accounts/{account_id}/activate", response_model=PlatformTwilioAccountsResponse)
 async def activate_twilio_account(
     account_id: int, _user: UserModel = Depends(get_superuser)
@@ -245,9 +325,16 @@ async def delete_twilio_account(
 @router.get("/numbers", response_model=ManagedNumbersResponse)
 async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
     """List all Sysevo-managed phone numbers across every org."""
+    # account_sid -> label, for resolving which platform Twilio account a
+    # managed number was bought under. Built once, not per-row.
+    accounts_by_sid = {
+        a["account_sid"]: (a["label"] or _mask_sid(a["account_sid"]))
+        for a in await db_client.list_platform_twilio_accounts()
+    }
+
     async with db_client.async_session() as session:
         stmt = (
-            select(TelephonyPhoneNumberModel, OrganizationModel, WorkflowModel)
+            select(TelephonyPhoneNumberModel, OrganizationModel, WorkflowModel, TelephonyConfigurationModel)
             .join(
                 TelephonyConfigurationModel,
                 TelephonyPhoneNumberModel.telephony_configuration_id
@@ -277,7 +364,7 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
         rows = result.all()
 
         # Calls run through each number = runs of its inbound workflow.
-        wf_ids = [num.inbound_workflow_id for num, _, _ in rows if num.inbound_workflow_id]
+        wf_ids = [num.inbound_workflow_id for num, _, _, _ in rows if num.inbound_workflow_id]
         run_counts: dict[int, int] = {}
         if wf_ids:
             run_stmt = (
@@ -289,7 +376,7 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
 
     items = []
     total_cost = 0
-    for num, org, workflow in rows:
+    for num, org, workflow, cfg in rows:
         meta = num.extra_metadata or {}
         raw_sid = meta.get("managed_twilio_sid", "")
         sid_preview = (raw_sid[:6] + "****") if raw_sid else None
@@ -297,6 +384,7 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
             (num.country_code or "").upper(), _DEFAULT_MONTHLY_COST_CENTS
         )
         total_cost += cost
+        platform_account_sid = (cfg.credentials or {}).get("account_sid") if cfg else None
         items.append(
             ManagedNumberItem(
                 phone_number_id=num.id,
@@ -316,6 +404,8 @@ async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
                 ),
                 monthly_cost_cents=cost,
                 call_count=run_counts.get(num.inbound_workflow_id, 0),
+                platform_account_label=accounts_by_sid.get(platform_account_sid),
+                platform_account_sid_preview=_mask_sid(platform_account_sid),
             )
         )
 

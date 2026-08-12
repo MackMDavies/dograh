@@ -47,6 +47,23 @@ class PlatformSettingsClient(BaseDBClient):
             "last_validated_at": row.last_validated_at,
         }
 
+    async def get_platform_twilio_credentials_by_id(self, account_id: int) -> Optional[dict]:
+        """
+        Return ``{"account_sid", "auth_token"}`` for a *specific* stored
+        account (regardless of ``is_active``), or ``None`` if it doesn't exist
+        or fails to decrypt. Lets an admin choose which platform Twilio
+        account to buy a number under, rather than always "the active one".
+        """
+        async with self.async_session() as session:
+            row = await session.get(PlatformTwilioCredentialsModel, account_id)
+        if not row:
+            return None
+        try:
+            token = decrypt_secret(row.auth_token_encrypted)
+        except Exception:
+            return None
+        return {"account_sid": row.account_sid, "auth_token": token}
+
     async def get_platform_twilio_sid(self) -> Optional[str]:
         """Return the active account's SID (no decryption), or ``None``."""
         async with self.async_session() as session:
@@ -116,11 +133,63 @@ class PlatformSettingsClient(BaseDBClient):
                 "dialer_configured": bool(
                     r.dialer_api_key_sid and r.dialer_api_key_secret_encrypted
                 ),
+                # Identifiers, not secrets — safe to show in full so the edit
+                # form can pre-fill them. Only auth_token / dialer_api_key_secret
+                # are ever masked/withheld.
+                "dialer_api_key_sid": r.dialer_api_key_sid,
                 "dialer_twiml_app_sid": r.dialer_twiml_app_sid,
                 "dialer_default_caller_id": r.dialer_default_caller_id,
             }
             for r in rows
         ]
+
+    async def update_platform_twilio_account(
+        self, account_id: int, updates: dict
+    ) -> Optional[str]:
+        """
+        Partially update a stored account. *updates* keys present are applied;
+        keys absent are left untouched (this is the caller's job to enforce —
+        pass only fields the client actually submitted, e.g. via
+        ``BaseModel.model_dump(exclude_unset=True)``).
+
+        Recognised keys: label, account_sid, auth_token, dialer_api_key_sid,
+        dialer_api_key_secret, dialer_twiml_app_sid, dialer_default_caller_id.
+        Empty string clears a nullable field; ``auth_token``/
+        ``dialer_api_key_secret`` are re-encrypted when present and non-empty,
+        left alone when absent, and only cleared (along with the paired SID)
+        by explicitly clearing ``dialer_api_key_sid`` to "".
+
+        Returns None on success, or an error string if the account doesn't exist.
+        """
+        async with self.async_session() as session:
+            row = await session.get(PlatformTwilioCredentialsModel, account_id)
+            if not row:
+                return "account not found"
+
+            if "label" in updates:
+                row.label = updates["label"] or None
+            if "account_sid" in updates and updates["account_sid"]:
+                row.account_sid = updates["account_sid"]
+            if "auth_token" in updates and updates["auth_token"]:
+                row.auth_token_encrypted = encrypt_secret(updates["auth_token"])
+            if "dialer_api_key_sid" in updates:
+                new_sid = updates["dialer_api_key_sid"] or None
+                row.dialer_api_key_sid = new_sid
+                if new_sid is None:
+                    row.dialer_api_key_secret_encrypted = None
+            if updates.get("dialer_api_key_secret"):
+                row.dialer_api_key_secret_encrypted = encrypt_secret(
+                    updates["dialer_api_key_secret"]
+                )
+            if "dialer_twiml_app_sid" in updates:
+                row.dialer_twiml_app_sid = updates["dialer_twiml_app_sid"] or None
+            if "dialer_default_caller_id" in updates:
+                row.dialer_default_caller_id = (
+                    updates["dialer_default_caller_id"] or None
+                )
+
+            await session.commit()
+            return None
 
     async def add_platform_twilio_account(
         self,
