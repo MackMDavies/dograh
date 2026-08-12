@@ -6,6 +6,7 @@ provider registry — see ProviderSpec.router.
 
 import json
 import os
+from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -93,6 +94,46 @@ async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
     return validator.validate(str(request.url), form_data, signature)
 
 
+def _conference_telemetry_attributes(*, events_url: str, recording_url: str) -> str:
+    """The conference-level attributes that must be identical on EVERY leg.
+
+    Twilio applies conference-level attributes only from the TwiML of the
+    participant that CREATES the conference, and ignores them on everyone
+    who joins afterwards. The rep normally creates it - calls.create returns
+    as soon as the lead's call is queued, and the lead still has to ring -
+    but "normally" is a race, not a guarantee: an instantly-answering
+    voicemail, a SIP endpoint, or an unusually slow rep leg can put the lead
+    in first. If that happens and only the rep's leg carried these, the
+    conference comes up with no recording, no recording callback and no
+    conference-start event at all - which also leaves conference_sid NULL,
+    so update_dialer_call_recording_by_conference_sid would have nothing to
+    match even if a recording did appear. So both legs carry them, from this
+    one definition, and whichever leg wins the race the conference is
+    recorded and reporting.
+
+    Repeating them cannot double-record: recording is a property of the
+    conference, not of a participant, so only the creator's copy takes
+    effect and the loser's is discarded.
+
+    Returns "" (attributes omitted entirely) unless BOTH URLs are absolute.
+    That is the guard for an unresolved backend endpoint, which yields a
+    relative "/api/v1/..." rather than an empty string: Twilio rejects a
+    relative callback URL, and a rejected TwiML document costs the whole
+    leg - silence for the lead - which is strictly worse than a conference
+    that merely isn't reporting.
+    """
+    if not events_url.startswith(("http://", "https://")):
+        return ""
+    if not recording_url.startswith(("http://", "https://")):
+        return ""
+    return (
+        f"statusCallback={quoteattr(events_url)} "
+        'statusCallbackEvent="start end join leave" '
+        'record="record-from-start" '
+        f"recordingStatusCallback={quoteattr(recording_url)} "
+    )
+
+
 @router.post("/voice-connect", include_in_schema=False)
 async def handle_voice_connect(request: Request):
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
@@ -159,9 +200,33 @@ async def handle_voice_connect(request: Request):
     # SDK's `disconnect` event, which is what makes the frontend show the
     # disposition panel. With end_on_exit=false the rep would be left alone
     # in a live conference, in silence, with a running timer and no prompt.
+    #
+    # events_url/recording_url are handed to the lead's leg so it can repeat
+    # the conference-level attributes verbatim - see
+    # _conference_telemetry_attributes on why every leg needs them. They're
+    # passed rather than re-resolved in that handler for two reasons: the
+    # lead is on the line waiting for that TwiML, and get_backend_endpoints()
+    # can block on a cloudflared lookup; and resolving once here is what
+    # makes the two legs' attributes identical by construction instead of by
+    # coincidence. Query params are covered by Twilio's signature (validated
+    # against the full request URL), and this endpoint already trusts a far
+    # more sensitive signed param in conference_name - which decides which
+    # live call you are placed into.
+    #
+    # urlencode, not concatenation: these values are absolute URLs whose "/"
+    # and ":" would otherwise land raw in a query string.
     lead_join_url = (
-        f"{backend_endpoint}/api/v1/telephony/dialer-conference-join"
-        f"?conference_name={conference_name}&muted=false&end_on_exit=true&start_on_enter=true"
+        f"{backend_endpoint}/api/v1/telephony/dialer-conference-join?"
+        + urlencode(
+            {
+                "conference_name": conference_name,
+                "muted": "false",
+                "end_on_exit": "true",
+                "start_on_enter": "true",
+                "events_url": conference_events_url,
+                "recording_url": recording_callback_url,
+            }
+        )
     )
     lead_status_callback_url = (
         f"{backend_endpoint}/api/v1/telephony/dialer-call-status"
@@ -222,11 +287,11 @@ async def handle_voice_connect(request: Request):
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
         "<Dial>"
-        f"<Conference statusCallback={quoteattr(conference_events_url)} "
-        'statusCallbackEvent="start end join leave" '
-        'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false" '
-        'record="record-from-start" '
-        f"recordingStatusCallback={quoteattr(recording_callback_url)}>"
+        "<Conference "
+        + _conference_telemetry_attributes(
+            events_url=conference_events_url, recording_url=recording_callback_url
+        )
+        + 'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">'
         f"{escape(conference_name)}</Conference>"
         "</Dial>"
         "</Response>"
@@ -241,6 +306,8 @@ async def handle_dialer_conference_join(
     muted: str = "false",
     end_on_exit: str = "true",
     start_on_enter: str = "true",
+    events_url: str = "",
+    recording_url: str = "",
 ):
     """Default end_on_exit="true" is deliberately the fail-SAFE default, even
     though voice-connect (its only caller) always passes it explicitly. If
@@ -260,6 +327,20 @@ async def handle_dialer_conference_join(
         logger.error("dialer-conference-join missing conference_name")
         return HTMLResponse(content=hangup, media_type="application/xml")
 
+    # voice-connect passes these so this leg can repeat the conference-level
+    # attributes - see _conference_telemetry_attributes. Absent (or not
+    # absolute) they're simply omitted, which is exactly how this leg behaved
+    # before, so an older in-flight join URL during a deploy still works.
+    telemetry_attributes = _conference_telemetry_attributes(
+        events_url=events_url, recording_url=recording_url
+    )
+    if not telemetry_attributes:
+        logger.warning(
+            f"dialer-conference-join for '{conference_name}' has no usable callback URLs - "
+            "this leg carries no conference recording/status attributes, so if it creates "
+            "the conference there will be no recording and no conference-start event"
+        )
+
     # The recording/monitoring disclosure lives here, on the lead's own leg,
     # rather than on the rep's leg in voice-connect - this is the leg the
     # called party is actually listening to. A manager's listen-in leg does
@@ -270,7 +351,8 @@ async def handle_dialer_conference_join(
         "<Response>"
         "<Say>This call may be recorded and monitored for quality assurance.</Say>"
         "<Dial>"
-        f"<Conference muted={quoteattr(muted)} endConferenceOnExit={quoteattr(end_on_exit)} "
+        f"<Conference {telemetry_attributes}muted={quoteattr(muted)} "
+        f"endConferenceOnExit={quoteattr(end_on_exit)} "
         f'startConferenceOnEnter={quoteattr(start_on_enter)} beep="false">'
         f"{escape(conference_name)}</Conference>"
         "</Dial></Response>"
@@ -417,8 +499,15 @@ async def handle_dialer_recording_callback(request: Request):
     # handler's guarantee. If recordingStatusCallbackEvent is ever expanded
     # to include in-progress/absent events, this guard stops a premature or
     # failed recording from being written as if it were a playable
-    # completed one.
+    # completed one. Logged rather than dropped in silence: of the statuses
+    # that would then arrive (in-progress/completed/absent/failed), "failed"
+    # means the operator expects audio and none exists, which is exactly the
+    # kind of thing that otherwise only surfaces as a human noticing.
     if recording_status != "completed":
+        logger.info(
+            f"dialer-recording-callback ignoring recording {recording_sid} for conference "
+            f"{conference_sid} at status '{recording_status or 'unknown'}' - not completed"
+        )
         return {"status": "ignored", "reason": "recording_not_completed"}
 
     await update_dialer_call_recording_by_conference_sid(

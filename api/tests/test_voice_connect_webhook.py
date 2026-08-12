@@ -162,6 +162,10 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
         join_conference_url=(
             "https://api.example.com/api/v1/telephony/dialer-conference-join"
             "?conference_name=call-CA111&muted=false&end_on_exit=true&start_on_enter=true"
+            "&events_url=https%3A%2F%2Fapi.example.com%2Fapi%2Fv1%2Ftelephony%2F"
+            "dialer-conference-events"
+            "&recording_url=https%3A%2F%2Fapi.example.com%2Fapi%2Fv1%2Ftelephony%2F"
+            "dialer-recording-callback"
         ),
         status_callback_url=(
             "https://api.example.com/api/v1/telephony/dialer-call-status?parent_call_sid=CA111"
@@ -459,6 +463,34 @@ def test_dialer_recording_callback_handles_missing_fields(monkeypatch):
         )
 
     assert response.status_code == 200
+    # Pin the reason, not just the 200: without this, this test and the
+    # not-completed one below assert the identical pair of facts and the two
+    # branches could be swapped with both still passing.
+    assert response.json()["reason"] == "missing_fields"
+    mock_update.assert_not_awaited()
+
+
+def test_dialer_recording_callback_handles_missing_conference_sid(monkeypatch):
+    """The realistic production shape of the missing-field case: a legacy
+    <Dial record> callback (RecordingSid, CallSid, no ConferenceSid) landing
+    from a call that started before this deploy."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_conference_sid",
+    ) as mock_update:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"CallSid": "CA111", "RecordingSid": "RE999", "RecordingStatus": "completed"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["reason"] == "missing_fields"
     mock_update.assert_not_awaited()
 
 
@@ -479,6 +511,7 @@ def test_dialer_recording_callback_ignores_non_completed_status(monkeypatch):
         )
 
     assert response.status_code == 200
+    assert response.json()["reason"] == "recording_not_completed"
     mock_update.assert_not_awaited()
 
 
@@ -510,6 +543,94 @@ def test_dialer_conference_join_returns_conference_twiml(monkeypatch):
     # recording/monitoring disclosure.
     assert _DISCLOSURE in response.text
     assert response.text.index(_DISCLOSURE) < response.text.index("<Dial>")
+
+
+def test_dialer_conference_join_repeats_conference_telemetry_attributes(monkeypatch):
+    """Twilio honours conference-level attributes only from whoever CREATES
+    the conference. The rep usually wins that race, but if the lead ever gets
+    there first (instant-answer voicemail, SIP endpoint, slow rep leg) and
+    only the rep's leg carried these, the call would come up unrecorded with
+    no conference-start event - hence no conference_sid to correlate on
+    either. Both legs must carry them."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111"
+            "&events_url=https%3A%2F%2Fapi.example.com%2Fapi%2Fv1%2Ftelephony%2F"
+            "dialer-conference-events"
+            "&recording_url=https%3A%2F%2Fapi.example.com%2Fapi%2Fv1%2Ftelephony%2F"
+            "dialer-recording-callback",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert 'record="record-from-start"' in response.text
+    assert 'statusCallbackEvent="start end join leave"' in response.text
+    assert (
+        'statusCallback="https://api.example.com/api/v1/telephony/dialer-conference-events"'
+        in response.text
+    )
+    assert (
+        'recordingStatusCallback="https://api.example.com/api/v1/telephony/'
+        'dialer-recording-callback"' in response.text
+    )
+    # The participant-level attributes must survive the addition.
+    assert 'muted="false"' in response.text
+    assert 'endConferenceOnExit="true"' in response.text
+    assert "call-CA111</Conference>" in response.text
+
+
+def test_dialer_conference_join_omits_telemetry_attributes_when_urls_absent(monkeypatch):
+    """No URLs (an in-flight join URL issued by the previous deploy) degrades
+    to the old attribute-free leg rather than emitting relative callback URLs
+    Twilio would reject - a rejected TwiML costs the lead the whole leg."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "record=" not in response.text
+    assert "statusCallback" not in response.text
+    assert "call-CA111</Conference>" in response.text
+
+
+def test_dialer_conference_join_ignores_relative_callback_urls(monkeypatch):
+    """An unresolved backend endpoint yields "/api/v1/..." - relative, not
+    empty - and Twilio rejects a relative callback URL, so the attributes are
+    dropped rather than emitted broken."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111"
+            "&events_url=%2Fapi%2Fv1%2Ftelephony%2Fdialer-conference-events"
+            "&recording_url=%2Fapi%2Fv1%2Ftelephony%2Fdialer-recording-callback",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "record=" not in response.text
+    assert "statusCallback" not in response.text
 
 
 def test_dialer_conference_join_respects_muted_param(monkeypatch):

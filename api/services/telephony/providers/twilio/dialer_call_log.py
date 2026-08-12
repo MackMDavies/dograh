@@ -188,23 +188,17 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     return None
 
 
-async def update_dialer_call_recording(*, parent_call_sid: str, recording_sid: str) -> None:
-    """Update recording_sid from the <Dial>'s recordingStatusCallback."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls recording")
-        return
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}"},
-                json={"recording_sid": recording_sid},
-                headers=_headers(),
-                timeout=5.0,
-            )
-            response.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
-        logger.error(f"Failed to update dialer_calls recording for {parent_call_sid}: {exc}")
+def _affected_row_count(content_range: str) -> int | None:
+    """Rows affected, read out of PostgREST's Content-Range header.
+
+    The header reads "0-2/3" for a hit and "*/0" for a miss, so the count is
+    whatever follows the final "/". Returns None - "can't tell" - for
+    anything that isn't a plain number ("*/*", or a header some proxy
+    stripped), so a caller can only ever act on a count PostgREST really
+    stated, never on an assumption.
+    """
+    total = content_range.rsplit("/", 1)[-1].strip()
+    return int(total) if total.isdigit() else None
 
 
 async def update_dialer_call_recording_by_conference_sid(
@@ -225,9 +219,25 @@ async def update_dialer_call_recording_by_conference_sid(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
                 params={"conference_sid": f"eq.{conference_sid}"},
                 json={"recording_sid": recording_sid},
-                headers=_headers(),
+                # count=exact is asked for HERE and nowhere else in this
+                # module, deliberately. A PATCH that matches no row is a
+                # perfectly healthy 204 - raise_for_status() cannot see it -
+                # and this correlation key is the one that can silently miss:
+                # conference_sid is written by a DIFFERENT webhook
+                # (dialer-conference-events on conference-start), so if that
+                # never fired the column is still NULL and this update hits
+                # nothing. The symptom would be a call that looks completely
+                # fine with no play button, and no error in Dograh, Twilio or
+                # Supabase to explain it. The count is what makes it say so.
+                headers={**_headers(), "Prefer": "count=exact"},
                 timeout=5.0,
             )
             response.raise_for_status()
+            if _affected_row_count(response.headers.get("Content-Range", "")) == 0:
+                logger.warning(
+                    f"dialer_calls recording update matched 0 rows for conference "
+                    f"{conference_sid} - recording {recording_sid} is orphaned, no row has "
+                    "this conference_sid (did dialer-conference-events miss conference-start?)"
+                )
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to update dialer_calls recording for conference {conference_sid}: {exc}")
