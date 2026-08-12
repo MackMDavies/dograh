@@ -173,13 +173,17 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to read dialer_calls row for {parent_call_sid}: {exc}")
         return None
-    # A 200 from a PostgREST table GET is always a JSON array (error bodies
-    # are objects, but raise_for_status has already rejected those, and we
-    # don't send the vnd.pgrst.object+json Accept header). The shape check is
-    # for what sits BETWEEN us and PostgREST - a proxy or captive portal
-    # answering 200 with an HTML/JSON error page - since "never raises" has
-    # to hold for a body that isn't ours at all.
-    if isinstance(rows, list) and rows:
+    # A 200 from a PostgREST table GET is always a JSON array of objects
+    # (error bodies are objects, but raise_for_status has already rejected
+    # those, and we don't send the vnd.pgrst.object+json Accept header). The
+    # shape check is for what sits BETWEEN us and PostgREST - a proxy or
+    # captive portal answering 200 with a body that isn't ours at all - since
+    # "never raises" has to hold for that too. Both halves earn their keep:
+    # a non-list body is caught by the first, and a list of NON-objects
+    # (["error"], [123], [["nested"]]) only by the second. Returning one of
+    # those would break this function's dict|None contract and blow up in the
+    # caller's .get() instead, outside any of this module's error handling.
+    if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return rows[0]
     return None
 

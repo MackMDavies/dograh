@@ -1,8 +1,10 @@
+from contextlib import contextmanager
 from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from loguru import logger
 
 from api.services.telephony.providers.twilio.routes import router
 
@@ -1039,3 +1041,121 @@ def test_voice_connect_does_not_persist_child_call_sid_when_dial_fails(monkeypat
     assert response.status_code == 200
     assert "<Hangup/>" in response.text
     mock_child_sid.assert_not_awaited()
+
+
+@contextmanager
+def _captured_error_logs():
+    """loguru doesn't feed pytest's caplog, so grab a sink directly."""
+    messages: list[str] = []
+    sink_id = logger.add(lambda message: messages.append(str(message)), level="ERROR")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink_id)
+
+
+def test_dialer_conference_events_stays_quiet_when_no_dialer_calls_row(monkeypatch):
+    """No row exists for an unrecognized rep identity, so conference-end for
+    one is routine, not an anomaly - it must not log at ERROR. That noise is
+    the same category the status gate exists to eliminate."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.cancel_call",
+    ) as mock_cancel, _captured_error_logs() as errors:
+        response = client.post(
+            "/dialer-conference-events",
+            data={"StatusCallbackEvent": "conference-end", "FriendlyName": "call-CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_cancel.assert_not_awaited()
+    assert errors == []
+
+
+def test_dialer_conference_events_errors_when_row_exists_without_child_sid(monkeypatch):
+    """The other side of that coin: a row that EXISTS but never got its lead
+    SID means the write failed and the leg is unreachable - a real anomaly,
+    and this is the only signal for it."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
+        return_value={"child_call_sid": None, "status": "ringing"},
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.cancel_call",
+    ) as mock_cancel, _captured_error_logs() as errors:
+        response = client.post(
+            "/dialer-conference-events",
+            data={"StatusCallbackEvent": "conference-end", "FriendlyName": "call-CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_cancel.assert_not_awaited()
+    assert len(errors) == 1
+    assert "child_call_sid" in errors[0]
+
+
+def test_dialer_conference_events_survives_a_raising_lookup(monkeypatch):
+    """The cleanup helper must be fail-soft on its own terms, not merely by
+    delegation: an exception in its own code (or from a callee that stops
+    swallowing its errors) would otherwise 500 and earn a Twilio retry."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
+        side_effect=RuntimeError("supabase exploded"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.cancel_call",
+    ) as mock_cancel:
+        response = client.post(
+            "/dialer-conference-events",
+            data={"StatusCallbackEvent": "conference-end", "FriendlyName": "call-CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_cancel.assert_not_awaited()
+
+
+def test_dialer_conference_events_survives_a_malformed_lookup_result(monkeypatch):
+    """Belt and braces for the bug this pairs with: even if
+    get_dialer_call_child_leg ever hands back a non-dict, the webhook must
+    not 500."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_call_child_leg",
+        return_value="not-a-dict",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.cancel_call",
+    ) as mock_cancel:
+        response = client.post(
+            "/dialer-conference-events",
+            data={"StatusCallbackEvent": "conference-end", "FriendlyName": "call-CA111"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_cancel.assert_not_awaited()

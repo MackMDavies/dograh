@@ -108,6 +108,13 @@ async def cancel_call(*, call_sid: str) -> bool:
     prevent, on the timing where it's most likely. "completed" terminates a
     call in any non-terminal state, ringing and in-progress alike.
 
+    CAUTION for future callers: that choice gives up a safety net this
+    function used to have for free. "canceled" was rejected by Twilio on any
+    answered call, so a wrong or stale SID could only ever fail harmlessly;
+    "completed" will genuinely terminate whatever live call the SID names.
+    The name still reads safer than the behavior - only pass a SID you are
+    certain belongs to a call you are entitled to end.
+
     Returns True if Twilio accepted it. Fails soft like everything else
     here - neither a rejection nor an outage may turn a status-callback
     webhook into a 500 that Twilio then retries.

@@ -289,33 +289,50 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
     an abandoned call placed from our own caller ID. The old <Dial><Number>
     bridge cancelled that leg for us. See dialer_conference.cancel_call.
 
-    Fail-soft throughout - both helpers swallow their own errors, so no
-    Supabase or Twilio failure can turn this status callback into a 500 that
-    Twilio then retries.
+    Fail-soft on its own terms, not merely by delegation: the two helpers it
+    calls each swallow their own errors, but the code BETWEEN them is this
+    function's, and an exception there would escape into the webhook and
+    become a 500 that Twilio retries. The blanket except is what makes the
+    guarantee independent of either callee's future contract.
     """
-    leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
-    child_call_sid = (leg or {}).get("child_call_sid")
-    lead_status = ((leg or {}).get("status") or "").strip().lower()
+    try:
+        leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
 
-    if not child_call_sid:
-        # voice-connect persists child_call_sid the moment the dial returns,
-        # so by the time a conference can end it should always be there.
-        # Reaching this means the row is missing or the write failed, and the
-        # lead's leg is now unreachable by SID - a real anomaly, not a race.
-        logger.error(
-            f"dialer-conference-events: no child_call_sid recorded for {parent_call_sid}, "
-            "cannot end a possibly-orphaned lead leg"
+        if leg is None:
+            # No dialer_calls row at all. Expected, not an anomaly: rows are
+            # only created for a recognized rep identity, so an unrecognized
+            # caller legitimately has none - and a row we never wrote can't
+            # have a lead leg we need to end.
+            logger.debug(
+                f"dialer-conference-events: no dialer_calls row for {parent_call_sid}, "
+                "nothing to clean up"
+            )
+            return
+
+        child_call_sid = leg.get("child_call_sid")
+        lead_status = (leg.get("status") or "").strip().lower()
+
+        if not child_call_sid:
+            # The row EXISTS but has no lead SID. voice-connect persists that
+            # the moment the dial returns, so by the time a conference can end
+            # it should always be there. Reaching this means the write failed
+            # and the lead's leg is now unreachable by SID - a real anomaly.
+            logger.error(
+                f"dialer-conference-events: dialer_calls row for {parent_call_sid} has no "
+                "child_call_sid, cannot end a possibly-orphaned lead leg"
+            )
+            return
+
+        if lead_status in _LEAD_LEG_SETTLED_STATUSES:
+            return
+
+        logger.info(
+            f"dialer-conference-events: conference ended with lead leg {child_call_sid} "
+            f"at status '{lead_status or 'unknown'}' - ending orphaned leg"
         )
-        return
-
-    if lead_status in _LEAD_LEG_SETTLED_STATUSES:
-        return
-
-    logger.info(
-        f"dialer-conference-events: conference ended with lead leg {child_call_sid} "
-        f"at status '{lead_status or 'unknown'}' - ending orphaned leg"
-    )
-    await cancel_call(call_sid=child_call_sid)
+        await cancel_call(call_sid=child_call_sid)
+    except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
+        logger.error(f"Failed orphaned lead leg cleanup for {parent_call_sid}: {exc}")
 
 
 @router.post("/dialer-conference-events", include_in_schema=False)

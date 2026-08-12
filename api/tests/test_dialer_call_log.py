@@ -2,6 +2,7 @@
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
+import pytest
 
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
@@ -353,3 +354,25 @@ async def test_update_dialer_call_child_sid_swallows_errors(monkeypatch):
         return_value=fake_client,
     ):
         await update_dialer_call_child_sid(parent_call_sid="CA111", child_call_sid="CA222")
+
+
+@pytest.mark.parametrize("body", [["not-a-dict"], [123], [["nested"]], [None]])
+async def test_get_dialer_call_child_leg_returns_none_for_array_of_non_objects(
+    monkeypatch, body
+):
+    """Regression: a 200 carrying a JSON array of non-objects (a proxy or
+    captive portal answering with something that isn't ours) must not be
+    returned as if it were a row. Handing back a str/int/list breaks this
+    function's dict|None contract and blows up in the caller's .get() -
+    outside every bit of error handling in this module."""
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json = MagicMock(return_value=body)
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
