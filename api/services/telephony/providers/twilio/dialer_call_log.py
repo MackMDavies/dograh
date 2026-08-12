@@ -205,3 +205,29 @@ async def update_dialer_call_recording(*, parent_call_sid: str, recording_sid: s
             response.raise_for_status()
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to update dialer_calls recording for {parent_call_sid}: {exc}")
+
+
+async def update_dialer_call_recording_by_conference_sid(
+    *, conference_sid: str, recording_sid: str
+) -> None:
+    """Update recording_sid from a Conference's recordingStatusCallback -
+    correlates via conference_sid (populated by dialer-conference-events),
+    not parent_call_sid, since a Conference recording's own callback
+    identifies the conference via ConferenceSid, not any participant's
+    CallSid - a genuinely different correlation key from the old
+    <Dial record> callback shape."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls recording")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"conference_sid": f"eq.{conference_sid}"},
+                json={"recording_sid": recording_sid},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to update dialer_calls recording for conference {conference_sid}: {exc}")

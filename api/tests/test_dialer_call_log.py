@@ -10,6 +10,7 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
     update_dialer_call_recording,
+    update_dialer_call_recording_by_conference_sid,
     update_dialer_call_status,
 )
 
@@ -208,6 +209,49 @@ async def test_update_dialer_call_recording_patches_by_parent_call_sid(monkeypat
     assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
     assert call.kwargs["params"] == {"parent_call_sid": "eq.CA111"}
     assert call.kwargs["json"] == {"recording_sid": "RE999"}
+
+
+async def test_update_dialer_call_recording_by_conference_sid_patches_by_conference_sid(
+    monkeypatch,
+):
+    """The whole point of this sibling function: a Conference recording's
+    callback knows the ConferenceSid and nothing else, so the WHERE clause
+    must be conference_sid - matching on parent_call_sid would silently
+    update zero rows."""
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_recording_by_conference_sid(
+            conference_sid="CF999", recording_sid="RE999"
+        )
+
+    fake_client.patch.assert_awaited_once()
+    call = fake_client.patch.await_args
+    assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
+    assert call.kwargs["params"] == {"conference_sid": "eq.CF999"}
+    assert call.kwargs["json"] == {"recording_sid": "RE999"}
+
+
+async def test_update_dialer_call_recording_by_conference_sid_swallows_errors(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = AsyncMock()
+    fake_client.patch = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_recording_by_conference_sid(
+            conference_sid="CF999", recording_sid="RE999"
+        )
 
 
 async def test_update_dialer_call_conference_sid_patches_by_parent_call_sid(monkeypatch):

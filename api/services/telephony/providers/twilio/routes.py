@@ -23,7 +23,7 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     get_dialer_call_child_leg,
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
-    update_dialer_call_recording,
+    update_dialer_call_recording_by_conference_sid,
     update_dialer_call_status,
 )
 from api.services.telephony.providers.twilio.dialer_conference import (
@@ -398,26 +398,32 @@ async def handle_dialer_recording_callback(request: Request):
         logger.warning("Invalid Twilio signature on dialer-recording-callback webhook")
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
-    # For a <Dial record>, Twilio's RecordingStatusCallback reports CallSid
-    # as the parent call - the leg that executed the Dial verb - which is
-    # exactly our parent_call_sid correlation key.
-    parent_call_sid = form_data.get("CallSid", "")
+    # A Conference recording's RecordingStatusCallback identifies the
+    # conference via ConferenceSid, not any participant's CallSid - this
+    # replaced the old <Dial record> callback shape (which reported the
+    # parent leg's own CallSid) when calls moved to a named Conference for
+    # live-monitoring support. See
+    # docs/superpowers/specs/2026-08-12-dialer-live-call-monitoring-design.md
+    # in the sysevo repo.
+    conference_sid = form_data.get("ConferenceSid", "")
     recording_sid = form_data.get("RecordingSid", "")
     recording_status = form_data.get("RecordingStatus", "")
-    if not parent_call_sid or not recording_sid:
-        logger.warning("dialer-recording-callback missing CallSid or RecordingSid")
+    if not conference_sid or not recording_sid:
+        logger.warning("dialer-recording-callback missing ConferenceSid or RecordingSid")
         return {"status": "ignored", "reason": "missing_fields"}
 
-    # Twilio's default <Dial> config (no recordingStatusCallbackEvent set)
-    # only fires this webhook once, on completion - but that's the TwiML's
-    # behavior, not this handler's guarantee. If recordingStatusCallbackEvent
-    # is ever expanded to include in-progress/absent events (e.g. for live
-    # call monitoring), this guard stops a premature/failed recording from
-    # ever getting written as if it were a playable completed one.
+    # <Conference record="record-from-start"> fires this webhook only on
+    # completion by default - but that's the TwiML's behavior, not this
+    # handler's guarantee. If recordingStatusCallbackEvent is ever expanded
+    # to include in-progress/absent events, this guard stops a premature or
+    # failed recording from being written as if it were a playable
+    # completed one.
     if recording_status != "completed":
         return {"status": "ignored", "reason": "recording_not_completed"}
 
-    await update_dialer_call_recording(parent_call_sid=parent_call_sid, recording_sid=recording_sid)
+    await update_dialer_call_recording_by_conference_sid(
+        conference_sid=conference_sid, recording_sid=recording_sid
+    )
     return {"status": "success"}
 
 
