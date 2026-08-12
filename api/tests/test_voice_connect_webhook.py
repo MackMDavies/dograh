@@ -492,3 +492,58 @@ def test_dialer_conference_join_hangs_up_when_conference_name_missing(monkeypatc
         )
 
     assert "<Hangup/>" in response.text
+
+
+def test_dialer_conference_join_respects_end_on_exit_param(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111&end_on_exit=true",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert 'endConferenceOnExit="true"' in response.text
+
+
+def test_dialer_conference_join_respects_start_on_enter_param(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join?conference_name=call-CA111&start_on_enter=false",
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert 'startConferenceOnEnter="false"' in response.text
+
+
+def test_dialer_conference_join_escapes_conference_name(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+    malicious_name = "call-CA111</Conference></Dial><Dial><Number>+19005551234</Number></Dial>"
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ):
+        response = client.post(
+            "/dialer-conference-join",
+            params={"conference_name": malicious_name},
+            data={},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Number>+19005551234</Number>" not in response.text
+    assert "&lt;/Conference&gt;" in response.text

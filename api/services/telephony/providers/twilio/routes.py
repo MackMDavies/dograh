@@ -6,6 +6,7 @@ provider registry — see ProviderSpec.router.
 
 import json
 import os
+from xml.sax.saxutils import escape, quoteattr
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
@@ -160,8 +161,8 @@ async def handle_dialer_conference_join(
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Dial>"
-        f'<Conference muted="{muted}" endConferenceOnExit="{end_on_exit}" '
-        f'startConferenceOnEnter="{start_on_enter}">{conference_name}</Conference>'
+        f"<Conference muted={quoteattr(muted)} endConferenceOnExit={quoteattr(end_on_exit)} "
+        f"startConferenceOnEnter={quoteattr(start_on_enter)}>{escape(conference_name)}</Conference>"
         "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
