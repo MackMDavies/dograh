@@ -309,20 +309,38 @@ class TelephonyPhoneNumberModel(Base):
 
 class PlatformTwilioCredentialsModel(Base):
     """
-    Single-row store for the platform-level (Sysevo-managed) Twilio account used
-    by Quick Connect to provision/forward numbers on behalf of any org.
+    Store of platform-level (Sysevo-managed) Twilio accounts. Quick Connect
+    provisioning and the internal sales-rep dialer both use whichever row has
+    ``is_active=True`` (at most one at a time — enforced in
+    ``PlatformSettingsClient``, not the DB). Multiple rows may exist so an
+    admin can hold several accounts and switch which one is live without
+    losing the others; switching never touches numbers already provisioned
+    under a prior active account, since Quick Connect snapshots credentials
+    onto the org's own ``telephony_configurations`` row at provision time.
 
     ``account_sid`` is non-secret and stored in clear (shown as a masked preview
     in the admin UI). ``auth_token_encrypted`` is encrypted at rest via
-    ``api.services.crypto``. When no row exists, the provisioner falls back to
-    the ``SYSEVO_TWILIO_ACCOUNT_SID`` / ``SYSEVO_TWILIO_AUTH_TOKEN`` env vars.
+    ``api.services.crypto``. When no row is active, the provisioner falls back
+    to the ``SYSEVO_TWILIO_ACCOUNT_SID`` / ``SYSEVO_TWILIO_AUTH_TOKEN`` env vars.
     """
 
     __tablename__ = "platform_twilio_credentials"
 
     id = Column(Integer, primary_key=True, index=True)
+    label = Column(String(120), nullable=True)
     account_sid = Column(String(64), nullable=False)
     auth_token_encrypted = Column(String, nullable=False)
+    # Optional — only needed if this account also powers the internal browser
+    # softphone dialer (Twilio Voice SDK). Account SID/auth token alone are
+    # not enough for that: the Voice SDK signs its own short-lived tokens with
+    # a separate API Key pair, and routes outbound calls through a TwiML
+    # Application configured in that Twilio account's console. All three must
+    # be created in the Twilio console for this specific account before the
+    # dialer can use it — there's no way to provision them via the API alone.
+    dialer_api_key_sid = Column(String(64), nullable=True)
+    dialer_api_key_secret_encrypted = Column(String, nullable=True)
+    dialer_twiml_app_sid = Column(String(64), nullable=True)
+    dialer_default_caller_id = Column(String(32), nullable=True)
     is_active = Column(
         Boolean, nullable=False, default=True, server_default=text("true")
     )
