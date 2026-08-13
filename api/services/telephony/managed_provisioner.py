@@ -163,18 +163,31 @@ def _provisioner_from_env() -> Optional[ManagedProvisioner]:
     return ManagedProvisioner(account_sid=sid, auth_token=token)
 
 
-async def get_managed_provisioner() -> Optional[ManagedProvisioner]:
+async def get_managed_provisioner(
+    account_id: Optional[int] = None,
+) -> Optional[ManagedProvisioner]:
     """
     Return a ManagedProvisioner if platform credentials are configured,
     otherwise None. Routes call this and return 503 when None.
 
-    Resolution order: DB-stored credentials (set via the admin UI) first, then
-    the SYSEVO_TWILIO_* environment variables as a fallback. The DB is read on
-    every call (no per-worker caching) so a credential saved on one worker takes
-    effect across all workers immediately.
+    If *account_id* is given, resolve that specific stored account instead of
+    "the active one" — lets a superuser choose which platform Twilio account
+    to buy a number under. Returns None if that id doesn't exist (callers
+    should 404, not silently fall back to a different account).
+
+    Otherwise, resolution order: the active DB-stored account first, then the
+    SYSEVO_TWILIO_* environment variables as a fallback. The DB is read on
+    every call (no per-worker caching) so a credential saved on one worker
+    takes effect across all workers immediately.
     """
     # Imported lazily to avoid an import cycle (db_client pulls in many models).
     from api.db import db_client
+
+    if account_id is not None:
+        creds = await db_client.get_platform_twilio_credentials_by_id(account_id)
+        if not creds:
+            return None
+        return ManagedProvisioner(account_sid=creds["account_sid"], auth_token=creds["auth_token"])
 
     try:
         creds = await db_client.get_platform_twilio_credentials()

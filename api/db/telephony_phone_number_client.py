@@ -403,15 +403,15 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 )
                 .where(
                     TelephonyConfigurationModel.provider == provider,
-                    _credentials_json().op("->>")(account_id_field)
-                    == account_id,
                     TelephonyPhoneNumberModel.address_normalized
                     == normalized.canonical,
                 )
             )
             result = await session.execute(stmt)
-            row = result.first()
-            return (row[0], row[1]) if row else None
+            for config, phone_number in result.all():
+                if _decrypted_credentials(config).get(account_id_field) == account_id:
+                    return (config, phone_number)
+            return None
 
     async def create_phone_number(
         self,
