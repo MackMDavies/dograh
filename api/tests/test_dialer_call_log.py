@@ -13,6 +13,7 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
     update_dialer_call_recording_by_conference_sid,
+    update_dialer_call_recording_url,
     update_dialer_call_status,
 )
 
@@ -73,7 +74,88 @@ async def test_create_dialer_call_posts_expected_payload(monkeypatch):
         "from_number": "+15551234567",
         "to_number": "+15559876543",
         "status": "initiated",
+        # Defaulted, not passed by the Twilio call site - the default is what
+        # keeps every existing caller correct without an edit.
+        "provider": "twilio",
     }
+
+
+async def test_create_dialer_call_records_an_explicit_provider(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await create_dialer_call(
+            parent_call_sid="sw-1",
+            rep_user_id="00000000-0000-0000-0000-000000000001",
+            entry_id=None,
+            from_number="+12092669253",
+            to_number="+14155550123",
+            provider="signalwire",
+        )
+
+    assert fake_client.post.await_args.kwargs["json"]["provider"] == "signalwire"
+
+
+async def test_update_dialer_call_recording_url_patches_by_parent_call_sid(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_recording_url(
+            parent_call_sid="sw-1", recording_url="https://rec.example/a.mp3"
+        )
+
+    call = fake_client.patch.await_args
+    assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
+    assert call.kwargs["params"] == {"parent_call_sid": "eq.sw-1"}
+    # recording_url, not recording_sid: SignalWire hands back a playable URL,
+    # where Twilio's SID has to go through the recording proxy.
+    assert call.kwargs["json"] == {"recording_url": "https://rec.example/a.mp3"}
+
+
+async def test_update_dialer_call_recording_url_swallows_errors(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = AsyncMock()
+    fake_client.patch = AsyncMock(side_effect=httpx.ConnectError("down"))
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_recording_url(
+            parent_call_sid="sw-1", recording_url="https://rec.example/a.mp3"
+        )
+
+
+async def test_update_dialer_call_recording_url_noops_without_supabase(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_SERVICE_ROLE_KEY",
+        "",
+    )
+    fake_client = AsyncMock()
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await update_dialer_call_recording_url(
+            parent_call_sid="sw-1", recording_url="https://rec.example/a.mp3"
+        )
+
+    fake_client.patch.assert_not_called()
 
 
 async def test_create_dialer_call_swallows_errors(monkeypatch):
