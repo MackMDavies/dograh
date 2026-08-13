@@ -1188,3 +1188,30 @@ def _mount_provider_routers() -> None:
 
 
 _mount_provider_routers()
+
+
+# The SignalWire sales-dialer webhooks are mounted DIRECTLY, outside the loop
+# above, and this is deliberate - do not "tidy" it into the registry.
+#
+# registry.all_specs() is what factory.py, audio_config.py, run_pipeline.py
+# and the telephony-config UI iterate over. Registering a "signalwire"
+# ProviderSpec would therefore make SignalWire selectable for AI-agent calls
+# and campaigns, which is exactly the boundary this integration is scoped
+# against: SignalWire exists here for the sales-rep browser softphone and
+# nothing else. Mounting the router by hand gives us the three webhook URLs
+# without granting SignalWire any presence in the agent pipeline.
+#
+# Invariant, asserted by tests/test_signalwire_dialer_routes.py:
+#     "signalwire" not in [s.name for s in registry.all_specs()]
+def _mount_signalwire_dialer_router() -> None:
+    # Imported inside the function for the same reason the provider routers
+    # are loaded lazily above: it pulls in Supabase/httpx call-log helpers
+    # that nothing else in this module needs at import time.
+    from api.services.telephony.dialer.signalwire_routes import (
+        router as signalwire_dialer_router,
+    )
+
+    router.include_router(signalwire_dialer_router)
+
+
+_mount_signalwire_dialer_router()

@@ -37,10 +37,18 @@ async def create_dialer_call(
     entry_id: str | None,
     from_number: str,
     to_number: str,
+    provider: str = "twilio",
 ) -> None:
     """Create the initial dialer_calls row synchronously, before voice-connect
     returns TwiML - see the module docstring on why this can't wait for an
-    async callback."""
+    async callback.
+
+    ``provider`` defaults to "twilio" so the existing Twilio call sites keep
+    working untouched; the SignalWire dialer webhook passes "signalwire"
+    explicitly. It matters downstream because the recording URL for a
+    SignalWire call is stored directly (recording_url) while Twilio's is a
+    SID the frontend proxies (recording_sid).
+    """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot create dialer_calls row")
         return
@@ -55,6 +63,7 @@ async def create_dialer_call(
                     "from_number": from_number,
                     "to_number": to_number,
                     "status": "initiated",
+                    "provider": provider,
                 },
                 headers=_headers(),
                 timeout=5.0,
@@ -186,6 +195,39 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return rows[0]
     return None
+
+
+async def update_dialer_call_recording_url(
+    *, parent_call_sid: str, recording_url: str
+) -> None:
+    """Store a directly-playable recording URL.
+
+    The SignalWire counterpart to update_dialer_call_recording_by_conference_sid,
+    and it correlates on parent_call_sid rather than conference_sid for a
+    concrete reason: SignalWire records the CALL, not a conference, so its
+    recording callback carries our own call id and needs no second webhook
+    to have populated a correlation column first. That also means there is
+    no silent-miss failure mode worth a count=exact check here.
+
+    Writes recording_url, not recording_sid: SignalWire hands back a URL we
+    can hand straight to an <audio> tag, whereas Twilio's SID has to go
+    through the recording proxy.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls recording_url")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                json={"recording_url": recording_url},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to update dialer_calls recording_url for {parent_call_sid}: {exc}")
 
 
 def _affected_row_count(content_range: str) -> int | None:

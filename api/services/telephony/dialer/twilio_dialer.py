@@ -16,7 +16,12 @@ class TwilioDialerProvider:
 
     async def mint_credentials(self, *, user_id: int) -> DialerCredentials:
         identity = f"rep-{user_id}"
-        token = generate_voice_access_token(identity)
+        # generate_voice_access_token is async - it reads the active platform
+        # Twilio credentials from the DB. Without the await this returns a
+        # coroutine object rather than a JWT, which serialises into the
+        # response as garbage and only fails later, in the browser, at
+        # Device.register() time.
+        token = await generate_voice_access_token(identity)
         # Twilio routes by the TwiML App's fixed Voice URL, so the browser has
         # no destination to dial - empty string keeps one response shape.
         return DialerCredentials(token=token, identity=identity, destination="")
