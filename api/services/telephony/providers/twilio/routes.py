@@ -89,14 +89,28 @@ async def get_voice_token(
 ) -> VoiceTokenResponse:
     identity = f"rep-{user.id}"
     try:
-        token = generate_voice_access_token(identity)
+        token = await generate_voice_access_token(identity)
     except VoiceSdkNotConfigured as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     return VoiceTokenResponse(token=token, identity=identity)
 
 
+async def _resolve_dialer_auth_token() -> str | None:
+    db_token = await db_client.get_platform_dialer_auth_token()
+    if db_token:
+        return db_token
+    return os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+
+
+async def _resolve_dialer_caller_id() -> str | None:
+    creds = await db_client.get_platform_dialer_credentials()
+    if creds and creds.get("default_caller_id"):
+        return creds["default_caller_id"]
+    return os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID")
+
+
 async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
-    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+    auth_token = await _resolve_dialer_auth_token()
     signature = request.headers.get("x-twilio-signature", "")
     if not auth_token or not signature:
         return False
@@ -179,13 +193,23 @@ async def handle_voice_connect(request: Request):
     raw_from = form_data.get("From", "")
     entry_id = form_data.get("EntryId", "").strip() or None
     parent_call_sid = form_data.get("CallSid", "")
+    # Three-tier resolution, most specific first:
+    #   1. the number assigned to THIS rep (dialer_phone_numbers), then
+    #   2. the active platform Twilio account's default_caller_id from the
+    #      platform_twilio_credentials table, then
+    #   3. the SYSEVO_TWILIO_DEFAULT_CALLER_ID env var.
+    # Tiers 2 and 3 are both inside _resolve_dialer_caller_id, which is what
+    # makes the per-account default apply here as well as to signature
+    # verification; tier 1 stays in front of it so per-rep assignment is not
+    # lost when an account-level default exists (it always does in prod).
     caller_id = (
         await resolve_assigned_caller_id(raw_from)
-        or os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "")
+        or await _resolve_dialer_caller_id()
+        or ""
     )
     if not to_number or not caller_id or not parent_call_sid:
         logger.error(
-            "voice-connect missing To number, SYSEVO_TWILIO_DEFAULT_CALLER_ID, or CallSid"
+            "voice-connect missing To number, a resolvable default caller id, or CallSid"
         )
         return HTMLResponse(content=hangup, media_type="application/xml")
 

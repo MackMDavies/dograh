@@ -19,7 +19,10 @@ from api.db.models import UserModel
 from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
 from api.services.org_concurrency import clamp_to_system_max
-from api.services.telephony.managed_provisioner import get_managed_provisioner
+from api.services.telephony.managed_provisioner import (
+    ManagedProvisioner,
+    get_managed_provisioner,
+)
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter(prefix="/telephony", tags=["telephony"])
@@ -38,6 +41,11 @@ class QuickConnectRequest(BaseModel):
     country: str                            # ISO 3166-1 alpha-2
     area_code: Optional[str] = None
     workflow_id: Optional[int] = None
+    # Superuser-only: buy under a specific platform Twilio account instead of
+    # whichever is active. Silently ignored for non-superusers — regular
+    # users never choose or see Twilio credentials, by design (see module
+    # docstring).
+    platform_account_id: Optional[int] = None
 
 
 class QuickConnectResponse(BaseModel):
@@ -58,13 +66,43 @@ class AvailableNumbersResponse(BaseModel):
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
 
+def _resolve_platform_account_id(
+    user: UserModel, requested: Optional[int]
+) -> Optional[int]:
+    """Superusers may pick a specific platform account; everyone else gets None (= active one)."""
+    return requested if (requested and user.is_superuser) else None
+
+
+async def _provisioner_for_number(row) -> Optional[ManagedProvisioner]:
+    """
+    Resolve the ManagedProvisioner that actually owns *row* on Twilio — its
+    own telephony_configuration's stored credentials, not "whichever platform
+    account is active right now". A number bought under a non-default
+    account can never be released via a different account's client; Twilio
+    scopes phone-number resources to the account that owns them.
+    """
+    cfg = await db_client.get_telephony_configuration(row.telephony_configuration_id)
+    creds = (cfg.credentials or {}) if cfg else {}
+    account_sid, auth_token = creds.get("account_sid"), creds.get("auth_token")
+    if account_sid and auth_token:
+        return ManagedProvisioner(account_sid=account_sid, auth_token=auth_token)
+    # Legacy row whose config predates credential storage, or credentials
+    # failed to decrypt — fall back to the active account rather than fail
+    # outright; the release may 404 on Twilio if it's genuinely the wrong
+    # account, but the DB row is deleted regardless (see call sites).
+    return await get_managed_provisioner()
+
+
 @router.get("/carrier-lookup", response_model=CarrierLookupResponse)
 async def carrier_lookup(
     number: str = Query(..., description="E.164 phone number to look up"),
+    platform_account_id: Optional[int] = Query(None),
     user: UserModel = Depends(get_user),
 ):
     """Detect carrier and line type for *number* via Twilio Lookup v2."""
-    provisioner = await get_managed_provisioner()
+    provisioner = await get_managed_provisioner(
+        _resolve_platform_account_id(user, platform_account_id)
+    )
     if provisioner is None:
         raise HTTPException(
             status_code=503,
@@ -78,10 +116,13 @@ async def carrier_lookup(
 async def available_numbers(
     country: str = Query(..., description="ISO 3166-1 alpha-2 country code"),
     area_code: Optional[str] = Query(None),
+    platform_account_id: Optional[int] = Query(None),
     user: UserModel = Depends(get_user),
 ):
     """List purchasable numbers from the platform Twilio account."""
-    provisioner = await get_managed_provisioner()
+    provisioner = await get_managed_provisioner(
+        _resolve_platform_account_id(user, platform_account_id)
+    )
     if provisioner is None:
         raise HTTPException(status_code=503, detail="Managed telephony not configured.")
     numbers = await asyncio.to_thread(provisioner.search_available_numbers, country, area_code)
@@ -103,9 +144,15 @@ async def quick_connect(
     if body.mode == "forward" and not body.existing_number:
         raise HTTPException(status_code=422, detail="existing_number is required for mode=forward")
 
-    provisioner = await get_managed_provisioner()
+    chosen_account_id = _resolve_platform_account_id(user, body.platform_account_id)
+    provisioner = await get_managed_provisioner(chosen_account_id)
     if provisioner is None:
-        raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+        detail = (
+            "That Twilio account no longer exists."
+            if chosen_account_id
+            else "Managed telephony not configured."
+        )
+        raise HTTPException(status_code=503, detail=detail)
 
     org_id = user.selected_organization_id
     # Use the resolved credentials (DB-stored or env) so the managed config's
@@ -191,11 +238,20 @@ async def quick_connect(
             )
 
     try:
-        # Find or create a "Sysevo Managed" telephony config for this org.
-        # Matched by name (not provider) because provider="twilio" could also
-        # match the org's own Twilio configs.
+        # Find or create a "Sysevo Managed" telephony config for this org,
+        # scoped to the platform account actually used for THIS purchase —
+        # not just by name. An admin choosing a different platform_account_id
+        # on a later purchase must get its own config, or the number would be
+        # silently attached to the wrong Twilio account's credentials.
         configs = await db_client.list_telephony_configurations(org_id)
-        managed_config = next((c for c in configs if c.name == _MANAGED_CONFIG_NAME), None)
+        managed_config = next(
+            (
+                c for c in configs
+                if c.name == _MANAGED_CONFIG_NAME
+                and (c.credentials or {}).get("account_sid") == platform_sid
+            ),
+            None,
+        )
 
         if managed_config is None:
             # Credentials stored so the Twilio inbound dispatcher can match the
@@ -266,15 +322,17 @@ async def delete_managed_number(
 
     twilio_sid = meta.get("managed_twilio_sid")
 
+    # Resolved BEFORE the delete, from the row's own config — once the row is
+    # gone we can no longer look up which account provisioned it.
+    provisioner = await _provisioner_for_number(row) if twilio_sid else None
+
     # Delete the DB row first so the record is gone even if Twilio release fails.
     await db_client.delete_phone_number(phone_number_id, organization_id=org_id)
 
-    if twilio_sid:
-        provisioner = await get_managed_provisioner()
-        if provisioner:
-            released = await asyncio.to_thread(provisioner.release_number, twilio_sid)
-            if not released:
-                logger.warning(f"[quick_connect] Failed to release Twilio SID {twilio_sid} for phone_number_id={phone_number_id}")
+    if twilio_sid and provisioner:
+        released = await asyncio.to_thread(provisioner.release_number, twilio_sid)
+        if not released:
+            logger.warning(f"[quick_connect] Failed to release Twilio SID {twilio_sid} for phone_number_id={phone_number_id}")
 
 
 class ToggleActiveRequest(BaseModel):
@@ -347,11 +405,11 @@ async def managed_number_billing(
     # release: hand the Twilio number back, then remove the DB row.
     meta = row.extra_metadata or {}
     twilio_sid = meta.get("managed_twilio_sid")
+    # Resolved BEFORE the delete, from the row's own config (see delete_managed_number).
+    provisioner = await _provisioner_for_number(row) if twilio_sid else None
     await db_client.delete_phone_number(body.phone_number_id)
-    if twilio_sid:
-        provisioner = await get_managed_provisioner()
-        if provisioner:
-            await asyncio.to_thread(provisioner.release_number, twilio_sid)
+    if twilio_sid and provisioner:
+        await asyncio.to_thread(provisioner.release_number, twilio_sid)
     return {"ok": True, "action": "release"}
 
 
