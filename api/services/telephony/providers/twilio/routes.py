@@ -96,16 +96,36 @@ async def get_voice_token(
 
 
 async def _resolve_dialer_auth_token() -> str | None:
-    db_token = await db_client.get_platform_dialer_auth_token()
-    if db_token:
-        return db_token
+    """Auth token for webhook signature verification: active account first,
+    env as fallback.
+
+    The DB lookup is guarded because this feeds _verify_twilio_signature,
+    which gates EVERY Twilio webhook. Unguarded, a momentary database blip
+    raises here, verification fails, and every in-flight call gets hangup
+    TwiML - a database wobble turned into a total telephony outage. Falling
+    back to env keeps calls connecting. Mirrors
+    voice_sdk._resolve_dialer_credentials, which guards the same call for
+    the same reason.
+    """
+    try:
+        db_token = await db_client.get_platform_dialer_auth_token()
+        if db_token:
+            return db_token
+    except Exception as exc:  # noqa: BLE001 - never break call setup on a DB hiccup
+        logger.error(f"Dialer auth token DB lookup failed, using env: {exc}")
     return os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
 
 
 async def _resolve_dialer_caller_id() -> str | None:
-    creds = await db_client.get_platform_dialer_credentials()
-    if creds and creds.get("default_caller_id"):
-        return creds["default_caller_id"]
+    """Account-default caller ID, env as fallback. Guarded for the same
+    reason as _resolve_dialer_auth_token: this runs during call setup, so a
+    DB blip should degrade to the env default rather than fail the dial."""
+    try:
+        creds = await db_client.get_platform_dialer_credentials()
+        if creds and creds.get("default_caller_id"):
+            return creds["default_caller_id"]
+    except Exception as exc:  # noqa: BLE001 - never break call setup on a DB hiccup
+        logger.error(f"Dialer caller-id DB lookup failed, using env: {exc}")
     return os.environ.get("SYSEVO_TWILIO_DEFAULT_CALLER_ID")
 
 
