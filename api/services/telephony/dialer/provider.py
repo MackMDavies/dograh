@@ -51,3 +51,15 @@ def get_dialer_provider(name: str) -> DialerProvider:
 
         return SignalWireDialerProvider()
     raise UnknownDialerProvider(f"No dialer provider implementation for {name!r}")
+
+
+def resolve_active_dialer_provider() -> str:
+    """Which provider the dialer currently runs on.
+
+    Env-based for now so it can be changed without a migration; the spec's
+    'platform setting' can replace this later without touching callers.
+    Defaults to twilio so an unset value preserves today's behaviour.
+    """
+    import os
+
+    return (os.environ.get("SYSEVO_DIALER_PROVIDER") or "twilio").strip().lower()

@@ -19,6 +19,11 @@ from twilio.request_validator import RequestValidator
 
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
+from api.services.telephony.dialer.provider import (
+    UnknownDialerProvider,
+    get_dialer_provider,
+    resolve_active_dialer_provider,
+)
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_listeners import (
     create_dialer_call_listener,
@@ -41,10 +46,6 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     is_manager_or_admin,
     resolve_assigned_caller_id,
-)
-from api.services.telephony.providers.twilio.voice_sdk import (
-    VoiceSdkNotConfigured,
-    generate_voice_access_token,
 )
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
@@ -81,18 +82,33 @@ _TWILIO_CALL_SID_PATTERN = re.compile(r"^CA[0-9a-f]{32}$")
 class VoiceTokenResponse(BaseModel):
     token: str
     identity: str
+    # Which SDK the browser should instantiate. Always populated from the
+    # provider that actually minted the token, never from the requested name,
+    # so the response cannot claim a provider that did not issue the creds.
+    provider: str
+    # Provider-specific dial target; "" for Twilio, which routes via the
+    # TwiML App's fixed Voice URL. Defaulted so older callers keep working.
+    destination: str = ""
 
 
 @router.get("/voice-token")
 async def get_voice_token(
     user=Depends(require_sales_dialer_role),
 ) -> VoiceTokenResponse:
-    identity = f"rep-{user.id}"
+    provider_name = resolve_active_dialer_provider()
     try:
-        token = generate_voice_access_token(identity)
-    except VoiceSdkNotConfigured as exc:
+        provider = get_dialer_provider(provider_name)
+        creds = await provider.mint_credentials(user_id=user.id)
+    except UnknownDialerProvider as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001 - any provider's "not configured"
         raise HTTPException(status_code=503, detail=str(exc)) from exc
-    return VoiceTokenResponse(token=token, identity=identity)
+    return VoiceTokenResponse(
+        token=creds.token,
+        identity=creds.identity,
+        provider=provider.name,
+        destination=creds.destination,
+    )
 
 
 async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
