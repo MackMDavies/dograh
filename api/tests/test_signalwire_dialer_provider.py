@@ -59,9 +59,10 @@ async def test_mint_credentials_posts_stable_reference_and_returns_token(monkeyp
     _, kwargs = client.post.call_args
     args, _ = client.post.call_args
     assert args[0] == "https://sysevo.signalwire.com/api/fabric/subscribers/tokens"
-    # Stable per rep - a random reference would create a new subscriber on
+    # ONE shared subscriber for the whole dialer - see the provider comment.
+    # A per-rep reference would bill per rep; a random one would create a new
     # every page load. This assertion is the guard against that regressing.
-    assert kwargs["json"] == {"reference": "rep-42"}
+    assert kwargs["json"] == {"reference": "sysevo-dialer"}
     assert kwargs["auth"] == ("proj-123", "PTtoken")
 
 
@@ -74,7 +75,7 @@ async def test_mint_credentials_uses_same_reference_for_repeat_calls(monkeypatch
         await SignalWireDialerProvider().mint_credentials(user_id=7)
 
     references = [c.kwargs["json"]["reference"] for c in client.post.call_args_list]
-    assert references == ["rep-7", "rep-7"]
+    assert references == ["sysevo-dialer", "sysevo-dialer"]
 
 
 async def test_mint_credentials_honours_destination_override(monkeypatch):
@@ -287,3 +288,101 @@ async def test_mint_surfaces_the_balance_reason_to_the_caller(monkeypatch):
             await SignalWireDialerProvider().mint_credentials(user_id=1)
 
     assert "insufficient balance" in str(ei.value).lower()
+
+
+# --- Cost containment -----------------------------------------------------
+# SignalWire bills each subscriber monthly, and `reference` is create-or-get,
+# so a per-rep reference would provision a billable resource per rep. These
+# pin the rule: the ONLY things that may cost money are a dial and a phone
+# number. Subscriber count must not scale with headcount.
+
+
+def _sw_env(monkeypatch):
+    monkeypatch.setenv("SIGNALWIRE_SPACE_URL", "example.signalwire.com")
+    monkeypatch.setenv("SIGNALWIRE_PROJECT_ID", "proj")
+    monkeypatch.setenv("SIGNALWIRE_API_TOKEN", "tok")
+    monkeypatch.delenv("SIGNALWIRE_SUBSCRIBER_REFERENCE", raising=False)
+
+
+def _capturing_client(refs):
+    from unittest.mock import AsyncMock, MagicMock
+
+    resp = MagicMock()
+    resp.raise_for_status = MagicMock()
+    resp.json.return_value = {"token": "t"}
+
+    async def _post(url, **kw):
+        refs.append(kw["json"]["reference"])
+        return resp
+
+    c = AsyncMock()
+    c.post = AsyncMock(side_effect=_post)
+    c.__aenter__ = AsyncMock(return_value=c)
+    c.__aexit__ = AsyncMock(return_value=False)
+    return c
+
+
+async def test_every_rep_shares_one_billable_subscriber(monkeypatch):
+    from unittest.mock import patch
+
+    from api.services.telephony.dialer.signalwire_dialer import (
+        SignalWireDialerProvider,
+    )
+
+    _sw_env(monkeypatch)
+    refs: list[str] = []
+    with patch(
+        "api.services.telephony.dialer.signalwire_dialer.httpx.AsyncClient",
+        return_value=_capturing_client(refs),
+    ):
+        p = SignalWireDialerProvider()
+        for uid in (1, 42, 7, 999, 12345):
+            await p.mint_credentials(user_id=uid)
+
+    # Five different reps, ONE subscriber reference -> one billable resource.
+    assert len(set(refs)) == 1, f"headcount would create {len(set(refs))} subscribers"
+    assert refs[0] == "sysevo-dialer"
+
+
+async def test_rep_identity_is_still_per_rep_for_attribution(monkeypatch):
+    from unittest.mock import patch
+
+    from api.services.telephony.dialer.signalwire_dialer import (
+        SignalWireDialerProvider,
+    )
+
+    _sw_env(monkeypatch)
+    refs: list[str] = []
+    with patch(
+        "api.services.telephony.dialer.signalwire_dialer.httpx.AsyncClient",
+        return_value=_capturing_client(refs),
+    ):
+        p = SignalWireDialerProvider()
+        a = await p.mint_credentials(user_id=1)
+        b = await p.mint_credentials(user_id=2)
+
+    # Sharing the SUBSCRIBER must not collapse per-rep attribution.
+    assert a.identity == "rep-1"
+    assert b.identity == "rep-2"
+
+
+async def test_subscriber_reference_is_never_randomised(monkeypatch):
+    """A random reference silently creates a NEW billable subscriber on every
+    call - this is exactly how three junk subscribers got provisioned."""
+    from unittest.mock import patch
+
+    from api.services.telephony.dialer.signalwire_dialer import (
+        SignalWireDialerProvider,
+    )
+
+    _sw_env(monkeypatch)
+    refs: list[str] = []
+    with patch(
+        "api.services.telephony.dialer.signalwire_dialer.httpx.AsyncClient",
+        return_value=_capturing_client(refs),
+    ):
+        p = SignalWireDialerProvider()
+        for _ in range(4):
+            await p.mint_credentials(user_id=1)
+
+    assert len(set(refs)) == 1

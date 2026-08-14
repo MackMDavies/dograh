@@ -133,8 +133,29 @@ class SignalWireDialerProvider:
                 "SignalWire dialer is not configured: missing " + ", ".join(missing)
             )
 
-        # Stable per rep - see the module docstring on create-or-get.
-        reference = f"rep-{user_id}"
+        # ONE shared subscriber for the whole dialer, deliberately - NOT one
+        # per rep.
+        #
+        # SignalWire bills each subscriber as a monthly resource, and
+        # `reference` is create-or-get: a per-rep reference silently
+        # provisions a billable resource the first time any rep opens the
+        # dialer. That makes the bill scale with headcount for no benefit,
+        # and it is a charge that is neither a dial nor a phone number -
+        # which is the line we agreed not to cross.
+        #
+        # Rep attribution does not need separate SignalWire identities: the
+        # rep id travels in the dial's user variables and is written to
+        # dialer_calls by sw-dialer-connect, so per-rep reporting comes from
+        # our own data. `identity` below still returns rep-{user_id} for that
+        # purpose - only the BILLABLE SignalWire subscriber is shared.
+        #
+        # Consequence to keep in mind: every rep's browser authenticates as
+        # the same subscriber, so inbound-to-a-specific-rep would not work.
+        # The dialer is outbound-only, so that costs us nothing today.
+        reference = os.environ.get(
+            "SIGNALWIRE_SUBSCRIBER_REFERENCE", "sysevo-dialer"
+        ).strip() or "sysevo-dialer"
+        identity = f"rep-{user_id}"
 
         try:
             async with httpx.AsyncClient() as client:
@@ -183,6 +204,9 @@ class SignalWireDialerProvider:
 
         return DialerCredentials(
             token=token,
-            identity=reference,
+            # The REP's identity, not the shared SignalWire subscriber. This
+            # is what the frontend sends back as a user variable and what
+            # dialer_calls attributes the call to.
+            identity=identity,
             destination=resolve_dialer_destination(),
         )
