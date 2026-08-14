@@ -169,3 +169,121 @@ async def test_provider_is_reachable_through_the_abstraction(monkeypatch):
     with patch(f"{_MODULE}.httpx.AsyncClient", return_value=client):
         creds = await provider.mint_credentials(user_id=3)
     assert creds.token == "tok"
+
+
+# --- Error decoding -------------------------------------------------------
+# These pin the real payload SignalWire returned in production on
+# 2026-08-14, when the account ran out of balance and the only thing logged
+# was "422 unknown".
+
+
+def _resp(status, json_body=None, text=""):
+    import httpx
+
+    if json_body is not None:
+        return httpx.Response(status, json=json_body)
+    return httpx.Response(status, text=text)
+
+
+def test_describe_names_insufficient_balance_as_an_account_action():
+    from api.services.telephony.dialer.signalwire_dialer import (
+        _describe_signalwire_error,
+    )
+
+    detail = _describe_signalwire_error(
+        _resp(
+            422,
+            {
+                "errors": [
+                    {
+                        "type": "account_error",
+                        "code": "insufficient_balance",
+                        "message": "The account has insufficient balance",
+                    }
+                ]
+            },
+        )
+    )
+    assert "insufficient balance" in detail.lower()
+    assert "top it up" in detail.lower()
+    assert "422" not in detail
+
+
+def test_describe_falls_back_to_message_and_code_for_unknown_errors():
+    from api.services.telephony.dialer.signalwire_dialer import (
+        _describe_signalwire_error,
+    )
+
+    detail = _describe_signalwire_error(
+        _resp(400, {"errors": [{"code": "bad_reference", "message": "Nope"}]})
+    )
+    assert detail == "Nope (bad_reference)"
+
+
+def test_describe_survives_a_non_json_body():
+    from api.services.telephony.dialer.signalwire_dialer import (
+        _describe_signalwire_error,
+    )
+
+    detail = _describe_signalwire_error(_resp(502, text="<html>bad gateway</html>"))
+    assert "502" in detail
+
+
+def test_describe_bounds_a_hostile_body():
+    from api.services.telephony.dialer.signalwire_dialer import (
+        _describe_signalwire_error,
+    )
+
+    detail = _describe_signalwire_error(
+        _resp(422, {"errors": [{"code": "x", "message": "A" * 5000}]})
+    )
+    assert len(detail) < 400
+
+
+def test_describe_handles_an_empty_or_odd_error_list():
+    from api.services.telephony.dialer.signalwire_dialer import (
+        _describe_signalwire_error,
+    )
+
+    assert "422" in _describe_signalwire_error(_resp(422, {"errors": []}))
+    assert "422" in _describe_signalwire_error(_resp(422, {"nope": 1}))
+
+
+async def test_mint_surfaces_the_balance_reason_to_the_caller(monkeypatch):
+    """The rep must see WHY, not 'refused'. /voice-token turns this text
+    into the 503 detail the dialer banner renders."""
+    import httpx
+    import pytest as _pytest
+    from unittest.mock import AsyncMock, patch
+
+    from api.services.telephony.dialer.signalwire_dialer import (
+        SignalWireDialerProvider,
+        SignalWireNotConfigured,
+    )
+
+    monkeypatch.setenv("SIGNALWIRE_SPACE_URL", "example.signalwire.com")
+    monkeypatch.setenv("SIGNALWIRE_PROJECT_ID", "proj")
+    monkeypatch.setenv("SIGNALWIRE_API_TOKEN", "tok")
+
+    resp = httpx.Response(
+        422,
+        json={
+            "errors": [
+                {"code": "insufficient_balance", "message": "The account has insufficient balance"}
+            ]
+        },
+        request=httpx.Request("POST", "https://example.signalwire.com/x"),
+    )
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=resp)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.dialer.signalwire_dialer.httpx.AsyncClient",
+        return_value=client,
+    ):
+        with _pytest.raises(SignalWireNotConfigured) as ei:
+            await SignalWireDialerProvider().mint_credentials(user_id=1)
+
+    assert "insufficient balance" in str(ei.value).lower()
