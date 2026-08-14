@@ -33,6 +33,52 @@ _DEFAULT_DESTINATION = "/public/sysevo-dialer?channel=audio"
 
 _TOKEN_PATH = "/api/fabric/subscribers/tokens"
 
+# Codes worth naming plainly, because the fix is an account action rather
+# than anything an engineer can change in this codebase.
+_ACCOUNT_LEVEL_HINTS = {
+    "insufficient_balance": "the SignalWire account has insufficient balance - top it up in the SignalWire dashboard",
+}
+
+
+def _describe_signalwire_error(response: "httpx.Response") -> str:
+    """Turn a SignalWire error response into something a human can act on.
+
+    SignalWire returns machine-readable errors in the BODY:
+
+        {"errors":[{"code":"insufficient_balance",
+                    "message":"The account has insufficient balance", ...}]}
+
+    The status line alone is useless - the first time this fired in
+    production it read "422 unknown", which took a manual curl to decode
+    when the answer was sitting in the body all along. Never returns the
+    raw body verbatim: it is bounded and shape-checked, so a surprise
+    payload cannot dump something large or sensitive into logs or the UI.
+    """
+    try:
+        payload = response.json()
+    except Exception:  # noqa: BLE001 - non-JSON error body
+        text = (response.text or "").strip()
+        return f"HTTP {response.status_code}" + (f": {text[:200]}" if text else "")
+
+    errors = payload.get("errors") if isinstance(payload, dict) else None
+    if not isinstance(errors, list) or not errors:
+        return f"HTTP {response.status_code}"
+
+    parts: list[str] = []
+    for err in errors[:3]:
+        if not isinstance(err, dict):
+            continue
+        code = str(err.get("code") or "").strip()
+        message = str(err.get("message") or "").strip()[:200]
+        hint = _ACCOUNT_LEVEL_HINTS.get(code)
+        if hint:
+            parts.append(hint)
+        elif code and message:
+            parts.append(f"{message} ({code})")
+        elif message or code:
+            parts.append(message or code)
+    return "; ".join(parts) or f"HTTP {response.status_code}"
+
 
 class SignalWireNotConfigured(Exception):
     """Raised when SignalWire credentials are missing, or the token endpoint
@@ -100,7 +146,22 @@ class SignalWireDialerProvider:
                 )
                 response.raise_for_status()
                 payload = response.json()
-        except Exception as exc:  # noqa: BLE001 - any transport/HTTP/JSON failure is "no token"
+        except httpx.HTTPStatusError as exc:
+            # SignalWire explains itself in the RESPONSE BODY, not the status
+            # line. Without this, an account-level problem surfaces as an
+            # opaque "422 unknown" and needs a manual curl to decode - which
+            # is exactly what happened the first time this fired, for
+            # insufficient_balance. Surface their words to the operator AND
+            # to the rep, so the UI says what is actually wrong.
+            detail = _describe_signalwire_error(exc.response)
+            logger.error(
+                f"SignalWire token mint failed for {reference} "
+                f"(HTTP {exc.response.status_code}): {detail}"
+            )
+            raise SignalWireNotConfigured(
+                f"SignalWire would not issue a dialer token: {detail}"
+            ) from exc
+        except Exception as exc:  # noqa: BLE001 - transport/JSON failures are "no token"
             # The exception text can carry the request body but never the
             # credentials (httpx keeps Basic auth in a header it does not
             # echo), and the token itself is only in the RESPONSE, which we
