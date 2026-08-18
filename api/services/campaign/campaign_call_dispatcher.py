@@ -221,7 +221,10 @@ class CampaignCallDispatcher:
                                 workflow_id=campaign.workflow_id,
                                 phone_number=phone_number,
                             )
-                        if dial_block_reason == "outside_calling_hours":
+                        if dial_block_reason in (
+                            "outside_calling_hours",
+                            "check_unavailable",
+                        ):
                             # Defer, don't fail — the same row waits and gets
                             # naturally re-claimed once the window opens
                             # (claim_queued_runs_for_processing's
@@ -232,9 +235,14 @@ class CampaignCallDispatcher:
                             # call was never attempted at all, so there's no
                             # outcome to retry from, just a wait before the
                             # first attempt.
+                            defer_label = (
+                                "outside calling hours"
+                                if dial_block_reason == "outside_calling_hours"
+                                else "dial-permission check unavailable"
+                            )
                             logger.info(
                                 f"Queued run {queued_run.id} deferred until {retry_at}: "
-                                f"outside calling hours"
+                                f"{defer_label}"
                             )
                             await db_client.update_queued_run(
                                 queued_run_id=queued_run.id,
@@ -244,15 +252,20 @@ class CampaignCallDispatcher:
                             await db_client.append_campaign_log(
                                 campaign_id=campaign_id,
                                 level="info",
-                                event="call_deferred_calling_hours",
+                                event=(
+                                    "call_deferred_calling_hours"
+                                    if dial_block_reason == "outside_calling_hours"
+                                    else "call_deferred_check_unavailable"
+                                ),
                                 message=(
                                     f"Deferred queued run {queued_run.id} until {retry_at}: "
-                                    f"outside calling hours"
+                                    f"{defer_label}"
                                 ),
                                 details={
                                     "queued_run_id": queued_run.id,
                                     "phone_number": phone_number,
                                     "retry_at": retry_at,
+                                    "reason": dial_block_reason,
                                 },
                             )
                             processed_run_ids.add(queued_run.id)

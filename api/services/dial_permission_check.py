@@ -9,6 +9,13 @@ specific number should be skipped:
   - "outside_calling_hours" — outside the effective calling-hours window for
     this contact right now. retry_at is an ISO 8601 UTC timestamp for when the
     window next opens; the caller should defer, not fail, this attempt.
+  - "check_unavailable" — the gate could not reach a verdict (timeout, non-2xx,
+    or an unhandled error). Fails CLOSED: retry_at is a short backoff and the
+    caller should defer exactly as it does for calling hours. Previously this
+    path allowed the call, which meant a Supabase blip silently disabled DNC
+    and calling-hours enforcement — the permissive answer is byte-identical to
+    a genuine "this number is fine". Set SYSEVO_DIAL_CHECK_FAIL_OPEN=true to
+    restore that behaviour deliberately.
 
 Pass `campaign_calling_hours` when calling from a campaign context that has
 its own calling-hours override (resolved from the campaign's
@@ -27,12 +34,40 @@ Dograh OSS distribution to run without this enforcement.
 """
 
 import os
+from datetime import UTC, datetime, timedelta
 from typing import Optional
 
 import httpx
 from loguru import logger
 
 _TIMEOUT = 8.0
+
+# How long to defer a number when the check itself could not be completed.
+# Short enough that a brief Supabase blip barely dents throughput, long enough
+# that a sustained outage isn't hammered on every dispatcher tick.
+_UNAVAILABLE_DEFER_SECONDS = 300
+
+# Reason returned when the gate could not reach a verdict. The dispatcher
+# treats it like "outside_calling_hours" — defer with a retry_at, never fail
+# the row — so an infrastructure wobble costs a few minutes, not the lead.
+REASON_CHECK_UNAVAILABLE = "check_unavailable"
+
+
+def _defer_response() -> tuple[bool, str, Optional[str]]:
+    """Fail closed: don't dial, come back shortly.
+
+    Set SYSEVO_DIAL_CHECK_FAIL_OPEN=true to restore the old behaviour of
+    dialling anyway when the check breaks. That trades a compliance risk
+    (calling a suppressed number, or outside legal calling hours, because the
+    gate was unreachable) for dial throughput during an outage — a deliberate
+    choice, so it has to be made explicitly.
+    """
+    if os.getenv("SYSEVO_DIAL_CHECK_FAIL_OPEN", "").strip().lower() == "true":
+        return True, "", None
+    retry_at = (
+        datetime.now(UTC) + timedelta(seconds=_UNAVAILABLE_DEFER_SECONDS)
+    ).isoformat()
+    return False, REASON_CHECK_UNAVAILABLE, retry_at
 
 
 async def check_dial_permitted(
@@ -70,9 +105,9 @@ async def check_dial_permitted(
 
         if not response.is_success:
             logger.warning(
-                f"[dial-permission] HTTP {response.status_code} for workflow {workflow_id} — allowing call"
+                f"[dial-permission] HTTP {response.status_code} for workflow {workflow_id} — deferring call"
             )
-            return True, "", None
+            return _defer_response()
 
         data = response.json()
         dynamic_vars = data.get("call_inbound", {}).get("dynamic_variables", {})
@@ -89,8 +124,8 @@ async def check_dial_permitted(
         return True, "", None
 
     except httpx.TimeoutException:
-        logger.warning(f"[dial-permission] timed out for workflow {workflow_id} — allowing call")
-        return True, "", None
+        logger.warning(f"[dial-permission] timed out for workflow {workflow_id} — deferring call")
+        return _defer_response()
     except Exception as e:
-        logger.error(f"[dial-permission] error for workflow {workflow_id}: {e} — allowing call")
-        return True, "", None
+        logger.error(f"[dial-permission] error for workflow {workflow_id}: {e} — deferring call")
+        return _defer_response()
