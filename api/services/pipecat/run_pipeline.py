@@ -424,6 +424,11 @@ async def _run_pipeline(
     # overrides come from run_configs (set by the agent editor's Responsiveness control).
     smart_turn_stop_secs = 0.6  # incomplete-turn timeout (was 2.0)
     flux_eot_timeout_ms = 1000  # Flux end-of-turn fallback in ms (was 3000)
+    # Confidence Flux must reach to declare the turn over. This is the knob that
+    # actually decides how fast a reply starts: below it, nothing happens until
+    # flux_eot_timeout_ms expires. eager_eot_threshold does NOT accelerate
+    # anything on this pipeline — see the note in service_factory.create_stt_service.
+    flux_eot_threshold = 0.6
     flux_eager_eot_threshold = 0.3  # eager (early) end-of-turn confidence (was 0.5)
     turn_stop_strategy = "transcription"  # Default to transcription-based detection
     keyterms = None  # Dictionary words for STT boosting
@@ -440,6 +445,9 @@ async def _run_pipeline(
 
         if "flux_eot_timeout_ms" in run_configs:
             flux_eot_timeout_ms = run_configs["flux_eot_timeout_ms"]
+
+        if "flux_eot_threshold" in run_configs:
+            flux_eot_threshold = run_configs["flux_eot_threshold"]
 
         if "flux_eager_eot_threshold" in run_configs:
             flux_eager_eot_threshold = run_configs["flux_eager_eot_threshold"]
@@ -545,6 +553,7 @@ async def _run_pipeline(
             audio_config,
             keyterms=keyterms,
             eot_timeout_ms=flux_eot_timeout_ms,
+            eot_threshold=flux_eot_threshold,
             eager_eot_threshold=flux_eager_eot_threshold,
         )
         tts = create_tts_service(user_config, audio_config)

@@ -120,12 +120,23 @@ def create_stt_service(
                     model=user_config.stt.model,
                     # SYSEVO_FLUX_LATENCY: these decide how long Flux waits
                     # after someone stops talking before it will admit the turn
-                    # ended, and they sat in front of EVERY reply. The 3s
+                    # ended, and they sit in front of EVERY reply. The 3s
                     # timeout was the worst of it: whenever confidence never
                     # crossed eot_threshold, the pipeline simply waited it out
                     # before the LLM was even asked for a response.
-                    # eager_eot lets generation start on a weaker signal, which
-                    # is what buys back most of the felt latency.
+                    #
+                    # Only eot_threshold and eot_timeout_ms affect latency.
+                    # eager_eot_threshold does NOT start generation early: on
+                    # EagerEndOfTurn pipecat only pushes an
+                    # InterimTranscriptionFrame (see
+                    # DeepgramFluxSTTBase._handle_eager_end_of_turn, which
+                    # carries an explicit "Pipecat doesn't yet provide built-in
+                    # Gate/control mechanisms ... TODO" note). Generation is
+                    # driven by ExternalUserTurnStopStrategy, which waits for
+                    # the UserStoppedSpeakingFrame broadcast on the *final*
+                    # EndOfTurn. Lowering eager_eot_threshold therefore buys no
+                    # latency — it only emits more interim frames. Revisit if
+                    # pipecat ever lands cancellable eager generation.
                     eot_timeout_ms=eot_timeout_ms,
                     eot_threshold=eot_threshold,
                     eager_eot_threshold=eager_eot_threshold,
