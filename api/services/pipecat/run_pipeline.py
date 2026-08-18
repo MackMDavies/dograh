@@ -716,6 +716,18 @@ async def _run_pipeline(
         logger.info("Disabling context_compaction_enabled for realtime workflow run")
         context_compaction_enabled = False
 
+    # Bridge the silence on transitions whose edge has no authored
+    # transition_speech. Opt-in per workflow: it changes what the agent says
+    # out loud, so it must never switch on for an agent nobody asked.
+    transition_filler_enabled = (workflow.workflow_configurations or {}).get(
+        "transition_filler_enabled", False
+    )
+    # Realtime services own speech generation end-to-end; a TTSSpeakFrame has
+    # no TTS to render it there.
+    if is_realtime and transition_filler_enabled:
+        logger.info("Disabling transition_filler_enabled for realtime workflow run")
+        transition_filler_enabled = False
+
     engine = PipecatEngine(
         llm=llm,
         inference_llm=inference_llm,
@@ -728,6 +740,7 @@ async def _run_pipeline(
         embeddings_base_url=embeddings_base_url,
         has_recordings=has_recordings,
         context_compaction_enabled=context_compaction_enabled,
+        transition_filler_enabled=transition_filler_enabled,
     )
 
     # Create pipeline components

@@ -62,6 +62,20 @@ from api.utils.template_renderer import render_template
 # caller who genuinely won't or can't provide the requested information.
 _MAX_REQUIRED_VARIABLE_RETRIES = 3
 
+# Spoken on a node transition when the edge carries no authored
+# transition_speech, and only when the workflow opts in via
+# `transition_filler_enabled`. Deliberately short, neutral and
+# context-free: an edge can fire at any point in a call, so anything
+# topic-specific risks landing wrong. Rotated rather than random so the
+# same phrase doesn't repeat back-to-back on a long call.
+TRANSITION_FILLERS = (
+    "Got it.",
+    "Okay, sure.",
+    "Right, understood.",
+    "Makes sense.",
+    "Okay.",
+)
+
 
 def _has_captured_value(value: Any) -> bool:
     """True when an extracted value counts as genuinely captured.
@@ -96,6 +110,7 @@ class PipecatEngine:
         embeddings_base_url: Optional[str] = None,
         has_recordings: bool = False,
         context_compaction_enabled: bool = False,
+        transition_filler_enabled: bool = False,
     ):
         self.task = task
         self.llm = llm
@@ -175,6 +190,12 @@ class PipecatEngine:
 
         # Background context summarization on node transitions
         self._context_compaction_enabled: bool = context_compaction_enabled
+        # Speak a short acknowledgement on transitions whose edge has no
+        # authored transition_speech, so the caller isn't left in silence
+        # while the post-transition completion runs. Rotates so a long call
+        # doesn't repeat one phrase into a verbal tic.
+        self._transition_filler_enabled: bool = transition_filler_enabled
+        self._transition_filler_index: int = 0
         self._context_summarization_manager: Optional[ContextSummarizationManager] = (
             None
         )
@@ -337,6 +358,25 @@ class PipecatEngine:
                     await self.task.queue_frame(
                         TTSSpeakFrame(
                             transition_speech,
+                            append_to_context=False,
+                            persist_to_logs=True,
+                        )
+                    )
+                elif self._transition_filler_enabled and self.task:
+                    # No authored speech on this edge. A transition costs two
+                    # sequential completions (this tool call, then a fresh one
+                    # against the new node's system prompt), and without
+                    # something to play the caller just hears silence for the
+                    # duration of the second one.
+                    filler = TRANSITION_FILLERS[
+                        self._transition_filler_index % len(TRANSITION_FILLERS)
+                    ]
+                    self._transition_filler_index += 1
+                    logger.info(f"Playing transition filler: {filler}")
+                    self._queued_speech_mute_state = "waiting"
+                    await self.task.queue_frame(
+                        TTSSpeakFrame(
+                            filler,
                             append_to_context=False,
                             persist_to_logs=True,
                         )
