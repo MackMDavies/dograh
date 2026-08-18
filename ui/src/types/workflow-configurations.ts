@@ -63,6 +63,7 @@ export interface WorkflowConfigurations {
     dictionary?: string;  // Comma-separated words for voice agent to listen for
     voicemail_detection?: VoicemailDetectionConfiguration;
     context_compaction_enabled?: boolean;  // Summarize context on node transitions to remove stale tool calls
+    transition_filler_enabled?: boolean;  // Speak a short acknowledgement on transitions whose edge has no authored transition_speech
     model_overrides?: ModelOverrides;  // Per-workflow model configuration overrides
     [key: string]: unknown;  // Allow additional properties for future configurations
 }
