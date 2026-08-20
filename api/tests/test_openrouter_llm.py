@@ -55,9 +55,25 @@ def test_openrouter_llm_service_declares_max_tokens():
     assert settings.max_tokens == OPENROUTER_DEFAULT_MAX_TOKENS
 
 
-def test_openai_llm_service_does_not_declare_max_tokens():
-    """The bound is OpenRouter-specific; direct OpenAI must be untouched."""
-    with patch("api.services.pipecat.service_factory.OpenAILLMService") as mock_service:
+def test_openai_llm_service_declares_its_own_spoken_turn_cap():
+    """Direct OpenAI carries the SYSEVO per-turn ceiling, not OpenRouter's.
+
+    This test used to patch `service_factory.OpenAILLMService` and assert the
+    service declared no max_tokens at all. Both halves went stale: the factory
+    builds a DograhOpenAILLMService now, so the patch target raised
+    AttributeError before reaching a single assertion, and a deliberate
+    max_tokens=120 spoken-turn cap was added afterwards.
+
+    A test that cannot reach its assertion cannot fail meaningfully, and this
+    one masked a live bug for as long as it was broken: that same
+    max_tokens=120, combined with pipecat's run_inference setting
+    max_completion_tokens without clearing it, made OpenAI reject every
+    context-summarisation request with 400 invalid_parameter_combination. See
+    test_openai_run_inference_token_caps.py.
+    """
+    with patch(
+        "api.services.pipecat.service_factory.DograhOpenAILLMService"
+    ) as mock_service:
         create_llm_service_from_provider(
             ServiceProviders.OPENAI.value,
             "gpt-4.1",
@@ -65,7 +81,8 @@ def test_openai_llm_service_does_not_declare_max_tokens():
         )
 
     settings = mock_service.call_args.kwargs["settings"]
-    assert not isinstance(settings.max_tokens, int)
+    assert settings.max_tokens == 120
+    assert settings.max_tokens != OPENROUTER_DEFAULT_MAX_TOKENS
 
 
 # ── validation ────────────────────────────────────────────────────────────
