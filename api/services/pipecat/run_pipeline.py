@@ -58,6 +58,7 @@ from api.services.pipecat.tracing_config import (
     ensure_tracing,
 )
 from api.services.pipecat.transport_setup import create_webrtc_transport
+from api.services.pipecat.voicemail_gating import should_run_voicemail_detection
 from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
@@ -257,6 +258,7 @@ async def run_pipeline_telephony(
             audio_config=audio_config,
             workflow_run=workflow_run,
             resolved_user_config=user_config,
+            is_telephony=True,
         )
     except Exception as e:
         logger.error(
@@ -361,6 +363,7 @@ async def _run_pipeline(
     user_provider_id: str | None = None,
     workflow_run=None,
     resolved_user_config=None,
+    is_telephony: bool = False,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration
@@ -868,11 +871,22 @@ async def _run_pipeline(
     voicemail_config = (workflow.workflow_configurations or {}).get(
         "voicemail_detection", {}
     )
-    if is_realtime and voicemail_config.get("enabled", False):
+    # SYSEVO_FIRST_TURN_LATENCY: the classifier sits in front of the main LLM
+    # (llm_gate), so every call that wires it in pays a whole extra completion
+    # before the agent's first reply. Only pay that on calls an answering
+    # machine can actually take.
+    run_voicemail_detection = should_run_voicemail_detection(
+        voicemail_config,
+        is_realtime=is_realtime,
+        is_telephony=is_telephony,
+        call_type=_call_type,
+    )
+    if voicemail_config.get("enabled", False) and not run_voicemail_detection:
         logger.info(
-            f"Disabling voicemail detection for realtime workflow run {workflow_run_id}"
+            f"Skipping voicemail detection for workflow run {workflow_run_id} "
+            f"(realtime={is_realtime} telephony={is_telephony} call_type={_call_type})"
         )
-    if voicemail_config.get("enabled", False) and not is_realtime:
+    if run_voicemail_detection:
         logger.info(f"Voicemail detection enabled for workflow run {workflow_run_id}")
         # Create a separate LLM instance for the voicemail sub-pipeline
         # (can't share with main pipeline as it would mess up frame linking)
