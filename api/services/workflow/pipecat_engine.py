@@ -211,6 +211,10 @@ class PipecatEngine:
         self._lookup_filler_index: int = 0
         # Workflow-level knowledge-base documents, resolved once per call.
         self._workflow_document_uuids: Optional[list[str]] = None
+        # Backstop that ends the call if a voicemail message overruns.
+        self._voicemail_deadline_task: Optional[asyncio.Task] = None
+        # One bridging filler per caller turn — see _speak_filler.
+        self._filler_spoken_this_turn: bool = False
         self._context_summarization_manager: Optional[ContextSummarizationManager] = (
             None
         )
@@ -293,6 +297,15 @@ class PipecatEngine:
 
         return render_template(prompt, self._call_context_vars)
 
+    def begin_user_turn(self) -> None:
+        """The caller has started a new turn.
+
+        Clears the once-per-turn filler latch so the next stretch of silent
+        work gets bridged, while consecutive transitions inside a single turn
+        still only speak once.
+        """
+        self._filler_spoken_this_turn = False
+
     async def _speak_filler(self, phrases: tuple[str, ...], index_attr: str) -> bool:
         """Speak one short holding phrase, rotating through `phrases`.
 
@@ -306,6 +319,16 @@ class PipecatEngine:
         """
         if not (self._transition_filler_enabled and self.task):
             return False
+
+        # Two transitions can fire back to back with no caller turn between
+        # them, and each one used to speak. On a live call that came out as
+        # "Got it. Okay, sure." before the agent had said anything of
+        # substance — it reads as a stall, which is the opposite of what a
+        # filler is for. One bridge per caller turn is all that gap needs.
+        if self._filler_spoken_this_turn:
+            logger.debug("Filler already spoken this turn — not stacking another")
+            return False
+        self._filler_spoken_this_turn = True
 
         index = getattr(self, index_attr)
         filler = phrases[index % len(phrases)]
@@ -1031,6 +1054,56 @@ class PipecatEngine:
         # Setup LLM context with prompts and functions.
         await self._setup_llm_context(node)
 
+    async def leave_voicemail(
+        self, node_id: str, *, max_seconds: float = 45.0
+    ) -> None:
+        """Route to the workflow's voicemail node and let it speak.
+
+        Until now a detected answering machine hung up instantly, which meant
+        a workflow could carry a fully wired voicemail script and never once
+        use it — on a list of named decision-makers' direct lines, machines
+        outnumbered humans nearly four to one, and every one of them got
+        silence.
+
+        This reuses the same two calls the opener uses at call start, so the
+        message is produced by the node's own prompt rather than anything
+        bolted on here. The node's outgoing "Done" edge ends the call normally
+        once the model has finished.
+
+        `max_seconds` is the backstop for when it does not: an answering
+        machine never hangs up on you, so without a deadline a call that fails
+        to transition would sit on the line until max_call_duration — half an
+        hour of billed telephony talking to a beep.
+        """
+        if self._call_disposed:
+            return
+
+        logger.info(f"Voicemail detected — leaving a message via node {node_id}")
+        await self.set_node(node_id)
+        await self.queue_node_opening(
+            node_id=node_id,
+            previous_node_id=None,
+            generate_if_no_greeting=True,
+        )
+
+        async def _deadline() -> None:
+            try:
+                await asyncio.sleep(max_seconds)
+            except asyncio.CancelledError:
+                raise
+            if self._call_disposed:
+                return
+            logger.warning(
+                f"Voicemail message still running after {max_seconds:.0f}s — "
+                "ending the call rather than holding the line open"
+            )
+            await self.end_call_with_reason(
+                reason=EndTaskReason.VOICEMAIL_DETECTED.value,
+                abort_immediately=True,
+            )
+
+        self._voicemail_deadline_task = asyncio.create_task(_deadline())
+
     async def end_call_with_reason(
         self,
         reason: str,
@@ -1326,6 +1399,12 @@ class PipecatEngine:
             and not self._user_response_timeout_task.done()
         ):
             self._user_response_timeout_task.cancel()
+
+        if (
+            self._voicemail_deadline_task
+            and not self._voicemail_deadline_task.done()
+        ):
+            self._voicemail_deadline_task.cancel()
 
         # Cancel any in-flight background summarization.
         # MCP sessions are closed in a finally block so they are guaranteed to

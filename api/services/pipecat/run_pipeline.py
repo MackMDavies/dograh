@@ -59,6 +59,7 @@ from api.services.pipecat.tracing_config import (
 )
 from api.services.pipecat.transport_setup import create_webrtc_transport
 from api.services.pipecat.voicemail_gating import should_run_voicemail_detection
+from api.services.workflow.voicemail_routing import find_voicemail_node_id
 from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
@@ -856,6 +857,7 @@ async def _run_pipeline(
     @user_context_aggregator.event_handler("on_user_turn_started")
     async def on_user_turn_started(aggregator, strategy):
         user_idle_handler.reset()
+        engine.begin_user_turn()
 
     voicemail_detector = None
     recording_router = None
@@ -908,14 +910,20 @@ async def _run_pipeline(
             custom_system_prompt=custom_system_prompt,
         )
 
-        # Register event handler to end task when voicemail is detected
+        # Leave a message when the workflow has one to leave; otherwise hang up.
+        voicemail_node_id = find_voicemail_node_id(engine.workflow)
+
         @voicemail_detector.event_handler("on_voicemail_detected")
         async def _on_voicemail_detected(_processor):
             logger.info(f"Voicemail detected for workflow run {workflow_run_id}")
-            await engine.end_call_with_reason(
-                reason=EndTaskReason.VOICEMAIL_DETECTED.value,
-                abort_immediately=True,
-            )
+            if voicemail_node_id is None:
+                # No voicemail node wired in this workflow — nothing to say.
+                await engine.end_call_with_reason(
+                    reason=EndTaskReason.VOICEMAIL_DETECTED.value,
+                    abort_immediately=True,
+                )
+                return
+            await engine.leave_voicemail(voicemail_node_id)
 
     # Recording router is only meaningful in non-realtime mode (it routes between
     # pre-recorded audio playback and dynamic TTS; realtime LLMs produce audio
