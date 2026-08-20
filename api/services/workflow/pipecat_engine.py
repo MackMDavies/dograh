@@ -76,6 +76,18 @@ TRANSITION_FILLERS = (
     "Okay.",
 )
 
+# Spoken while a knowledge-base retrieval runs. That lookup is an embedding
+# call plus a vector search plus a second completion, none of which produce
+# any speech, so the caller otherwise hears the line go dead mid-answer.
+# Worded as "I'm looking this up" rather than as an acknowledgement, because
+# that is what is actually happening.
+LOOKUP_FILLERS = (
+    "Let me check that.",
+    "One second, let me look.",
+    "Let me pull that up.",
+    "Bear with me one second.",
+)
+
 
 def _has_captured_value(value: Any) -> bool:
     """True when an extracted value counts as genuinely captured.
@@ -196,6 +208,9 @@ class PipecatEngine:
         # doesn't repeat one phrase into a verbal tic.
         self._transition_filler_enabled: bool = transition_filler_enabled
         self._transition_filler_index: int = 0
+        self._lookup_filler_index: int = 0
+        # Workflow-level knowledge-base documents, resolved once per call.
+        self._workflow_document_uuids: Optional[list[str]] = None
         self._context_summarization_manager: Optional[ContextSummarizationManager] = (
             None
         )
@@ -278,6 +293,31 @@ class PipecatEngine:
 
         return render_template(prompt, self._call_context_vars)
 
+    async def _speak_filler(self, phrases: tuple[str, ...], index_attr: str) -> bool:
+        """Speak one short holding phrase, rotating through `phrases`.
+
+        Used to cover a stretch of the turn that produces no speech at all —
+        a blocking extraction, a knowledge-base lookup, or the second
+        completion a node transition costs. Returns True if something was
+        queued.
+
+        Rotated rather than random so the same phrase never lands twice in a
+        row on a long call.
+        """
+        if not (self._transition_filler_enabled and self.task):
+            return False
+
+        index = getattr(self, index_attr)
+        filler = phrases[index % len(phrases)]
+        setattr(self, index_attr, index + 1)
+
+        logger.info(f"Playing filler: {filler}")
+        self._queued_speech_mute_state = "waiting"
+        await self.task.queue_frame(
+            TTSSpeakFrame(filler, append_to_context=False, persist_to_logs=True)
+        )
+        return True
+
     async def _create_transition_func(
         self,
         name: str,
@@ -319,13 +359,38 @@ class PipecatEngine:
                     )
                     return
 
+                speech_type = transition_speech_type or "text"
+                has_authored_speech = bool(
+                    (
+                        speech_type == "audio"
+                        and transition_speech_recording_id
+                        and self._fetch_recording_audio
+                    )
+                    or transition_speech
+                )
+
+                # A transition costs two sequential completions (this tool
+                # call, then a fresh one against the new node's system
+                # prompt), and on a node with `required_for_exit` variables
+                # the gate below adds a third — extraction is awaited
+                # synchronously there. None of that produces speech.
+                #
+                # When the edge carries no authored speech, start the neutral
+                # filler *before* the gate so the extraction wait isn't
+                # silent. Authored speech deliberately stays after the gate:
+                # it can promise the transition ("putting you through now"),
+                # and the gate may still refuse it.
+                if not has_authored_speech:
+                    await self._speak_filler(
+                        TRANSITION_FILLERS, "_transition_filler_index"
+                    )
+
                 if not await self._enforce_required_variables_before_exit(
                     name, function_call_params
                 ):
                     return
 
                 # Queue transition speech/audio before switching nodes
-                speech_type = transition_speech_type or "text"
                 if (
                     speech_type == "audio"
                     and transition_speech_recording_id
@@ -358,25 +423,6 @@ class PipecatEngine:
                     await self.task.queue_frame(
                         TTSSpeakFrame(
                             transition_speech,
-                            append_to_context=False,
-                            persist_to_logs=True,
-                        )
-                    )
-                elif self._transition_filler_enabled and self.task:
-                    # No authored speech on this edge. A transition costs two
-                    # sequential completions (this tool call, then a fresh one
-                    # against the new node's system prompt), and without
-                    # something to play the caller just hears silence for the
-                    # duration of the second one.
-                    filler = TRANSITION_FILLERS[
-                        self._transition_filler_index % len(TRANSITION_FILLERS)
-                    ]
-                    self._transition_filler_index += 1
-                    logger.info(f"Playing transition filler: {filler}")
-                    self._queued_speech_mute_state = "waiting"
-                    await self.task.queue_frame(
-                        TTSSpeakFrame(
-                            filler,
                             append_to_context=False,
                             persist_to_logs=True,
                         )
@@ -466,6 +512,13 @@ class PipecatEngine:
 
             try:
                 query = function_call_params.arguments.get("query", "")
+
+                # Retrieval is an embedding call, then a vector search, then a
+                # second completion once the chunks come back — none of which
+                # emit any speech. Mid-answer that reads as the line going
+                # dead, so say what's happening.
+                await self._speak_filler(LOOKUP_FILLERS, "_lookup_filler_index")
+
                 organization_id = await self._get_organization_id()
 
                 if not organization_id:
@@ -756,10 +809,18 @@ class PipecatEngine:
         workflow_id = await self._get_workflow_id()
         organization_id = await self._get_organization_id()
         if workflow_id and organization_id:
-            workflow_uuids = await db_client.get_document_uuids_for_workflow(
-                workflow_id=workflow_id,
-                organization_id=organization_id,
-            )
+            # Same two arguments on every node, so this is one answer for the
+            # whole call — but _setup_llm_context runs on every transition,
+            # which put a database round trip between the transition's two
+            # completions. Resolve it once.
+            if self._workflow_document_uuids is None:
+                self._workflow_document_uuids = (
+                    await db_client.get_document_uuids_for_workflow(
+                        workflow_id=workflow_id,
+                        organization_id=organization_id,
+                    )
+                )
+            workflow_uuids = list(self._workflow_document_uuids)
             # Deduplicate: workflow-level takes precedence, node-level added on top
             seen = set(workflow_uuids)
             for uid in kb_doc_uuids:
