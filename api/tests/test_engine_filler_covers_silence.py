@@ -211,8 +211,12 @@ class TestTransitionFiller:
 
     @pytest.mark.asyncio
     async def test_fillers_rotate_rather_than_repeat(self):
+        # One transition per caller turn, as on a real call — consecutive
+        # transitions inside a single turn are deliberately bridged only once
+        # (see TestOneFillerPerTurn).
         engine, rec = _engine()
         for _ in range(3):
+            engine.begin_user_turn()
             engine._current_node = engine.workflow.nodes["collect"]
             await _run_transition(engine, rec, extracted={"phone": "+1555"})
 
@@ -304,3 +308,42 @@ class TestPerCallCaching:
 
         assert captured == [["doc-a"], ["doc-a"], ["doc-a"]]
         assert engine._workflow_document_uuids == ["doc-a"]
+
+
+class TestOneFillerPerTurn:
+    """Two transitions can fire back to back with no caller turn between them.
+
+    Each one speaking produced "Got it. Okay, sure." on a live call (run 2801)
+    — which reads as a stall, the opposite of what a filler is for.
+    """
+
+    @pytest.mark.asyncio
+    async def test_consecutive_transitions_only_bridge_once(self):
+        engine, rec = _engine()
+        engine.begin_user_turn()
+        await engine._speak_filler(TRANSITION_FILLERS, "_transition_filler_index")
+        await engine._speak_filler(TRANSITION_FILLERS, "_transition_filler_index")
+        await engine._speak_filler(LOOKUP_FILLERS, "_lookup_filler_index")
+
+        assert rec.spoken == [TRANSITION_FILLERS[0]]
+
+    @pytest.mark.asyncio
+    async def test_the_next_caller_turn_gets_its_own_bridge(self):
+        engine, rec = _engine()
+        engine.begin_user_turn()
+        await engine._speak_filler(TRANSITION_FILLERS, "_transition_filler_index")
+        engine.begin_user_turn()
+        await engine._speak_filler(TRANSITION_FILLERS, "_transition_filler_index")
+
+        assert rec.spoken == list(TRANSITION_FILLERS[:2])
+
+    @pytest.mark.asyncio
+    async def test_a_knowledge_base_lookup_still_speaks_after_a_transition_turn(self):
+        # Different turns, so the lookup is not suppressed by the transition.
+        engine, rec = _engine()
+        engine.begin_user_turn()
+        await engine._speak_filler(TRANSITION_FILLERS, "_transition_filler_index")
+        engine.begin_user_turn()
+        await engine._speak_filler(LOOKUP_FILLERS, "_lookup_filler_index")
+
+        assert rec.spoken == [TRANSITION_FILLERS[0], LOOKUP_FILLERS[0]]
