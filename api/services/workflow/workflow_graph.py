@@ -24,22 +24,12 @@ LEGACY_FALLBACK_FILTER = "fallback"
 # _resolve_builtin_variable() in api/utils/template_renderer.py — keep the two in
 # step: a name listed here but not resolved there renders blank on a live call,
 # which is worse than the validation error, because it fails silently.
-_SYSTEM_VARIABLES = {
-    "campaign_id",
-    "provider",
-    "source_uuid",
-    # Date / time built-ins. An agent that has to work the date out itself gets
-    # it wrong — this prompt set was added after a real customer was booked into
-    # the wrong YEAR.
-    "current_time",
-    "current_weekday",
-    "current_date",
-    "current_date_spoken",
-    "current_day",
-    "current_year",
-    "time_now",
-    "time_now_spoken",
-    "upcoming_days",
+# Everything the Sysevo memory pre-call fetch supplies. Unlike the rest of
+# _SYSTEM_VARIABLES these are NOT available when the call opens — they arrive
+# when the fetch returns. Anything that has to decide whether it can proceed
+# without the fetch (see api.services.pipecat.opening_gate) needs to tell the
+# two groups apart, so keep this the single source of truth for the split.
+PRE_CALL_FETCH_VARIABLES = {
     # Inbound caller recognition, injected by the Sysevo memory pre-call fetch.
     # Someone ringing our outbound number is usually ringing BACK, so the agent
     # is told who they are before it speaks. These must be listed here or a
@@ -64,10 +54,30 @@ _SYSTEM_VARIABLES = {
     "caller_last_sentiment",
 }
 
+_SYSTEM_VARIABLES = {
+    "campaign_id",
+    "provider",
+    "source_uuid",
+    # Date / time built-ins. An agent that has to work the date out itself gets
+    # it wrong — this prompt set was added after a real customer was booked into
+    # the wrong YEAR.
+    "current_time",
+    "current_weekday",
+    "current_date",
+    "current_date_spoken",
+    "current_day",
+    "current_year",
+    "time_now",
+    "time_now_spoken",
+    "upcoming_days",
+    *PRE_CALL_FETCH_VARIABLES,
+}
 
-def extract_template_variables(text: str) -> Set[str]:
+
+def extract_template_variables(text: str, *, include_system: bool = False) -> Set[str]:
     """Extract template variable names from a string, excluding nested paths,
-    variables with a fallback filter, and system-injected variables."""
+    variables with a fallback filter, and (unless `include_system`) the
+    system-injected variables."""
     variables: Set[str] = set()
     for match in re.finditer(TEMPLATE_VAR_PATTERN, text):
         var_name = match.group(1).strip()
@@ -81,7 +91,7 @@ def extract_template_variables(text: str) -> Set[str]:
         if filter_name is not None:
             continue
         # Skip system-injected variables
-        if var_name in _SYSTEM_VARIABLES:
+        if not include_system and var_name in _SYSTEM_VARIABLES:
             continue
 
         variables.add(var_name)

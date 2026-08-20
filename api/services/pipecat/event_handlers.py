@@ -15,6 +15,7 @@ from api.services.pipecat.in_memory_buffers import (
     InMemoryLogsBuffer,
 )
 from api.services.pipecat.llm_error_classification import classify_llm_exhaustion
+from api.services.pipecat.opening_gate import opening_depends_on_pre_call_fetch
 from api.services.pipecat.pipeline_metrics_aggregator import PipelineMetricsAggregator
 from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
@@ -118,11 +119,52 @@ def register_event_handlers(
         "initial_response_triggered": False,
     }
 
+    async def _merge_pre_call_result(fetch_result) -> None:
+        """Land a pre-call fetch payload on the call context and persist it."""
+        if not fetch_result:
+            return
+        if pre_call_fetch_is_memory:
+            # Land memory values on the variables they're bound to (a variable
+            # may map to a differently-named memory attribute), then fill only
+            # the gaps — campaign/explicit values and non-empty workflow
+            # defaults win.
+            fetch_result = remap_memory_variables(
+                fetch_result, memory_attr_map or {}
+            )
+            fill_if_absent(engine._call_context_vars, fetch_result)
+        else:
+            # Generic pre-call HTTP fetch keeps its enrich/override behaviour.
+            engine._call_context_vars.update(fetch_result)
+        try:
+            await db_client.update_workflow_run(
+                workflow_run_id,
+                initial_context={**engine._call_context_vars},
+            )
+        except Exception as e:
+            logger.error(f"Failed to persist pre-call fetch context: {e}")
+        logger.info(
+            f"Pre-call fetch complete, merged keys: {list(fetch_result.keys())}"
+        )
+
+    def _merge_pre_call_result_in_background(fetch_task: asyncio.Task) -> None:
+        """Merge the fetch's payload whenever it lands, without blocking."""
+
+        async def _merge_when_done() -> None:
+            try:
+                await _merge_pre_call_result(await fetch_task)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Pre-call fetch failed after greeting started: {e}")
+
+        asyncio.create_task(_merge_when_done())
+
     async def maybe_trigger_initial_response():
         """Start the conversation after both pipeline_started and client_connected events.
 
-        If a pre-call fetch is in progress, plays a ringer while waiting for the
-        response, then merges the result into the call context before proceeding.
+        An in-flight pre-call fetch is only waited on when the opening actually
+        references something it could still fill in; otherwise the greeting
+        starts immediately and the fetch merges in the background.
         """
         if (
             ready_state["pipeline_started"]
@@ -137,57 +179,52 @@ def register_event_handlers(
                 )
             )
 
-            # Wait (briefly) for the pre-call fetch if it's still in flight.
-            # We deliberately do NOT play an audible ringer here: on an answered
+            # Decide what to do about an in-flight pre-call fetch. We
+            # deliberately do NOT play an audible ringer here: on an answered
             # call — especially outbound — a ring tone after pickup is confusing
             # and was heard as the "ringing sound effect" that delayed the agent.
-            # Cap the wait so a slow memory service can never stall the greeting;
-            # if it hasn't returned in time, start the greeting now (the shielded
-            # task keeps running, and outbound memory lookups add nothing anyway).
+            # Any wait is capped, so a slow memory service can never stall the
+            # greeting, and the result is merged whichever branch we take.
             if pre_call_fetch_task is not None:
-                fetch_result = None
                 if pre_call_fetch_task.done():
-                    fetch_result = pre_call_fetch_task.result()
+                    await _merge_pre_call_result(pre_call_fetch_task.result())
+                elif not opening_depends_on_pre_call_fetch(
+                    engine.workflow, engine._call_context_vars
+                ):
+                    # SYSEVO_PICKUP_LATENCY: nothing the opening says is still
+                    # blank, so the fetch cannot change a word of it — memory
+                    # lands via fill_if_absent, which only fills gaps. Waiting
+                    # here would just be silence on a call that has already
+                    # been answered. Greet now; merge when it arrives, in time
+                    # for the nodes that come after.
+                    logger.info(
+                        "Pre-call fetch still in flight but the opening has no "
+                        "unresolved variables — greeting now, merging in background"
+                    )
+                    _merge_pre_call_result_in_background(pre_call_fetch_task)
                 else:
                     try:
-                        fetch_result = await asyncio.wait_for(
-                            asyncio.shield(pre_call_fetch_task),
-                            timeout=_PRE_CALL_GREETING_WAIT_S,
+                        await _merge_pre_call_result(
+                            await asyncio.wait_for(
+                                asyncio.shield(pre_call_fetch_task),
+                                timeout=_PRE_CALL_GREETING_WAIT_S,
+                            )
                         )
                     except asyncio.TimeoutError:
                         logger.info(
                             f"Pre-call fetch slow (>{_PRE_CALL_GREETING_WAIT_S:.1f}s); "
                             "starting greeting without blocking on it"
                         )
+                        # The shielded task is still running. Merge whenever it
+                        # lands rather than discarding it — the values are no
+                        # use to the greeting by now, but every later node
+                        # renders against the same context.
+                        _merge_pre_call_result_in_background(pre_call_fetch_task)
 
-                if fetch_result:
-                    if pre_call_fetch_is_memory:
-                        # Land memory values on the variables they're bound to
-                        # (a variable may map to a differently-named memory
-                        # attribute), then fill only the gaps — campaign/explicit
-                        # values and non-empty workflow defaults win.
-                        fetch_result = remap_memory_variables(
-                            fetch_result, memory_attr_map or {}
-                        )
-                        fill_if_absent(engine._call_context_vars, fetch_result)
-                    else:
-                        # Generic pre-call HTTP fetch keeps its enrich/override
-                        # behaviour.
-                        engine._call_context_vars.update(fetch_result)
-                    try:
-                        await db_client.update_workflow_run(
-                            workflow_run_id,
-                            initial_context={**engine._call_context_vars},
-                        )
-                    except Exception as e:
-                        logger.error(f"Failed to persist pre-call fetch context: {e}")
-                    logger.info(
-                        f"Pre-call fetch complete, merged keys: "
-                        f"{list(fetch_result.keys())}"
-                    )
-
-            # Set the start node now (after pre-call fetch data is merged)
-            # so that render_template() has the complete _call_context_vars.
+            # Set the start node now that whatever the opening depends on has
+            # been merged, so render_template() sees those _call_context_vars.
+            # Anything merged later still reaches every subsequent node, which
+            # compose their prompts at transition time.
             await engine.set_node(engine.workflow.start_node_id)
             await engine.queue_node_opening(
                 node_id=engine.workflow.start_node_id,
