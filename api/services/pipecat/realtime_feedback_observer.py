@@ -291,13 +291,15 @@ class RealtimeFeedbackObserver(BaseObserver):
                     result=frame.result,
                 )
             )
-        # Handle TTFB metrics - capture LLM generation time only
+        # Handle TTFB metrics — the two stages a caller actually waits on
         elif isinstance(frame, MetricsFrame):
-            # Check if this MetricsFrame contains TTFB data from an LLM processor
             for metric_data in frame.data:
                 if isinstance(metric_data, TTFBMetricsData):
-                    # Only send TTFB if it's from an LLM processor
-                    if metric_data.processor and "LLM" in metric_data.processor:
+                    # LLM *and* TTS. Thinking time and time-to-first-audio are
+                    # both dead air on the call, and reporting only the first
+                    # makes a slow voice look like a fast turn.
+                    processor = metric_data.processor or ""
+                    if "LLM" in processor or "TTS" in processor:
                         await self._send_message(
                             build_ttfb_metric_event(
                                 ttfb_seconds=metric_data.value,
