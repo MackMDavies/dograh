@@ -456,7 +456,10 @@ async def test_status_updates_from_plausible_locations(status_update, body, quer
     assert response.status_code == 200
     kwargs = status_update.call_args.kwargs
     assert kwargs["parent_call_sid"] == "sw-1"
-    assert kwargs["status"] == "ended"
+    # Mapped, not passed through. "ended" is not a legal dialer_calls.status -- the CHECK
+    # constraint allows completed/busy/failed/no-answer/canceled and friends -- so writing
+    # it verbatim would have been rejected and the row left unchanged, silently.
+    assert kwargs["status"] == "completed"
     assert kwargs["duration_seconds"] == 42
 
 
@@ -579,3 +582,437 @@ def test_signalwire_dialer_routes_are_mounted():
     assert "/telephony/sw-dialer-connect" in paths
     assert "/telephony/sw-call-status" in paths
     assert "/telephony/sw-recording" in paths
+
+
+# ── Inbound ──────────────────────────────────────────────────────────────────────
+
+
+async def test_dialer_connect_joins_a_conference_instead_of_dialling():
+    """A rep accepting an inbound call has no lead number to dial.
+
+    The conference branch must be checked before the lead lookup: falling through would
+    hit the "no dialable lead number" hangup and drop a caller who is already on the line.
+    """
+    response = await handle_sw_dialer_connect(
+        _authed({"vars": {"userVariables": {"rep": "rep-1", "conference": "inbound-abc"}}})
+    )
+    doc = _payload_of(response)
+
+    assert doc["sections"]["main"] == [{"join_room": {"name": "inbound-abc"}}]
+
+
+async def test_dialer_connect_still_dials_when_no_conference_is_given():
+    """The outbound path must be untouched by the inbound branch."""
+    with (
+        patch(f"{_MODULE}.create_dialer_call", new=AsyncMock()),
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value=None)),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_dialer_connect(
+            _authed({"vars": {"userVariables": {"rep": "rep-1", "lead": "+15550001111"}}})
+        )
+    doc = _payload_of(response)
+
+    assert any("connect" in step for step in doc["sections"]["main"])
+
+
+async def test_inbound_holds_the_caller_and_rings_available_reps():
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = {}
+
+    async def _capture(**kwargs):
+        created.update(kwargs)
+        return {"id": "row-1"}
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[
+            {"user_id": "user-a", "reach": "live", "forward_number": None},
+            {"user_id": "user-b", "reach": "live", "forward_number": None},
+        ])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_inbound(
+            _authed({"call": {"call_id": "abc", "from": "+447700900000", "to": "+12092669253"}})
+        )
+
+    doc = _payload_of(response)
+    # The caller is joined to a room, not connected to anyone: nobody has answered yet.
+    assert {"join_room": {"name": "inbound-abc"}} in doc["sections"]["main"]
+    assert created["target_user_ids"] == ["user-a", "user-b"]
+    assert created["conference_name"] == "inbound-abc"
+
+
+async def test_inbound_records_a_missed_call_when_nobody_is_available():
+    """No available reps is a missed call on arrival, not a call left ringing.
+
+    RLS keys visibility on target_user_ids, so a 'ringing' row with no targets would be
+    invisible to everyone except a manager and would sit in the list forever.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = {}
+
+    async def _capture(**kwargs):
+        created.update(kwargs)
+        return None
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        await handle_sw_inbound(
+            _authed({"call": {"call_id": "abc", "from": "+447700900000", "to": "+12092669253"}})
+        )
+
+    assert created["target_user_ids"] == []
+
+
+async def test_inbound_tells_the_caller_when_nobody_can_take_the_call():
+    """A caller nobody is ringing for must be told, not parked.
+
+    The hold SWML greets with "connecting you now" and joins a conference. With no
+    targets, no rep will ever join it, so the caller hears that greeting and then hold
+    music until they give up -- while the leg keeps billing.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[])),
+        patch(f"{_MODULE}.create_inbound_call", new=AsyncMock(return_value=None)),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_inbound(
+            _authed({"call": {"call_id": "abc", "from": "+447700900000", "to": "+12092669253"}})
+        )
+
+    steps = _payload_of(response)["sections"]["main"]
+    assert not any("join_room" in step for step in steps), (
+        "no rep is ringing, so joining a conference strands the caller"
+    )
+    assert steps[-1] == {"hangup": {}}
+    assert "say:" in steps[0]["play"]["url"]
+
+
+async def test_inbound_still_logs_the_call_when_nobody_is_available():
+    """Hanging up on the caller must not cost the team the record of them ringing."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = {}
+
+    async def _capture(**kwargs):
+        created.update(kwargs)
+        return None
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        await handle_sw_inbound(
+            _authed({"call": {"call_id": "abc", "from": "+447700900000", "to": "+12092669253"}})
+        )
+
+    assert created["from_number"] == "+447700900000"
+    assert created["provider_call_id"] == "abc"
+
+
+async def test_inbound_normalises_a_sip_caller_id():
+    """`from` arrives as a bare number or a SIP URI depending on how the call routed.
+
+    Stored and compared shapes must match, or assignment routing silently never finds the
+    number and every call falls back to everyone.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = {}
+
+    async def _capture(**kwargs):
+        created.update(kwargs)
+        return None
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[{"user_id": "u", "reach": "live", "forward_number": None}])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        await handle_sw_inbound(
+            _authed({"call": {
+                "call_id": "abc",
+                "from": "sip:+447700900000@x.call.signalwire.com;context=private",
+                "to": "+12092669253",
+            }})
+        )
+
+    assert created["from_number"] == "+447700900000"
+
+
+async def test_inbound_rejects_a_bad_secret():
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    response = await handle_sw_inbound(
+        _request({"call": {"call_id": "abc"}}, query={"k": "wrong"})
+    )
+    assert _payload_of(response)["sections"]["main"] == [{"hangup": {}}]
+
+
+async def test_hangup_marks_an_unanswered_call_missed():
+    """A caller who gives up while ringing is a missed call, not a call still ringing.
+
+    Patching only ended_at left every unanswered call reading "Ringing" in the history
+    forever, with the missed counter stuck at zero -- the number a manager actually acts on.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound_status
+
+    calls = []
+
+    async def _close(*, provider_call_id):
+        calls.append(provider_call_id)
+
+    with patch(f"{_MODULE}.close_inbound_call", new=_close):
+        result = await handle_sw_inbound_status(
+            _authed({"call": {"call_id": "abc"}, "params": {"call_state": "ended"}})
+        )
+
+    assert result["status"] == "success"
+    assert calls == ["abc"]
+
+
+async def test_close_inbound_call_only_marks_missed_while_still_ringing():
+    """The 'missed' patch must be conditional, or it overwrites a call somebody answered.
+
+    An answered call gets its end time and keeps its status; a race between the rep
+    answering and the caller hanging up must not erase the fact that it was picked up.
+    """
+    from api.services.telephony.dialer.inbound_call_log import close_inbound_call
+
+    seen = []
+
+    async def _update(*, provider_call_id, patch, extra_filters=None):
+        seen.append((patch, extra_filters))
+
+    with patch(
+        "api.services.telephony.dialer.inbound_call_log.update_inbound_call", new=_update
+    ):
+        await close_inbound_call(provider_call_id="abc")
+
+    missed_patch, missed_filters = seen[0]
+    assert missed_patch["status"] == "missed"
+    assert missed_filters == {"status": "eq.ringing"}
+
+    end_patch, end_filters = seen[1]
+    assert "status" not in end_patch, "an answered call must keep its status"
+    assert end_filters == {"ended_at": "is.null"}
+
+
+async def test_inbound_refuses_a_payload_with_neither_end_identified():
+    """A probe or an unreadable payload must not become a ringing call.
+
+    One did: a row with from='unknown' and to='' rang the whole team, somebody answered
+    it, and with no status callback to close it that rep was treated as on a call — and
+    so kept out of the ring pool — for an hour.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = []
+
+    async def _capture(**kwargs):
+        created.append(kwargs)
+        return None
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[{"user_id": "u", "reach": "live", "forward_number": None}])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_inbound(_authed({"call": {"call_id": "probe"}}))
+
+    assert created == [], "no row may be written for a call with neither end identified"
+    assert _payload_of(response)["sections"]["main"] == [{"hangup": {}}]
+
+
+async def test_inbound_still_accepts_a_withheld_caller_id():
+    """Withheld number is a real call. Only 'neither end' is refused."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    created = {}
+
+    async def _capture(**kwargs):
+        created.update(kwargs)
+        return None
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=[{"user_id": "u", "reach": "live", "forward_number": None}])),
+        patch(f"{_MODULE}.create_inbound_call", new=_capture),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        await handle_sw_inbound(
+            _authed({"call": {"call_id": "abc", "to": "+13292029868"}})
+        )
+
+    assert created["from_number"] == "unknown"
+    assert created["to_number"] == "+13292029868"
+
+
+def test_outbound_connect_omits_ringback():
+    """ringback takes play URIs; ["ring"] is not one, and passing it dropped calls."""
+    from api.services.telephony.dialer.swml import build_dialer_swml
+
+    doc = build_dialer_swml(
+        lead_number="+15550001111", caller_id="+12092669253", recording_webhook=""
+    )
+    connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
+    assert "ringback" not in connect
+    assert connect["timeout"] == 30
+
+
+def test_outbound_connect_reports_far_end_progress():
+    """The only source of truth about whether the callee answered.
+
+    The resource-level Status Change Webhook describes the script's own leg, not the leg
+    being dialled, which is why sw-call-status never fired once despite being configured.
+    call_state_url is per-connect and reports the B-leg.
+    """
+    from api.services.telephony.dialer.swml import build_dialer_swml
+
+    doc = build_dialer_swml(
+        lead_number="+15550001111",
+        caller_id="+12092669253",
+        recording_webhook="",
+        call_state_webhook="https://api.example.com/sw-call-status?call_id=abc",
+    )
+    connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
+    assert "answer_on_bridge" not in connect
+    assert connect["call_state_url"].endswith("call_id=abc")
+    assert "answered" in connect["call_state_events"]
+    # No ringback key: it takes play URIs, and the documented default is the provider's
+    # own ringback. Passing ["ring"] is what made calls drop after a second.
+    assert "ringback" not in connect
+
+
+async def test_inbound_does_not_wait_for_the_push_before_answering():
+    """SWML must come back before a notification is sent, not after.
+
+    A caller is on the line and SignalWire is holding the call waiting for this document.
+    Awaiting the push put an HTTP hop to an edge function -- which then calls OneSignal --
+    on the critical path: the call rang once and dropped, and the notification landed just
+    as it died, because the push was what delayed the answer.
+    """
+    import asyncio
+
+    from api.services.telephony.dialer import inbound_call_log
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def _slow_push(_id: str) -> None:
+        started.set()
+        await release.wait()
+
+    captured: dict = {}
+
+    async def _fake_post(*args, **kwargs):
+        class _Resp:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return [{"id": "row-1"}]
+
+        captured["called"] = True
+        return _Resp()
+
+    with (
+        patch.object(inbound_call_log, "_notify_targets", new=_slow_push),
+        patch.object(inbound_call_log, "SUPABASE_URL", "https://example.supabase.co"),
+        patch.object(inbound_call_log, "SUPABASE_SERVICE_ROLE_KEY", "key"),
+        patch("httpx.AsyncClient.post", new=_fake_post),
+    ):
+        # Returns while the push is still in flight. If create_inbound_call awaited it,
+        # this would block until release is set and the test would time out.
+        row = await asyncio.wait_for(
+            inbound_call_log.create_inbound_call(
+                provider_call_id="abc",
+                from_number="+15550001111",
+                to_number="+13292029939",
+                conference_name="inbound-abc",
+                target_user_ids=["u1"],
+            ),
+            timeout=2.0,
+        )
+
+    assert row == {"id": "row-1"}
+    release.set()
+
+
+async def test_inbound_holds_on_the_sysevo_line_and_never_forwards():
+    """A colleague's line behaves like a desk phone: it keeps ringing.
+
+    Forwarding to a personal mobile routed every call to a number that could not be
+    reached, turning "nobody is at their screen" into "rings once, then cuts off". The
+    caller now waits on the line while a push brings the person to it.
+    """
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    plan = [{"user_id": "u1", "reach": "push", "forward_number": "+447700900123"}]
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=plan)),
+        patch(f"{_MODULE}.create_inbound_call", new=AsyncMock(return_value=None)),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_inbound(
+            _authed({"call": {"call_id": "hold", "from": "+15550001111", "to": "+13292029939"}})
+        )
+
+    steps = _payload_of(response)["sections"]["main"]
+    assert any("join_room" in s for s in steps)
+    # A forward_number in the plan must not tempt it: no connect, ever.
+    assert not any("connect" in s for s in steps)
+
+
+async def test_inbound_treats_live_and_push_the_same():
+    """Both are somebody we can reach; the difference is only how fast they notice."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_inbound
+
+    plan = [{"user_id": "u1", "reach": "live", "forward_number": None}]
+
+    with (
+        patch(f"{_MODULE}.resolve_inbound_plan", new=AsyncMock(return_value=plan)),
+        patch(f"{_MODULE}.create_inbound_call", new=AsyncMock(return_value=None)),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_inbound(
+            _authed({"call": {"call_id": "hold2", "from": "+15550001111", "to": "+13292029939"}})
+        )
+
+    assert any("join_room" in s for s in _payload_of(response)["sections"]["main"])
+
+
+async def test_background_push_task_is_held_until_it_finishes():
+    """asyncio keeps only a weak reference to a running task.
+
+    A task nobody holds can be collected before it completes, and the failure is silent:
+    the push never arrives, with no error and nothing logged. That is indistinguishable
+    from the call having died first — the precise confusion this code already caused once.
+    """
+    import asyncio
+
+    from api.services.telephony.dialer import inbound_call_log
+
+    ran = asyncio.Event()
+
+    async def _work() -> None:
+        await asyncio.sleep(0)
+        ran.set()
+
+    inbound_call_log._spawn(_work())
+    # Held while in flight, so a collection pass cannot take it.
+    assert inbound_call_log._background, "the task must be referenced while running"
+
+    await asyncio.wait_for(ran.wait(), timeout=1.0)
+    await asyncio.sleep(0)
+    # And released once done, so the set is not a leak.
+    assert not inbound_call_log._background, "finished tasks must be discarded"

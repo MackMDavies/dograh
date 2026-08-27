@@ -51,6 +51,7 @@ from api.services.workflow.pipecat_engine_custom_tools import (
 from api.services.workflow.pipecat_engine_variable_extractor import (
     VariableExtractionManager,
 )
+from api.services.workflow.repeat_contact_variants import resolve_repeat_contact_text
 from api.services.workflow.tools.knowledge_base import (
     retrieve_from_knowledge_base,
 )
@@ -956,8 +957,19 @@ class PipecatEngine:
         if greeting_type == "audio" and node.greeting_recording_id:
             return ("audio", node.greeting_recording_id)
 
-        if node.greeting:
-            return ("text", self._format_prompt(node.greeting))
+        greeting_text = node.greeting
+        if node.is_start:
+            bucket = (self._call_context_vars or {}).get(
+                "prior_contact_relationship_type"
+            )
+            greeting_text = resolve_repeat_contact_text(
+                default_text=greeting_text,
+                bucket=bucket,
+                variants_by_bucket=node.repeat_contact_greetings,
+            )
+
+        if greeting_text:
+            return ("text", self._format_prompt(greeting_text))
 
         return None
 

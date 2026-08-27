@@ -10,6 +10,7 @@ def _node(**kw):
     kw.setdefault("prompt", "")
     kw.setdefault("greeting", None)
     kw.setdefault("out_edges", [])
+    kw.setdefault("is_start", False)
     return SimpleNamespace(**kw)
 
 

@@ -1,6 +1,6 @@
 import re
 from collections import Counter
-from typing import Dict, List, Set
+from typing import Dict, List, Optional, Set
 
 from api.services.workflow.dto import EdgeDataDTO, NodeType, ReactFlowDTO
 from api.services.workflow.errors import ItemKind, WorkflowError
@@ -166,8 +166,55 @@ class Node:
         self.pre_call_fetch_credential_uuid = getattr(
             data, "pre_call_fetch_credential_uuid", None
         )
+        self.repeat_contact_variants_enabled = getattr(
+            data, "repeat_contact_variants_enabled", False
+        )
+        self.repeat_contact_greeting_spoke_directly = getattr(
+            data, "repeat_contact_greeting_spoke_directly", None
+        )
+        self.repeat_contact_greeting_gatekeeper_screened = getattr(
+            data, "repeat_contact_greeting_gatekeeper_screened", None
+        )
+        self.repeat_contact_greeting_no_answer = getattr(
+            data, "repeat_contact_greeting_no_answer", None
+        )
+        self.repeat_contact_prompt_spoke_directly = getattr(
+            data, "repeat_contact_prompt_spoke_directly", None
+        )
+        self.repeat_contact_prompt_gatekeeper_screened = getattr(
+            data, "repeat_contact_prompt_gatekeeper_screened", None
+        )
+        self.repeat_contact_prompt_no_answer = getattr(
+            data, "repeat_contact_prompt_no_answer", None
+        )
 
         self.data = data
+
+    @property
+    def repeat_contact_greetings(self) -> Dict[str, Optional[str]]:
+        """Bucket -> greeting variant map, or {} if the feature is off for
+        this node. Empty when disabled (not just when unauthored) so a
+        stale variant left over from before an author toggled this off can
+        never resurface."""
+        if not self.repeat_contact_variants_enabled:
+            return {}
+        return {
+            "spoke_directly": self.repeat_contact_greeting_spoke_directly,
+            "gatekeeper_screened": self.repeat_contact_greeting_gatekeeper_screened,
+            "no_answer": self.repeat_contact_greeting_no_answer,
+        }
+
+    @property
+    def repeat_contact_prompts(self) -> Dict[str, Optional[str]]:
+        """Bucket -> prompt variant map, or {} if the feature is off for
+        this node."""
+        if not self.repeat_contact_variants_enabled:
+            return {}
+        return {
+            "spoke_directly": self.repeat_contact_prompt_spoke_directly,
+            "gatekeeper_screened": self.repeat_contact_prompt_gatekeeper_screened,
+            "no_answer": self.repeat_contact_prompt_no_answer,
+        }
 
 
 class WorkflowGraph:
@@ -224,7 +271,7 @@ class WorkflowGraph:
         and edge transition speeches.
 
         Scans:
-          - Start node: prompt, greeting
+          - Start node: prompt, greeting, repeat-contact opening variants
           - Agent / End / Global nodes: prompt
           - All edges: transition_speech
 
@@ -244,9 +291,22 @@ class WorkflowGraph:
                 if node.prompt:
                     variables |= extract_template_variables(node.prompt)
 
-            # greeting is only relevant on the start node
-            if node.node_type == NodeType.startNode and node.greeting:
-                variables |= extract_template_variables(node.greeting)
+            # greeting and repeat-contact opening variants are only relevant
+            # on the start node. repeat_contact_greetings/repeat_contact_prompts
+            # already return {} when the feature is disabled for that node, so
+            # this is naturally a no-op for workflows that don't use it — a
+            # campaign launch must still catch a {{variable}} that only
+            # appears inside a variant, the same as it already does for the
+            # default prompt/greeting.
+            if node.node_type == NodeType.startNode:
+                if node.greeting:
+                    variables |= extract_template_variables(node.greeting)
+                for text in node.repeat_contact_greetings.values():
+                    if text:
+                        variables |= extract_template_variables(text)
+                for text in node.repeat_contact_prompts.values():
+                    if text:
+                        variables |= extract_template_variables(text)
 
         for edge in self.edges:
             if edge.transition_speech:

@@ -232,7 +232,16 @@ services:
       # Unset leaves those endpoints unauthenticated - they log a warning
       # saying so on every single request.
       SIGNALWIRE_WEBHOOK_KEY: "${SIGNALWIRE_WEBHOOK_KEY:-}"
-
+      # Live captions on a tapped call. Unset simply turns them off -- the tap still
+      # relays audio, and the post-call transcript is produced by the Supabase function
+      # against the finished recording either way. Listed HERE and not only in .env
+      # because this service enumerates its environment explicitly: a variable present in
+      # .env but missing from this block never reaches the container, and the feature is
+      # then silently inert with nothing anywhere to explain it.
+      DEEPGRAM_API_KEY: "${DEEPGRAM_API_KEY:-}"
+      # Kill switch for live call tapping (monitoring + captions). Unset means ON.
+      # Set to 0 to stop tapping calls without a code change, if the verb ever misbehaves.
+      SYSEVO_DIALER_TAP: "${SYSEVO_DIALER_TAP:-}"
       # CORS / deployment
       DEPLOYMENT_MODE: "${DEPLOYMENT_MODE:-oss}"
       CORS_ALLOWED_ORIGINS: "${CORS_ALLOWED_ORIGINS:-}"

@@ -227,6 +227,13 @@ class _ToolDocumentRefsMixin(BaseModel):
         "pre_call_fetch_enabled",
         "pre_call_fetch_url",
         "pre_call_fetch_credential_uuid",
+        "repeat_contact_variants_enabled",
+        "repeat_contact_greeting_spoke_directly",
+        "repeat_contact_greeting_gatekeeper_screened",
+        "repeat_contact_greeting_no_answer",
+        "repeat_contact_prompt_spoke_directly",
+        "repeat_contact_prompt_gatekeeper_screened",
+        "repeat_contact_prompt_no_answer",
     ),
     field_overrides={
         "name": {
@@ -321,6 +328,86 @@ class _ToolDocumentRefsMixin(BaseModel):
             "llm_hint": "Credential UUID from `list_credentials`.",
             "display_options": DisplayOptions(show={"pre_call_fetch_enabled": [True]}),
         },
+        "repeat_contact_variants_enabled": {
+            "display_name": "Repeat-Contact Openings",
+            "description": (
+                "When true, this node can open differently for a number "
+                "we've called before, based on what happened last time."
+            ),
+        },
+        "repeat_contact_greeting_spoke_directly": {
+            "display_name": "Greeting — we already spoke to someone",
+            "description": (
+                "Greeting used instead of the default when the last call to "
+                "this number reached a person directly. Leave empty to use "
+                "the default greeting for this scenario."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+            "editor": "textarea",
+        },
+        "repeat_contact_greeting_gatekeeper_screened": {
+            "display_name": "Greeting — a gatekeeper screened us last time",
+            "description": (
+                "Greeting used instead of the default when the last call to "
+                "this number was screened by a receptionist/gatekeeper "
+                "before reaching the contact. Leave empty to use the "
+                "default greeting."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+            "editor": "textarea",
+        },
+        "repeat_contact_greeting_no_answer": {
+            "display_name": "Greeting — nobody answered last time",
+            "description": (
+                "Greeting used instead of the default when the last call to "
+                "this number rang out unanswered. Leave empty to use the "
+                "default greeting."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+            "editor": "textarea",
+        },
+        "repeat_contact_prompt_spoke_directly": {
+            "display_name": "Prompt — we already spoke to someone",
+            "description": (
+                "System prompt used instead of the default opening prompt "
+                "when the last call to this number reached a person "
+                "directly. Supports {{template_variables}}. Leave empty to "
+                "use the default prompt."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+        },
+        "repeat_contact_prompt_gatekeeper_screened": {
+            "display_name": "Prompt — a gatekeeper screened us last time",
+            "description": (
+                "System prompt used instead of the default opening prompt "
+                "when the last call to this number was screened by a "
+                "receptionist/gatekeeper. Supports {{template_variables}}. "
+                "Leave empty to use the default prompt."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+        },
+        "repeat_contact_prompt_no_answer": {
+            "display_name": "Prompt — nobody answered last time",
+            "description": (
+                "System prompt used instead of the default opening prompt "
+                "when the last call to this number rang out unanswered. "
+                "Supports {{template_variables}}. Leave empty to use the "
+                "default prompt."
+            ),
+            "display_options": DisplayOptions(
+                show={"repeat_contact_variants_enabled": [True]}
+            ),
+        },
     },
 )
 class StartCallNodeData(
@@ -349,6 +436,27 @@ class StartCallNodeData(
     )
     pre_call_fetch_credential_uuid: Optional[str] = spec_field(
         default=None, ui_type=PropertyType.credential_ref
+    )
+    repeat_contact_variants_enabled: bool = spec_field(
+        default=False, ui_type=PropertyType.boolean
+    )
+    repeat_contact_greeting_spoke_directly: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.string
+    )
+    repeat_contact_greeting_gatekeeper_screened: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.string
+    )
+    repeat_contact_greeting_no_answer: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.string
+    )
+    repeat_contact_prompt_spoke_directly: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.mention_textarea
+    )
+    repeat_contact_prompt_gatekeeper_screened: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.mention_textarea
+    )
+    repeat_contact_prompt_no_answer: Optional[str] = spec_field(
+        default=None, ui_type=PropertyType.mention_textarea
     )
 
 

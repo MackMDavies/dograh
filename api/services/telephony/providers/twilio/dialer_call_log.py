@@ -216,18 +216,61 @@ async def update_dialer_call_recording_url(
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls recording_url")
         return
+    row_id: str | None = None
     try:
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                params={
+                    "parent_call_sid": f"eq.{parent_call_sid}",
+                    # The row id is what the transcriber addresses work by, and this is
+                    # the only moment we hold both the provider's id and ours.
+                    "select": "id",
+                },
                 json={"recording_url": recording_url},
-                headers=_headers(),
+                headers={**_headers(), "Prefer": "return=representation"},
                 timeout=5.0,
             )
             response.raise_for_status()
+            rows = response.json()
+            if isinstance(rows, list) and rows:
+                row_id = str(rows[0].get("id") or "") or None
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to update dialer_calls recording_url for {parent_call_sid}: {exc}")
+        return
+
+    if row_id:
+        await _kick_transcription(row_id)
+
+
+async def _kick_transcription(dialer_call_id: str) -> None:
+    """Start transcription the moment the recording lands.
+
+    The cron sweep already guarantees every recording is eventually transcribed, but
+    "eventually" is up to two minutes, and a rep who has just hung up expects the call to
+    be there. This is the fast path; the sweep stays as the safety net for a recording
+    whose callback never arrives or whose kick fails.
+
+    Fire-and-forget by design: a rep's call must never fail because a transcription could
+    not be started, and the sweep will pick it up regardless.
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            await client.post(
+                f"{SUPABASE_URL}/functions/v1/dialer-call-transcribe",
+                json={"dialer_call_id": dialer_call_id},
+                headers={
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Content-Type": "application/json",
+                },
+                timeout=10.0,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            f"Could not start transcription for {dialer_call_id} ({exc}); "
+            "the sweep will pick it up"
+        )
 
 
 def _affected_row_count(content_range: str) -> int | None:

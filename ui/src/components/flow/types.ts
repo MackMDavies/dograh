@@ -32,6 +32,14 @@ export type FlowNodeData = {
     pre_call_fetch_enabled?: boolean;
     pre_call_fetch_url?: string;
     pre_call_fetch_credential_uuid?: string;
+    // Repeat-contact opening variants (StartCall only)
+    repeat_contact_variants_enabled?: boolean;
+    repeat_contact_greeting_spoke_directly?: string;
+    repeat_contact_greeting_gatekeeper_screened?: string;
+    repeat_contact_greeting_no_answer?: string;
+    repeat_contact_prompt_spoke_directly?: string;
+    repeat_contact_prompt_gatekeeper_screened?: string;
+    repeat_contact_prompt_no_answer?: string;
     // Trigger node specific
     trigger_path?: string;
     // Webhook node specific

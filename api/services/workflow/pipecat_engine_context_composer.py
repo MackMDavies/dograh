@@ -16,6 +16,7 @@ from api.services.workflow.unresolved_variables import (
     find_unresolved_variables,
     build_unresolved_directive,
 )
+from api.services.workflow.repeat_contact_variants import resolve_repeat_contact_text
 
 # ---------------------------------------------------------------------------
 # Recording response mode markers
@@ -78,7 +79,25 @@ def compose_system_prompt_for_node(
         global_node = workflow.nodes[workflow.global_node_id]
         global_prompt = format_prompt(global_node.prompt)
 
-    formatted_node_prompt = format_prompt(node.prompt)
+    # Repeat-contact opening variants apply to the start node only — every
+    # other node's prompt/greeting is untouched, matching the design's
+    # "start node only" scope.
+    node_prompt = node.prompt
+    node_greeting = node.greeting
+    if node.is_start:
+        bucket = (call_context_vars or {}).get("prior_contact_relationship_type")
+        node_prompt = resolve_repeat_contact_text(
+            default_text=node.prompt,
+            bucket=bucket,
+            variants_by_bucket=node.repeat_contact_prompts,
+        )
+        node_greeting = resolve_repeat_contact_text(
+            default_text=node.greeting,
+            bucket=bucket,
+            variants_by_bucket=node.repeat_contact_greetings,
+        )
+
+    formatted_node_prompt = format_prompt(node_prompt)
 
     parts = [p for p in (global_prompt, formatted_node_prompt) if p]
 
@@ -88,17 +107,19 @@ def compose_system_prompt_for_node(
     # WS4 auto-reword: warn the model about variables this node's speech
     # references that have no value, so it rewords / asks instead of speaking
     # a blank. Scans the global + node prompt, greeting, and outgoing transition
-    # speech against the live call context.
+    # speech against the live call context. Uses the resolved (possibly
+    # variant) prompt/greeting so the scan matches what will actually be
+    # said, not the unused default.
     if call_context_vars is not None:
         raw_texts: list[str] = []
         if workflow.global_node_id and node.add_global_prompt:
             global_raw = workflow.nodes[workflow.global_node_id].prompt
             if global_raw:
                 raw_texts.append(global_raw)
-        if node.prompt:
-            raw_texts.append(node.prompt)
-        if node.greeting:
-            raw_texts.append(node.greeting)
+        if node_prompt:
+            raw_texts.append(node_prompt)
+        if node_greeting:
+            raw_texts.append(node_greeting)
         for edge in node.out_edges:
             if edge.transition_speech:
                 raw_texts.append(edge.transition_speech)

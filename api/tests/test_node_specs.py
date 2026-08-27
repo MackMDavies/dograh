@@ -231,6 +231,13 @@ def test_all_registered_node_models_inherit_base_node_data():
                 "pre_call_fetch_enabled",
                 "pre_call_fetch_url",
                 "pre_call_fetch_credential_uuid",
+                "repeat_contact_variants_enabled",
+                "repeat_contact_greeting_spoke_directly",
+                "repeat_contact_greeting_gatekeeper_screened",
+                "repeat_contact_greeting_no_answer",
+                "repeat_contact_prompt_spoke_directly",
+                "repeat_contact_prompt_gatekeeper_screened",
+                "repeat_contact_prompt_no_answer",
             ],
         ),
         (
