@@ -950,29 +950,34 @@ async def websocket_sw_tap(websocket: WebSocket):
         logger.error(f"tap for call {call_id} failed: {exc}")
 
 
-async def _is_rep_on_call(user_id: str, call_id: str) -> bool:
-    """True when this user is the rep whose call this is.
+def _looks_like_uuid(value: str) -> bool:
+    """Whether a string can be used in an ``id=eq.`` filter on a uuid column.
 
-    A rep is allowed at their OWN call's stream, which is what powers their live captions
-    and the coaching panel. It is not monitoring: they are already on the call and can
-    hear every word of it. Denying them the text of a conversation they are having would
-    be theatre.
-
-    Fails CLOSED, like _may_monitor_calls. Same reason: "we could not check" must not
-    become "yes".
+    PostgREST answers 400 to a non-uuid there, and a 400 on this path reads as "no such
+    call" -- so an unchecked value would turn a provider call id into a denial rather
+    than a lookup that simply misses.
     """
-    if not user_id or not call_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        uuid.UUID(value)
+    except (AttributeError, TypeError, ValueError):
         return False
+    return True
+
+
+async def _supabase_rows(table: str, params: dict) -> list[dict]:
+    """One service-role read. Returns [] on any failure.
+
+    Empty means "no", never "we could not tell": every caller below fails CLOSED, for
+    the same reason as _may_monitor_calls -- a Supabase blip must not hand somebody a
+    live customer conversation.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return []
     try:
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{SUPABASE_URL}/rest/v1/dialer_calls",
-                params={
-                    "select": "id",
-                    "id": f"eq.{call_id}",
-                    "rep_user_id": f"eq.{user_id}",
-                    "limit": "1",
-                },
+                f"{SUPABASE_URL}/rest/v1/{table}",
+                params=params,
                 headers={
                     "apikey": SUPABASE_SERVICE_ROLE_KEY,
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -980,10 +985,67 @@ async def _is_rep_on_call(user_id: str, call_id: str) -> bool:
                 timeout=5.0,
             )
             response.raise_for_status()
-            return bool(response.json())
+            rows = response.json()
+            return rows if isinstance(rows, list) else []
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"listen auth: own-call check failed for {user_id}: {exc}")
-        return False
+        logger.warning(f"listen auth: read of {table} failed: {exc}")
+        return []
+
+
+async def _resolve_live_call(call_id: str, user_id: str) -> tuple[str | None, bool]:
+    """The tap's channel key for a call, and whether this user is on that call.
+
+    ONE lookup answers both, deliberately, because as two they disagreed and the
+    disagreement was invisible. Authorisation matched a row by ``dialer_calls.id`` and
+    the subscription then used that same UUID as the Redis channel -- but /sw-tap
+    publishes under the PROVIDER's call id (``parent_call_sid``), the only id SWML has
+    at the moment the tap is attached. So every listener authenticated, opened a
+    socket, and subscribed to a channel nothing had ever published to. A healthy,
+    silent socket: exactly how the coaching panel spent months saying "Listening" and
+    how live listen-in produced no audio.
+
+    Returns (channel key, is-own-call). No key means there is no such live call.
+    """
+    if not call_id:
+        return None, False
+
+    # Not a UUID: already a provider call id, i.e. the tap's own key. It identifies no
+    # row and no rep, so no own-call claim can rest on it -- returned unowned, and only
+    # a monitoring role gets through on it.
+    if not _looks_like_uuid(call_id):
+        return call_id, False
+
+    outbound = await _supabase_rows(
+        "dialer_calls",
+        {"select": "parent_call_sid,rep_user_id", "id": f"eq.{call_id}", "limit": "1"},
+    )
+    if outbound:
+        row = outbound[0]
+        key = str(row.get("parent_call_sid") or "").strip()
+        return (key or None), bool(user_id) and str(row.get("rep_user_id") or "") == user_id
+
+    # An answered inbound call has NO dialer_calls row: inbound is logged in
+    # inbound_calls, and the tap rides the caller's held leg keyed on provider_call_id.
+    inbound = await _supabase_rows(
+        "inbound_calls",
+        {
+            "select": "provider_call_id,answered_by,target_user_ids",
+            "id": f"eq.{call_id}",
+            "limit": "1",
+        },
+    )
+    if inbound:
+        row = inbound[0]
+        key = str(row.get("provider_call_id") or "").strip()
+        targets = [str(t) for t in (row.get("target_user_ids") or [])]
+        # Rung-for counts as well as answered-by. answered_by is stamped by a callback
+        # that may not have landed yet, and the rep is already mid-sentence.
+        own = bool(user_id) and (
+            str(row.get("answered_by") or "") == user_id or user_id in targets
+        )
+        return (key or None), own
+
+    return None, False
 
 
 @router.websocket("/sw-listen")
@@ -1000,22 +1062,35 @@ async def websocket_sw_listen(websocket: WebSocket):
     # sending it would put their own voice back in their ear a fifth of a second late.
     captions_only = websocket.query_params.get("captions_only") in ("1", "true", "yes")
 
-    user_id = await _supabase_user_id(token)
-    permitted = bool(user_id) and (
-        await _may_monitor_calls(user_id)
-        or (captions_only and await _is_rep_on_call(user_id, call_id))
-    )
-    if not permitted:
-        # Closed before accept, and with the same code whether the token was bad or the
-        # role was wrong: telling the two apart is a way to probe who is a manager.
-        await websocket.close(code=4403, reason="not permitted")
-        return
     if not call_id:
         await websocket.close(code=4400, reason="missing call_id")
         return
 
+    user_id = await _supabase_user_id(token)
+    # The channel to subscribe to and the right to subscribe to it come from the same
+    # lookup, so they cannot drift apart again. See _resolve_live_call.
+    channel_key, own_call = (
+        await _resolve_live_call(call_id, user_id) if user_id else (None, False)
+    )
+    permitted = (
+        bool(user_id)
+        and bool(channel_key)
+        and (
+            await _may_monitor_calls(user_id)
+            or (captions_only and own_call)
+        )
+    )
+    if not permitted:
+        # Closed before accept, and with the same code whether the token was bad, the
+        # role was wrong or the call does not exist: telling those apart is a way to
+        # probe who is a manager and which call ids are real.
+        await websocket.close(code=4403, reason="not permitted")
+        return
+
     await websocket.accept()
-    logger.info(f"listener {user_id} attached to call {call_id}")
+    logger.info(
+        f"listener {user_id} attached to call {call_id} on tap channel {channel_key}"
+    )
 
     stop = asyncio.Event()
 
@@ -1038,7 +1113,7 @@ async def websocket_sw_listen(websocket: WebSocket):
     watcher = asyncio.create_task(watch_for_close())
     frames_sent = 0
     try:
-        async for kind, payload in subscribe_stream(call_id, stop):
+        async for kind, payload in subscribe_stream(channel_key, stop):
             # Audio as binary, captions as text. The browser tells them apart by the
             # frame type rather than by inspecting bytes, which is why they travel on
             # separate Redis channels in the first place.
