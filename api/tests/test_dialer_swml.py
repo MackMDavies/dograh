@@ -59,3 +59,38 @@ def test_swml_is_json_serialisable():
             lead_number="+1555", caller_id="+1666", recording_webhook="https://x/y"
         )
     )
+
+
+def test_spoken_company_name_is_not_the_written_spelling():
+    """Our own name is spelled for the ear here, not for the eye.
+
+    "Sysevo" is not a word, so TTS reads it letter-pattern-wise and says
+    "Sys-AY-vo" - every caller who reached the hold greeting heard the company
+    introduce itself by the wrong name. This guards the respelling against being
+    tidied back, which is exactly what it looks like it needs.
+    """
+    from api.services.telephony.dialer.swml import SPOKEN_COMPANY_NAME
+
+    assert "Sysevo" not in SPOKEN_COMPANY_NAME
+    # Still recognisably us, so a mistyped constant cannot pass silently.
+    assert SPOKEN_COMPANY_NAME.lower().startswith("sis")
+    assert "ee" in SPOKEN_COMPANY_NAME.lower()
+
+
+def test_inbound_greeting_is_never_read_out_as_the_written_spelling():
+    from api.services.telephony.dialer.swml import (
+        SPOKEN_COMPANY_NAME,
+        build_inbound_hold_swml,
+    )
+
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc",
+        recording_webhook="",
+        greeting=f"Thanks for calling {SPOKEN_COMPANY_NAME}.",
+    )
+    spoken = [
+        s["play"]["url"] for s in doc["sections"]["main"] if "play" in s
+    ]
+    assert spoken, "the greeting must actually be spoken"
+    for line in spoken:
+        assert "Sysevo" not in line

@@ -98,6 +98,19 @@ def build_dialer_swml(
     return {"sections": {"main": steps}}
 
 
+# How our own name has to be SPELLED so a speech engine SAYS it correctly.
+#
+# "Sysevo" is not a word, so TTS reads it letter-pattern-wise and lands on
+# "Sys-AY-vo". Every caller who reached the hold greeting heard the company
+# introduce itself by the wrong name. The doubled s closes the first syllable
+# and "ee" forces the long second one, giving SIS-ee-vo.
+#
+# DO NOT "correct" this spelling. It is wrong on purpose, and it is only ever
+# passed to a say: URI - never written to a caller, a record or an email, where
+# the real spelling is the only acceptable one.
+SPOKEN_COMPANY_NAME = "Sisseevo"
+
+
 def build_inbound_hold_swml(
     *,
     conference_name: str,

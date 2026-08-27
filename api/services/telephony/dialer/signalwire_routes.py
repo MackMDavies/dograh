@@ -47,6 +47,7 @@ from starlette.responses import JSONResponse
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.telephony.dialer.swml import (
     build_conference_join_swml,
+    SPOKEN_COMPANY_NAME,
     build_dialer_swml,
     build_hangup_swml,
     build_inbound_hold_swml,
@@ -776,8 +777,10 @@ async def handle_sw_inbound(request: Request):
                 build_inbound_hold_swml(
                     conference_name=conference_name,
                     recording_webhook=recording_webhook,
+                    # SPOKEN_COMPANY_NAME, not "Sysevo": this string is read
+                    # aloud by TTS, which says "Sys-AY-vo" for the real spelling.
                     greeting=(
-                        "Thanks for calling Sysevo. "
+                        f"Thanks for calling {SPOKEN_COMPANY_NAME}. "
                         "Please hold while we connect you to the team."
                     ),
                     # The caller's leg carries both sides of the conversation once a rep
