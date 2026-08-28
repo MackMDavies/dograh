@@ -29,6 +29,7 @@ Delete the payload logging once the shape is confirmed.
 """
 
 import asyncio
+import hashlib
 import hmac
 from contextlib import suppress
 import json
@@ -394,6 +395,43 @@ def _webhook_url(backend_endpoint: str, path: str, call_id: str) -> str:
     return f"{backend_endpoint}/api/v1/telephony/{path}?" + urlencode(params)
 
 
+def _tap_token(call_id: str) -> str:
+    """A credential for ONE call's tap, derived rather than configured.
+
+    /sw-tap was unauthenticated in production for months: anyone who guessed a call id
+    could open the socket and push audio frames into whatever a manager was listening to.
+    The ?k= shared secret was supposed to cover it, but that secret is shared with
+    the HTTP webhooks -- and those are fetched from URLs configured in the SignalWire
+    DASHBOARD, which carry no k. Setting SIGNALWIRE_WEBHOOK_KEY to close this hole
+    therefore made _secret_ok() reject every SWML fetch and took ALL calling down: ring,
+    then immediate hangup. See the revert in project_dograh_prod_deploy.
+
+    This cannot repeat, because the tap URL is not a dashboard URL -- WE build it, per
+    call, in _tap_websocket_url below. The same function derives the token on both sides,
+    from the same environment, so the two can never disagree about whether one is
+    expected. There is no half-enabled state to get into.
+
+    Per call rather than static: a token that leaks buys the holder one call id, for as
+    long as that one call is live, instead of every call forever.
+
+    Derived from a secret that is ALREADY set on every box that can place a call, so this
+    needs no new environment variable and no deploy-order dance. SIGNALWIRE_WEBHOOK_KEY is
+    preferred if somebody has set it; SIGNALWIRE_API_TOKEN is the fallback and is
+    necessarily present -- without it there are no calls to tap. The secret itself never
+    leaves the server; only the digest travels.
+    """
+    secret = (
+        os.environ.get("SIGNALWIRE_WEBHOOK_KEY")
+        or os.environ.get("SIGNALWIRE_API_TOKEN")
+        or ""
+    ).strip()
+    if not secret or not call_id:
+        return ""
+    return hmac.new(
+        secret.encode("utf-8"), call_id.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
 def _tap_websocket_url(backend_endpoint: str, call_id: str) -> str:
     """The wss:// address SignalWire should fork this call's audio to.
 
@@ -420,6 +458,12 @@ def _tap_websocket_url(backend_endpoint: str, call_id: str) -> str:
     http_url = _webhook_url(backend_endpoint, "sw-tap", call_id)
     if not http_url:
         return ""
+    # Appended here rather than inside _webhook_url: the HTTP webhooks are fetched from
+    # dashboard-configured URLs that cannot carry a per-call value, so a token on them
+    # would be an expectation nothing could ever satisfy. Only the tap URL is ours.
+    token = _tap_token(call_id)
+    if token:
+        http_url += "&" + urlencode({"t": token})
     if http_url.startswith("https://"):
         return "wss://" + http_url[len("https://"):]
     return "ws://" + http_url[len("http://"):]
@@ -911,8 +955,30 @@ async def websocket_sw_tap(websocket: WebSocket):
     if not call_id:
         await websocket.close(code=4400, reason="missing call_id")
         return
-    if not expected:
-        logger.warning("SIGNALWIRE_WEBHOOK_KEY is unset - /sw-tap is UNAUTHENTICATED.")
+
+    # The per-call token. Checked AFTER call_id, because the token is derived from it and
+    # there is nothing to compare against until we have one.
+    #
+    # Enforced exactly when it is issuable: _tap_token() is the same function that built
+    # the URL, reading the same environment, so "we expect a token" and "the URL carries
+    # a token" are the same condition by construction. That is the whole point -- the
+    # outage this replaces came from turning on a check whose counterpart lived somewhere
+    # else entirely and could not be turned on with it.
+    expected_token = _tap_token(call_id)
+    if expected_token and not hmac.compare_digest(
+        str(websocket.query_params.get("t", "")), expected_token
+    ):
+        # 4401 like the shared-secret path: refused before the handshake is accepted, so
+        # an unauthenticated caller is not even told the call id was valid.
+        await websocket.close(code=4401, reason="bad token")
+        return
+    if not expected_token:
+        # Only reachable with no SignalWire credentials at all, which is a box that
+        # cannot place calls. Loud, because it is the state this fix exists to end.
+        logger.warning(
+            "No SignalWire secret available - /sw-tap is UNAUTHENTICATED for "
+            f"call {call_id}."
+        )
 
     await websocket.accept()
     logger.info(f"tap opened for call {call_id}")
