@@ -4,7 +4,7 @@ Dograh's own UserModel has no `role` concept — Sysevo roles (sales_rep,
 sales_manager, client, ...) live entirely in Supabase's `user_roles` table.
 `require_sales_dialer_role` resolves them live over Supabase's REST API
 (anon key + the caller's own bearer token) and 403s anyone who isn't a
-superuser or a sales_rep/sales_manager/super_admin.
+superuser or a sales_rep/sales_closer/sales_manager/super_admin.
 """
 
 from types import SimpleNamespace
@@ -63,6 +63,36 @@ async def test_require_sales_dialer_role_allows_sales_rep(monkeypatch):
 
     user = SimpleNamespace(id=1, provider_id="user-uuid-123", is_superuser=False)
     mock_client = _mock_role_response(["sales_rep"])
+
+    with patch(
+        "api.services.auth.sysevo_roles.httpx.AsyncClient"
+    ) as mock_client_class:
+        mock_client_class.return_value.__aenter__.return_value = mock_client
+
+        result = await require_sales_dialer_role(
+            authorization="Bearer some-access-token", user=user
+        )
+
+        assert result is user
+
+
+async def test_require_sales_dialer_role_allows_sales_closer(monkeypatch):
+    """Closers cold-call and ring clients from the same dialer as reps.
+
+    Regression guard for the 403 ("This feature requires a Sysevo sales role.")
+    that /voice-token returned to every sales_closer: the Supabase side already
+    admitted them (dialer-agent-call's ALLOWED_ROLES) while this set did not.
+    """
+    monkeypatch.setattr("api.services.auth.sysevo_roles.AUTH_PROVIDER", "supabase")
+    monkeypatch.setattr(
+        "api.services.auth.sysevo_roles.SUPABASE_URL", "https://example.supabase.co"
+    )
+    monkeypatch.setattr(
+        "api.services.auth.sysevo_roles.SUPABASE_ANON_KEY", "test-anon-key"
+    )
+
+    user = SimpleNamespace(id=7, provider_id="closer-uuid-789", is_superuser=False)
+    mock_client = _mock_role_response(["sales_closer"])
 
     with patch(
         "api.services.auth.sysevo_roles.httpx.AsyncClient"
