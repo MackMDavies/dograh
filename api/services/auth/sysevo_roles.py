@@ -16,7 +16,7 @@ from api.constants import AUTH_PROVIDER, SUPABASE_ANON_KEY, SUPABASE_URL
 from api.db.models import UserModel
 from api.services.auth.depends import get_user
 
-SALES_DIALER_ROLES = {"sales_rep", "sales_manager", "super_admin"}
+SALES_DIALER_ROLES = {"sales_rep", "sales_closer", "sales_manager", "super_admin"}
 
 _ACCESS_DENIED_DETAIL = "This feature requires a Sysevo sales role."
 
