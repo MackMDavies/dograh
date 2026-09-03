@@ -21,6 +21,17 @@ from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE
 
 _DIALER_CALLS_URL_SUFFIX = "/rest/v1/dialer_calls"
 
+# The carrier is done with the leg. ALL of these end a call - not just "completed",
+# which is what this module used to test and is why a cancelled or unanswered call
+# settled in Supabase with a status but no end time. Anything reading `ended_at is
+# null` then read those rows as calls in progress: a manager's Live tab showed two
+# calls that had hung up half an hour earlier, with running timers and a Listen
+# button each. Mirrors dialer_terminal_statuses() in the Supabase schema and
+# DIALER_ENDED_STATUSES in the sysevo frontend.
+_TERMINAL_CALL_STATUSES = frozenset(
+    {"completed", "busy", "failed", "no-answer", "canceled"}
+)
+
 
 def _headers() -> dict:
     return {
@@ -84,17 +95,31 @@ async def update_dialer_call_status(
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls status")
         return
+    # Only the fields this callback actually knows. A PATCH that always sends every
+    # key writes null for the ones it has nothing for, and null in a PATCH is an
+    # instruction to ERASE - so a "no-answer" callback carrying no duration wiped a
+    # real duration another callback had already recorded, and the old unconditional
+    # ended_at wiped a real end time the same way. Omitting a key leaves the column
+    # untouched, which is what "I have nothing to say about this" should mean.
+    payload: dict[str, object] = {"status": status}
+    if child_call_sid is not None:
+        payload["child_call_sid"] = child_call_sid
+    if duration_seconds is not None:
+        payload["duration_seconds"] = duration_seconds
+    if status in _TERMINAL_CALL_STATUSES:
+        # now(), not started_at + duration: this callback arrives at the hangup, and
+        # duration counts talk time only - a call that rang for twenty seconds before
+        # anyone answered genuinely ended later than start + duration implies. The
+        # Supabase trigger derives that lower bound as a backstop when nothing else
+        # supplies one; this is the better number, so it goes in first.
+        payload["ended_at"] = datetime.now(UTC).isoformat()
+
     try:
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
                 params={"parent_call_sid": f"eq.{parent_call_sid}"},
-                json={
-                    "child_call_sid": child_call_sid,
-                    "status": status,
-                    "duration_seconds": duration_seconds,
-                    "ended_at": datetime.now(UTC).isoformat() if status == "completed" else None,
-                },
+                json=payload,
                 headers=_headers(),
                 timeout=5.0,
             )

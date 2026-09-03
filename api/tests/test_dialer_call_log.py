@@ -221,7 +221,8 @@ async def test_update_dialer_call_status_patches_by_parent_call_sid(monkeypatch)
     assert call.kwargs["json"]["ended_at"] is not None
 
 
-async def test_update_dialer_call_status_leaves_ended_at_null_when_not_completed(monkeypatch):
+async def _patched_payload(monkeypatch, **kwargs) -> dict:
+    """Run update_dialer_call_status and hand back the JSON body it would PATCH."""
     monkeypatch.setattr(
         "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_URL",
         "https://example.supabase.co",
@@ -238,12 +239,77 @@ async def test_update_dialer_call_status_leaves_ended_at_null_when_not_completed
         "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
         return_value=fake_client,
     ):
-        await update_dialer_call_status(
-            parent_call_sid="CA111", child_call_sid="CA222", status="ringing", duration_seconds=None
-        )
+        await update_dialer_call_status(**kwargs)
 
-    call = fake_client.patch.await_args
-    assert call.kwargs["json"]["ended_at"] is None
+    return fake_client.patch.await_args.kwargs["json"]
+
+
+async def test_update_dialer_call_status_omits_ended_at_while_the_call_is_being_set_up(
+    monkeypatch,
+):
+    """A setup status is not an ending, and the key is ABSENT rather than null.
+
+    Absent and null are different instructions to PostgREST: absent leaves the column
+    alone, null erases it. This used to send null, which is why a 'ringing' callback
+    arriving after a real end time had been recorded could wipe it.
+    """
+    payload = await _patched_payload(
+        monkeypatch,
+        parent_call_sid="CA111",
+        child_call_sid="CA222",
+        status="ringing",
+        duration_seconds=None,
+    )
+
+    assert "ended_at" not in payload
+    # Nothing is known about the duration on this callback, so nothing is said about it.
+    assert "duration_seconds" not in payload
+
+
+@pytest.mark.parametrize("status", ["completed", "busy", "failed", "no-answer", "canceled"])
+async def test_update_dialer_call_status_stamps_an_end_time_for_every_ending(
+    monkeypatch, status
+):
+    """The regression, and it was four fifths of all endings.
+
+    Only 'completed' used to get an end time. Every cancelled, busy, failed or
+    unanswered call therefore settled in Supabase with a terminal status and no
+    ended_at -- and anything asking `ended_at is null` read those as calls in
+    progress. A manager's Live tab showed two calls that had hung up half an hour
+    earlier, with running timers and a Listen button on each.
+    """
+    payload = await _patched_payload(
+        monkeypatch,
+        parent_call_sid="CA111",
+        child_call_sid="CA222",
+        status=status,
+        duration_seconds=7,
+    )
+
+    assert payload["ended_at"] is not None
+    assert payload["status"] == status
+
+
+async def test_update_dialer_call_status_never_erases_what_it_does_not_know(monkeypatch):
+    """A null in a PATCH is an instruction to erase, so unknowns are omitted.
+
+    The old body sent every key on every callback. A 'no-answer' carrying no duration
+    therefore blanked a real duration another callback had already written, and the
+    same was true of child_call_sid.
+    """
+    payload = await _patched_payload(
+        monkeypatch,
+        parent_call_sid="CA111",
+        child_call_sid=None,
+        status="no-answer",
+        duration_seconds=None,
+    )
+
+    assert "child_call_sid" not in payload
+    assert "duration_seconds" not in payload
+    # ...but the ending itself is known, and is still recorded.
+    assert payload["status"] == "no-answer"
+    assert payload["ended_at"] is not None
 
 
 async def test_update_dialer_call_status_swallows_errors(monkeypatch):
