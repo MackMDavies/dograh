@@ -228,28 +228,39 @@ async def initiate_call(
     # Resolve optional caller-ID. The config has already been validated against
     # the user's organization, so filtering by config_id is sufficient for
     # tenant isolation.
-    from_number: str | None = None
-    if request.from_phone_number_id is not None:
-        if telephony_configuration_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="from_phone_number_id_requires_telephony_configuration",
+    # Everything from caller-ID resolution through provider dispatch can fail
+    # (e.g. Twilio rejects an unverified caller ID with 21210, or the from-number
+    # row is missing). Any failure after the concurrency slot was bound above
+    # must release it — otherwise the slot leaks until its stale TTL (~20-30 min)
+    # and falsely trips "Concurrent call limit reached" on the next attempt.
+    # release_call_slot is idempotent and a no-op when no slot is bound.
+    try:
+        from_number: str | None = None
+        if request.from_phone_number_id is not None:
+            if telephony_configuration_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="from_phone_number_id_requires_telephony_configuration",
+                )
+            phone_row = await db_client.get_phone_number_for_config(
+                request.from_phone_number_id, telephony_configuration_id
             )
-        phone_row = await db_client.get_phone_number_for_config(
-            request.from_phone_number_id, telephony_configuration_id
-        )
-        if not phone_row or not phone_row.is_active:
-            raise HTTPException(status_code=400, detail="from_phone_number_not_found")
-        from_number = phone_row.address_normalized
+            if not phone_row or not phone_row.is_active:
+                raise HTTPException(status_code=400, detail="from_phone_number_not_found")
+            from_number = phone_row.address_normalized
 
-    # Initiate call via provider
-    result = await provider.initiate_call(
-        to_number=phone_number,
-        webhook_url=webhook_url,
-        workflow_run_id=workflow_run_id,
-        from_number=from_number,
-        **keywords,
-    )
+        # Initiate call via provider
+        result = await provider.initiate_call(
+            to_number=phone_number,
+            webhook_url=webhook_url,
+            workflow_run_id=workflow_run_id,
+            from_number=from_number,
+            **keywords,
+        )
+    except Exception:
+        from api.services.telephony.call_concurrency import release_call_slot
+        await release_call_slot(workflow_run_id)
+        raise
 
     # Store provider metadata and caller_number in workflow run context
     gathered_context = {
