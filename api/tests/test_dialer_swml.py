@@ -1,5 +1,10 @@
 """Unit tests for SWML generation. SWML is JSON - assert on parsed structure."""
-from api.services.telephony.dialer.swml import build_dialer_swml, build_hangup_swml
+from api.services.telephony.dialer.swml import (
+    build_conference_join_swml,
+    build_dialer_swml,
+    build_hangup_swml,
+    build_inbound_hold_swml,
+)
 
 
 def test_build_dialer_swml_connects_to_lead_with_caller_id():
@@ -94,3 +99,152 @@ def test_inbound_greeting_is_never_read_out_as_the_written_spelling():
     assert spoken, "the greeting must actually be spoken"
     for line in spoken:
         assert "Sysevo" not in line
+
+# ── Inbound hold: a conference, not a video room ──────────────────────────
+#
+# join_room fails here in a way that only shows up on a live call — see the
+# SignalWire voice log quoted in build_inbound_hold_swml. These pin the verb and
+# the two flags that decide who starts and ends the room.
+
+
+def test_inbound_hold_uses_a_conference_not_a_video_room():
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc123",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+    )
+    steps = doc["sections"]["main"]
+    assert not any("join_room" in s for s in steps), "join_room joins a VIDEO room"
+    conference = next(s["join_conference"] for s in steps if "join_conference" in s)
+    assert conference["name"] == "inbound-abc123"
+
+
+def test_waiting_caller_does_not_start_the_conference():
+    # Starting it on the caller's arrival puts them alone in a live room, which is
+    # silence rather than hold treatment.
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc123",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+    )
+    conference = next(
+        s["join_conference"] for s in doc["sections"]["main"] if "join_conference" in s
+    )
+    assert conference["start_on_enter"] is False
+
+
+def test_waiting_caller_hanging_up_does_not_tear_down_the_conference():
+    # A rep may be halfway into joining it.
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc123",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+    )
+    conference = next(
+        s["join_conference"] for s in doc["sections"]["main"] if "join_conference" in s
+    )
+    assert conference["end_on_exit"] is False
+
+
+def test_inbound_hold_still_records_before_joining():
+    # The opening seconds, including the greeting, are captured on the caller's leg.
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc123",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+    )
+    steps = doc["sections"]["main"]
+    record_at = next(i for i, s in enumerate(steps) if "record_call" in s)
+    join_at = next(i for i, s in enumerate(steps) if "join_conference" in s)
+    assert record_at < join_at
+
+
+def test_answering_rep_starts_and_ends_the_conference():
+    # The rep is the main participant. Without end_on_exit the caller is left alone
+    # in a room after the rep hangs up, with nothing saying the call is over.
+    doc = build_conference_join_swml(conference_name="inbound-abc123")
+    steps = doc["sections"]["main"]
+    assert not any("join_room" in s for s in steps)
+    conference = next(s["join_conference"] for s in steps if "join_conference" in s)
+    assert conference["name"] == "inbound-abc123"
+    assert conference["start_on_enter"] is True
+    assert conference["end_on_exit"] is True
+
+
+def test_answering_rep_does_not_record_a_second_copy():
+    # The caller's leg is already recording. A second recorder bills twice for one
+    # conversation and produces two files to reconcile.
+    doc = build_conference_join_swml(conference_name="inbound-abc123")
+    assert not any("record_call" in s for s in doc["sections"]["main"])
+
+
+# ── Live audio taps ──────────────────────────────────────────────────────────
+#
+# The tap is what makes a call listenable while it is happening. It is additive:
+# it must never change how the call is bridged, because that path took two
+# outages to get working.
+
+
+def test_outbound_taps_both_directions():
+    # `direction` defaults to `speak`, which is only our side. A manager monitoring
+    # a call needs to hear the prospect too.
+    doc = build_dialer_swml(
+        lead_number="+15559876543",
+        caller_id="+15551234567",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+        tap_websocket="wss://api.example.com/api/v1/telephony/sw-tap?call_id=abc",
+    )
+    tap = next(s["tap"] for s in doc["sections"]["main"] if "tap" in s)
+    assert tap["uri"] == "wss://api.example.com/api/v1/telephony/sw-tap?call_id=abc"
+    assert tap["direction"] == "both"
+
+
+def test_inbound_taps_the_caller_leg():
+    doc = build_inbound_hold_swml(
+        conference_name="inbound-abc123",
+        recording_webhook="",
+        tap_websocket="wss://api.example.com/tap",
+    )
+    steps = doc["sections"]["main"]
+    assert any("tap" in s for s in steps)
+    # Before the join, for the same reason recording is: the greeting and the wait
+    # are part of the call.
+    assert next(i for i, s in enumerate(steps) if "tap" in s) < next(
+        i for i, s in enumerate(steps) if "join_conference" in s
+    )
+
+
+def test_tap_starts_before_the_bridge():
+    # A tap started after the connect would miss the opening of the conversation,
+    # which is the part worth hearing.
+    doc = build_dialer_swml(
+        lead_number="+15559876543",
+        caller_id="+15551234567",
+        recording_webhook="",
+        tap_websocket="wss://api.example.com/tap",
+    )
+    steps = doc["sections"]["main"]
+    assert next(i for i, s in enumerate(steps) if "tap" in s) < next(
+        i for i, s in enumerate(steps) if "connect" in s
+    )
+
+
+def test_no_tap_url_means_no_tap_step():
+    # Monitoring is worth having; it is not worth a malformed SWML document on a
+    # live call. No endpoint, no tap, call proceeds exactly as before.
+    doc = build_dialer_swml(
+        lead_number="+15559876543",
+        caller_id="+15551234567",
+        recording_webhook="",
+    )
+    assert not any("tap" in s for s in doc["sections"]["main"])
+    assert any("connect" in s for s in doc["sections"]["main"])
+
+
+def test_tap_does_not_disturb_the_connect():
+    # The whole justification for a tap over a conference: the bridge is untouched.
+    without = build_dialer_swml(
+        lead_number="+15559876543", caller_id="+15551234567", recording_webhook="",
+    )
+    with_tap = build_dialer_swml(
+        lead_number="+15559876543", caller_id="+15551234567", recording_webhook="",
+        tap_websocket="wss://api.example.com/tap",
+    )
+    connect_of = lambda d: next(s["connect"] for s in d["sections"]["main"] if "connect" in s)
+    assert connect_of(without) == connect_of(with_tap)
