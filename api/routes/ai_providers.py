@@ -188,9 +188,11 @@ async def update_connection(
     user=Depends(get_user),
 ):
     """Update API key or config for an existing connection. Admin only."""
+    # Superusers see connections across all orgs (list_all_connections_superuser),
+    # so they must be able to edit any org's connection — not just their selected one.
     conn = await db_client.update_connection(
         connection_id=connection_id,
-        organization_id=user.selected_organization_id,
+        organization_id=None if user.is_superuser else user.selected_organization_id,
         api_key=body.api_key,
         extra_config=body.extra_config,
         display_name=body.display_name,
@@ -203,9 +205,10 @@ async def update_connection(
 @router.delete("/connections/{connection_id}")
 async def delete_connection(connection_id: int, user=Depends(get_user)):
     """Soft-delete a provider connection and all its models. Admin only."""
+    # Superusers can delete any org's connection (they can see all of them).
     removed = await db_client.delete_connection(
         connection_id=connection_id,
-        organization_id=user.selected_organization_id,
+        organization_id=None if user.is_superuser else user.selected_organization_id,
     )
     if not removed:
         raise HTTPException(status_code=404, detail="Connection not found")
