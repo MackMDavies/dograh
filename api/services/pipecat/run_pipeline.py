@@ -421,7 +421,7 @@ async def _run_pipeline(
     run_configs = run_definition.workflow_configurations or {}
 
     # Extract configurations from the version's workflow_configurations
-    max_call_duration_seconds = 300  # Default 5 minutes
+    max_call_duration_seconds = 600  # Default 10 minutes (aligned with agent UI default)
     max_user_idle_timeout = 10.0  # Default 10 seconds
     # Latency / responsiveness defaults — tuned "ultra-fast" so agents reply almost
     # immediately after the caller stops, instead of the old 2s/3s waits. Per-agent
