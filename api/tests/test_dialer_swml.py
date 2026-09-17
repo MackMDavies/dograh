@@ -19,6 +19,27 @@ def test_build_dialer_swml_connects_to_lead_with_caller_id():
     assert connect["from"] == "+15551234567"
 
 
+def test_a_long_call_is_never_cut_short_by_the_script():
+    """A rep on a good call can be on it for half an hour.
+
+    `timeout` bounds the RING, not the conversation, and the two get confused:
+    when reps reported being cut off mid-call it was the first thing suspected.
+    Guard both facts so neither can be quietly changed into a cap — and state
+    max_duration rather than inheriting whatever SignalWire's default happens to
+    be, so a thirty-minute call cannot depend on a number nobody here verified.
+    """
+    doc = build_dialer_swml(
+        lead_number="+15559876543",
+        caller_id="+15551234567",
+        recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
+    )
+    connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
+    # Ring timeout: short on purpose, and NOT a limit on the conversation.
+    assert connect["timeout"] == 30
+    # Conversation length: stated, and far beyond any real sales call.
+    assert connect["max_duration"] >= 4 * 60 * 60
+
+
 def test_build_dialer_swml_records_before_connecting():
     doc = build_dialer_swml(
         lead_number="+15559876543",

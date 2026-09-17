@@ -71,7 +71,21 @@ def build_dialer_swml(
         "from": caller_id,
         # Default is 60s; shorter so a rep working a list is not left waiting, and short
         # of most voicemail pickups so "no answer" stays "no answer".
+        #
+        # RING timeout only. It bounds how long we wait for an answer and has no
+        # bearing on how long the conversation may run -- worth stating, because it
+        # was the first thing suspected when reps reported being cut off mid-call.
         "timeout": 30,
+        # How long the CONVERSATION may run, stated rather than inherited.
+        #
+        # A rep on a good call can be on it for half an hour, and the requirement is
+        # that nothing shortens that. Leaving this unset left the limit to whatever
+        # SignalWire's default happens to be -- a number nobody here has verified and
+        # which could change without us noticing. Four hours is far beyond any real
+        # sales call, so this can only ever be the thing that does NOT end a call,
+        # while making the intent greppable for the next person who goes looking for
+        # a cap.
+        "max_duration": 14400,
     }
     # Two parameters are deliberately absent, both removed after breaking live calls:
     #
