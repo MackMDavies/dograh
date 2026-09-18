@@ -1284,3 +1284,45 @@ class CampaignClient(BaseDBClient):
             )
             result = await session.execute(query)
             return list(result.scalars().all())
+
+    async def get_abandoned_queued_runs(
+        self, campaign_id: int, older_than: datetime
+    ) -> list[QueuedRunModel]:
+        """Queued runs claimed for processing that never became a call.
+
+        `claim_queued_runs_for_processing` flips a row to `processing` BEFORE the
+        dispatcher creates its workflow run. If anything fails in that gap — a
+        worker restart, a telephony error before the run row is written — the
+        queued run keeps `processing` forever and nothing dials.
+
+        `get_stuck_campaign_runs` above cannot see these: it looks for an
+        INCOMPLETE WORKFLOW RUN, and for an abandoned claim no workflow run was
+        ever created. On campaign 51 that left runs 404 and 916 claimed since
+        2026-09-17 while the recovery sweep found zero incomplete runs and
+        reported the campaign healthy. 916 was a prospect who asked to be rung
+        back within the hour; the callback simply never happened, and nothing in
+        the system would ever have freed it.
+
+        Ordered by the time the run was due so the oldest abandonment is handled
+        first. `scheduled_for` is NULL for regular queued work, so the cutoff
+        falls back to `created_at` — the two together are "when this should have
+        gone out".
+        """
+        async with self.async_session() as session:
+            due_at = func.coalesce(
+                QueuedRunModel.scheduled_for, QueuedRunModel.created_at
+            )
+            query = (
+                select(QueuedRunModel)
+                .where(
+                    QueuedRunModel.campaign_id == campaign_id,
+                    QueuedRunModel.state == "processing",
+                    due_at < older_than,
+                    ~select(WorkflowRunModel.id)
+                    .where(WorkflowRunModel.queued_run_id == QueuedRunModel.id)
+                    .exists(),
+                )
+                .order_by(due_at)
+            )
+            result = await session.execute(query)
+            return list(result.scalars().all())

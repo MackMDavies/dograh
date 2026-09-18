@@ -621,6 +621,62 @@ class CampaignOrchestrator:
                 from api.services.campaign.campaign_call_dispatcher import campaign_call_dispatcher
                 await campaign_call_dispatcher.release_call_slot(run.id)
 
+        await self._recover_abandoned_claims(campaign_id)
+
+    async def _recover_abandoned_claims(self, campaign_id: int) -> None:
+        """Requeue runs claimed for processing that never became a call.
+
+        The loop above recovers a call that STARTED and hung. This recovers the
+        gap before it: `claim_queued_runs_for_processing` marks a row
+        `processing` before the workflow run exists, so a failure in between
+        strands the row with no run to find. See get_abandoned_queued_runs.
+
+        Requeued rather than failed, which is the opposite of the stuck-run path
+        above and deliberate: nothing was dialled, nobody was contacted and no
+        telephony was spent, so the work is still outstanding. Marking it failed
+        would silently discard a callback somebody asked for — on campaign 51
+        that was a prospect expecting a call back within the hour.
+
+        `retry_count` is incremented so an abandonment that keeps recurring is
+        bounded by the campaign's own retry ceiling instead of cycling forever;
+        a row already at the ceiling is failed so it stops being re-claimed and
+        shows up as a failure rather than disappearing.
+        """
+        cutoff = datetime.now(UTC) - timedelta(minutes=15)
+        try:
+            abandoned = await db_client.get_abandoned_queued_runs(campaign_id, older_than=cutoff)
+        except Exception:
+            logger.exception(f"campaign_id: {campaign_id} - Could not look for abandoned claims")
+            return
+
+        if not abandoned:
+            return
+
+        # get_campaign_by_id, not get_campaign: the latter requires an
+        # organization_id to scope the lookup, which the orchestrator does not
+        # carry — it works per campaign id, exactly as the retry path above does.
+        campaign = await db_client.get_campaign_by_id(campaign_id)
+        max_retries = (campaign.retry_config or {}).get("max_retries", 2) if campaign else 2
+
+        for run in abandoned:
+            due = run.scheduled_for or run.created_at
+            if (run.retry_count or 0) >= max_retries:
+                logger.error(
+                    f"campaign_id: {campaign_id} - Queued run {run.id} abandoned in processing "
+                    f"since {due} and out of retries ({run.retry_count}); marking failed"
+                )
+                await db_client.update_queued_run(run.id, state="failed")
+                continue
+            logger.warning(
+                f"campaign_id: {campaign_id} - Requeueing queued run {run.id}, claimed for "
+                f"processing since {due} with no workflow run ever created"
+            )
+            await db_client.update_queued_run(
+                run.id,
+                state="queued",
+                retry_count=(run.retry_count or 0) + 1,
+            )
+
     async def _should_mark_complete(self, campaign: CampaignModel) -> bool:
         """Check if campaign has no activity for 1 hour."""
         campaign_id = campaign.id
