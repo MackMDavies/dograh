@@ -505,19 +505,18 @@ async def handle_sw_dialer_connect(request: Request):
 
         lead_number = _extract_lead_number(payload, query)
         if not lead_number:
-            logger.error(
-                "sw-dialer-connect found no dialable lead number anywhere in the "
-                "payload or query string - hanging up"
+            return await _hangup_and_record(
+                reason="no dialable lead number in the payload or query string",
+                identity=identity, payload=payload, query=query,
             )
-            return _swml(build_hangup_swml())
 
         caller_id = await _resolve_signalwire_caller_id(identity)
         if not caller_id:
-            logger.error(
-                "sw-dialer-connect has no usable caller ID - set "
-                "SIGNALWIRE_DEFAULT_CALLER_ID - hanging up"
+            return await _hangup_and_record(
+                reason="no usable caller ID - set SIGNALWIRE_DEFAULT_CALLER_ID",
+                identity=identity, payload=payload, query=query,
+                lead_number=lead_number,
             )
-            return _swml(build_hangup_swml())
 
         # Correlation key for the status/recording callbacks. Preferred from
         # the payload so those callbacks can find this row; a synthetic id
@@ -573,7 +572,61 @@ async def handle_sw_dialer_connect(request: Request):
         )
     except Exception as exc:  # noqa: BLE001 - deliberate: a live leg is waiting
         logger.exception(f"sw-dialer-connect failed, hanging up: {exc}")
-        return _swml(build_hangup_swml())
+        return await _hangup_and_record(
+            reason=f"unhandled error: {exc}",
+            identity=locals().get("identity"),
+            payload=locals().get("payload") or {},
+            query=locals().get("query") or {},
+        )
+
+
+async def _hangup_and_record(
+    *,
+    reason: str,
+    identity: str | None,
+    payload: dict,
+    query: dict,
+    lead_number: str | None = None,
+    caller_id: str | None = None,
+) -> JSONResponse:
+    """Hang the leg up, but leave a record that says why.
+
+    A bare ``build_hangup_swml()`` is the most invisible failure this service has. By
+    the time this endpoint is reached SignalWire has ALREADY answered the rep's WebRTC
+    leg in order to fetch the script, so the softphone has told the rep "connected".
+    Returning a hangup therefore reads, on the rep's screen, as a call that connected
+    and then dropped by itself -- and because the ``dialer_calls`` row is only created
+    further down, after these checks, there was no row, no error and no trace anywhere.
+    Reps reported calls "cutting off on their own" and every log looked clean, because
+    the only thing that had happened was us telling SignalWire to hang up.
+
+    So each of these now writes the row first, with ``status='failed'``, before the
+    hangup goes back. The call still ends -- there is genuinely nothing to connect it
+    to -- but it ends visibly: in the rep's Recent Calls, in the disposition counts,
+    and on the admin analysis page that already reads this table.
+    """
+    logger.error(f"sw-dialer-connect hanging up: {reason}")
+    try:
+        rep_user_id = await _rep_supabase_id(identity) if identity else None
+        if rep_user_id:
+            call_id = _extract(payload, query, _CALL_ID_KEYS) or f"sw-{uuid.uuid4().hex}"
+            await create_dialer_call(
+                parent_call_sid=call_id,
+                rep_user_id=rep_user_id,
+                entry_id=_extract(payload, query, _ENTRY_KEYS) or None,
+                from_number=caller_id or "",
+                to_number=lead_number or "",
+                provider="signalwire",
+            )
+            await update_dialer_call_status(
+                parent_call_sid=call_id,
+                child_call_sid=None,
+                status="failed",
+                duration_seconds=0,
+            )
+    except Exception as exc:  # noqa: BLE001 - recording must never stop the hangup
+        logger.error(f"sw-dialer-connect could not record the hangup: {exc}")
+    return _swml(build_hangup_swml())
 
 
 def _map_call_state(state: str, end_reason: str) -> str:
