@@ -534,10 +534,23 @@ async def handle_sw_dialer_connect(request: Request):
                 to_number=lead_number,
                 provider="signalwire",
             )
-        else:
+        elif (identity or "").strip():
+            # An identity that IS present and does not map is a real problem: a rep
+            # dialled and their call will not appear in Recent Calls.
             logger.warning(
                 f"sw-dialer-connect could not map identity {identity!r} to a Supabase "
                 "user - connecting the call anyway, but it will not appear in Recent Calls"
+            )
+        else:
+            # No identity at all means no rep: an agent or campaign leg, which has
+            # never belonged in dialer_calls and is not a fault. It was logged at
+            # WARNING every time, and something places one every five minutes -- 288
+            # warnings a day, which is how three genuine errors in the same window
+            # came to be invisible. The distinction is the point: a missing identity
+            # is expected here, an unmappable one is not.
+            logger.debug(
+                "sw-dialer-connect: no rep identity on this leg (agent or campaign "
+                "call) - connecting it, and not recording it in Recent Calls"
             )
 
         # An unresolvable backend endpoint omits recording rather than
