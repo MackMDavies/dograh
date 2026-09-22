@@ -34,8 +34,9 @@ def test_a_long_call_is_never_cut_short_by_the_script():
         recording_webhook="https://api.example.com/api/v1/telephony/sw-recording",
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
-    # Ring timeout: short on purpose, and NOT a limit on the conversation.
-    assert connect["timeout"] == 30
+    # Ring timeout: long enough for voicemail to answer, and NOT a limit on the
+    # conversation.
+    assert connect["timeout"] == 55
     # Conversation length: stated, and far beyond any real sales call.
     assert connect["max_duration"] >= 4 * 60 * 60
 

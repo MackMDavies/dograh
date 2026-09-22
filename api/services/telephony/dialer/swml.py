@@ -69,13 +69,18 @@ def build_dialer_swml(
     connect: dict = {
         "to": lead_number,
         "from": caller_id,
-        # Default is 60s; shorter so a rep working a list is not left waiting, and short
-        # of most voicemail pickups so "no answer" stays "no answer".
+        # Long enough for voicemail to pick up. It was 30s, chosen to be "short of most
+        # voicemail pickups so no answer stays no answer" -- which is the opposite of
+        # what reps need: a mailbox is somewhere to leave a message (and the dialer now
+        # offers to send their recorded one), and carriers commonly divert to it at
+        # 20-40s, so a 30s cap hung up on a share of them seconds before the greeting.
+        # Short of SignalWire's 60s default so a genuinely unanswered line still frees
+        # the rep for the next dial.
         #
         # RING timeout only. It bounds how long we wait for an answer and has no
         # bearing on how long the conversation may run -- worth stating, because it
         # was the first thing suspected when reps reported being cut off mid-call.
-        "timeout": 30,
+        "timeout": 55,
         # How long the CONVERSATION may run, stated rather than inherited.
         #
         # A rep on a good call can be on it for half an hour, and the requirement is

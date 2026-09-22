@@ -865,7 +865,7 @@ def test_outbound_connect_omits_ringback():
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "ringback" not in connect
-    assert connect["timeout"] == 30
+    assert connect["timeout"] == 55
 
 
 def test_outbound_connect_reports_far_end_progress():
