@@ -170,18 +170,27 @@ async def initialize_embed_session(request: Request, init_request: InitEmbedRequ
             detail=f"Agent is not active ({active_reason})",
         )
 
+    # Syra's voice is a person talking to their own assistant: not billable voice, and
+    # not a call competing for the org's campaign slots. See api/services/syra_voice.py.
+    from api.services.syra_voice import is_syra_voice_workflow
+
+    syra_voice = await is_syra_voice_workflow(embed_token.workflow_id)
+
     # Check Sysevo wallet balance before creating the run
-    wallet_allowed, wallet_reason = await check_wallet_before_call(embed_token.workflow_id)
-    if not wallet_allowed:
-        raise HTTPException(
-            status_code=402,
-            detail=f"Insufficient balance: {wallet_reason}",
-        )
+    if not syra_voice:
+        wallet_allowed, wallet_reason = await check_wallet_before_call(embed_token.workflow_id)
+        if not wallet_allowed:
+            raise HTTPException(
+                status_code=402,
+                detail=f"Insufficient balance: {wallet_reason}",
+            )
 
     # Concurrency gate — refuse if the org is at its plan's simultaneous-call limit.
-    _cc_allowed, _cc_slot = await acquire_call_slot(embed_token.organization_id)
-    if not _cc_allowed:
-        raise HTTPException(status_code=429, detail="Concurrent call limit reached")
+    _cc_slot = None
+    if not syra_voice:
+        _cc_allowed, _cc_slot = await acquire_call_slot(embed_token.organization_id)
+        if not _cc_allowed:
+            raise HTTPException(status_code=429, detail="Concurrent call limit reached")
 
     # Create workflow run
     try:
@@ -193,11 +202,13 @@ async def initialize_embed_session(request: Request, init_request: InitEmbedRequ
             initial_context=init_request.context_variables,
         )
     except Exception as e:
-        await release_slot_for_failed_start(embed_token.organization_id, _cc_slot)
+        if _cc_slot is not None:
+            await release_slot_for_failed_start(embed_token.organization_id, _cc_slot)
         logger.error(f"Failed to create workflow run: {e}")
         raise HTTPException(status_code=500, detail="Failed to create workflow run")
 
-    await bind_slot(workflow_run.id, embed_token.organization_id, _cc_slot)
+    if _cc_slot is not None:
+        await bind_slot(workflow_run.id, embed_token.organization_id, _cc_slot)
 
     # Generate session token
     session_token = generate_session_token()

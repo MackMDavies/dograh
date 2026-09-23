@@ -187,6 +187,14 @@ async def process_workflow_completion(
                 except Exception as e:
                     logger.warning(f"Failed to clean up temp transcript file: {e}")
 
+    # A Syra voice call is a person talking to their own assistant: no QA analysis, no
+    # caller memory, no wallet debit, no live-call board. See api/services/syra_voice.py.
+    from api.services.syra_voice import is_syra_voice_run
+
+    if await is_syra_voice_run(workflow_run_id):
+        logger.info(f"Run {workflow_run_id} is a Syra voice call; post-call webhooks skipped")
+        return
+
     # Step 3: Run integrations including QA analysis (after uploads are complete)
     try:
         await run_integrations_post_workflow_run(_ctx, workflow_run_id)

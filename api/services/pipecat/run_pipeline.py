@@ -623,7 +623,8 @@ async def _run_pipeline(
     # telephony call (inbound or outbound) that has a caller_number, as long
     # as SYSEVO_MEMORY_PRE_CALL_URL is configured on this server and the
     # workflow's start node hasn't already claimed the pre_call_fetch slot.
-    _sysevo_memory_url = os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    # Never for Syra's voice: the person is her user, not a caller to look up.
+    _sysevo_memory_url = None if run_configs.get("syra_voice") else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
     _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
     # Gate on the LEAD's number, not on caller_number. On an outbound run
     # caller_number is our own outbound caller ID, and 13 telephony runs carry
@@ -653,7 +654,8 @@ async def _run_pipeline(
     # shows as live in the Sysevo client + admin dashboards. Keyed by run_id, so
     # concurrent calls (e.g. a campaign dialer) each get their own live row. The row
     # is removed by the matching "ended" signal at call completion. Non-fatal.
-    if os.getenv("SYSEVO_CALL_LIVE_URL"):
+    # Not for Syra's voice: a person talking to their own assistant is not a live call.
+    if os.getenv("SYSEVO_CALL_LIVE_URL") and not run_configs.get("syra_voice"):
         asyncio.create_task(
             fire_call_live(
                 event="started",
