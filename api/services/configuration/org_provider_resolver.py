@@ -249,7 +249,15 @@ async def enrich_overrides_with_org_api_keys(
         if conn is None:
             continue
 
-        if conn.api_key:
+        # An override that points at ITS OWN endpoint (base_url) keeps its own real key:
+        # the org's key for that provider can never be the right one for someone else's
+        # server. This used to overwrite unconditionally, so Sysevo's Syra voice workflow
+        # (base_url = syra-voice-llm, key = SYRA_VOICE_SECRET) had the org's OpenAI key
+        # stamped over its own on every save and 401'd on every turn. Every other case is
+        # unchanged — including re-stamping an ordinary override's copy of the org key,
+        # which is how a rotated org key reaches existing workflows.
+        keeps_own_key = has_real_api_key and bool(override.get("base_url"))
+        if conn.api_key and not keeps_own_key:
             override["api_key"] = conn.api_key
 
         for k, v in (conn.extra_config or {}).items():
