@@ -598,7 +598,11 @@ async def test_dialer_connect_joins_a_conference_instead_of_dialling():
     )
     doc = _payload_of(response)
 
-    assert doc["sections"]["main"] == [{"join_room": {"name": "inbound-abc"}}]
+    # join_conference, not join_room: join_room 500'd on SignalWire's side ~100s into a
+    # real call (see build_inbound_hold_swml). The rep is the main participant.
+    assert doc["sections"]["main"] == [
+        {"join_conference": {"name": "inbound-abc", "start_on_enter": True, "end_on_exit": True}}
+    ]
 
 
 async def test_dialer_connect_still_dials_when_no_conference_is_given():
@@ -639,7 +643,9 @@ async def test_inbound_holds_the_caller_and_rings_available_reps():
 
     doc = _payload_of(response)
     # The caller is joined to a room, not connected to anyone: nobody has answered yet.
-    assert {"join_room": {"name": "inbound-abc"}} in doc["sections"]["main"]
+    assert {
+        "join_conference": {"name": "inbound-abc", "start_on_enter": False, "end_on_exit": False}
+    } in doc["sections"]["main"]
     assert created["target_user_ids"] == ["user-a", "user-b"]
     assert created["conference_name"] == "inbound-abc"
 
@@ -689,7 +695,9 @@ async def test_inbound_tells_the_caller_when_nobody_can_take_the_call():
         )
 
     steps = _payload_of(response)["sections"]["main"]
-    assert not any("join_room" in step for step in steps), (
+    # join_conference is what a held caller would be put into; checking for the old
+    # join_room here passed vacuously, since nothing emits it any more.
+    assert not any("join_conference" in step or "join_room" in step for step in steps), (
         "no rep is ringing, so joining a conference strands the caller"
     )
     assert steps[-1] == {"hangup": {}}
@@ -968,7 +976,7 @@ async def test_inbound_holds_on_the_sysevo_line_and_never_forwards():
         )
 
     steps = _payload_of(response)["sections"]["main"]
-    assert any("join_room" in s for s in steps)
+    assert any("join_conference" in s for s in steps)
     # A forward_number in the plan must not tempt it: no connect, ever.
     assert not any("connect" in s for s in steps)
 
@@ -988,7 +996,7 @@ async def test_inbound_treats_live_and_push_the_same():
             _authed({"call": {"call_id": "hold2", "from": "+15550001111", "to": "+13292029939"}})
         )
 
-    assert any("join_room" in s for s in _payload_of(response)["sections"]["main"])
+    assert any("join_conference" in s for s in _payload_of(response)["sections"]["main"])
 
 
 async def test_background_push_task_is_held_until_it_finishes():
