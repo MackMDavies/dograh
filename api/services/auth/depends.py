@@ -1,6 +1,7 @@
 from typing import Annotated, Optional
 
 import asyncio
+import re
 
 import httpx
 from fastapi import Header, HTTPException, Query, WebSocket
@@ -21,6 +22,7 @@ from api.utils.auth import decode_jwt_token
 async def get_user(
     authorization: Annotated[str | None, Header()] = None,
     x_api_key: Annotated[str | None, Header(alias="X-API-Key")] = None,
+    x_sysevo_act_as_account: Annotated[str | None, Header(alias="X-Sysevo-Act-As-Account")] = None,
 ) -> UserModel:
     # ------------------------------------------------------------------
     # Check if API key is provided (takes precedence)
@@ -38,7 +40,10 @@ async def get_user(
     # Check if we're using Supabase auth
     # ------------------------------------------------------------------
     if AUTH_PROVIDER == "supabase":
-        return await _handle_supabase_auth(authorization)
+        user = await _handle_supabase_auth(authorization)
+        if x_sysevo_act_as_account:
+            await _apply_sysevo_act_as(user, authorization, x_sysevo_act_as_account)
+        return user
 
     # ------------------------------------------------------------------
     # 1. Validate and fetch the authenticated Stack user
@@ -238,6 +243,51 @@ async def _handle_supabase_auth(authorization: str | None) -> UserModel:
         raise HTTPException(status_code=500, detail=f"Failed to map user to organization: {e}")
 
     return user
+
+
+_UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+
+
+async def _apply_sysevo_act_as(user: UserModel, authorization: str | None, client_account_id: str) -> None:
+    """SYSEVO_ACT_AS: a Sysevo super_admin works inside ONE client's voice org, for one request.
+
+    Why: a workflow lands in the org keyed off the CALLER'S token, and every Sysevo staff
+    token is stamped to the internal account, so staff building an agent for a client
+    could only build it in Sysevo's own org, where the client never sees it. The
+    per-client service-key route is rejected by this API (2026-09-21).
+
+    Guard rails, all fail-closed:
+      - only super_admin, read from Supabase user_roles with the caller's OWN token for the
+        server-verified user id (provider_id), never a client-supplied id;
+      - only an org that ALREADY exists for that client account; this never creates one,
+        so a mistyped id cannot mint a stray org;
+      - in memory only: the stored selected_organization_id is untouched, so the next
+        ordinary request is back in their own org.
+    """
+    account = client_account_id.strip().lower()
+    if not _UUID_RE.match(account):
+        raise HTTPException(status_code=400, detail="X-Sysevo-Act-As-Account must be a client account id")
+    token = (authorization or "").removeprefix("Bearer ").strip()
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/user_roles",
+                params={"select": "role", "user_id": f"eq.{user.provider_id}"},
+                headers={"apikey": SUPABASE_ANON_KEY, "Authorization": f"Bearer {token}"},
+                timeout=10.0,
+            )
+            response.raise_for_status()
+            roles = {row.get("role") for row in response.json()}
+    except httpx.HTTPError as exc:
+        logger.error(f"act-as: could not verify Sysevo role for {user.provider_id}: {exc}")
+        raise HTTPException(status_code=503, detail="Unable to verify Sysevo role.") from exc
+    if "super_admin" not in roles:
+        raise HTTPException(status_code=403, detail="Only a Sysevo super admin can work in a client's voice account.")
+    org = await db_client.get_organization_by_provider_id(f"supabase_org_acct_{account}")
+    if org is None:
+        raise HTTPException(status_code=404, detail="That client has no voice account yet.")
+    logger.info(f"act-as: super_admin {user.provider_id} -> org {org.id} (client account {account})")
+    user.selected_organization_id = org.id
 
 
 async def _handle_oss_auth(authorization: str | None) -> UserModel:

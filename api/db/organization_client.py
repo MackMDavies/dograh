@@ -26,6 +26,16 @@ class OrganizationClient(BaseDBClient):
             )
             return result.scalars().first()
 
+    async def get_organization_by_provider_id(
+        self, org_provider_id: str
+    ) -> Optional[OrganizationModel]:
+        """An existing organization by provider_id, or None. Never creates one."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(OrganizationModel).where(OrganizationModel.provider_id == org_provider_id)
+            )
+            return result.scalars().first()
+
     async def get_or_create_organization_by_provider_id(
         self, org_provider_id: str, user_id: int
     ) -> tuple[OrganizationModel, bool]:
