@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import sys
 
 import loguru
@@ -21,6 +22,21 @@ from api.utils.worker import get_worker_id, is_worker_process
 _logging_initialized = False
 
 
+# Credentials that arrive in a query string. A browser WebSocket cannot set headers, so
+# /sw-listen authenticates with ?token=<the rep's Supabase access token>, and uvicorn's
+# access log printed the whole URL: every listening rep's session token, in plaintext,
+# in `docker logs`. The webhook secret travels as ?k= the same way. Redacted here, where
+# every uvicorn line passes, rather than route by route.
+_SECRET_QUERY_PARAM = re.compile(
+    r"(?i)([?&](?:amp;)?(?:token|access_token|refresh_token|apikey|api_key|k|key|secret)=)[^&\s\"']+"
+)
+
+
+def redact_secrets(message: str) -> str:
+    """Replace credential-bearing query parameter values with [redacted]."""
+    return _SECRET_QUERY_PARAM.sub(r"\1[redacted]", message)
+
+
 class InterceptHandler(logging.Handler):
     """
     Intercept standard library logging calls and redirect them to loguru.
@@ -38,7 +54,7 @@ class InterceptHandler(logging.Handler):
         # This preserves the logger name (e.g., "uvicorn.access") in the logs
         loguru.logger.patch(lambda r: r.update(name=record.name)).opt(
             exception=record.exc_info
-        ).log(level, record.getMessage())
+        ).log(level, redact_secrets(record.getMessage()))
 
 
 def inject_run_id(record):

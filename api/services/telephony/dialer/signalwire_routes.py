@@ -134,6 +134,31 @@ _CALL_ID_KEYS = (
 _STATE_KEYS = ("call_state", "callState", "state", "status", "CallStatus", "call_status")
 _DURATION_KEYS = ("duration", "call_duration", "duration_seconds", "CallDuration")
 _END_REASON_KEYS = ("end_reason", "endReason", "failed_reason", "failedReason")
+_END_SOURCE_KEYS = ("end_source", "endSource")
+
+
+def _ended_by(state: str, end_source: str) -> str | None:
+    """Which side of the call hung up, from SignalWire's ``end_source``.
+
+    The connect's call_state events describe the leg being DIALLED, and on its
+    ``ended`` event ``end_source`` says where the hangup came from. Calibrated on
+    2026-09-25 against calls whose ending is known: ``outbound`` on every call a rep
+    ended (including voicemails they left), ``inbound`` on every call the prospect
+    ended with a goodbye. Three calls reps reported as "cut off mid-sentence" were all
+    ``inbound`` with ``end_reason: hangup``: the prospect's side of the line.
+
+    Until this was stored, nothing could say so. SignalWire's record of a cut rep and
+    a callee who hung up look alike everywhere else, and the rep's wrap-up read "Call
+    ended" either way.
+    """
+    if (state or "").strip().lower() != "ended":
+        return None
+    source = (end_source or "").strip().lower()
+    if source == "outbound":
+        return "rep"
+    if source == "inbound":
+        return "prospect"
+    return None
 _RECORDING_URL_KEYS = ("url", "recording_url", "recordingUrl", "RecordingUrl", "record_url")
 
 
@@ -700,6 +725,7 @@ async def handle_sw_call_status(request: Request):
         # busy or declined -- the difference between a call worth retrying and one that
         # was actively refused.
         end_reason = _extract(payload, query, _END_REASON_KEYS)
+        ended_by = _ended_by(state or "", _extract(payload, query, _END_SOURCE_KEYS) or "")
 
         if not call_id or not state:
             logger.warning(
@@ -720,6 +746,7 @@ async def handle_sw_call_status(request: Request):
             child_call_sid=None,
             status=_map_call_state(state, end_reason),
             duration_seconds=duration,
+            ended_by=ended_by,
         )
         return JSONResponse(content={"ok": True})
     except Exception as exc:  # noqa: BLE001 - a status callback must never 500

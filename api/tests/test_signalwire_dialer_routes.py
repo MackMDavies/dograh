@@ -1024,3 +1024,25 @@ async def test_background_push_task_is_held_until_it_finishes():
     await asyncio.sleep(0)
     # And released once done, so the set is not a leak.
     assert not inbound_call_log._background, "finished tasks must be discarded"
+
+
+# --------------------------------------------------------------------------
+# Who hung up (end_source), calibrated 2026-09-25.
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "end_source,expected",
+    [("outbound", "rep"), ("inbound", "prospect"), ("INBOUND", "prospect"), ("", None), ("weird", None)],
+)
+async def test_status_records_which_side_hung_up(status_update, end_source, expected):
+    # The real payload shape from the 20:13 call reps reported as cut off.
+    body = {"params": {"call_id": "far-leg", "call_state": "ended", "end_reason": "hangup", "end_source": end_source}}
+    await handle_sw_call_status(_request(body, query={"k": _SECRET, "call_id": "sw-1"}))
+    assert status_update.call_args.kwargs["ended_by"] == expected
+
+
+async def test_end_source_is_ignored_before_the_call_ends(status_update):
+    body = {"params": {"call_id": "far-leg", "call_state": "answered", "end_source": "inbound"}}
+    await handle_sw_call_status(_request(body, query={"k": _SECRET, "call_id": "sw-1"}))
+    assert status_update.call_args.kwargs["ended_by"] is None

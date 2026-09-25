@@ -90,8 +90,13 @@ async def update_dialer_call_status(
     child_call_sid: str | None,
     status: str,
     duration_seconds: int | None,
+    ended_by: str | None = None,
 ) -> None:
-    """Update status/duration from the <Number>'s statusCallback."""
+    """Update status/duration from the <Number>'s statusCallback.
+
+    ``ended_by`` ('rep' | 'prospect') only when the provider said which side hung up;
+    omitted otherwise, for the same reason as every other key below.
+    """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls status")
         return
@@ -106,6 +111,8 @@ async def update_dialer_call_status(
         payload["child_call_sid"] = child_call_sid
     if duration_seconds is not None:
         payload["duration_seconds"] = duration_seconds
+    if ended_by is not None:
+        payload["ended_by"] = ended_by
     if status in _TERMINAL_CALL_STATUSES:
         # now(), not started_at + duration: this callback arrives at the hangup, and
         # duration counts talk time only - a call that rang for twenty seconds before
