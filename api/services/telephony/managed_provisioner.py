@@ -6,6 +6,7 @@ variables to provision and release phone numbers on behalf of any org.
 Credentials are never stored in the database — they live in the environment.
 """
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -32,7 +33,8 @@ def _end_user_attributes(kyc: Dict[str, Any]) -> Dict[str, str]:
         "business_website": business.get("website") or "",
         "first_name": rep.get("first_name") or "",
         "last_name": rep.get("last_name") or "",
-        "phone_number": rep.get("phone") or "",
+        # Twilio's constraint is strict E.164 (^\+[1-9]\d{1,14}$): no spaces or dashes.
+        "phone_number": re.sub(r"[\s().-]", "", rep.get("phone") or ""),
         "email": rep.get("email") or "",
         # The bundle is the client's own: they are Twilio's direct customer's customer,
         # and the number is assigned to them.
@@ -221,14 +223,20 @@ class ManagedProvisioner:
                 f"{country} needs documents we cannot supply automatically: {', '.join(unmet)}"
             )
 
+        # Twilio lists every end-user field; `detailed_fields[].constraint` is EMPTY for an
+        # optional one (GB's `comments`). Only required fields may be reported missing.
         wanted: List[str] = []
+        optional: set = set()
         for end_user in req.get("end_user") or []:
             wanted.extend(end_user.get("fields") or [])
+            for detail in end_user.get("detailed_fields") or []:
+                if not (detail.get("constraint") or "").strip():
+                    optional.add(detail.get("machine_name"))
         available = _end_user_attributes(kyc)
-        missing = [f for f in wanted if not available.get(f)]
+        missing = [f for f in wanted if f not in optional and not available.get(f)]
         if missing:
             raise ValueError(f"KYC is missing fields {country} requires: {', '.join(missing)}")
-        attributes = {f: available[f] for f in wanted}
+        attributes = {f: available[f] for f in wanted if available.get(f)}
 
         address = kyc.get("address") or {}
         street = ", ".join(x for x in [address.get("street"), address.get("street2")] if x)

@@ -21,7 +21,16 @@ GB_REGULATION = {
         "fields": [
             "business_name", "business_registration_identifier", "business_registration_number",
             "business_website", "first_name", "last_name", "phone_number", "email",
-            "business_identity", "is_subassigned",
+            "business_identity", "is_subassigned", "comments",
+        ],
+        # As Twilio returns it: an EMPTY constraint marks an optional field.
+        "detailed_fields": [
+            {"machine_name": f, "constraint": ("" if f == "comments" else f"business['{f}'] != null")}
+            for f in [
+                "business_name", "business_registration_identifier", "business_registration_number",
+                "business_website", "first_name", "last_name", "phone_number", "email",
+                "business_identity", "is_subassigned", "comments",
+            ]
         ],
     }],
     "supporting_document": [[{
@@ -109,6 +118,8 @@ class TestCreateBundle:
         assert attrs["business_name"] == "Bright Smile Dental Ltd"
         assert attrs["business_registration_identifier"] == "UK:CRN"
         assert attrs["phone_number"] == "+447700900123"
+        # Optional and not in our KYC: left out, not reported missing.
+        assert "comments" not in attrs
         # Constants: the bundle is the CLIENT's (a direct customer), and we assign the number to them.
         assert attrs["business_identity"] == "DIRECT_CUSTOMER"
         assert attrs["is_subassigned"] == "YES"
@@ -120,6 +131,14 @@ class TestCreateBundle:
         assigned = [c.kwargs["object_sid"] for c in bundle.item_assignments.create.call_args_list]
         assert assigned == ["ITuser", "RDdoc"]
         bundle.update.assert_called_once_with(status="pending-review")
+
+    def test_sends_the_phone_as_strict_e164(self, provisioner):
+        # Our KYC form allows "+44 7700 900123"; Twilio's constraint is ^\+[1-9]\d{1,14}$.
+        spaced = {**KYC, "representative": {**KYC["representative"], "phone": "+44 7700 (900)-123"}}
+        with patch.object(provisioner, "_client") as client:
+            rc, _ = self._client(client)
+            provisioner.create_bundle("GB", spaced, email="ops@sysevo.io")
+        assert rc.end_users.create.call_args.kwargs["attributes"]["phone_number"] == "+447700900123"
 
     def test_does_not_submit_a_bundle_twilio_evaluates_as_noncompliant(self, provisioner):
         with patch.object(provisioner, "_client") as client:
