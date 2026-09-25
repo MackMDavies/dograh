@@ -381,7 +381,13 @@ class CustomToolManager:
                 result = await execute_http_tool(
                     tool=tool,
                     arguments=function_call_params.arguments,
-                    call_context_vars=self._engine._call_context_vars,
+                    # The run id joins the call context so a tool can say WHICH call it
+                    # came from ({{workflow_run_id}}): Sysevo keys call_analysis on it,
+                    # and a booking made on a call is stamped onto that call's analysis.
+                    call_context_vars={
+                        **(self._engine._call_context_vars or {}),
+                        "workflow_run_id": self._engine._workflow_run_id,
+                    },
                     gathered_context_vars=self._engine._gathered_context,
                     organization_id=await self.get_organization_id(),
                 )
