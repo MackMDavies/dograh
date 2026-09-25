@@ -5,13 +5,16 @@ agent-memory-lookup function, scoped to a specific client account.
 """
 
 import os
+import re
 from typing import Optional
+
+import httpx
 
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 
-from api.constants import SUPABASE_ANON_KEY, SUPABASE_URL
+from api.constants import SUPABASE_URL
 from api.db import db_client
 from api.db.models import UserModel
 from api.services.auth.depends import get_user
@@ -147,36 +150,50 @@ _TOOL_SPECS = [
 ]
 
 
-def _build_tool_definition(action: str, parameters: list, client_account_id: str) -> dict:
-    # Send the INTERNAL_API_SECRET (server-side only). The public anon key is NO LONGER
-    # accepted by the agent-memory-lookup edge function — it ships in the browser bundle, so
-    # accepting it made that endpoint effectively unauthenticated. INTERNAL_API_SECRET MUST
-    # be set in the Dograh backend env; the anon-key fallback below will be rejected by the
-    # edge function and is only kept to avoid an empty header.
-    auth_key = os.getenv("INTERNAL_API_SECRET", "") or SUPABASE_ANON_KEY
+AGENT_KEY_HEADER = "x-sysevo-agent-key"
+_ORG_ACCOUNT = re.compile(r"^supabase_org_acct_([0-9a-f-]{36})$")
+
+
+def _build_tool_definition(action: str, parameters: list, credential_uuid: str) -> dict:
+    # Authenticated by THIS org's own agent key, held in a Dograh credential and referenced
+    # by uuid. It used to send the platform-wide INTERNAL_API_SECRET in a plain header --
+    # readable by any member of the org through GET /tools/, and able to act on every
+    # client account -- plus the account id as a preset any org member could change.
+    # agent-memory-lookup now takes the account FROM the key.
     return {
         "schema_version": 1,
         "type": "http_api",
         "config": {
             "method": "POST",
             "url": f"{_EDGE_FN_BASE}?action={action}",
-            "headers": {
-                "Authorization": f"Bearer {auth_key}",
-                "Content-Type": "application/json",
-            },
+            "credential_uuid": credential_uuid,
             "parameters": parameters,
-            "preset_parameters": [
-                {
-                    "name": "client_account_id",
-                    "type": "string",
-                    "value_template": client_account_id,
-                    "required": True,
-                }
-            ],
             "timeout_ms": 8000,
             "customMessage": "Let me check that for you.",
         },
     }
+
+
+def _account_for_org(provider_id: Optional[str]) -> Optional[str]:
+    """The Sysevo client account a Dograh org belongs to (one org per account)."""
+    m = _ORG_ACCOUNT.match(provider_id or "")
+    return m.group(1) if m else None
+
+
+async def _mint_agent_key(client_account_id: str) -> dict:
+    """A fresh per-account key from Sysevo (only its hash is stored there)."""
+    secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not secret:
+        raise HTTPException(status_code=503, detail="SYSEVO_MEMORY_SECRET is not configured")
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{SUPABASE_URL}/functions/v1/mint-agent-key",
+            headers={"x-sysevo-secret": secret, "Content-Type": "application/json"},
+            json={"client_account_id": client_account_id, "permissions": ["agent_tools"], "name": "Voice agent tools"},
+        )
+    if resp.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"could not mint an agent key: {resp.status_code} {resp.text[:200]}")
+    return resp.json()
 
 
 class ProvisionRequest(BaseModel):
@@ -206,6 +223,26 @@ async def provision_memory_tools(
 
     org_id = user.selected_organization_id
 
+    # The account is the ORG's, never the caller's say-so: any member of any org could
+    # previously point these tools at another client's account.
+    org = await db_client.get_organization_by_id(org_id)
+    org_account = _account_for_org(getattr(org, "provider_id", None))
+    if org_account is None:
+        raise HTTPException(status_code=400, detail="This organisation is not linked to a Sysevo client account.")
+    if body.client_account_id != org_account:
+        raise HTTPException(status_code=403, detail="client_account_id does not belong to this organisation.")
+
+    minted = await _mint_agent_key(org_account)
+    credential = await db_client.create_credential(
+        organization_id=org_id,
+        user_id=user.id,
+        # Credential names are unique per org: each key's carries its own prefix.
+        name=f"Sysevo agent tools {minted['key_prefix']}",
+        description=f"Voice agent tools key {minted['key_prefix']}",
+        credential_type="custom_header",
+        credential_data={"header_name": AGENT_KEY_HEADER, "header_value": minted["key"]},
+    )
+
     selected_names = set(body.tool_names) if body.tool_names else {s["name"] for s in _TOOL_SPECS}
     specs_to_create = [s for s in _TOOL_SPECS if s["name"] in selected_names]
 
@@ -218,7 +255,7 @@ async def provision_memory_tools(
 
     created_uuids: list[str] = []
     for spec in specs_to_create:
-        definition = _build_tool_definition(spec["action"], spec["parameters"], body.client_account_id)
+        definition = _build_tool_definition(spec["action"], spec["parameters"], credential.credential_uuid)
         tool = await db_client.create_tool(
             organization_id=org_id,
             user_id=user.id,
