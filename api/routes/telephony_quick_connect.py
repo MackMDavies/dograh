@@ -21,6 +21,7 @@ from api.services.auth.depends import get_user
 from api.services.org_concurrency import clamp_to_system_max
 from api.services.telephony.managed_provisioner import (
     ManagedProvisioner,
+    RegulationNotAutomatable,
     get_managed_provisioner,
 )
 from api.utils.common import get_backend_endpoints
@@ -46,6 +47,46 @@ class QuickConnectRequest(BaseModel):
     # users never choose or see Twilio credentials, by design (see module
     # docstring).
     platform_account_id: Optional[int] = None
+    # The CLIENT's own approved Regulatory Bundle (and its Address) for a regulated
+    # country, built by POST /telephony/regulatory/bundles from their KYC. Required to
+    # buy a local number in e.g. GB; never looked up platform-wide (see quick_connect).
+    address_sid: Optional[str] = None
+    bundle_sid: Optional[str] = None
+
+
+class RegulationResponse(BaseModel):
+    country: str
+    requires_bundle: bool
+    regulation_sid: Optional[str] = None
+
+
+class BundleRequest(BaseModel):
+    country: str
+    # {business:{name, registration_identifier, registration_number, website},
+    #  representative:{first_name, last_name, email, phone},
+    #  address:{street, street2, city, region, postal_code, country}}
+    kyc: dict
+    email: str
+    status_callback: Optional[str] = None
+
+
+class BundleResponse(BaseModel):
+    bundle_sid: str
+    address_sid: str
+    status: str
+    failures: list = []
+
+
+class BundleStatusResponse(BaseModel):
+    sid: str
+    status: str
+    iso_country: Optional[str] = None
+    valid_until: Optional[str] = None
+    failures: list = []
+
+
+def _regulatory_error(code: str, message: str, status: int = 409, **extra) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": message, **extra})
 
 
 class QuickConnectResponse(BaseModel):
@@ -163,8 +204,49 @@ async def quick_connect(
     # /inbound/run is the workflow-agnostic dispatcher; /twiml needs pre-known params
     voice_url = f"{backend_url}/api/v1/telephony/inbound/run"
 
-    # Determine the number to purchase
-    target_country = (body.country or "US").upper()
+    # Determine the number to purchase. No default country: guessing US bought a US
+    # number for a UK business.
+    target_country = body.country.upper()
+
+    # REGULATED COUNTRIES NEED THE CLIENT'S OWN APPROVED BUNDLE, checked BEFORE buying.
+    # This used to look up "any approved bundle for the country" in the platform account
+    # -- which, once bundles are per client, could attach client A's bundle to client
+    # B's number -- and, failing that, silently bought a US line. Neither happens now.
+    if body.bundle_sid:
+        try:
+            bundle = await asyncio.to_thread(provisioner.get_bundle, body.bundle_sid)
+        except TwilioRestException:
+            raise _regulatory_error(
+                "regulatory_bundle_not_found",
+                "That regulatory bundle does not exist in the account that buys numbers.",
+            )
+        if bundle.get("status") != "twilio-approved":
+            raise _regulatory_error(
+                "regulatory_bundle_not_approved",
+                f"The regulatory bundle is {bundle.get('status')}; a number can only be bought once Twilio approves it.",
+                status_detail=bundle.get("status"),
+            )
+        if (bundle.get("iso_country") or "").upper() != target_country:
+            raise _regulatory_error(
+                "regulatory_bundle_wrong_country",
+                f"The regulatory bundle is for {bundle.get('iso_country')}, not {target_country}.",
+            )
+        address_sid, bundle_sid = body.address_sid, body.bundle_sid
+    else:
+        address_sid = bundle_sid = None
+        try:
+            regulation = await asyncio.to_thread(provisioner.regulation_for, target_country)
+        except TwilioRestException as exc:
+            # Could not ask; let the purchase decide rather than block on a lookup.
+            logger.warning(f"[quick_connect] regulation lookup failed for {target_country}: {exc}")
+            regulation = {"requires_bundle": False}
+        if regulation.get("requires_bundle"):
+            raise _regulatory_error(
+                "regulatory_bundle_required",
+                f"Local numbers in {target_country} need an approved regulatory bundle for this business.",
+                country=target_country,
+            )
+
     if body.mode == "new" and body.existing_number:
         # Path B: user already picked a specific number from /available-numbers
         target_e164 = body.existing_number
@@ -179,13 +261,6 @@ async def quick_connect(
                 detail=f"No numbers available in {body.country}. Try a different area code or country.",
             )
         target_e164 = numbers[0]
-
-    # Regulated countries (e.g. GB and most of the EU) require a registered Twilio
-    # Address and an approved Regulatory Bundle to buy local numbers. Attach both
-    # automatically when the platform account has them — that lets the number
-    # provision IN-COUNTRY (UK -> UK) instead of falling back to a US line.
-    address_sid = await asyncio.to_thread(provisioner.get_address_sid, target_country)
-    bundle_sid = await asyncio.to_thread(provisioner.get_bundle_sid, target_country)
 
     # Provision on Twilio
     try:
@@ -207,35 +282,15 @@ async def quick_connect(
                 "not provided for country",
             )
         )
-        if needs_regulatory and target_country != "US":
-            # The chosen country needs regulatory paperwork (Address + Bundle) we
-            # don't have, so the purchase is blocked. Fall back to a US number,
-            # which has no such requirement, so the flow always completes. For a
-            # forwarded number the caller still dials the user's own number; for a
-            # new number the user gets a working Sysevo line. A true local number
-            # requires completing Twilio regulatory compliance for that country.
-            us_numbers = await asyncio.to_thread(
-                provisioner.search_available_numbers, "US", None, 1
+        if needs_regulatory:
+            # No silent US fallback: a UK business given a +1 line has callers dialling
+            # internationally, and nobody notices until they complain.
+            raise _regulatory_error(
+                "regulatory_bundle_required",
+                f"Twilio needs an approved regulatory bundle for local numbers in {target_country}: {exc.msg}",
+                country=target_country,
             )
-            if not us_numbers:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Twilio provisioning failed: {exc.msg}",
-                )
-            try:
-                provisioned = await asyncio.to_thread(
-                    provisioner.provision_number, us_numbers[0], voice_url
-                )
-                target_country = "US"
-            except TwilioRestException as exc2:
-                raise HTTPException(
-                    status_code=502,
-                    detail=f"Twilio provisioning failed: {exc2.msg}",
-                )
-        else:
-            raise HTTPException(
-                status_code=502, detail=f"Twilio provisioning failed: {exc.msg}"
-            )
+        raise HTTPException(status_code=502, detail=f"Twilio provisioning failed: {exc.msg}")
 
     try:
         # Find or create a "Sysevo Managed" telephony config for this org,
@@ -300,6 +355,63 @@ async def quick_connect(
         telephony_config_id=managed_config.id,
         phone_number_id=phone_row.id,
     )
+
+
+@router.get("/regulatory/requirements", response_model=RegulationResponse)
+async def regulatory_requirements(
+    country: str = Query(..., description="ISO 3166-1 alpha-2 country code"),
+    user: UserModel = Depends(get_user),
+):
+    """Whether a local business number in *country* needs a regulatory bundle."""
+    provisioner = await get_managed_provisioner()
+    if provisioner is None:
+        raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+    try:
+        reg = await asyncio.to_thread(provisioner.regulation_for, country)
+    except TwilioRestException as exc:
+        raise HTTPException(status_code=502, detail=f"Twilio regulation lookup failed: {exc.msg}")
+    return RegulationResponse(country=country.upper(), requires_bundle=reg["requires_bundle"], regulation_sid=reg["sid"])
+
+
+@router.post("/regulatory/bundles", response_model=BundleResponse)
+async def create_regulatory_bundle(
+    body: BundleRequest,
+    user: UserModel = Depends(get_user),
+):
+    """
+    Build and submit ONE client's regulatory bundle from their KYC, in the account that
+    buys numbers (bundles cannot be shared across Twilio accounts). Review takes Twilio
+    about one business day; poll GET /regulatory/bundles/{sid}.
+    """
+    provisioner = await get_managed_provisioner()
+    if provisioner is None:
+        raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+    try:
+        out = await asyncio.to_thread(
+            provisioner.create_bundle, body.country, body.kyc, body.email, body.status_callback
+        )
+    except RegulationNotAutomatable as exc:
+        raise _regulatory_error("regulation_not_automatable", str(exc), status=422)
+    except ValueError as exc:
+        raise _regulatory_error("kyc_incomplete", str(exc), status=422)
+    except TwilioRestException as exc:
+        raise HTTPException(status_code=502, detail=f"Twilio bundle creation failed: {exc.msg}")
+    return BundleResponse(**out)
+
+
+@router.get("/regulatory/bundles/{bundle_sid}", response_model=BundleStatusResponse)
+async def regulatory_bundle_status(
+    bundle_sid: str,
+    user: UserModel = Depends(get_user),
+):
+    provisioner = await get_managed_provisioner()
+    if provisioner is None:
+        raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+    try:
+        out = await asyncio.to_thread(provisioner.get_bundle, bundle_sid)
+    except TwilioRestException as exc:
+        raise HTTPException(status_code=404 if exc.status == 404 else 502, detail=f"Bundle lookup failed: {exc.msg}")
+    return BundleStatusResponse(**out)
 
 
 @router.delete("/managed-numbers/{phone_number_id}", status_code=204)

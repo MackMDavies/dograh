@@ -15,6 +15,32 @@ from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
 
+class RegulationNotAutomatable(Exception):
+    """The country's regulation needs something we cannot supply automatically (e.g. an
+    uploaded document). The message names the requirements, for a person to handle."""
+
+
+# End-user fields we can fill from a client's KYC, by Twilio attribute name. Anything a
+# regulation asks for that is NOT here is reported as missing rather than guessed.
+def _end_user_attributes(kyc: Dict[str, Any]) -> Dict[str, str]:
+    business = kyc.get("business") or {}
+    rep = kyc.get("representative") or {}
+    return {
+        "business_name": business.get("name") or "",
+        "business_registration_identifier": business.get("registration_identifier") or "",
+        "business_registration_number": business.get("registration_number") or "",
+        "business_website": business.get("website") or "",
+        "first_name": rep.get("first_name") or "",
+        "last_name": rep.get("last_name") or "",
+        "phone_number": rep.get("phone") or "",
+        "email": rep.get("email") or "",
+        # The bundle is the client's own: they are Twilio's direct customer's customer,
+        # and the number is assigned to them.
+        "business_identity": "DIRECT_CUSTOMER",
+        "is_subassigned": "YES",
+    }
+
+
 @dataclass
 class ProvisionedNumber:
     e164: str
@@ -133,6 +159,147 @@ class ManagedProvisioner:
                 f"[managed_provisioner] Bundle lookup failed for {iso_country}: {exc}"
             )
             return None
+
+    # ── Regulatory bundles (in-country numbers) ──────────────────────────────────
+    #
+    # Twilio refuses a local number in a regulated country (GB, most of the EU) without an
+    # approved Regulatory Bundle, created IN THE ACCOUNT THAT BUYS THE NUMBER (end users and
+    # documents cannot be shared across accounts). Each client's bundle is built from their
+    # own KYC; nothing here is platform-wide.
+
+    def _regulation(self, country: str) -> Optional[Any]:
+        found = self._client.numbers.v2.regulatory_compliance.regulations.list(
+            iso_country=country.upper(),
+            number_type="local",
+            end_user_type="business",
+            include_constraints=True,
+        )
+        return found[0] if found else None
+
+    def regulation_for(self, country: str) -> Dict[str, Any]:
+        """Whether a local business number in *country* needs a bundle, and which regulation."""
+        reg = self._regulation(country)
+        if reg is None:
+            return {"sid": None, "requires_bundle": False}
+        req = reg.requirements or {}
+        needs = bool(req.get("end_user")) or any(group for group in (req.get("supporting_document") or []))
+        return {"sid": reg.sid, "requires_bundle": needs}
+
+    def create_bundle(
+        self,
+        country: str,
+        kyc: Dict[str, Any],
+        email: str,
+        status_callback: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Build and submit a bundle for one client: Address -> Bundle -> EndUser ->
+        SupportingDocument(address) -> assignments -> evaluation -> pending-review.
+
+        Returns {bundle_sid, address_sid, status, failures}. A bundle Twilio's own
+        evaluation calls noncompliant is left in draft with the failures, not submitted.
+        Raises ValueError naming missing KYC fields BEFORE creating anything, and
+        RegulationNotAutomatable when the regulation needs an uploaded file.
+        """
+        country = country.upper()
+        reg = self._regulation(country)
+        if reg is None:
+            raise ValueError(f"no regulation for local business numbers in {country}")
+        req = reg.requirements or {}
+
+        # Which supporting documents we can satisfy: only address-based ones.
+        doc_types: List[str] = []
+        unmet: List[str] = []
+        for group in req.get("supporting_document") or []:
+            usable = [d for d in (group[0].get("accepted_documents") or []) if "address_sids" in (d.get("fields") or [])] if group else []
+            if usable:
+                doc_types.append(usable[0]["type"])
+            elif group:
+                unmet.append(group[0].get("name") or group[0].get("requirement_name") or "a supporting document")
+        if unmet:
+            raise RegulationNotAutomatable(
+                f"{country} needs documents we cannot supply automatically: {', '.join(unmet)}"
+            )
+
+        wanted: List[str] = []
+        for end_user in req.get("end_user") or []:
+            wanted.extend(end_user.get("fields") or [])
+        available = _end_user_attributes(kyc)
+        missing = [f for f in wanted if not available.get(f)]
+        if missing:
+            raise ValueError(f"KYC is missing fields {country} requires: {', '.join(missing)}")
+        attributes = {f: available[f] for f in wanted}
+
+        address = kyc.get("address") or {}
+        street = ", ".join(x for x in [address.get("street"), address.get("street2")] if x)
+        rc = self._client.numbers.v2.regulatory_compliance
+        created_address = self._client.addresses.create(
+            customer_name=available["business_name"],
+            street=street,
+            city=address.get("city") or "",
+            region=address.get("region") or "",
+            postal_code=address.get("postal_code") or "",
+            iso_country=(address.get("country") or country).upper(),
+            friendly_name=available["business_name"][:64],
+        )
+        bundle = rc.bundles.create(
+            friendly_name=f"{available['business_name']} ({country} local)"[:64],
+            email=email,
+            regulation_sid=reg.sid,
+            **({"status_callback": status_callback} if status_callback else {}),
+        )
+        end_user = rc.end_users.create(
+            friendly_name=available["business_name"][:64], type="business", attributes=attributes,
+        )
+        documents = [
+            rc.supporting_documents.create(
+                friendly_name=f"{available['business_name']} address"[:64],
+                type=doc_type,
+                attributes={"address_sids": [created_address.sid]},
+            )
+            for doc_type in doc_types
+        ]
+        handle = rc.bundles(bundle.sid)
+        for item in [end_user, *documents]:
+            handle.item_assignments.create(object_sid=item.sid)
+
+        evaluation = handle.evaluations.create()
+        if getattr(evaluation, "status", None) != "compliant":
+            return {
+                "bundle_sid": bundle.sid,
+                "address_sid": created_address.sid,
+                "status": "draft",
+                "failures": list(getattr(evaluation, "results", None) or []),
+            }
+        updated = handle.update(status="pending-review")
+        return {
+            "bundle_sid": bundle.sid,
+            "address_sid": created_address.sid,
+            "status": getattr(updated, "status", "pending-review"),
+            "failures": [],
+        }
+
+    def get_bundle(self, bundle_sid: str) -> Dict[str, Any]:
+        """A bundle's status and country. A bundle from another account 404s (TwilioRestException)."""
+        rc = self._client.numbers.v2.regulatory_compliance
+        bundle = rc.bundles(bundle_sid).fetch()
+        iso_country = None
+        if getattr(bundle, "regulation_sid", None):
+            iso_country = getattr(rc.regulations(bundle.regulation_sid).fetch(), "iso_country", None)
+        failures: List[Any] = []
+        if bundle.status == "twilio-rejected":
+            try:
+                latest = rc.bundles(bundle_sid).evaluations.list(limit=1)
+                failures = list(latest[0].results or []) if latest else []
+            except TwilioRestException:
+                failures = []
+        return {
+            "sid": bundle.sid,
+            "status": bundle.status,
+            "iso_country": iso_country,
+            "valid_until": str(bundle.valid_until) if getattr(bundle, "valid_until", None) else None,
+            "failures": failures,
+        }
 
     def release_number(self, twilio_sid: str) -> bool:
         """Release a number back to Twilio. Returns True on success."""
