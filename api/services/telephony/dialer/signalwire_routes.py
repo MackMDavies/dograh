@@ -52,6 +52,7 @@ from api.services.telephony.dialer.swml import (
     build_dialer_swml,
     build_hangup_swml,
     build_inbound_hold_swml,
+    build_agent_overflow_swml,
     build_no_agents_swml,
 )
 from api.services.telephony.dialer.live_transcribe import LiveTranscriber
@@ -397,6 +398,26 @@ async def _rep_supabase_id(identity: str) -> str | None:
         logger.error(f"Rep lookup failed for {identity!r}: {exc}")
         return None
     return user.provider_id if user and user.provider_id else None
+
+
+def _inbound_agent_number() -> str:
+    """Sam INBOUND Sales' own number, when set: callers nobody can answer go to it.
+
+    Empty (the default) keeps the old behaviour -- a spoken "nobody available" and a
+    hangup -- so this is inert until the agent and its number exist. E.164 only: an
+    unusable value must not turn a turned-away caller into a failed connect.
+    """
+    value = (os.environ.get("SYSEVO_SAM_INBOUND_NUMBER") or "").strip()
+    return value if value.startswith("+") and value[1:].isdigit() and 8 <= len(value) <= 16 else ""
+
+
+def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
+    """What a caller hears when no rep can take the call: the AI agent, or the message."""
+    agent = _inbound_agent_number()
+    if not agent:
+        return build_no_agents_swml()
+    logger.info(f"sw-inbound: nobody available for {rang_number} - {caller_number} handed to Sam INBOUND")
+    return build_agent_overflow_swml(agent_number=agent, caller_id=rang_number)
 
 
 def _swml(document: dict) -> JSONResponse:
@@ -875,11 +896,8 @@ async def handle_sw_inbound(request: Request):
             # Nobody to ring. The row is already logged as missed, so the team still
             # sees the call - but the caller must be told, not parked in a conference
             # that will never be joined.
-            logger.warning(
-                f"sw-inbound: nobody available for {to_number} - caller {from_number} "
-                "told and hung up"
-            )
-            return _swml(build_no_agents_swml())
+            logger.warning(f"sw-inbound: nobody available for {to_number} - caller {from_number}")
+            return _swml(_no_answer_swml(caller_number=from_number, rang_number=to_number))
 
         recording_webhook = ""
         try:
@@ -930,7 +948,7 @@ async def handle_sw_inbound(request: Request):
         # on a call. The row is logged so the team sees it; the caller is told rather than
         # held for somebody who is never coming.
         logger.warning(f"sw-inbound: nobody reachable for {to_number}")
-        return _swml(build_no_agents_swml())
+        return _swml(_no_answer_swml(caller_number=from_number, rang_number=to_number))
     except Exception as exc:  # noqa: BLE001 - a live caller is waiting
         logger.exception(f"sw-inbound failed, hanging up: {exc}")
         return _swml(build_hangup_swml())

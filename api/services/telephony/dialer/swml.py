@@ -254,3 +254,58 @@ def build_conference_join_swml(*, conference_name: str) -> dict:
             ]
         }
     }
+
+
+def build_agent_overflow_swml(
+    *,
+    agent_number: str,
+    caller_id: str,
+    recording_webhook: str = "",
+    tap_websocket: str = "",
+    fallback_message: str = (
+        "Sorry, there is nobody available to take your call right now. "
+        "Please try again shortly."
+    ),
+) -> dict:
+    """Hand a caller nobody can answer to the inbound AI agent (Sam INBOUND Sales).
+
+    On 2026-09-25 a prospect rang a rep's number back three times before getting an
+    answer: twice the rep was already on a call, so there was nobody to ring and
+    build_no_agents_swml told her so and hung up. Four of six callbacks to that rep's
+    number in four days went unanswered. A prospect calling back is the warmest lead
+    the floor has; losing them to "nobody available" is the worst outcome.
+
+    The agent lives on Dograh, which carries its calls on Twilio -- there is no
+    SignalWire provider there, deliberately -- so the caller is bridged to the agent's
+    own phone number with connect, exactly like a rep's outbound leg. `from` is the
+    number the caller rang (one of ours, so SignalWire will present it), which is also
+    how the agent knows whose prospect this is.
+
+    If the agent cannot be reached, the caller still gets the honest message rather
+    than silence: connect_result is anything but "connected".
+    """
+    steps: list[dict] = []
+    if recording_webhook:
+        steps.append(
+            {"record_call": {"stereo": True, "format": "mp3", "status_url": recording_webhook}}
+        )
+    tap = _tap_step(tap_websocket)
+    if tap:
+        steps.append(tap)
+    steps.append(
+        {"connect": {"to": agent_number, "from": caller_id, "timeout": 30, "max_duration": 7200}}
+    )
+    steps.append(
+        {
+            "switch": {
+                "variable": "connect_result",
+                "case": {"connected": [{"hangup": {}}]},
+                "default": [
+                    {"play": {"url": f"say:{fallback_message}"}},
+                    {"hangup": {}},
+                ],
+            }
+        }
+    )
+    return {"sections": {"main": steps}}
+

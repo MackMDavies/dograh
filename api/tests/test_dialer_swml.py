@@ -270,3 +270,34 @@ def test_tap_does_not_disturb_the_connect():
     )
     connect_of = lambda d: next(s["connect"] for s in d["sections"]["main"] if "connect" in s)
     assert connect_of(without) == connect_of(with_tap)
+
+
+# ── Sam INBOUND overflow (2026-09-26) ──────────────────────────────────────────────
+from api.services.telephony.dialer.swml import build_agent_overflow_swml  # noqa: E402
+
+
+def test_overflow_bridges_the_caller_to_the_inbound_agent_from_the_number_they_rang():
+    doc = build_agent_overflow_swml(agent_number="+15550001111", caller_id="+12093093570")
+    steps = doc["sections"]["main"]
+    connect = next(s["connect"] for s in steps if "connect" in s)
+    assert connect["to"] == "+15550001111"
+    # The number they rang: ours, so SignalWire presents it, and it tells the agent whose prospect this is.
+    assert connect["from"] == "+12093093570"
+
+
+def test_overflow_falls_back_to_the_honest_message_when_the_agent_cannot_be_reached():
+    doc = build_agent_overflow_swml(agent_number="+15550001111", caller_id="+12093093570")
+    switch = next(s["switch"] for s in doc["sections"]["main"] if "switch" in s)
+    assert switch["variable"] == "connect_result"
+    assert switch["case"]["connected"] == [{"hangup": {}}]
+    assert any("play" in s for s in switch["default"])
+    assert switch["default"][-1] == {"hangup": {}}
+
+
+def test_overflow_records_and_taps_when_asked():
+    doc = build_agent_overflow_swml(
+        agent_number="+15550001111", caller_id="+12093093570",
+        recording_webhook="https://x/rec", tap_websocket="wss://x/tap",
+    )
+    kinds = [next(iter(s)) for s in doc["sections"]["main"]]
+    assert kinds[:3] == ["record_call", "tap", "connect"]
