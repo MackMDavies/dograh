@@ -417,7 +417,9 @@ def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
     if not agent:
         return build_no_agents_swml()
     logger.info(f"sw-inbound: nobody available for {rang_number} - {caller_number} handed to Sam INBOUND")
-    return build_agent_overflow_swml(agent_number=agent, caller_id=rang_number)
+    # No caller_id: SignalWire presents the prospect's own number, so Sam's memory and
+    # lookups see who is actually calling (see build_agent_overflow_swml).
+    return build_agent_overflow_swml(agent_number=agent)
 
 
 def _swml(document: dict) -> JSONResponse:

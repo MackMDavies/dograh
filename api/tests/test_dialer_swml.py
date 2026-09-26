@@ -276,12 +276,18 @@ def test_tap_does_not_disturb_the_connect():
 from api.services.telephony.dialer.swml import build_agent_overflow_swml  # noqa: E402
 
 
-def test_overflow_bridges_the_caller_to_the_inbound_agent_from_the_number_they_rang():
-    doc = build_agent_overflow_swml(agent_number="+15550001111", caller_id="+12093093570")
+def test_overflow_presents_the_real_caller_to_the_inbound_agent():
+    doc = build_agent_overflow_swml(agent_number="+15550001111")
     steps = doc["sections"]["main"]
     connect = next(s["connect"] for s in steps if "connect" in s)
     assert connect["to"] == "+15550001111"
-    # The number they rang: ours, so SignalWire presents it, and it tells the agent whose prospect this is.
+    # No `from`: SignalWire presents the calling party, so the agent's memory sees the prospect.
+    assert "from" not in connect
+
+
+def test_overflow_can_still_override_the_presented_number():
+    doc = build_agent_overflow_swml(agent_number="+15550001111", caller_id="+12093093570")
+    connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert connect["from"] == "+12093093570"
 
 

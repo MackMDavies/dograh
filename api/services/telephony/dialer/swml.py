@@ -259,7 +259,7 @@ def build_conference_join_swml(*, conference_name: str) -> dict:
 def build_agent_overflow_swml(
     *,
     agent_number: str,
-    caller_id: str,
+    caller_id: str | None = None,
     recording_webhook: str = "",
     tap_websocket: str = "",
     fallback_message: str = (
@@ -277,9 +277,13 @@ def build_agent_overflow_swml(
 
     The agent lives on Dograh, which carries its calls on Twilio -- there is no
     SignalWire provider there, deliberately -- so the caller is bridged to the agent's
-    own phone number with connect, exactly like a rep's outbound leg. `from` is the
-    number the caller rang (one of ours, so SignalWire will present it), which is also
-    how the agent knows whose prospect this is.
+    own phone number with connect, exactly like a rep's outbound leg.
+
+    `from` is left unset by default, so SignalWire presents the CALLER's own number
+    (connect.from defaults to the calling party). That is what the agent needs: its
+    caller memory and CRM lookups are keyed on the number it sees, and with our rep's
+    number there it greeted every returning prospect as a stranger. Pass caller_id only
+    to override it.
 
     If the agent cannot be reached, the caller still gets the honest message rather
     than silence: connect_result is anything but "connected".
@@ -292,9 +296,10 @@ def build_agent_overflow_swml(
     tap = _tap_step(tap_websocket)
     if tap:
         steps.append(tap)
-    steps.append(
-        {"connect": {"to": agent_number, "from": caller_id, "timeout": 30, "max_duration": 7200}}
-    )
+    connect: dict = {"to": agent_number, "timeout": 30, "max_duration": 7200}
+    if caller_id:
+        connect["from"] = caller_id
+    steps.append({"connect": connect})
     steps.append(
         {
             "switch": {
