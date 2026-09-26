@@ -76,6 +76,12 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
     resolve_assigned_caller_id,
 )
 from api.db import db_client
+from api.services.telephony.dialer import sam_handoff
+from api.services.telephony.dialer.sam_handoff_rules import (
+    REP_ANSWER_SECONDS,
+    ring_first_seconds,
+    transfer_request_allowed,
+)
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
@@ -420,6 +426,20 @@ def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
     # No caller_id: SignalWire presents the prospect's own number, so Sam's memory and
     # lookups see who is actually calling (see build_agent_overflow_swml).
     return build_agent_overflow_swml(agent_number=agent)
+
+
+def _reroute_url(backend_endpoint: str, call_id: str, mode: str) -> str:
+    """Where a live inbound call is moved to: our own SWML for that hand-off."""
+    base = _webhook_url(backend_endpoint, "sw-inbound-reroute", call_id)
+    return f"{base}&{urlencode({'mode': mode})}" if base else ""
+
+
+def _sam_inbound_workflow_id() -> int:
+    """Sam INBOUND Sales' Dograh workflow: the only agent allowed to hand a caller back."""
+    try:
+        return int((os.environ.get("SYSEVO_SAM_INBOUND_WORKFLOW_ID") or "214").strip())
+    except ValueError:
+        return 214
 
 
 def _swml(document: dict) -> JSONResponse:
@@ -930,6 +950,14 @@ async def handle_sw_inbound(request: Request):
         # the caller is already waiting in. Live or push, the treatment is the same --
         # the difference is only how quickly they notice.
         if plan:
+            # RING FIRST: the reps' dialers ring; nobody answering in time moves the caller
+            # to Sam INBOUND instead of leaving them on hold until they give up. Off unless
+            # both SYSEVO_SAM_RING_FIRST_SECONDS and the agent's number are set.
+            wait = ring_first_seconds(os.environ.get("SYSEVO_SAM_RING_FIRST_SECONDS"))
+            if wait and _inbound_agent_number():
+                agent_url = _reroute_url(backend_endpoint, call_id, "agent")
+                if agent_url:
+                    sam_handoff.spawn(sam_handoff.hand_to_sam_if_unanswered(call_id, wait, agent_url))
             return _swml(
                 build_inbound_hold_swml(
                     conference_name=conference_name,
@@ -954,6 +982,116 @@ async def handle_sw_inbound(request: Request):
     except Exception as exc:  # noqa: BLE001 - a live caller is waiting
         logger.exception(f"sw-inbound failed, hanging up: {exc}")
         return _swml(build_hangup_swml())
+
+
+@router.post("/sw-inbound-reroute", include_in_schema=False)
+async def handle_sw_inbound_reroute(request: Request):
+    """SWML for a live inbound call being MOVED (SignalWire calling.transfer points here).
+
+    mode=agent       nobody answered: over to Sam INBOUND
+    mode=agent_back  a rep missed Sam's transfer: back to Sam, told why
+    mode=hold        Sam is handing the caller to the rep: into the room the rep's
+                     dialer joins, exactly like a fresh inbound call
+    """
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-inbound-reroute", request, payload)
+        if not _secret_ok("sw-inbound-reroute", request):
+            return _swml(build_hangup_swml())
+        call_id = (request.query_params.get("call_id") or "").strip()
+        mode = (request.query_params.get("mode") or "").strip()
+        agent = _inbound_agent_number()
+        if mode in ("agent", "agent_back") and agent:
+            return _swml(
+                build_agent_overflow_swml(
+                    agent_number=agent,
+                    prelude=(
+                        "They're tied up on another call right now, so I'll put you back through."
+                        if mode == "agent_back"
+                        else ""
+                    ),
+                )
+            )
+        if mode == "hold" and call_id:
+            try:
+                backend_endpoint, _ = await get_backend_endpoints()
+            except Exception:  # noqa: BLE001
+                backend_endpoint = ""
+            return _swml(
+                build_inbound_hold_swml(
+                    conference_name=f"inbound-{call_id}",
+                    recording_webhook=_webhook_url(str(backend_endpoint or ""), "sw-recording", call_id),
+                    greeting="Connecting you now.",
+                    tap_websocket=_tap_websocket_url(str(backend_endpoint or ""), call_id),
+                )
+            )
+        logger.error(f"sw-inbound-reroute: nothing to do for mode={mode!r} call={call_id!r}")
+        return _swml(build_no_agents_swml())
+    except Exception as exc:  # noqa: BLE001 - a live caller is on this call
+        logger.exception(f"sw-inbound-reroute failed: {exc}")
+        return _swml(build_no_agents_swml())
+
+
+@router.post("/sam-transfer-to-rep", include_in_schema=False)
+async def handle_sam_transfer_to_rep(request: Request):
+    """Sam INBOUND's transfer_to_rep tool: ring the rep who owns the number the caller rang.
+
+    The tool sends {{workflow_run_id}} and {{caller_number}} from Sam's own call, and the
+    request is honoured only for a live Sam INBOUND run of that caller (see
+    transfer_request_allowed). The reply is what Sam says next: "ringing_rep" (the caller
+    is about to be moved, say nothing more) or "unavailable" (book a meeting instead).
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    caller = str(body.get("caller_number") or "")
+    try:
+        run_id = int(str(body.get("workflow_run_id") or "0"))
+    except ValueError:
+        run_id = 0
+    run = await db_client.get_workflow_run(run_id) if run_id else None
+    ok, reason = transfer_request_allowed(
+        run_workflow_id=getattr(run, "workflow_id", None),
+        run_is_completed=getattr(run, "is_completed", None),
+        run_caller_number=((getattr(run, "initial_context", None) or {}).get("caller_number")),
+        claimed_caller_number=caller,
+        sam_workflow_id=_sam_inbound_workflow_id(),
+    )
+    if not ok:
+        logger.warning(f"sam-transfer-to-rep refused (run {run_id}): {reason}")
+        return JSONResponse(status_code=403, content={"status": "refused", "reason": reason})
+
+    unavailable = {
+        "status": "unavailable",
+        "say": "The team is tied up on calls right now. Offer to book a time on the calendar, or take their name, reason and best time for a callback.",
+    }
+    call = await sam_handoff.find_live_call_for(caller)
+    if not call:
+        # Rang Sam's own number (not a rep's), or the inbound record is gone: nobody to ring.
+        return JSONResponse(content={**unavailable, "reason": "no rep line behind this call"})
+    call_id = call["provider_call_id"]
+    plan = await resolve_inbound_plan(call.get("to_number") or "")
+    targets = [str(p["user_id"]) for p in plan if p.get("user_id")]
+    if not targets:
+        return JSONResponse(content={**unavailable, "reason": "the rep is on another call or offline"})
+
+    try:
+        backend_endpoint, _ = await get_backend_endpoints()
+    except Exception:  # noqa: BLE001
+        backend_endpoint = ""
+    hold_url = _reroute_url(str(backend_endpoint or ""), call_id, "hold")
+    back_url = _reroute_url(str(backend_endpoint or ""), call_id, "agent_back")
+    row = await sam_handoff.ring_again(call_id, targets)
+    if not row or not hold_url:
+        return JSONResponse(content={**unavailable, "reason": "could not reach the rep's dialer"})
+    if not await sam_handoff.move_call(call_id, hold_url):
+        # Leave everything as it was: stop ringing, Sam keeps the caller.
+        await sam_handoff.mark_missed_if_ringing(call_id)
+        return JSONResponse(content={**unavailable, "reason": "could not move the call"})
+    sam_handoff.spawn(sam_handoff.back_to_sam_if_rep_misses(call_id, back_url))
+    logger.info(f"sam-transfer-to-rep: {call_id} moved to the rep's dialer ({len(targets)} rung, {REP_ANSWER_SECONDS}s)")
+    return JSONResponse(content={"status": "ringing_rep", "say": "Say only: 'Putting you through now.' The call is being moved to the rep."})
 
 
 @router.post("/sw-inbound-status", include_in_schema=False)

@@ -266,8 +266,12 @@ def build_agent_overflow_swml(
         "Sorry, there is nobody available to take your call right now. "
         "Please try again shortly."
     ),
+    prelude: str = "",
 ) -> dict:
     """Hand a caller nobody can answer to the inbound AI agent (Sam INBOUND Sales).
+
+    `prelude` is said first, for a caller coming BACK to the agent after a rep did not
+    pick up ("They're tied up right now, let me put you back through.").
 
     On 2026-09-25 a prospect rang a rep's number back three times before getting an
     answer: twice the rep was already on a call, so there was nobody to ring and
@@ -289,6 +293,8 @@ def build_agent_overflow_swml(
     than silence: connect_result is anything but "connected".
     """
     steps: list[dict] = []
+    if prelude:
+        steps.append({"play": {"url": f"say:{prelude}"}})
     if recording_webhook:
         steps.append(
             {"record_call": {"stereo": True, "format": "mp3", "status_url": recording_webhook}}
