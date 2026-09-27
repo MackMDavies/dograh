@@ -77,6 +77,8 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
 )
 from api.db import db_client
 from api.services.telephony.dialer import sam_handoff
+from api.services.telephony.dialer import sam_knowledge
+from api.services.telephony.dialer.sam_knowledge_rules import answer_for
 from api.services.telephony.dialer.sam_handoff_rules import (
     REP_ANSWER_SECONDS,
     ring_first_seconds,
@@ -1092,6 +1094,40 @@ async def handle_sam_transfer_to_rep(request: Request):
     sam_handoff.spawn(sam_handoff.back_to_sam_if_rep_misses(call_id, back_url))
     logger.info(f"sam-transfer-to-rep: {call_id} moved to the rep's dialer ({len(targets)} rung, {REP_ANSWER_SECONDS}s)")
     return JSONResponse(content={"status": "ringing_rep", "say": "Say only: 'Putting you through now.' The call is being moved to the rep."})
+
+
+@router.post("/sam-knowledge", include_in_schema=False)
+async def handle_sam_knowledge(request: Request):
+    """Sam INBOUND's sysevo_knowledge tool: the team's checked answer to a caller's question.
+
+    Honoured on the same terms as transfer_to_rep — a live Sam INBOUND run and that call's
+    caller number, both filled in by Dograh from Sam's own call — so the documents are not
+    readable by anyone who finds the URL. The reply tells Sam what to say; see answer_for.
+    """
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    try:
+        run_id = int(str(body.get("workflow_run_id") or "0"))
+    except ValueError:
+        run_id = 0
+    run = await db_client.get_workflow_run(run_id) if run_id else None
+    ok, reason = transfer_request_allowed(
+        run_workflow_id=getattr(run, "workflow_id", None),
+        run_is_completed=getattr(run, "is_completed", None),
+        run_caller_number=((getattr(run, "initial_context", None) or {}).get("caller_number")),
+        claimed_caller_number=str(body.get("caller_number") or ""),
+        sam_workflow_id=_sam_inbound_workflow_id(),
+    )
+    if not ok:
+        logger.warning(f"sam-knowledge refused (run {run_id}): {reason}")
+        return JSONResponse(status_code=403, content={"status": "refused", "reason": reason})
+
+    question = str(body.get("question") or "").strip()[:500]
+    reply = answer_for(await sam_knowledge.load_entries(), question)
+    logger.info(f"sam-knowledge: run {run_id} asked {question!r} -> {reply['status']}")
+    return JSONResponse(content=reply)
 
 
 @router.post("/sw-inbound-status", include_in_schema=False)
