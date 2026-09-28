@@ -40,7 +40,7 @@ from typing import Any
 from urllib.parse import parse_qsl, urlencode
 
 import httpx
-from fastapi import APIRouter, Request, WebSocket
+from fastapi import APIRouter, Depends, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
 from loguru import logger
 from starlette.responses import JSONResponse
@@ -76,14 +76,16 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
     resolve_assigned_caller_id,
 )
 from api.db import db_client
+from api.db.models import UserModel
+from api.services.auth.depends import get_user
 from api.services.telephony.dialer import sam_handoff
 from api.services.telephony.dialer import sam_knowledge
 from api.services.telephony.dialer.sam_knowledge_rules import answer_for
 from api.services.telephony.dialer.sam_handoff_rules import (
     REP_ANSWER_SECONDS,
-    ring_first_seconds,
     transfer_request_allowed,
 )
+from api.services.telephony.dialer.inbound_agent import current_inbound_agent, number_hands_to_agent
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
@@ -408,24 +410,26 @@ async def _rep_supabase_id(identity: str) -> str | None:
     return user.provider_id if user and user.provider_id else None
 
 
-def _inbound_agent_number() -> str:
-    """Sam INBOUND Sales' own number, when set: callers nobody can answer go to it.
+async def _inbound_agent_number() -> str:
+    """The number of the agent that takes callers nobody can answer, or "" for none.
 
-    Empty (the default) keeps the old behaviour -- a spoken "nobody available" and a
-    hangup -- so this is inert until the agent and its number exist. E.164 only: an
-    unusable value must not turn a turned-away caller into a failed connect.
+    Chosen on the dialer's Agents page (see inbound_agent); until an agent is picked there,
+    the old SYSEVO_SAM_INBOUND_NUMBER setting still applies. Empty keeps the old behaviour --
+    a spoken "nobody available" and a hangup.
     """
-    value = (os.environ.get("SYSEVO_SAM_INBOUND_NUMBER") or "").strip()
-    return value if value.startswith("+") and value[1:].isdigit() and 8 <= len(value) <= 16 else ""
+    return (await current_inbound_agent()).number
 
 
-def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
+async def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
     """What a caller hears when no rep can take the call: the AI agent, or the message."""
-    agent = _inbound_agent_number()
+    agent = await _inbound_agent_number()
     if not agent:
         return build_no_agents_swml()
-    logger.info(f"sw-inbound: nobody available for {rang_number} - {caller_number} handed to Sam INBOUND")
-    # No caller_id: SignalWire presents the prospect's own number, so Sam's memory and
+    if not await number_hands_to_agent(rang_number):
+        logger.info(f"sw-inbound: {rang_number} is switched off for hand-over - caller {caller_number} told nobody is available")
+        return build_no_agents_swml()
+    logger.info(f"sw-inbound: nobody available for {rang_number} - {caller_number} handed to the inbound agent")
+    # No caller_id: SignalWire presents the prospect's own number, so the agent's memory and
     # lookups see who is actually calling (see build_agent_overflow_swml).
     return build_agent_overflow_swml(agent_number=agent)
 
@@ -436,12 +440,10 @@ def _reroute_url(backend_endpoint: str, call_id: str, mode: str) -> str:
     return f"{base}&{urlencode({'mode': mode})}" if base else ""
 
 
-def _sam_inbound_workflow_id() -> int:
-    """Sam INBOUND Sales' Dograh workflow: the only agent allowed to hand a caller back."""
-    try:
-        return int((os.environ.get("SYSEVO_SAM_INBOUND_WORKFLOW_ID") or "214").strip())
-    except ValueError:
-        return 214
+async def _sam_inbound_workflow_id() -> int:
+    """The inbound agent's Dograh workflow: the only agent allowed to hand a caller back or
+    use the knowledge lookup. Follows the Agents page; 214 (Sam INBOUND) when nothing says."""
+    return (await current_inbound_agent()).workflow_id or 214
 
 
 def _swml(document: dict) -> JSONResponse:
@@ -921,7 +923,7 @@ async def handle_sw_inbound(request: Request):
             # sees the call - but the caller must be told, not parked in a conference
             # that will never be joined.
             logger.warning(f"sw-inbound: nobody available for {to_number} - caller {from_number}")
-            return _swml(_no_answer_swml(caller_number=from_number, rang_number=to_number))
+            return _swml(await _no_answer_swml(caller_number=from_number, rang_number=to_number))
 
         recording_webhook = ""
         try:
@@ -953,10 +955,12 @@ async def handle_sw_inbound(request: Request):
         # the difference is only how quickly they notice.
         if plan:
             # RING FIRST: the reps' dialers ring; nobody answering in time moves the caller
-            # to Sam INBOUND instead of leaving them on hold until they give up. Off unless
-            # both SYSEVO_SAM_RING_FIRST_SECONDS and the agent's number are set.
-            wait = ring_first_seconds(os.environ.get("SYSEVO_SAM_RING_FIRST_SECONDS"))
-            if wait and _inbound_agent_number():
+            # to the inbound agent instead of leaving them on hold until they give up. Set on
+            # the dialer's Agents page (ring-first seconds, the agent, and per-number
+            # hand-over); off when no timer is set or the number is switched off.
+            agent = await current_inbound_agent()
+            wait = agent.ring_first_seconds
+            if wait and agent.number and await number_hands_to_agent(to_number):
                 agent_url = _reroute_url(backend_endpoint, call_id, "agent")
                 if agent_url:
                     sam_handoff.spawn(sam_handoff.hand_to_sam_if_unanswered(call_id, wait, agent_url))
@@ -980,7 +984,7 @@ async def handle_sw_inbound(request: Request):
         # on a call. The row is logged so the team sees it; the caller is told rather than
         # held for somebody who is never coming.
         logger.warning(f"sw-inbound: nobody reachable for {to_number}")
-        return _swml(_no_answer_swml(caller_number=from_number, rang_number=to_number))
+        return _swml(await _no_answer_swml(caller_number=from_number, rang_number=to_number))
     except Exception as exc:  # noqa: BLE001 - a live caller is waiting
         logger.exception(f"sw-inbound failed, hanging up: {exc}")
         return _swml(build_hangup_swml())
@@ -1002,7 +1006,7 @@ async def handle_sw_inbound_reroute(request: Request):
             return _swml(build_hangup_swml())
         call_id = (request.query_params.get("call_id") or "").strip()
         mode = (request.query_params.get("mode") or "").strip()
-        agent = _inbound_agent_number()
+        agent = await _inbound_agent_number()
         if mode in ("agent", "agent_back") and agent:
             return _swml(
                 build_agent_overflow_swml(
@@ -1034,6 +1038,27 @@ async def handle_sw_inbound_reroute(request: Request):
         return _swml(build_no_agents_swml())
 
 
+@router.get("/inbound-agent-status", include_in_schema=False)
+async def handle_inbound_agent_status(user: UserModel = Depends(get_user)):
+    """What the server is ACTUALLY doing with inbound calls nobody answers.
+
+    The Agents page shows this rather than its own saved values: a setting that is saved
+    but not acted on is exactly the kind of thing that reads as working. Read fresh, not
+    from the call-path cache, so a change shows up the moment it is made.
+    """
+    agent = await current_inbound_agent(fresh=True)
+    return JSONResponse(
+        {
+            "live": bool(agent.number),
+            "source": agent.source,
+            "number": agent.number,
+            "workflow_id": agent.workflow_id,
+            "ring_first_seconds": agent.ring_first_seconds,
+            "problem": agent.problem,
+        }
+    )
+
+
 @router.post("/sam-transfer-to-rep", include_in_schema=False)
 async def handle_sam_transfer_to_rep(request: Request):
     """Sam INBOUND's transfer_to_rep tool: ring the rep who owns the number the caller rang.
@@ -1058,7 +1083,7 @@ async def handle_sam_transfer_to_rep(request: Request):
         run_is_completed=getattr(run, "is_completed", None),
         run_caller_number=((getattr(run, "initial_context", None) or {}).get("caller_number")),
         claimed_caller_number=caller,
-        sam_workflow_id=_sam_inbound_workflow_id(),
+        sam_workflow_id=await _sam_inbound_workflow_id(),
     )
     if not ok:
         logger.warning(f"sam-transfer-to-rep refused (run {run_id}): {reason}")
@@ -1118,7 +1143,7 @@ async def handle_sam_knowledge(request: Request):
         run_is_completed=getattr(run, "is_completed", None),
         run_caller_number=((getattr(run, "initial_context", None) or {}).get("caller_number")),
         claimed_caller_number=str(body.get("caller_number") or ""),
-        sam_workflow_id=_sam_inbound_workflow_id(),
+        sam_workflow_id=await _sam_inbound_workflow_id(),
     )
     if not ok:
         logger.warning(f"sam-knowledge refused (run {run_id}): {reason}")
