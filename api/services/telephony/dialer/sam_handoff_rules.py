@@ -72,3 +72,39 @@ def transfer_request_allowed(
     if len(tail) < 10 or tail != phone_tail(run_caller_number):
         return False, "caller number does not match the call"
     return True, ""
+
+
+#: Run modes where the caller is in a browser (website widget, in-app test): no phone number exists.
+BROWSER_RUN_MODES = frozenset({"smallwebrtc", "webrtc"})
+
+
+def knowledge_request_allowed(
+    *,
+    run_workflow_id: int | None,
+    run_is_completed: bool | None,
+    run_mode: str | None,
+    run_caller_number: str | None,
+    claimed_caller_number: str | None,
+    sam_workflow_id: int,
+) -> tuple[bool, str]:
+    """Whether a sysevo_knowledge lookup is genuine.
+
+    A phone call is held to the transfer rule: its run and its caller's number. A browser
+    call has no number at all, so every lookup on the website widget failed and Sam fell back
+    to "we'd go through that on a call". Those are allowed on the run alone -- live, and Sam's
+    -- because the answers are the prospect-safe ones read to any caller. Transfers keep the
+    strict rule: ringing a rep is not something a guessed run id should do.
+    """
+    ok, reason = transfer_request_allowed(
+        run_workflow_id=run_workflow_id,
+        run_is_completed=run_is_completed,
+        run_caller_number=run_caller_number,
+        claimed_caller_number=claimed_caller_number,
+        sam_workflow_id=sam_workflow_id,
+    )
+    if ok or reason != "caller number does not match the call":
+        return ok, reason
+    browser = str(run_mode or "").lower() in BROWSER_RUN_MODES
+    if browser and not phone_tail(run_caller_number) and not phone_tail(claimed_caller_number):
+        return True, ""
+    return ok, reason

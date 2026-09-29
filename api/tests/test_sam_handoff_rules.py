@@ -56,3 +56,33 @@ def test_back_to_sam_says_why_first():
     steps = doc["sections"]["main"]
     assert steps[0] == {"play": {"url": "say:They're tied up right now."}}
     assert any("connect" in s for s in steps)
+
+
+# ── Knowledge lookups: a browser call has no caller number ──────────────────────────────
+from api.services.telephony.dialer.sam_handoff_rules import knowledge_request_allowed  # noqa: E402
+
+
+def _knowledge(**over):
+    args = dict(run_workflow_id=SAM, run_is_completed=False, run_mode="twilio", run_caller_number="+17727736378",
+                claimed_caller_number="+17727736378", sam_workflow_id=SAM)
+    args.update(over)
+    return knowledge_request_allowed(**args)
+
+
+def test_a_phone_call_may_look_up_knowledge_on_the_same_terms_as_a_transfer():
+    assert _knowledge() == (True, "")
+    assert _knowledge(claimed_caller_number="+15550000000")[0] is False
+
+
+def test_a_live_browser_call_with_no_number_may_look_up_knowledge():
+    # Website widget and in-app test calls carry no caller number at all.
+    assert _knowledge(run_mode="smallwebrtc", run_caller_number=None, claimed_caller_number="") == (True, "")
+    assert _knowledge(run_mode="webrtc", run_caller_number="", claimed_caller_number="") == (True, "")
+
+
+def test_the_browser_exception_never_opens_a_phone_call_or_another_agent():
+    # A phone call without a number is not a browser call.
+    assert _knowledge(run_mode="twilio", run_caller_number=None, claimed_caller_number="")[0] is False
+    assert _knowledge(run_mode="smallwebrtc", run_caller_number=None, claimed_caller_number="", run_workflow_id=200)[0] is False
+    assert _knowledge(run_mode="smallwebrtc", run_caller_number=None, claimed_caller_number="", run_is_completed=True)[0] is False
+    assert _knowledge(run_mode="smallwebrtc", run_caller_number=None, claimed_caller_number="", run_workflow_id=None)[0] is False

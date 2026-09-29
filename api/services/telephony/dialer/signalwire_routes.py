@@ -83,6 +83,7 @@ from api.services.telephony.dialer import sam_knowledge
 from api.services.telephony.dialer.sam_knowledge_rules import answer_for
 from api.services.telephony.dialer.sam_handoff_rules import (
     REP_ANSWER_SECONDS,
+    knowledge_request_allowed,
     transfer_request_allowed,
 )
 from api.services.telephony.dialer.inbound_agent import current_inbound_agent, number_hands_to_agent
@@ -1138,9 +1139,10 @@ async def handle_sam_knowledge(request: Request):
     except ValueError:
         run_id = 0
     run = await db_client.get_workflow_run(run_id) if run_id else None
-    ok, reason = transfer_request_allowed(
+    ok, reason = knowledge_request_allowed(
         run_workflow_id=getattr(run, "workflow_id", None),
         run_is_completed=getattr(run, "is_completed", None),
+        run_mode=getattr(run, "mode", None),
         run_caller_number=((getattr(run, "initial_context", None) or {}).get("caller_number")),
         claimed_caller_number=str(body.get("caller_number") or ""),
         sam_workflow_id=await _sam_inbound_workflow_id(),
