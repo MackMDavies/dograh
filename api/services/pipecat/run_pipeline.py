@@ -488,6 +488,20 @@ async def _run_pipeline(
     else:
         user_config = resolved_user_config
 
+    # Syra's personal rate comes from the signed-in user's saved setting,
+    # forwarded in the voice session's initial context. Apply it only to the
+    # Syra workflow and only for ElevenLabs; all other calls retain their saved
+    # workflow/provider configuration.
+    if user_config.tts is not None:
+        from api.services.syra_voice import is_syra_voice_config, syra_speech_speed
+
+        if is_syra_voice_config(run_configs):
+            speed = syra_speech_speed(merged_call_context_vars.get("syra_speech_speed"))
+            provider = getattr(user_config.tts.provider, "value", user_config.tts.provider)
+            if speed is not None and provider == "elevenlabs":
+                user_config = user_config.model_copy(deep=True)
+                user_config.tts = user_config.tts.model_copy(update={"speed": speed})
+
     # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
     if user_config.tts is not None:
         tts_override = run_configs.get("model_overrides", {}).get("tts", {})

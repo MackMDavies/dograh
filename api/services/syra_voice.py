@@ -16,7 +16,18 @@ Everything else — STT, VAD, turn-taking, interruption, TTS — is the ordinary
 that is the point of running her here.
 """
 
+import math
 from typing import Any, Optional
+
+
+def syra_speech_speed(value: Any) -> Optional[float]:
+    """Return a safe per-call ElevenLabs speed, or None to keep the workflow default."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    speed = float(value)
+    if not math.isfinite(speed):
+        return None
+    return max(0.85, min(1.2, speed))
 
 
 def is_syra_voice_config(workflow_configurations: Optional[dict[str, Any]]) -> bool:
