@@ -88,6 +88,44 @@ async def resolve_assigned_caller_id(raw_from: str) -> str | None:
     return rows[0]["phone_number"] if rows else None
 
 
+async def resolve_assigned_dialer_number(rep_id: int) -> dict | None:
+    """Resolve the active number/provider assigned to a rep for SDK selection.
+
+    The server derives the owner from its authenticated user record and reads
+    the assignment with the service key; no client supplied provider or caller
+    ID is trusted. A lookup outage leaves the configured default provider in
+    place, matching the legacy dialer's fail-open assignment behavior.
+    """
+    try:
+        user = await db_client.get_user_by_id(rep_id)
+        if not user or not user.provider_id:
+            return None
+        if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            logger.warning("Supabase service key missing - cannot resolve dialer assignment")
+            return None
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/dialer_phone_numbers",
+                params={
+                    "select": "phone_number,provider",
+                    "assigned_user_id": f"eq.{user.provider_id}",
+                    "is_active": "eq.true",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+        return rows[0] if rows else None
+    except Exception as exc:  # noqa: BLE001 - assignment is not an auth decision
+        logger.error(f"Failed to resolve dialer number for rep {rep_id}: {type(exc).__name__}")
+        return None
+
+
 async def is_manager_or_admin(provider_id: str) -> bool:
     """Checks whether a Supabase user has the sales_manager or super_admin
     role, via the service-role key. Used to gate listen-in from inside a

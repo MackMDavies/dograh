@@ -19,6 +19,9 @@ async def test_voice_token_reports_active_provider():
         "api.services.telephony.providers.twilio.routes.resolve_active_dialer_provider",
         return_value="signalwire",
     ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        new=AsyncMock(return_value=None),
+    ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
         return_value=provider,
     ):
@@ -43,6 +46,9 @@ async def test_voice_token_defaults_to_twilio():
         "api.services.telephony.providers.twilio.routes.resolve_active_dialer_provider",
         return_value="twilio",
     ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        new=AsyncMock(return_value=None),
+    ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
         return_value=provider,
     ):
@@ -50,3 +56,28 @@ async def test_voice_token_defaults_to_twilio():
 
     assert result.provider == "twilio"
     assert result.destination == ""
+
+
+async def test_voice_token_uses_telnyx_for_a_rep_assigned_a_telnyx_number():
+    from api.services.telephony.providers.twilio.routes import get_voice_token
+
+    fake_user = type("U", (), {"id": 42})()
+    creds = DialerCredentials(
+        token="telnyx-jwt", identity="rep-42", destination=""
+    )
+    provider = AsyncMock()
+    provider.name = "telnyx"
+    provider.mint_credentials = AsyncMock(return_value=creds)
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        new=AsyncMock(return_value={"provider": "telnyx", "phone_number": "+15551234567"}),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_provider",
+        return_value=provider,
+    ):
+        result = await get_voice_token(user=fake_user)
+
+    assert result.provider == "telnyx"
+    assert result.token == "telnyx-jwt"
+    assert result.caller_number == "+15551234567"

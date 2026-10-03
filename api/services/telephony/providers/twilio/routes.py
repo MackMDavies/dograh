@@ -7,17 +7,22 @@ provider registry — see ProviderSpec.router.
 import json
 import os
 import re
+from datetime import UTC, datetime
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+import httpx
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from typing import Literal
+from uuid import UUID
 from starlette.responses import HTMLResponse
 from twilio.request_validator import RequestValidator
 
 from api.db import db_client
+from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer.provider import (
     UnknownDialerProvider,
@@ -46,6 +51,7 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     is_manager_or_admin,
     resolve_assigned_caller_id,
+    resolve_assigned_dialer_number,
 )
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
@@ -89,13 +95,45 @@ class VoiceTokenResponse(BaseModel):
     # Provider-specific dial target; "" for Twilio, which routes via the
     # TwiML App's fixed Voice URL. Defaulted so older callers keep working.
     destination: str = ""
+    caller_number: str = ""
+
+
+class TelnyxDialerCallStartRequest(BaseModel):
+    call_id: UUID
+    to_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    entry_id: UUID | None = None
+
+
+class TelnyxDialerCallStatusRequest(BaseModel):
+    call_id: UUID
+    status: Literal["ringing", "answered", "completed", "failed", "no-answer"]
+    duration_seconds: int | None = Field(default=None, ge=0, le=86400)
+
+
+class TelnyxInboundCallRequest(BaseModel):
+    call_id: str = Field(min_length=1, max_length=200)
+    from_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    to_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    caller_name: str | None = Field(default=None, max_length=200)
+
+
+class TelnyxInboundCallEndRequest(BaseModel):
+    call_id: str = Field(min_length=1, max_length=200)
+    outcome: Literal["completed", "failed", "missed"] = "completed"
+    duration_seconds: int | None = Field(default=None, ge=0, le=86400)
 
 
 @router.get("/voice-token")
 async def get_voice_token(
     user=Depends(require_sales_dialer_role),
 ) -> VoiceTokenResponse:
-    provider_name = resolve_active_dialer_provider()
+    assigned = await resolve_assigned_dialer_number(user.id)
+    assigned_provider = str((assigned or {}).get("provider") or "").strip().lower()
+    provider_name = (
+        assigned_provider
+        if assigned_provider in {"twilio", "signalwire", "telnyx"}
+        else resolve_active_dialer_provider()
+    )
     try:
         provider = get_dialer_provider(provider_name)
         creds = await provider.mint_credentials(user_id=user.id)
@@ -108,7 +146,181 @@ async def get_voice_token(
         identity=creds.identity,
         provider=provider.name,
         destination=creds.destination,
+        caller_number=(assigned or {}).get("phone_number", "")
+        if provider.name == "telnyx"
+        else "",
     )
+
+
+@router.post("/dialer/telnyx/calls/start", status_code=201)
+async def start_telnyx_dialer_call(
+    body: TelnyxDialerCallStartRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    """Create a history row before Telnyx originates the PSTN call."""
+    assigned = await resolve_assigned_dialer_number(user.id)
+    if not assigned or assigned.get("provider") != "telnyx":
+        raise HTTPException(status_code=409, detail="This rep has no active Telnyx number assigned.")
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    created = await create_dialer_call(
+        parent_call_sid=str(body.call_id),
+        rep_user_id=user.provider_id,
+        entry_id=str(body.entry_id) if body.entry_id else None,
+        from_number=str(assigned["phone_number"]),
+        to_number=body.to_number,
+        provider="telnyx",
+    )
+    if not created:
+        raise HTTPException(status_code=503, detail="Could not save this call to dialer history.")
+    return {"call_id": str(body.call_id), "status": "initiated"}
+
+
+@router.post("/dialer/telnyx/calls/status", status_code=204)
+async def update_telnyx_dialer_call_status(
+    body: TelnyxDialerCallStatusRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    await update_dialer_call_status(
+        parent_call_sid=str(body.call_id),
+        child_call_sid=None,
+        # ``answered`` is the SDK's event name; dialer_calls stores the
+        # connected state as ``in-progress`` (the DB constraint has no
+        # ``answered`` status).
+        status="in-progress" if body.status == "answered" else body.status,
+        duration_seconds=body.duration_seconds,
+        rep_user_id=user.provider_id,
+        provider="telnyx",
+    )
+    return None
+
+
+@router.post("/dialer/telnyx/inbound/start", status_code=201)
+async def start_telnyx_inbound_dialer_call(
+    body: TelnyxInboundCallRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    """Record an inbound WebRTC invite only on the rep assigned to that DID."""
+    assigned = await resolve_assigned_dialer_number(user.id)
+    if (
+        not assigned
+        or assigned.get("provider") != "telnyx"
+        or assigned.get("phone_number") != body.to_number
+    ):
+        raise HTTPException(status_code=404, detail="This incoming Telnyx call is not assigned to this rep.")
+    if not user.provider_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Inbound Telnyx call logging is not configured.")
+
+    inbound = {
+        "provider_call_id": body.call_id,
+        "provider": "telnyx",
+        "from_number": body.from_number,
+        "to_number": body.to_number,
+        "conference_name": f"telnyx-direct-{body.call_id}",
+        "status": "ringing",
+        "target_user_ids": [user.provider_id],
+        "caller_name": body.caller_name or None,
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/inbound_calls?on_conflict=provider_call_id",
+                json=inbound,
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json",
+                    # Duplicate SDK notifications or multiple sessions for one rep must
+                    # never reset an already-answered call to ringing.
+                    "Prefer": "resolution=ignore-duplicates,return=representation",
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if not rows:
+                existing = await client.get(
+                    f"{SUPABASE_URL.rstrip('/')}/rest/v1/inbound_calls",
+                    params={
+                        "select": "id",
+                        "provider_call_id": f"eq.{body.call_id}",
+                        "provider": "eq.telnyx",
+                        "target_user_ids": f"cs.{{{user.provider_id}}}",
+                        "limit": "1",
+                    },
+                    headers={
+                        "apikey": SUPABASE_ANON_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    },
+                    timeout=5.0,
+                )
+                existing.raise_for_status()
+                rows = existing.json()
+    except Exception as exc:  # noqa: BLE001 - call signaling must remain independent of logging
+        logger.error(f"Could not record Telnyx inbound call {body.call_id}: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail="Could not prepare the inbound call in the dialer.") from exc
+    if not rows or not isinstance(rows[0], dict):
+        raise HTTPException(status_code=503, detail="Telnyx inbound call record was not created.")
+    return {"id": rows[0]["id"], "provider_call_id": body.call_id}
+
+
+@router.post("/dialer/telnyx/inbound/end", status_code=204)
+async def end_telnyx_inbound_dialer_call(
+    body: TelnyxInboundCallEndRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    if not user.provider_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Inbound Telnyx call logging is not configured.")
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+    now = datetime.now(UTC).isoformat()
+    ended_status = "failed" if body.outcome == "failed" else "missed"
+    base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/inbound_calls"
+    params = {
+        "provider_call_id": f"eq.{body.call_id}",
+        "provider": "eq.telnyx",
+        "target_user_ids": f"cs.{{{user.provider_id}}}",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            # An unanswered invite becomes missed. If another request has already
+            # claimed it, the following patch preserves that answered status.
+            missed = await client.patch(
+                base,
+                params={**params, "status": "eq.ringing"},
+                json={"status": ended_status, "ended_at": now},
+                headers=headers,
+                timeout=5.0,
+            )
+            missed.raise_for_status()
+            answered = await client.patch(
+                base,
+                params={**params, "status": "eq.answered"},
+                json={
+                    "status": "failed" if body.outcome == "failed" else "answered",
+                    "ended_at": now,
+                },
+                headers=headers,
+                timeout=5.0,
+            )
+            answered.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - never block teardown on a history write
+        logger.error(f"Could not close Telnyx inbound call {body.call_id}: {type(exc).__name__}")
+    await update_dialer_call_status(
+        parent_call_sid=body.call_id,
+        child_call_sid=None,
+        status={"completed": "completed", "failed": "failed", "missed": "no-answer"}[body.outcome],
+        duration_seconds=body.duration_seconds if body.outcome == "completed" else None,
+        rep_user_id=user.provider_id,
+        provider="telnyx",
+    )
+    return None
 
 
 async def _resolve_dialer_auth_token() -> str | None:

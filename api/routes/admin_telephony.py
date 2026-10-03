@@ -5,6 +5,7 @@ import asyncio
 import os
 from typing import Literal, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
+from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.db import db_client
 from api.db.models import (
     OrganizationModel,
@@ -125,6 +127,148 @@ class ManagedNumbersResponse(BaseModel):
     numbers: list[ManagedNumberItem]
     total: int
     total_monthly_cost_cents: int
+
+
+class TelnyxDialerCredentialsRequest(BaseModel):
+    api_key: Optional[str] = None
+    connection_id: str
+    telephony_credential_id: str
+
+
+class TelnyxDialerCredentialsResponse(BaseModel):
+    configured: bool
+    api_key_preview: Optional[str] = None
+    connection_id: Optional[str] = None
+    telephony_credential_id: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+def _mask_key(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return f"{value[:5]}…{value[-4:]}" if len(value) > 12 else "••••••••"
+
+
+async def _telnyx_dialer_credentials() -> dict:
+    saved = await db_client.get_platform_telnyx_dialer_credentials()
+    if saved:
+        return saved
+    return {
+        "api_key": os.environ.get("TELNYX_API_KEY", ""),
+        "connection_id": os.environ.get("TELNYX_DIALER_CONNECTION_ID", ""),
+        "telephony_credential_id": os.environ.get("TELNYX_DIALER_CREDENTIAL_ID", ""),
+    }
+
+
+def _telnyx_credentials_response(saved: Optional[dict]) -> TelnyxDialerCredentialsResponse:
+    saved = saved or {}
+    key = saved.get("api_key") or ""
+    return TelnyxDialerCredentialsResponse(
+        configured=bool(
+            key and saved.get("connection_id") and saved.get("telephony_credential_id")
+        ),
+        api_key_preview=_mask_key(key),
+        connection_id=saved.get("connection_id") or None,
+        telephony_credential_id=saved.get("telephony_credential_id") or None,
+        updated_at=(saved.get("updated_at").isoformat() if saved.get("updated_at") else None),
+    )
+
+
+@router.get("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)
+async def get_telnyx_dialer_settings(_user: UserModel = Depends(get_superuser)):
+    saved = await _telnyx_dialer_credentials()
+    return _telnyx_credentials_response(saved)
+
+
+@router.put("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)
+async def save_telnyx_dialer_settings(
+    body: TelnyxDialerCredentialsRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    """Store Telnyx dialer settings; the API key is encrypted by the DB model."""
+    current = await _telnyx_dialer_credentials()
+    api_key = (body.api_key or current.get("api_key") or "").strip()
+    connection_id = body.connection_id.strip()
+    credential_id = body.telephony_credential_id.strip()
+    if not api_key:
+        raise HTTPException(status_code=422, detail="Enter a Telnyx API key.")
+    if not connection_id or not credential_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Telnyx SIP connection ID and telephony credential ID are required.",
+        )
+    await db_client.save_platform_telnyx_dialer_credentials(
+        api_key=api_key,
+        connection_id=connection_id,
+        telephony_credential_id=credential_id,
+    )
+    return _telnyx_credentials_response(
+        await db_client.get_platform_telnyx_dialer_credentials()
+    )
+
+
+@router.post("/telnyx-dialer/sync-numbers")
+async def sync_telnyx_dialer_numbers(_user: UserModel = Depends(get_superuser)):
+    """Sync Telnyx numbers attached to the configured SIP connection."""
+    credentials = await _telnyx_dialer_credentials()
+    api_key = (credentials.get("api_key") or "").strip()
+    connection_id = (credentials.get("connection_id") or "").strip()
+    if not api_key or not connection_id:
+        raise HTTPException(status_code=409, detail="Save the Telnyx API key and SIP connection ID first.")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Dialer inventory sync is not configured on the server.")
+
+    numbers: list[dict] = []
+    page = 1
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        while True:
+            response = await client.get(
+                "https://api.telnyx.com/v2/phone_numbers",
+                params={
+                    "page[number]": page,
+                    "page[size]": 250,
+                    "filter[connection_id]": connection_id,
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if response.status_code in (401, 403):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Telnyx rejected access to the number inventory. Check the API key, KYC status, and connection permissions.",
+                )
+            if not response.is_success:
+                logger.error(f"[admin_telephony] Telnyx number sync failed: HTTP {response.status_code}")
+                raise HTTPException(status_code=502, detail="Telnyx number inventory request failed.")
+            payload = response.json()
+            for number in payload.get("data") or []:
+                if number.get("connection_id") != connection_id:
+                    continue
+                numbers.append({
+                    "phone_number": number["phone_number"],
+                    "friendly_name": number.get("connection_name") or None,
+                    "provider": "telnyx",
+                    "twilio_sid": None,
+                })
+            if page >= (payload.get("meta") or {}).get("total_pages", page):
+                break
+            page += 1
+
+        for start in range(0, len(numbers), 500):
+            batch = numbers[start : start + 500]
+            response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_phone_numbers?on_conflict=phone_number",
+                json=batch,
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+            )
+            if not response.is_success:
+                logger.error(f"[admin_telephony] Telnyx inventory upsert failed: HTTP {response.status_code}")
+                raise HTTPException(status_code=502, detail="Could not save Telnyx numbers to the dialer inventory.")
+    return {"synced": len(numbers), "connection_id": connection_id}
 
 
 def _mask_sid(sid: Optional[str]) -> Optional[str]:

@@ -49,7 +49,7 @@ async def create_dialer_call(
     from_number: str,
     to_number: str,
     provider: str = "twilio",
-) -> None:
+) -> bool:
     """Create the initial dialer_calls row synchronously, before voice-connect
     returns TwiML - see the module docstring on why this can't wait for an
     async callback.
@@ -62,7 +62,7 @@ async def create_dialer_call(
     """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot create dialer_calls row")
-        return
+        return False
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
@@ -80,8 +80,10 @@ async def create_dialer_call(
                 timeout=5.0,
             )
             response.raise_for_status()
+        return True
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to create dialer_calls row for {parent_call_sid}: {exc}")
+        return False
 
 
 async def update_dialer_call_status(
@@ -91,6 +93,8 @@ async def update_dialer_call_status(
     status: str,
     duration_seconds: int | None,
     ended_by: str | None = None,
+    rep_user_id: str | None = None,
+    provider: str | None = None,
 ) -> None:
     """Update status/duration from the <Number>'s statusCallback.
 
@@ -125,7 +129,11 @@ async def update_dialer_call_status(
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                params={
+                    "parent_call_sid": f"eq.{parent_call_sid}",
+                    **({"rep_user_id": f"eq.{rep_user_id}"} if rep_user_id else {}),
+                    **({"provider": f"eq.{provider}"} if provider else {}),
+                },
                 json=payload,
                 headers=_headers(),
                 timeout=5.0,
