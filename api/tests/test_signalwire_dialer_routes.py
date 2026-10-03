@@ -81,6 +81,27 @@ def test_dynamic_webhook_fails_closed_without_a_valid_signature(monkeypatch):
     )
 
 
+def test_pre_redaction_callback_signature_is_no_longer_valid(monkeypatch):
+    import hashlib
+    import hmac
+    import time
+
+    monkeypatch.delenv("SIGNALWIRE_WEBHOOK_KEY", raising=False)
+    monkeypatch.setenv("SIGNALWIRE_API_TOKEN", "provider-secret")
+    expires = int(time.time()) + 3600
+    old_sig = hmac.new(
+        b"provider-secret",
+        f"webhook:call-123:{expires}".encode(),
+        hashlib.sha256,
+    ).hexdigest()
+    request = _request(
+        {}, query={"call_id": "call-123", "exp": str(expires), "sig": old_sig}
+    )
+    assert not _secret_ok(
+        "sw-call-status", request, allow_per_call_signature=True
+    )
+
+
 def test_signed_callback_secret_is_redacted_from_logs():
     request = _request(
         {}, query={"call_id": "call-123", "exp": "12345", "sig": "secret-digest"}

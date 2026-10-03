@@ -19,6 +19,16 @@ def test_redacts_the_webhook_secret_and_plain_ampersands():
     assert "k=[redacted]" in out
 
 
+def test_redacts_call_scoped_callback_and_tap_signatures():
+    out = redact_secrets(
+        "POST /sw-connect-status?call_id=x&exp=123&sig=callback-secret"
+        "&t=tap-secret HTTP/1.1"
+    )
+    assert "callback-secret" not in out
+    assert "tap-secret" not in out
+    assert "sig=[redacted]" in out and "t=[redacted]" in out
+
+
 def test_leaves_ordinary_parameters_alone():
     line = 'GET /rest/v1/dialer_calls?select=id&parent_call_sid=eq.b78f&limit=1 "HTTP/1.1 200 OK"'
     assert redact_secrets(line) == line

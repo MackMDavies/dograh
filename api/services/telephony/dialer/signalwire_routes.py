@@ -518,7 +518,9 @@ def _webhook_signature(call_id: str, expires_at: int) -> str:
     ).strip()
     if not secret or not call_id or expires_at <= 0:
         return ""
-    message = f"webhook:{call_id}:{expires_at}".encode("utf-8")
+    # v2 invalidates callback signatures already exposed by the previous
+    # access-log format, while keeping callbacks scoped to a call and expiry.
+    message = f"webhook-v2:{call_id}:{expires_at}".encode("utf-8")
     return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 

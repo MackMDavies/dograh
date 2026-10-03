@@ -28,7 +28,7 @@ _logging_initialized = False
 # in `docker logs`. The webhook secret travels as ?k= the same way. Redacted here, where
 # every uvicorn line passes, rather than route by route.
 _SECRET_QUERY_PARAM = re.compile(
-    r"(?i)([?&](?:amp;)?(?:token|access_token|refresh_token|apikey|api_key|k|key|secret)=)[^&\s\"']+"
+    r"(?i)([?&](?:amp;)?(?:token|access_token|refresh_token|apikey|api_key|k|key|secret|sig|t)=)[^&\s\"']+"
 )
 
 
