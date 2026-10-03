@@ -449,12 +449,14 @@ async def test_bad_secret_returns_hangup_and_touches_nothing(connect_deps, query
     connect_deps["create"].assert_not_called()
 
 
-async def test_unset_secret_allows_the_request(connect_deps, monkeypatch):
+async def test_unset_secret_rejects_outbound_call_instructions(connect_deps, monkeypatch):
     monkeypatch.delenv("SIGNALWIRE_WEBHOOK_KEY", raising=False)
+    monkeypatch.delenv("SIGNALWIRE_DIALER_CONNECT_KEY", raising=False)
     document = _payload_of(
         await handle_sw_dialer_connect(_request({"params": {"lead": "+14155550123"}}))
     )
-    assert _connect_verb(document)["to"] == "+14155550123"
+    assert _is_hangup(document)
+    connect_deps["create"].assert_not_called()
 
 
 # --------------------------------------------------------------------------
@@ -997,7 +999,8 @@ def test_outbound_connect_reports_far_end_progress():
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "answer_on_bridge" not in connect
-    assert connect["from_name"] == "SYSEVO"
+    # SignalWire's from_name property only applies to SIP calls, not PSTN.
+    assert "from_name" not in connect
     assert connect["call_state_url"].endswith("call_id=abc")
     assert connect["status_url"].endswith("call_id=abc")
     assert "answered" in connect["call_state_events"]

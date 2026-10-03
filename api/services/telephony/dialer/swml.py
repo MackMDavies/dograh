@@ -70,9 +70,6 @@ def build_dialer_swml(
     connect: dict = {
         "to": lead_number,
         "from": caller_id,
-        # Brand the PSTN caller ID even when a number's carrier-side CNAM
-        # registration is still pending or unavailable.
-        "from_name": "SYSEVO",
         # Match SignalWire's documented 60-second default. The previous 55-second
         # cap could end an outbound attempt just before a slow carrier finished routing
         # it or before voicemail answered. This is ring time only; it does not limit

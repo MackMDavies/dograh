@@ -320,20 +320,28 @@ def _secret_ok(
     *,
     allow_per_call_signature: bool = False,
 ) -> bool:
-    """Authenticate shared-key callbacks or call-scoped HMAC callbacks.
+    """Authenticate provider webhooks before returning call instructions.
 
-    SignalWire's request-signing scheme for SWML webhooks is unverified on
-    this account, so a signature check would be a guess that silently fails
-    closed on every real call. A query-string secret is verifiable and
-    proportionate here: /sw-dialer-connect only RETURNS a SWML document, it
-    does not place a call. The blast radius of a forged request is therefore
-    a spurious dialer_calls row, not an outbound call at our expense.
-
-    Dynamic callbacks can use a call-scoped HMAC when the shared key is absent.
-    The dashboard SWML-fetch endpoint retains its compatibility behavior because
-    SignalWire's static destination URL cannot receive a per-call credential.
+    The SWML bootstrap endpoint can place an outbound PSTN call, so it must always
+    require a secret in its configured SignalWire webhook URL. Other callbacks use
+    the shared key or their per-call HMAC. The bootstrap secret is separate from
+    callback auth so securing this static resource cannot break dynamic callbacks.
     """
-    expected = (os.environ.get("SIGNALWIRE_WEBHOOK_KEY") or "").strip()
+    expected = ""
+    if endpoint == "sw-dialer-connect":
+        expected = (
+            os.environ.get("SIGNALWIRE_DIALER_CONNECT_KEY")
+            or os.environ.get("SIGNALWIRE_WEBHOOK_KEY")
+            or ""
+        ).strip()
+        if not expected:
+            logger.error(
+                "SIGNALWIRE_DIALER_CONNECT_KEY is unset - rejecting unauthenticated "
+                "SWML requests"
+            )
+            return False
+    else:
+        expected = (os.environ.get("SIGNALWIRE_WEBHOOK_KEY") or "").strip()
     if not expected:
         if allow_per_call_signature:
             call_id = (request.query_params.get("call_id") or "").strip()
@@ -355,10 +363,7 @@ def _secret_ok(
                 return True
             logger.warning(f"{endpoint} rejected: missing or invalid per-call signature")
             return False
-        logger.warning(
-            f"SIGNALWIRE_WEBHOOK_KEY is unset - {endpoint} is UNAUTHENTICATED. "
-            "Set it in the Dograh .env and append ?k=<key> to the SWML endpoint URL."
-        )
+        logger.warning(f"SIGNALWIRE_WEBHOOK_KEY is unset - {endpoint} is UNAUTHENTICATED.")
         return True
     return hmac.compare_digest(str(request.query_params.get("k", "")), expected)
 
