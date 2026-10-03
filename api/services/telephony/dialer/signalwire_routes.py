@@ -328,7 +328,7 @@ def _secret_ok(
     callback auth so securing this static resource cannot break dynamic callbacks.
     """
     expected = ""
-    if endpoint == "sw-dialer-connect":
+    if endpoint in {"sw-dialer-connect", "sw-inbound"}:
         expected = (
             os.environ.get("SIGNALWIRE_DIALER_CONNECT_KEY")
             or os.environ.get("SIGNALWIRE_WEBHOOK_KEY")
@@ -336,8 +336,8 @@ def _secret_ok(
         ).strip()
         if not expected:
             logger.error(
-                "SIGNALWIRE_DIALER_CONNECT_KEY is unset - rejecting unauthenticated "
-                "SWML requests"
+                f"SIGNALWIRE_DIALER_CONNECT_KEY is unset - rejecting unauthenticated "
+                f"{endpoint} SWML requests"
             )
             return False
     else:
@@ -1128,7 +1128,9 @@ async def handle_sw_inbound_reroute(request: Request):
     try:
         payload = await _read_payload(request)
         _log_payload("sw-inbound-reroute", request, payload)
-        if not _secret_ok("sw-inbound-reroute", request):
+        if not _secret_ok(
+            "sw-inbound-reroute", request, allow_per_call_signature=True
+        ):
             return _swml(build_hangup_swml())
         call_id = (request.query_params.get("call_id") or "").strip()
         mode = (request.query_params.get("mode") or "").strip()

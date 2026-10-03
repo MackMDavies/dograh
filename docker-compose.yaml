@@ -228,8 +228,9 @@ services:
       SIGNALWIRE_API_TOKEN: "${SIGNALWIRE_API_TOKEN:-}"
       SIGNALWIRE_DEFAULT_CALLER_ID: "${SIGNALWIRE_DEFAULT_CALLER_ID:-}"
       SIGNALWIRE_DIALER_DESTINATION: "${SIGNALWIRE_DIALER_DESTINATION:-}"
-      # Required query secret configured on the sysevo-dialer SWML webhook.
-      # This endpoint can place PSTN calls, so it fails closed without the key.
+      # Required query secret configured on SignalWire's static outbound/inbound
+      # SWML webhook resources. These endpoints return call instructions and fail
+      # closed without the key.
       SIGNALWIRE_DIALER_CONNECT_KEY: "${SIGNALWIRE_DIALER_CONNECT_KEY:-}"
       # Shared secret for the SWML/status/recording webhooks (?k=...).
       # Unset leaves those endpoints unauthenticated - they log a warning

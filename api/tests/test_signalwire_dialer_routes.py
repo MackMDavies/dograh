@@ -459,6 +459,12 @@ async def test_unset_secret_rejects_outbound_call_instructions(connect_deps, mon
     connect_deps["create"].assert_not_called()
 
 
+def test_static_inbound_swml_requires_configured_key(monkeypatch):
+    monkeypatch.delenv("SIGNALWIRE_WEBHOOK_KEY", raising=False)
+    monkeypatch.delenv("SIGNALWIRE_DIALER_CONNECT_KEY", raising=False)
+    assert not _secret_ok("sw-inbound", _request({}))
+
+
 # --------------------------------------------------------------------------
 # Nothing escapes as a 500.
 # --------------------------------------------------------------------------
