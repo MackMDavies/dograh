@@ -35,6 +35,7 @@ from contextlib import suppress
 import json
 import os
 import re
+import time
 import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
@@ -149,8 +150,8 @@ _END_REASON_KEYS = ("end_reason", "endReason", "failed_reason", "failedReason")
 _END_SOURCE_KEYS = ("end_source", "endSource")
 
 
-def _ended_by(state: str, end_source: str) -> str | None:
-    """Which side of the call hung up, from SignalWire's ``end_source``.
+def _ended_by(state: str, end_source: str, end_reason: str) -> str | None:
+    """Which side hung up, only when SignalWire says it was a normal hangup.
 
     The connect's call_state events describe the leg being DIALLED, and on its
     ``ended`` event ``end_source`` says where the hangup came from. Calibrated on
@@ -164,6 +165,13 @@ def _ended_by(state: str, end_source: str) -> str | None:
     ended" either way.
     """
     if (state or "").strip().lower() != "ended":
+        return None
+    # end_source describes the leg SignalWire was trying to connect, not
+    # necessarily a person who actually hung up. In live US logs, `noAnswer`
+    # arrives with end_source=`outbound`; treating that as a rep hangup makes a
+    # ring-out look like a deliberate hangup. Failed, busy, canceled and
+    # unanswered calls have no human side to attribute.
+    if re.sub(r"[^a-z]", "", (end_reason or "").strip().lower()) != "hangup":
         return None
     source = (end_source or "").strip().lower()
     if source == "outbound":
@@ -260,7 +268,8 @@ def normalize_lead_number(raw: str) -> str | None:
 
 def _redacted_query(request: Request) -> dict:
     return {
-        k: ("<redacted>" if k == "k" else v) for k, v in request.query_params.items()
+        k: ("<redacted>" if k in {"k", "sig"} else v)
+        for k, v in request.query_params.items()
     }
 
 
@@ -305,8 +314,13 @@ def _log_payload(endpoint: str, request: Request, payload: dict) -> None:
     )
 
 
-def _secret_ok(endpoint: str, request: Request) -> bool:
-    """Shared-secret check via ``?k=``.
+def _secret_ok(
+    endpoint: str,
+    request: Request,
+    *,
+    allow_per_call_signature: bool = False,
+) -> bool:
+    """Authenticate shared-key callbacks or call-scoped HMAC callbacks.
 
     SignalWire's request-signing scheme for SWML webhooks is unverified on
     this account, so a signature check would be a guess that silently fails
@@ -315,12 +329,32 @@ def _secret_ok(endpoint: str, request: Request) -> bool:
     does not place a call. The blast radius of a forged request is therefore
     a spurious dialer_calls row, not an outbound call at our expense.
 
-    An unset SIGNALWIRE_WEBHOOK_KEY allows the request - the alternative is a
-    dialer that cannot connect at all until someone notices an env var - but
-    says so loudly on every single request.
+    Dynamic callbacks can use a call-scoped HMAC when the shared key is absent.
+    The dashboard SWML-fetch endpoint retains its compatibility behavior because
+    SignalWire's static destination URL cannot receive a per-call credential.
     """
     expected = (os.environ.get("SIGNALWIRE_WEBHOOK_KEY") or "").strip()
     if not expected:
+        if allow_per_call_signature:
+            call_id = (request.query_params.get("call_id") or "").strip()
+            supplied = str(request.query_params.get("sig", ""))
+            expires_raw = str(request.query_params.get("exp", ""))
+            try:
+                expires_at = int(expires_raw)
+            except (TypeError, ValueError):
+                expires_at = 0
+            derived = _webhook_signature(call_id, expires_at)
+            now = int(time.time())
+            if (
+                call_id
+                and expires_at >= now
+                and expires_at <= now + 7 * 24 * 60 * 60
+                and derived
+                and hmac.compare_digest(supplied, derived)
+            ):
+                return True
+            logger.warning(f"{endpoint} rejected: missing or invalid per-call signature")
+            return False
         logger.warning(
             f"SIGNALWIRE_WEBHOOK_KEY is unset - {endpoint} is UNAUTHENTICATED. "
             "Set it in the Dograh .env and append ?k=<key> to the SWML endpoint URL."
@@ -465,7 +499,27 @@ def _webhook_url(backend_endpoint: str, path: str, call_id: str) -> str:
     secret = (os.environ.get("SIGNALWIRE_WEBHOOK_KEY") or "").strip()
     if secret:
         params["k"] = secret
+    else:
+        params["exp"] = str(int(time.time()) + 7 * 24 * 60 * 60)
+        signature = _webhook_signature(call_id, int(params["exp"]))
+        if signature:
+            params["sig"] = signature
+        else:
+            params.pop("exp", None)
     return f"{backend_endpoint}/api/v1/telephony/{path}?" + urlencode(params)
+
+
+def _webhook_signature(call_id: str, expires_at: int) -> str:
+    """Sign one callback URL, with a bounded lifetime, using an existing secret."""
+    secret = (
+        os.environ.get("SIGNALWIRE_WEBHOOK_KEY")
+        or os.environ.get("SIGNALWIRE_API_TOKEN")
+        or ""
+    ).strip()
+    if not secret or not call_id or expires_at <= 0:
+        return ""
+    message = f"webhook:{call_id}:{expires_at}".encode("utf-8")
+    return hmac.new(secret.encode("utf-8"), message, hashlib.sha256).hexdigest()
 
 
 def _tap_token(call_id: str) -> str:
@@ -646,12 +700,16 @@ async def handle_sw_dialer_connect(request: Request):
         # Change Webhook describes this script's leg, not the leg being dialled, which is
         # why sw-call-status has never fired despite being configured for months.
         call_state_webhook = _webhook_url(backend_endpoint, "sw-call-status", call_id)
+        connect_status_webhook = _webhook_url(
+            backend_endpoint, "sw-connect-status", call_id
+        )
 
         return _swml(
             build_dialer_swml(
                 lead_number=lead_number,
                 caller_id=caller_id,
                 call_state_webhook=call_state_webhook,
+                connect_status_webhook=connect_status_webhook,
                 recording_webhook=recording_webhook,
                 tap_websocket=_tap_websocket_url(backend_endpoint, call_id),
             )
@@ -726,7 +784,11 @@ def _map_call_state(state: str, end_reason: str) -> str:
     busy are worth another attempt, declined is not.
     """
     normalised = (state or "").strip().lower()
-    reason = (end_reason or "").strip().lower()
+    # SWML event logs use camelCase (`noAnswer`), while older callback examples
+    # and parts of our own code use snake_case (`no_answer`). Normalize both
+    # spellings before mapping so an unanswered call never falls through to
+    # `completed`, which the browser reasonably interprets as a conversation.
+    reason = re.sub(r"[^a-z]", "", (end_reason or "").strip().lower())
 
     if normalised == "answered":
         return "in-progress"
@@ -736,11 +798,17 @@ def _map_call_state(state: str, end_reason: str) -> str:
         return "initiated"
     if normalised == "ended":
         return {
-            "no_answer": "no-answer",
+            "noanswer": "no-answer",
             "busy": "busy",
-            "declined": "busy",
+            "decline": "canceled",
+            "declined": "canceled",
             "cancel": "canceled",
+            "cancelled": "canceled",
+            "canceled": "canceled",
+            "abandoned": "canceled",
             "error": "failed",
+            "notfound": "failed",
+            "maxduration": "completed",
         }.get(reason, "completed")
     # Already one of ours (Twilio's callback speaks this vocabulary directly).
     return normalised or "completed"
@@ -754,7 +822,7 @@ async def handle_sw_call_status(request: Request):
         payload = await _read_payload(request)
         _log_payload("sw-call-status", request, payload)
 
-        if not _secret_ok("sw-call-status", request):
+        if not _secret_ok("sw-call-status", request, allow_per_call_signature=True):
             logger.warning("sw-call-status rejected: bad or missing ?k= secret")
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
@@ -773,7 +841,11 @@ async def handle_sw_call_status(request: Request):
         # busy or declined -- the difference between a call worth retrying and one that
         # was actively refused.
         end_reason = _extract(payload, query, _END_REASON_KEYS)
-        ended_by = _ended_by(state or "", _extract(payload, query, _END_SOURCE_KEYS) or "")
+        ended_by = _ended_by(
+            state or "",
+            _extract(payload, query, _END_SOURCE_KEYS) or "",
+            _extract(payload, query, _END_REASON_KEYS) or "",
+        )
 
         if not call_id or not state:
             logger.warning(
@@ -802,6 +874,56 @@ async def handle_sw_call_status(request: Request):
         return JSONResponse(content={"ok": True})
 
 
+@router.post("/sw-connect-status", include_in_schema=False)
+async def handle_sw_connect_status(request: Request):
+    """Persist SignalWire connect-operation results, including failed_reason.
+
+    This is separate from the call-state callback: a `failed` connect event carries
+    actionable routing outcomes such as `no_answer`, `busy`, and `not_found`. Keeping
+    it separate avoids letting a late `disconnected` event overwrite the final B-leg
+    status and duration recorded by /sw-call-status.
+    """
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-connect-status", request, payload)
+        if not _secret_ok("sw-connect-status", request, allow_per_call_signature=True):
+            logger.warning("sw-connect-status rejected: bad or missing ?k= secret")
+            return JSONResponse(status_code=401, content={"error": "unauthorized"})
+
+        query = dict(request.query_params)
+        call_id = (query.get("call_id") or "").strip() or _extract(
+            payload, query, _CALL_ID_KEYS
+        )
+        state = _extract(payload, query, ("connect_state", "connectState"))
+        failed_reason = _extract(payload, query, ("failed_reason", "failedReason"))
+        if not call_id or not state:
+            logger.warning(
+                f"sw-connect-status missing call id ({call_id!r}) or connect state ({state!r})"
+            )
+            return JSONResponse(content={"ok": True})
+
+        state = state.strip().lower()
+        if state == "connected":
+            status = "in-progress"
+        elif state == "failed":
+            status = _map_call_state("ended", failed_reason)
+            if status == "completed":
+                status = "failed"
+        else:
+            return JSONResponse(content={"ok": True})
+
+        await update_dialer_call_status(
+            parent_call_sid=call_id,
+            child_call_sid=None,
+            status=status,
+            duration_seconds=None,
+        )
+        return JSONResponse(content={"ok": True})
+    except Exception as exc:  # noqa: BLE001 - provider callbacks must never 500
+        logger.exception(f"sw-connect-status failed: {exc}")
+        return JSONResponse(content={"ok": True})
+
+
 @router.post("/sw-recording", include_in_schema=False)
 async def handle_sw_recording(request: Request):
     """Recording callback. Same 401-not-SWML reasoning as sw-call-status."""
@@ -809,7 +931,7 @@ async def handle_sw_recording(request: Request):
         payload = await _read_payload(request)
         _log_payload("sw-recording", request, payload)
 
-        if not _secret_ok("sw-recording", request):
+        if not _secret_ok("sw-recording", request, allow_per_call_signature=True):
             logger.warning("sw-recording rejected: bad or missing ?k= secret")
             return JSONResponse(status_code=401, content={"error": "unauthorized"})
 
@@ -934,12 +1056,8 @@ async def handle_sw_inbound(request: Request):
             backend_endpoint = ""
         backend_endpoint = str(backend_endpoint or "")
         if backend_endpoint.startswith(("http://", "https://")):
-            params = {"call_id": call_id}
-            secret = (os.environ.get("SIGNALWIRE_WEBHOOK_KEY") or "").strip()
-            if secret:
-                params["k"] = secret
-            recording_webhook = (
-                f"{backend_endpoint}/api/v1/telephony/sw-recording?" + urlencode(params)
+            recording_webhook = _webhook_url(
+                backend_endpoint, "sw-recording", call_id
             )
 
         # Hold the caller on the Sysevo line and bring the person to it.

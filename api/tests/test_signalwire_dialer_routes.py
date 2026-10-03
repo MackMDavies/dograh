@@ -11,9 +11,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from api.services.telephony.dialer.signalwire_routes import (
+    handle_sw_connect_status,
     handle_sw_call_status,
     handle_sw_dialer_connect,
     handle_sw_recording,
+    _redacted_query,
+    _secret_ok,
+    _webhook_signature,
+    _webhook_url,
     normalize_lead_number,
 )
 
@@ -39,6 +44,52 @@ def _authed(body, *, query: dict | None = None) -> MagicMock:
 
 def _payload_of(response) -> dict:
     return json.loads(response.body)
+
+
+def test_dynamic_webhook_uses_call_scoped_signature_without_shared_key(monkeypatch):
+    from urllib.parse import parse_qs, urlsplit
+
+    monkeypatch.delenv("SIGNALWIRE_WEBHOOK_KEY", raising=False)
+    monkeypatch.setenv("SIGNALWIRE_API_TOKEN", "provider-secret")
+    url = _webhook_url("https://api.example.com", "sw-call-status", "call-123")
+    query = parse_qs(urlsplit(url).query)
+    assert query["call_id"] == ["call-123"]
+    assert query["sig"] == [
+        _webhook_signature("call-123", int(query["exp"][0]))
+    ]
+    assert "k" not in query
+
+    request = _request({}, query={key: values[0] for key, values in query.items()})
+    assert _secret_ok("sw-call-status", request, allow_per_call_signature=True)
+    wrong_call = _request({}, query={**request.query_params, "call_id": "call-456"})
+    assert not _secret_ok(
+        "sw-call-status", wrong_call, allow_per_call_signature=True
+    )
+
+
+def test_dynamic_webhook_fails_closed_without_a_valid_signature(monkeypatch):
+    monkeypatch.delenv("SIGNALWIRE_WEBHOOK_KEY", raising=False)
+    monkeypatch.setenv("SIGNALWIRE_API_TOKEN", "provider-secret")
+    assert not _secret_ok(
+        "sw-recording", _request({}, query={"call_id": "call-123"}),
+        allow_per_call_signature=True,
+    )
+    assert not _secret_ok(
+        "sw-recording",
+        _request({}, query={"call_id": "call-123", "exp": "1999999999", "sig": "wrong"}),
+        allow_per_call_signature=True,
+    )
+
+
+def test_signed_callback_secret_is_redacted_from_logs():
+    request = _request(
+        {}, query={"call_id": "call-123", "exp": "12345", "sig": "secret-digest"}
+    )
+    assert _redacted_query(request) == {
+        "call_id": "call-123",
+        "exp": "12345",
+        "sig": "<redacted>",
+    }
 
 
 @pytest.fixture(autouse=True)
@@ -499,6 +550,36 @@ async def test_status_never_500s(status_update):
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize(
+    "connect_state,failed_reason,expected",
+    [
+        ("failed", "no_answer", "no-answer"),
+        ("failed", "busy", "busy"),
+        ("failed", "not_found", "failed"),
+        ("connected", "", "in-progress"),
+    ],
+)
+async def test_connect_status_records_provider_result(
+    status_update, connect_state, failed_reason, expected
+):
+    response = await handle_sw_connect_status(
+        _authed(
+            {
+                "event_type": "calling.call.connect",
+                "params": {
+                    "call_id": "sw-1",
+                    "connect_state": connect_state,
+                    "failed_reason": failed_reason,
+                },
+            },
+            query={"call_id": "sw-1"},
+        )
+    )
+    assert response.status_code == 200
+    assert status_update.call_args.kwargs["parent_call_sid"] == "sw-1"
+    assert status_update.call_args.kwargs["status"] == expected
+
+
 # --------------------------------------------------------------------------
 # Recording callback.
 # --------------------------------------------------------------------------
@@ -581,6 +662,7 @@ def test_signalwire_dialer_routes_are_mounted():
     paths = {route.path for route in telephony_routes.router.routes}
     assert "/telephony/sw-dialer-connect" in paths
     assert "/telephony/sw-call-status" in paths
+    assert "/telephony/sw-connect-status" in paths
     assert "/telephony/sw-recording" in paths
 
 
@@ -873,7 +955,7 @@ def test_outbound_connect_omits_ringback():
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "ringback" not in connect
-    assert connect["timeout"] == 55
+    assert connect["timeout"] == 60
 
 
 def test_outbound_connect_reports_far_end_progress():
@@ -890,10 +972,12 @@ def test_outbound_connect_reports_far_end_progress():
         caller_id="+12092669253",
         recording_webhook="",
         call_state_webhook="https://api.example.com/sw-call-status?call_id=abc",
+        connect_status_webhook="https://api.example.com/sw-connect-status?call_id=abc",
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "answer_on_bridge" not in connect
     assert connect["call_state_url"].endswith("call_id=abc")
+    assert connect["status_url"].endswith("call_id=abc")
     assert "answered" in connect["call_state_events"]
     # No ringback key: it takes play URIs, and the documented default is the provider's
     # own ringback. Passing ["ring"] is what made calls drop after a second.
@@ -1040,6 +1124,39 @@ async def test_status_records_which_side_hung_up(status_update, end_source, expe
     body = {"params": {"call_id": "far-leg", "call_state": "ended", "end_reason": "hangup", "end_source": end_source}}
     await handle_sw_call_status(_request(body, query={"k": _SECRET, "call_id": "sw-1"}))
     assert status_update.call_args.kwargs["ended_by"] == expected
+
+
+@pytest.mark.parametrize(
+    "end_reason,expected_status",
+    [
+        ("noAnswer", "no-answer"),
+        ("no_answer", "no-answer"),
+        ("NO-ANSWER", "no-answer"),
+        ("busy", "busy"),
+        ("declined", "canceled"),
+        ("decline", "canceled"),
+        ("abandoned", "canceled"),
+        ("not_found", "failed"),
+        ("max_duration", "completed"),
+        ("cancel", "canceled"),
+        ("error", "failed"),
+    ],
+)
+async def test_terminal_reason_aliases_do_not_turn_ringouts_into_completed(
+    status_update, end_reason, expected_status
+):
+    body = {
+        "params": {
+            "call_id": "far-leg",
+            "call_state": "ended",
+            "end_reason": end_reason,
+            "end_source": "outbound",
+            "duration": 55,
+        }
+    }
+    await handle_sw_call_status(_request(body, query={"k": _SECRET, "call_id": "sw-1"}))
+    assert status_update.call_args.kwargs["status"] == expected_status
+    assert status_update.call_args.kwargs["ended_by"] is None
 
 
 async def test_end_source_is_ignored_before_the_call_ends(status_update):

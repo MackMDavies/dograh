@@ -36,7 +36,7 @@ def test_a_long_call_is_never_cut_short_by_the_script():
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     # Ring timeout: long enough for voicemail to answer, and NOT a limit on the
     # conversation.
-    assert connect["timeout"] == 55
+    assert connect["timeout"] == 60
     # Conversation length: stated, and far beyond any real sales call.
     assert connect["max_duration"] >= 4 * 60 * 60
 
