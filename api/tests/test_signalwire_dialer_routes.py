@@ -997,6 +997,7 @@ def test_outbound_connect_reports_far_end_progress():
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "answer_on_bridge" not in connect
+    assert connect["from_name"] == "SYSEVO"
     assert connect["call_state_url"].endswith("call_id=abc")
     assert connect["status_url"].endswith("call_id=abc")
     assert "answered" in connect["call_state_events"]
