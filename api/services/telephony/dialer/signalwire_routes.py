@@ -73,6 +73,8 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     update_dialer_call_status,
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
+    DialerNumberAssignmentUnavailable,
+    DialerNumberProviderMismatch,
     _parse_rep_id_from_identity,
     resolve_assigned_caller_id,
 )
@@ -404,24 +406,18 @@ async def _is_signalwire_owned_number(number: str) -> bool:
 async def _resolve_signalwire_caller_id(identity: str) -> str:
     """The number to dial FROM - and it must be one SignalWire owns.
 
-    resolve_assigned_caller_id is provider-agnostic: it returns whatever
-    number dialer_phone_numbers has assigned to this rep, which today is
-    overwhelmingly a TWILIO number. Handing a Twilio-owned number to
-    SignalWire as the caller ID gets the call rejected outright, so a
-    per-rep assignment is only honoured when we can show it is SignalWire's:
-    either it IS the configured SignalWire default, or dialer_phone_numbers
-    marks it provider='signalwire'. Everything else falls back to the env
-    default.
-
-    Kept deliberately simple - two positive checks and a fallback - because
-    the failure mode of getting this wrong is every dialer call failing, and
-    the fallback is always a number we know works.
+    A configured platform default is used only for reps without an assigned
+    line. If a rep has rotated to another provider, a stale SignalWire client
+    is rejected instead of presenting the platform default caller ID.
     """
     env_default = (os.environ.get("SIGNALWIRE_DEFAULT_CALLER_ID") or "").strip()
 
     assigned = ""
     try:
-        assigned = (await resolve_assigned_caller_id(identity) or "").strip()
+        assigned = (await resolve_assigned_caller_id(identity, provider_name="signalwire") or "").strip()
+    except (DialerNumberProviderMismatch, DialerNumberAssignmentUnavailable) as exc:
+        logger.warning(f"SignalWire dial rejected for {identity!r}: {exc}")
+        return ""
     except Exception as exc:  # noqa: BLE001 - contract is never-raise, but belt and braces
         logger.error(f"Assigned caller-id lookup failed for {identity!r}: {exc}")
 
@@ -432,8 +428,9 @@ async def _resolve_signalwire_caller_id(identity: str) -> str:
             return assigned
         logger.warning(
             f"Rep {identity!r} is assigned {assigned}, which is not known to be a "
-            f"SignalWire number - falling back to SIGNALWIRE_DEFAULT_CALLER_ID"
+            "SignalWire number - rejecting the call rather than substituting a line."
         )
+        return ""
     return env_default
 
 

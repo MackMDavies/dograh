@@ -48,10 +48,13 @@ from api.services.telephony.providers.twilio.dialer_conference import (
     parent_call_sid_from_conference_name,
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
+    DialerNumberAssignmentUnavailable,
+    DialerNumberProviderMismatch,
     _parse_rep_id_from_identity,
     is_manager_or_admin,
     resolve_assigned_caller_id,
     resolve_assigned_dialer_number,
+    user_owns_dialer_number,
 )
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
@@ -60,6 +63,16 @@ from api.services.telephony.status_processor import (
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
+
+
+async def _get_assigned_dialer_number_or_503(rep_id: int):
+    try:
+        return await resolve_assigned_dialer_number(rep_id)
+    except DialerNumberAssignmentUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify your assigned dialer number. Please try again shortly; no call was placed.",
+        ) from exc
 
 # Statuses at which issuing a cancel on the lead's leg is pointless: the leg
 # either joined the conference (Twilio's own teardown ends it) or is already
@@ -96,6 +109,7 @@ class VoiceTokenResponse(BaseModel):
     # TwiML App's fixed Voice URL. Defaulted so older callers keep working.
     destination: str = ""
     caller_number: str = ""
+    next_rotation_at: datetime | None = None
 
 
 class TelnyxDialerCallStartRequest(BaseModel):
@@ -123,11 +137,15 @@ class TelnyxInboundCallEndRequest(BaseModel):
     duration_seconds: int | None = Field(default=None, ge=0, le=86400)
 
 
+class TelnyxInboundCallAnswerRequest(BaseModel):
+    call_id: str = Field(min_length=1, max_length=200)
+
+
 @router.get("/voice-token")
 async def get_voice_token(
     user=Depends(require_sales_dialer_role),
 ) -> VoiceTokenResponse:
-    assigned = await resolve_assigned_dialer_number(user.id)
+    assigned = await _get_assigned_dialer_number_or_503(user.id)
     assigned_provider = str((assigned or {}).get("provider") or "").strip().lower()
     provider_name = (
         assigned_provider
@@ -149,6 +167,7 @@ async def get_voice_token(
         caller_number=(assigned or {}).get("phone_number", "")
         if provider.name == "telnyx"
         else "",
+        next_rotation_at=(assigned or {}).get("next_rotation_at"),
     )
 
 
@@ -158,9 +177,14 @@ async def start_telnyx_dialer_call(
     user=Depends(require_sales_dialer_role),
 ):
     """Create a history row before Telnyx originates the PSTN call."""
-    assigned = await resolve_assigned_dialer_number(user.id)
+    assigned = await _get_assigned_dialer_number_or_503(user.id)
     if not assigned or assigned.get("provider") != "telnyx":
         raise HTTPException(status_code=409, detail="This rep has no active Telnyx number assigned.")
+    if assigned.get("direction") not in {"outbound", "both"}:
+        raise HTTPException(
+            status_code=409,
+            detail="The assigned Telnyx number is not enabled for outbound calls. Set its direction to Outbound or Inbound & outbound in Dialer → Numbers.",
+        )
     if not user.provider_id:
         raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
     created = await create_dialer_call(
@@ -173,7 +197,11 @@ async def start_telnyx_dialer_call(
     )
     if not created:
         raise HTTPException(status_code=503, detail="Could not save this call to dialer history.")
-    return {"call_id": str(body.call_id), "status": "initiated"}
+    return {
+        "call_id": str(body.call_id),
+        "status": "initiated",
+        "from_number": str(assigned["phone_number"]),
+    }
 
 
 @router.post("/dialer/telnyx/calls/status", status_code=204)
@@ -186,9 +214,8 @@ async def update_telnyx_dialer_call_status(
     await update_dialer_call_status(
         parent_call_sid=str(body.call_id),
         child_call_sid=None,
-        # ``answered`` is the SDK's event name; dialer_calls stores the
-        # connected state as ``in-progress`` (the DB constraint has no
-        # ``answered`` status).
+        # Supabase dialer_calls.status only accepts in-progress for a live call.
+        # Telnyx reports the WebRTC leg as "answered"; normalize before storing.
         status="in-progress" if body.status == "answered" else body.status,
         duration_seconds=body.duration_seconds,
         rep_user_id=user.provider_id,
@@ -203,12 +230,11 @@ async def start_telnyx_inbound_dialer_call(
     user=Depends(require_sales_dialer_role),
 ):
     """Record an inbound WebRTC invite only on the rep assigned to that DID."""
-    assigned = await resolve_assigned_dialer_number(user.id)
-    if (
-        not assigned
-        or assigned.get("provider") != "telnyx"
-        or assigned.get("phone_number") != body.to_number
-    ):
+    try:
+        owns_number = await user_owns_dialer_number(user.id, body.to_number, "telnyx")
+    except DialerNumberAssignmentUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Could not verify the incoming Telnyx line.") from exc
+    if not owns_number:
         raise HTTPException(status_code=404, detail="This incoming Telnyx call is not assigned to this rep.")
     if not user.provider_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise HTTPException(status_code=503, detail="Inbound Telnyx call logging is not configured.")
@@ -264,6 +290,58 @@ async def start_telnyx_inbound_dialer_call(
     if not rows or not isinstance(rows[0], dict):
         raise HTTPException(status_code=503, detail="Telnyx inbound call record was not created.")
     return {"id": rows[0]["id"], "provider_call_id": body.call_id}
+
+
+@router.post("/dialer/telnyx/inbound/answer", status_code=204)
+async def answer_telnyx_inbound_dialer_call(
+    body: TelnyxInboundCallAnswerRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    """Atomically mark this rep's ringing Telnyx invite answered."""
+    if not user.provider_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Inbound Telnyx call logging is not configured.")
+    headers = {
+        "apikey": SUPABASE_ANON_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    base = f"{SUPABASE_URL.rstrip('/')}/rest/v1/inbound_calls"
+    scope = {
+        "provider_call_id": f"eq.{body.call_id}",
+        "provider": "eq.telnyx",
+        "target_user_ids": f"cs.{{{user.provider_id}}}",
+    }
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                base,
+                params={**scope, "status": "eq.ringing"},
+                json={"status": "answered", "answered_by": user.provider_id},
+                headers=headers,
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+            if rows:
+                return None
+            existing = await client.get(
+                base,
+                params={**scope, "select": "status,answered_by", "limit": "1"},
+                headers=headers,
+                timeout=5.0,
+            )
+            existing.raise_for_status()
+            records = existing.json()
+    except Exception as exc:  # noqa: BLE001 - signaling ownership must fail closed
+        logger.error(f"Could not claim Telnyx inbound call {body.call_id}: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail="Could not verify this inbound call.") from exc
+    if not records:
+        raise HTTPException(status_code=404, detail="This inbound call is not assigned to this rep.")
+    row = records[0]
+    if row.get("status") == "answered" and row.get("answered_by") == user.provider_id:
+        return None
+    raise HTTPException(status_code=409, detail="This inbound call has already been answered or ended.")
 
 
 @router.post("/dialer/telnyx/inbound/end", status_code=204)
@@ -450,10 +528,16 @@ async def handle_voice_connect(request: Request):
     # makes the per-account default apply here as well as to signature
     # verification; tier 1 stays in front of it so per-rep assignment is not
     # lost when an account-level default exists (it always does in prod).
-    caller_id = (
-        await resolve_assigned_caller_id(raw_from)
-        or await _resolve_dialer_caller_id()
-        or ""
+    try:
+        assigned_caller_id = await resolve_assigned_caller_id(raw_from)
+    except (DialerNumberProviderMismatch, DialerNumberAssignmentUnavailable) as exc:
+        logger.warning(f"Twilio dial rejected for {raw_from!r}: {exc}")
+        assigned_caller_id = ""
+        provider_mismatch = True
+    else:
+        provider_mismatch = False
+    caller_id = assigned_caller_id or (
+        "" if provider_mismatch else (await _resolve_dialer_caller_id() or "")
     )
     if not to_number or not caller_id or not parent_call_sid:
         logger.error(

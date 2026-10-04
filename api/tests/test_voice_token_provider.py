@@ -65,13 +65,14 @@ async def test_voice_token_uses_telnyx_for_a_rep_assigned_a_telnyx_number():
     creds = DialerCredentials(
         token="telnyx-jwt", identity="rep-42", destination=""
     )
+    boundary = "2026-10-05T00:00:00+00:00"
     provider = AsyncMock()
     provider.name = "telnyx"
     provider.mint_credentials = AsyncMock(return_value=creds)
 
     with patch(
         "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
-        new=AsyncMock(return_value={"provider": "telnyx", "phone_number": "+15551234567"}),
+        new=AsyncMock(return_value={"provider": "telnyx", "phone_number": "+15551234567", "next_rotation_at": boundary}),
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
         return_value=provider,
@@ -81,3 +82,4 @@ async def test_voice_token_uses_telnyx_for_a_rep_assigned_a_telnyx_number():
     assert result.provider == "telnyx"
     assert result.token == "telnyx-jwt"
     assert result.caller_number == "+15551234567"
+    assert result.next_rotation_at.isoformat() == boundary

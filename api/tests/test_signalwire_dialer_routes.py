@@ -281,18 +281,23 @@ async def test_caller_id_falls_back_to_env_default_when_rep_unassigned(connect_d
     assert _connect_verb(document)["from"] == "+12092669253"
 
 
-async def test_assigned_twilio_number_is_rejected_in_favour_of_env_default(connect_deps):
-    # The realistic case: dialer_phone_numbers has a Twilio number for this
-    # rep. SignalWire would reject it outright as a caller ID.
+async def test_assigned_number_not_confirmed_as_signalwire_is_rejected(connect_deps):
+    # A stale SignalWire client must not silently substitute another line.
     connect_deps["assigned"].return_value = "+15551230000"
     connect_deps["owned"].return_value = False
 
-    document = _payload_of(
-        await handle_sw_dialer_connect(
-            _authed({"params": {"lead": "+14155550123", "rep": "rep-42"}})
+    with patch(f"{_MODULE}.update_dialer_call_status", new=AsyncMock()) as update:
+        document = _payload_of(
+            await handle_sw_dialer_connect(
+                _authed({"params": {"lead": "+14155550123", "rep": "rep-42"}})
+            )
         )
-    )
-    assert _connect_verb(document)["from"] == "+12092669253"
+    assert _is_hangup(document)
+    connect_deps["create"].assert_awaited_once()
+    assert connect_deps["create"].await_args.kwargs["from_number"] == ""
+    assert connect_deps["create"].await_args.kwargs["provider"] == "signalwire"
+    update.assert_awaited_once()
+    assert update.await_args.kwargs["status"] == "failed"
 
 
 async def test_assigned_number_is_used_when_marked_signalwire_owned(connect_deps):
@@ -332,7 +337,7 @@ async def test_identity_is_read_from_plausible_locations(connect_deps):
     await handle_sw_dialer_connect(
         _authed({"params": {"lead": "+14155550123", "identity": "client:rep-9"}})
     )
-    connect_deps["assigned"].assert_awaited_with("client:rep-9")
+    connect_deps["assigned"].assert_awaited_with("client:rep-9", provider_name="signalwire")
 
 
 # --------------------------------------------------------------------------
@@ -716,16 +721,13 @@ async def test_dialer_connect_joins_a_conference_instead_of_dialling():
     ]
 
 
-async def test_dialer_connect_still_dials_when_no_conference_is_given():
+async def test_dialer_connect_still_dials_when_no_conference_is_given(connect_deps):
     """The outbound path must be untouched by the inbound branch."""
-    with (
-        patch(f"{_MODULE}.create_dialer_call", new=AsyncMock()),
-        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value=None)),
-        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
-    ):
-        response = await handle_sw_dialer_connect(
-            _authed({"vars": {"userVariables": {"rep": "rep-1", "lead": "+15550001111"}}})
-        )
+    connect_deps["rep"].return_value = None
+    connect_deps["endpoints"].return_value = ("", "")
+    response = await handle_sw_dialer_connect(
+        _authed({"vars": {"userVariables": {"rep": "rep-1", "lead": "+15550001111"}}})
+    )
     doc = _payload_of(response)
 
     assert any("connect" in step for step in doc["sections"]["main"])
