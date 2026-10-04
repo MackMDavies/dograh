@@ -12,6 +12,7 @@ import pytest
 
 from api.services.telephony.dialer.signalwire_routes import (
     handle_sw_call_status,
+    handle_sw_connect_status,
     handle_sw_dialer_connect,
     handle_sw_recording,
     normalize_lead_number,
@@ -260,7 +261,7 @@ async def test_identity_is_read_from_plausible_locations(connect_deps):
     await handle_sw_dialer_connect(
         _authed({"params": {"lead": "+14155550123", "identity": "client:rep-9"}})
     )
-    connect_deps["assigned"].assert_awaited_with("client:rep-9")
+    connect_deps["assigned"].assert_awaited_with("client:rep-9", provider_name="signalwire")
 
 
 # --------------------------------------------------------------------------
@@ -329,6 +330,10 @@ async def test_recording_webhook_points_at_sw_recording_with_secret(connect_deps
     record = next(s["record_call"] for s in document["sections"]["main"] if "record_call" in s)
     assert record["status_url"] == (
         "https://api.sysevo.io/api/v1/telephony/sw-recording?call_id=sw-1&k=shhh"
+    )
+    connect = _connect_verb(document)
+    assert connect["status_url"] == (
+        "https://api.sysevo.io/api/v1/telephony/sw-connect-status?call_id=sw-1&k=shhh"
     )
 
 
@@ -499,6 +504,24 @@ async def test_status_never_500s(status_update):
     assert response.status_code == 200
 
 
+@pytest.mark.parametrize(
+    "state,failed_reason,expected",
+    [
+        ("connected", "", "in-progress"),
+        ("failed", "no_answer", "no-answer"),
+        ("failed", "busy", "busy"),
+        ("failed", "not_found", "failed"),
+    ],
+)
+async def test_connect_status_preserves_carrier_result(status_update, state, failed_reason, expected):
+    response = await handle_sw_connect_status(
+        _authed({"connect_state": state, "failed_reason": failed_reason}, query={"call_id": "sw-1"})
+    )
+    assert response.status_code == 200
+    assert status_update.call_args.kwargs["parent_call_sid"] == "sw-1"
+    assert status_update.call_args.kwargs["status"] == expected
+
+
 # --------------------------------------------------------------------------
 # Recording callback.
 # --------------------------------------------------------------------------
@@ -598,7 +621,9 @@ async def test_dialer_connect_joins_a_conference_instead_of_dialling():
     )
     doc = _payload_of(response)
 
-    assert doc["sections"]["main"] == [{"join_room": {"name": "inbound-abc"}}]
+    assert doc["sections"]["main"] == [{"join_conference": {
+        "name": "inbound-abc", "start_on_enter": True, "end_on_exit": True,
+    }}]
 
 
 async def test_dialer_connect_still_dials_when_no_conference_is_given():
@@ -639,7 +664,9 @@ async def test_inbound_holds_the_caller_and_rings_available_reps():
 
     doc = _payload_of(response)
     # The caller is joined to a room, not connected to anyone: nobody has answered yet.
-    assert {"join_room": {"name": "inbound-abc"}} in doc["sections"]["main"]
+    assert {"join_conference": {
+        "name": "inbound-abc", "start_on_enter": False, "end_on_exit": False,
+    }} in doc["sections"]["main"]
     assert created["target_user_ids"] == ["user-a", "user-b"]
     assert created["conference_name"] == "inbound-abc"
 
@@ -865,7 +892,7 @@ def test_outbound_connect_omits_ringback():
     )
     connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
     assert "ringback" not in connect
-    assert connect["timeout"] == 30
+    assert connect["timeout"] == 60
 
 
 def test_outbound_connect_reports_far_end_progress():
@@ -968,7 +995,7 @@ async def test_inbound_holds_on_the_sysevo_line_and_never_forwards():
         )
 
     steps = _payload_of(response)["sections"]["main"]
-    assert any("join_room" in s for s in steps)
+    assert any("join_conference" in s for s in steps)
     # A forward_number in the plan must not tempt it: no connect, ever.
     assert not any("connect" in s for s in steps)
 
@@ -988,7 +1015,7 @@ async def test_inbound_treats_live_and_push_the_same():
             _authed({"call": {"call_id": "hold2", "from": "+15550001111", "to": "+13292029939"}})
         )
 
-    assert any("join_room" in s for s in _payload_of(response)["sections"]["main"])
+    assert any("join_conference" in s for s in _payload_of(response)["sections"]["main"])
 
 
 async def test_background_push_task_is_held_until_it_finishes():

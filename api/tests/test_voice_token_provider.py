@@ -21,6 +21,9 @@ async def test_voice_token_reports_active_provider():
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
         return_value=provider,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
+        new=AsyncMock(return_value=None),
     ):
         result = await get_voice_token(user=fake_user)
 
@@ -28,6 +31,7 @@ async def test_voice_token_reports_active_provider():
     assert result.token == "sw-tok"
     assert result.identity == "rep-42"
     assert result.destination == "/private/dialer"
+    assert result.next_rotation_at is None
 
 
 async def test_voice_token_defaults_to_twilio():
@@ -45,8 +49,39 @@ async def test_voice_token_defaults_to_twilio():
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
         return_value=provider,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
+        new=AsyncMock(return_value=None),
     ):
         result = await get_voice_token(user=fake_user)
 
     assert result.provider == "twilio"
     assert result.destination == ""
+
+
+async def test_voice_token_exposes_next_rotation_boundary():
+    from datetime import UTC, datetime
+
+    from api.services.telephony.providers.twilio.routes import get_voice_token
+
+    fake_user = type("U", (), {"id": 42})()
+    boundary = datetime(2026, 10, 5, tzinfo=UTC)
+    creds = DialerCredentials(token="sw-tok", identity="rep-42", destination="/private/dialer")
+    provider = AsyncMock()
+    provider.name = "signalwire"
+    provider.mint_credentials = AsyncMock(return_value=creds)
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.resolve_active_dialer_provider",
+        return_value="twilio",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
+        new=AsyncMock(return_value={"provider": "signalwire", "next_rotation_at": boundary}),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_provider",
+        return_value=provider,
+    ):
+        result = await get_voice_token(user=fake_user)
+
+    assert result.provider == "signalwire"
+    assert result.next_rotation_at == boundary

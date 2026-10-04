@@ -12,6 +12,21 @@ def test_build_dialer_swml_connects_to_lead_with_caller_id():
     connect = next(s["connect"] for s in steps if "connect" in s)
     assert connect["to"] == "+15559876543"
     assert connect["from"] == "+15551234567"
+    assert connect["timeout"] == 60
+    assert connect["max_duration"] == 14400
+
+
+def test_build_dialer_swml_wires_both_call_progress_callbacks():
+    doc = build_dialer_swml(
+        lead_number="+15559876543",
+        caller_id="+15551234567",
+        recording_webhook="https://api.example.com/recording",
+        call_state_webhook="https://api.example.com/call-state",
+        connect_status_webhook="https://api.example.com/connect-state",
+    )
+    connect = next(s["connect"] for s in doc["sections"]["main"] if "connect" in s)
+    assert connect["call_state_url"] == "https://api.example.com/call-state"
+    assert connect["status_url"] == "https://api.example.com/connect-state"
 
 
 def test_build_dialer_swml_records_before_connecting():

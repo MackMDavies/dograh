@@ -13,13 +13,81 @@ from datetime import UTC, datetime
 from typing import Optional
 
 from sqlalchemy import select
+from sqlalchemy.dialects.postgresql import insert
 
 from api.db.base_client import BaseDBClient
-from api.db.models import PlatformTwilioCredentialsModel
+from api.db.models import (
+    PlatformTelnyxDialerCredentialsModel,
+    PlatformTelnyxUserCredentialModel,
+    PlatformTwilioCredentialsModel,
+)
 from api.services.crypto import decrypt_secret, encrypt_secret
 
 
 class PlatformSettingsClient(BaseDBClient):
+    async def get_platform_telnyx_user_credential(self, user_id: int) -> Optional[dict]:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTelnyxUserCredentialModel, user_id)
+        if not row:
+            return None
+        return {
+            "connection_id": row.connection_id,
+            "telephony_credential_id": row.telephony_credential_id,
+        }
+
+    async def save_platform_telnyx_user_credential(
+        self, *, user_id: int, connection_id: str, telephony_credential_id: str
+    ) -> None:
+        values = {
+            "user_id": user_id,
+            "connection_id": connection_id,
+            "telephony_credential_id": telephony_credential_id,
+            "updated_at": datetime.now(UTC),
+        }
+        async with self.async_session() as session:
+            statement = insert(PlatformTelnyxUserCredentialModel).values(**values)
+            statement = statement.on_conflict_do_update(
+                index_elements=[PlatformTelnyxUserCredentialModel.user_id],
+                set_={
+                    "connection_id": statement.excluded.connection_id,
+                    "telephony_credential_id": statement.excluded.telephony_credential_id,
+                    "updated_at": statement.excluded.updated_at,
+                },
+            )
+            await session.execute(statement)
+            await session.commit()
+
+    async def get_platform_telnyx_dialer_credentials(self) -> Optional[dict]:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTelnyxDialerCredentialsModel, 1)
+        if not row:
+            return None
+        return {
+            "api_key": row.api_key_encrypted,
+            "connection_id": row.connection_id,
+            "telephony_credential_id": row.telephony_credential_id,
+            "updated_at": row.updated_at,
+        }
+
+    async def save_platform_telnyx_dialer_credentials(
+        self, *, api_key: str, connection_id: str, telephony_credential_id: str
+    ) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTelnyxDialerCredentialsModel, 1)
+            if row is None:
+                row = PlatformTelnyxDialerCredentialsModel(
+                    id=1,
+                    api_key_encrypted=api_key,
+                    connection_id=connection_id,
+                    telephony_credential_id=telephony_credential_id,
+                )
+                session.add(row)
+            else:
+                row.api_key_encrypted = api_key
+                row.connection_id = connection_id
+                row.telephony_credential_id = telephony_credential_id
+            await session.commit()
+
     async def get_platform_twilio_credentials(self) -> Optional[dict]:
         """
         Return ``{"account_sid", "auth_token", "last_validated_at"}`` for the

@@ -5,6 +5,7 @@ import asyncio
 import os
 from typing import Literal, Optional
 
+import httpx
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
@@ -12,6 +13,7 @@ from sqlalchemy import func, select
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
+from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.db import db_client
 from api.db.models import (
     OrganizationModel,
@@ -125,6 +127,358 @@ class ManagedNumbersResponse(BaseModel):
     numbers: list[ManagedNumberItem]
     total: int
     total_monthly_cost_cents: int
+
+
+class TelnyxDialerCredentialsRequest(BaseModel):
+    api_key: Optional[str] = None
+    connection_id: str
+
+
+class TelnyxDialerCredentialsResponse(BaseModel):
+    configured: bool
+    api_key_preview: Optional[str] = None
+    connection_id: Optional[str] = None
+    telephony_credential_id: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+def _mask_key(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    return f"{value[:5]}…{value[-4:]}" if len(value) > 12 else "••••••••"
+
+
+async def _telnyx_request(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
+    try:
+        return await client.request(method, url, **kwargs)
+    except httpx.RequestError as exc:
+        logger.error(f"Telnyx API request failed: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail="Could not reach Telnyx. Check the connection and try again.") from exc
+
+
+async def _telnyx_dialer_credentials() -> dict:
+    saved = await db_client.get_platform_telnyx_dialer_credentials()
+    if saved:
+        return saved
+    return {
+        "api_key": os.environ.get("TELNYX_API_KEY", ""),
+        "connection_id": os.environ.get("TELNYX_DIALER_CONNECTION_ID", ""),
+        "telephony_credential_id": os.environ.get("TELNYX_DIALER_CREDENTIAL_ID", ""),
+    }
+
+
+def _telnyx_credentials_response(saved: Optional[dict]) -> TelnyxDialerCredentialsResponse:
+    saved = saved or {}
+    key = saved.get("api_key") or ""
+    return TelnyxDialerCredentialsResponse(
+        configured=bool(
+            key and saved.get("connection_id") and saved.get("telephony_credential_id")
+        ),
+        api_key_preview=_mask_key(key),
+        connection_id=saved.get("connection_id") or None,
+        telephony_credential_id=saved.get("telephony_credential_id") or None,
+        updated_at=(saved.get("updated_at").isoformat() if saved.get("updated_at") else None),
+    )
+
+
+@router.get("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)
+async def get_telnyx_dialer_settings(_user: UserModel = Depends(get_superuser)):
+    saved = await _telnyx_dialer_credentials()
+    return _telnyx_credentials_response(saved)
+
+
+@router.put("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)
+async def save_telnyx_dialer_settings(
+    body: TelnyxDialerCredentialsRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    """Store Telnyx dialer settings; the API key is encrypted by the DB model."""
+    current = await _telnyx_dialer_credentials()
+    api_key = (body.api_key or current.get("api_key") or "").strip()
+    connection_id = body.connection_id.strip()
+    if not api_key:
+        raise HTTPException(status_code=422, detail="Enter a Telnyx API key.")
+    if not connection_id:
+        raise HTTPException(
+            status_code=422,
+            detail="Enter the Telnyx SIP connection ID.",
+        )
+
+    # On-demand WebRTC credentials are API resources attached to a credential
+    # connection. They are not displayed as the connection's ID in Mission
+    # Control. Reuse an existing credential for this connection where possible;
+    # otherwise create one so setup only requires the API key and connection ID.
+    credential_id = (current.get("telephony_credential_id") or "").strip()
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+        existing_is_valid = False
+        if credential_id and current.get("connection_id") == connection_id:
+            existing = await _telnyx_request(
+                client, "GET", f"https://api.telnyx.com/v2/telephony_credentials/{credential_id}",
+                headers=headers,
+            )
+            if existing.is_success:
+                existing_data = existing.json().get("data") or {}
+                existing_is_valid = (
+                    existing_data.get("resource_id") == f"connection:{connection_id}"
+                    and not existing_data.get("expired", False)
+                )
+            elif existing.status_code not in (404, 422):
+                logger.error(f"Telnyx credential validation failed: HTTP {existing.status_code}")
+                raise HTTPException(status_code=502, detail="Telnyx could not validate the saved WebRTC credential.")
+
+        if not existing_is_valid:
+            # Credentials created in the portal/API may already be attached to
+            # this connection. Find and reuse one before creating another.
+            found_existing_id = False
+            page = 1
+            while True:
+                listed = await _telnyx_request(
+                    client, "GET", "https://api.telnyx.com/v2/telephony_credentials",
+                    params={"page[number]": page, "page[size]": 250},
+                    headers=headers,
+                )
+                if listed.status_code in (401, 403):
+                    raise HTTPException(status_code=502, detail="Telnyx rejected the API key or its credential permissions.")
+                if not listed.is_success:
+                    logger.error(f"Telnyx credential lookup failed: HTTP {listed.status_code}")
+                    raise HTTPException(status_code=502, detail="Could not check Telnyx WebRTC credentials.")
+                payload = listed.json()
+                match = next(
+                    (item for item in payload.get("data", [])
+                     if item.get("resource_id") == f"connection:{connection_id}"
+                     and item.get("id") and not item.get("expired", False)),
+                    None,
+                )
+                if match:
+                    credential_id = match["id"]
+                    found_existing_id = True
+                    break
+                meta = payload.get("meta") or {}
+                if page >= (meta.get("total_pages") or page) or not payload.get("data"):
+                    break
+                page += 1
+
+            if not found_existing_id:
+                created = await _telnyx_request(
+                    client, "POST", "https://api.telnyx.com/v2/telephony_credentials",
+                    headers=headers,
+                    json={"connection_id": connection_id, "name": "Sysevo Dialer"},
+                )
+                if created.status_code in (401, 403):
+                    raise HTTPException(status_code=502, detail="Telnyx rejected the API key or its permission to create WebRTC credentials.")
+                if not created.is_success:
+                    logger.error(f"Telnyx WebRTC credential creation failed: HTTP {created.status_code}")
+                    raise HTTPException(status_code=502, detail="Telnyx could not create a WebRTC credential for this SIP connection. Check the connection ID and API key permissions.")
+                credential_id = (created.json().get("data") or {}).get("id", "")
+                if not credential_id:
+                    raise HTTPException(status_code=502, detail="Telnyx created no usable WebRTC credential.")
+
+    await db_client.save_platform_telnyx_dialer_credentials(
+        api_key=api_key,
+        connection_id=connection_id,
+        telephony_credential_id=credential_id,
+    )
+    return _telnyx_credentials_response(
+        await db_client.get_platform_telnyx_dialer_credentials()
+    )
+
+
+@router.post("/telnyx-dialer/check")
+async def check_telnyx_dialer_connection(_user: UserModel = Depends(get_superuser)):
+    """Verify the saved Telnyx connection can issue WebRTC tokens and route PSTN calls.
+
+    This is a configuration check only. It does not place a live call or promise
+    that a downstream carrier will deliver a specific call.
+    """
+    credentials = await _telnyx_dialer_credentials()
+    api_key = (credentials.get("api_key") or "").strip()
+    connection_id = (credentials.get("connection_id") or "").strip()
+    credential_id = (credentials.get("telephony_credential_id") or "").strip()
+    if not api_key or not connection_id or not credential_id:
+        raise HTTPException(status_code=409, detail="Save the Telnyx API key and SIP connection first.")
+
+    headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        connection_response = await _telnyx_request(
+            client,
+            "GET",
+            f"https://api.telnyx.com/v2/credential_connections/{connection_id}",
+            headers=headers,
+        )
+        if connection_response.status_code in (401, 403):
+            raise HTTPException(status_code=502, detail="Telnyx rejected the API key or SIP connection access.")
+        if not connection_response.is_success:
+            raise HTTPException(status_code=502, detail="Telnyx could not find the saved SIP connection. Check its ID.")
+        connection = connection_response.json().get("data") or {}
+        active = connection.get("active") is True
+        outbound = connection.get("outbound") or {}
+        profile_id = str(outbound.get("outbound_voice_profile_id") or "").strip()
+        profile_enabled = False
+        us_destination_enabled = False
+        if profile_id:
+            profile_response = await _telnyx_request(
+                client,
+                "GET",
+                f"https://api.telnyx.com/v2/outbound_voice_profiles/{profile_id}",
+                headers=headers,
+            )
+            if profile_response.status_code in (401, 403):
+                raise HTTPException(status_code=502, detail="Telnyx rejected access to the outbound voice profile.")
+            if not profile_response.is_success:
+                raise HTTPException(status_code=502, detail="Telnyx could not load the outbound voice profile assigned to this connection.")
+            profile = profile_response.json().get("data") or {}
+            profile_enabled = profile.get("enabled") is True
+            destinations = profile.get("whitelisted_destinations") or []
+            us_destination_enabled = any(
+                str(destination).strip().upper() in {"US", "ALL", "WORLD"}
+                for destination in destinations
+            ) if isinstance(destinations, list) else False
+
+        credential_response = await _telnyx_request(
+            client,
+            "GET",
+            f"https://api.telnyx.com/v2/telephony_credentials/{credential_id}",
+            headers=headers,
+        )
+        if credential_response.status_code in (401, 403):
+            raise HTTPException(status_code=502, detail="Telnyx rejected access to the dialer's WebRTC credential.")
+        if not credential_response.is_success:
+            raise HTTPException(status_code=502, detail="The saved WebRTC credential is unavailable in Telnyx.")
+        credential = credential_response.json().get("data") or {}
+        credential_matches = (
+            credential.get("resource_id") == f"connection:{connection_id}"
+            and not credential.get("expired", False)
+        )
+        token_issued = False
+        if credential_matches:
+            token_response = await _telnyx_request(
+                client,
+                "POST",
+                f"https://api.telnyx.com/v2/telephony_credentials/{credential_id}/token",
+                headers={"Authorization": f"Bearer {api_key}", "Accept": "text/plain"},
+            )
+            token_issued = token_response.is_success and bool(token_response.text.strip().strip('"'))
+
+        numbers_response = await _telnyx_request(
+            client,
+            "GET",
+            "https://api.telnyx.com/v2/phone_numbers",
+            params={"page[number]": 1, "page[size]": 250, "filter[connection_id]": connection_id},
+            headers=headers,
+        )
+        if numbers_response.status_code in (401, 403):
+            raise HTTPException(status_code=502, detail="Telnyx rejected access to the phone number inventory.")
+        if not numbers_response.is_success:
+            raise HTTPException(status_code=502, detail="Telnyx could not verify numbers on the SIP connection.")
+        numbers = [
+            item for item in (numbers_response.json().get("data") or [])
+            if item.get("connection_id") == connection_id
+        ]
+
+    checks = {
+        "connection_active": active,
+        "outbound_voice_profile_assigned": bool(profile_id),
+        "outbound_voice_profile_enabled": profile_enabled,
+        "us_destination_enabled": us_destination_enabled,
+        "webrtc_credential_matches_connection": credential_matches,
+        "webrtc_token_issued": token_issued,
+        "phone_numbers_attached": len(numbers),
+    }
+    warnings = []
+    if not active:
+        warnings.append("The Telnyx SIP connection is inactive.")
+    if not profile_id:
+        warnings.append("Assign an outbound voice profile to this SIP connection to route PSTN calls.")
+    elif not profile_enabled:
+        warnings.append("Enable the outbound voice profile assigned to this connection.")
+    if profile_id and not us_destination_enabled:
+        warnings.append("Add United States (US) to the assigned outbound voice profile's allowed destinations.")
+    if not credential_matches:
+        warnings.append("The WebRTC credential is not attached to the saved SIP connection.")
+    elif not token_issued:
+        warnings.append("Telnyx could not issue a WebRTC login token for this connection.")
+    if not numbers:
+        warnings.append("No Telnyx numbers are attached to this SIP connection.")
+    ready_for_outbound = (
+        active
+        and bool(profile_id)
+        and profile_enabled
+        and us_destination_enabled
+        and credential_matches
+        and token_issued
+        and bool(numbers)
+    )
+    return {
+        "ready_for_outbound": ready_for_outbound,
+        "checks": checks,
+        "warnings": warnings,
+        "live_call_test_required": True,
+    }
+
+
+@router.post("/telnyx-dialer/sync-numbers")
+async def sync_telnyx_dialer_numbers(_user: UserModel = Depends(get_superuser)):
+    """Sync Telnyx numbers attached to the configured SIP connection."""
+    credentials = await _telnyx_dialer_credentials()
+    api_key = (credentials.get("api_key") or "").strip()
+    connection_id = (credentials.get("connection_id") or "").strip()
+    if not api_key or not connection_id:
+        raise HTTPException(status_code=409, detail="Save the Telnyx API key and SIP connection ID first.")
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Dialer inventory sync is not configured on the server.")
+
+    numbers: list[dict] = []
+    page = 1
+    async with httpx.AsyncClient(timeout=20.0) as client:
+        while True:
+            response = await client.get(
+                "https://api.telnyx.com/v2/phone_numbers",
+                params={
+                    "page[number]": page,
+                    "page[size]": 250,
+                    "filter[connection_id]": connection_id,
+                },
+                headers={"Authorization": f"Bearer {api_key}"},
+            )
+            if response.status_code in (401, 403):
+                raise HTTPException(
+                    status_code=502,
+                    detail="Telnyx rejected access to the number inventory. Check the API key, KYC status, and connection permissions.",
+                )
+            if not response.is_success:
+                logger.error(f"[admin_telephony] Telnyx number sync failed: HTTP {response.status_code}")
+                raise HTTPException(status_code=502, detail="Telnyx number inventory request failed.")
+            payload = response.json()
+            for number in payload.get("data") or []:
+                if number.get("connection_id") != connection_id:
+                    continue
+                numbers.append({
+                    "phone_number": number["phone_number"],
+                    "friendly_name": number.get("connection_name") or None,
+                    "provider": "telnyx",
+                    "twilio_sid": None,
+                })
+            if page >= (payload.get("meta") or {}).get("total_pages", page):
+                break
+            page += 1
+
+        for start in range(0, len(numbers), 500):
+            batch = numbers[start : start + 500]
+            response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_phone_numbers?on_conflict=phone_number",
+                json=batch,
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                },
+            )
+            if not response.is_success:
+                logger.error(f"[admin_telephony] Telnyx inventory upsert failed: HTTP {response.status_code}")
+                raise HTTPException(status_code=502, detail="Could not save Telnyx numbers to the dialer inventory.")
+    return {"synced": len(numbers), "connection_id": connection_id}
 
 
 def _mask_sid(sid: Optional[str]) -> Optional[str]:

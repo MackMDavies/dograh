@@ -7,6 +7,7 @@ from api.services.telephony.providers.twilio.dialer_number_assignment import (
     _parse_rep_id_from_identity,
     is_manager_or_admin,
     resolve_assigned_caller_id,
+    user_owns_dialer_number,
 )
 
 
@@ -53,11 +54,11 @@ async def test_resolve_assigned_caller_id_returns_phone_number_on_match(monkeypa
     fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000001")
 
     fake_response = MagicMock()
-    fake_response.json.return_value = [{"phone_number": "+15559998888"}]
+    fake_response.json.return_value = [{"phone_number": "+15559998888", "provider": "twilio"}]
     fake_response.raise_for_status = MagicMock()
 
     fake_http_client = AsyncMock()
-    fake_http_client.get = AsyncMock(return_value=fake_response)
+    fake_http_client.post = AsyncMock(return_value=fake_response)
     fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
     fake_http_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -85,7 +86,7 @@ async def test_resolve_assigned_caller_id_returns_none_on_http_error(monkeypatch
     fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000001")
 
     fake_http_client = AsyncMock()
-    fake_http_client.get = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    fake_http_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
     fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
     fake_http_client.__aexit__ = AsyncMock(return_value=False)
 
@@ -99,6 +100,41 @@ async def test_resolve_assigned_caller_id_returns_none_on_http_error(monkeypatch
         result = await resolve_assigned_caller_id("client:rep-42")
 
     assert result is None
+
+
+async def test_inbound_ownership_checks_any_assigned_line(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_user = MagicMock(provider_id="00000000-0000-0000-0000-000000000001")
+    fake_response = MagicMock()
+    fake_response.json.return_value = True
+    fake_response.raise_for_status = MagicMock()
+    fake_http_client = AsyncMock()
+    fake_http_client.post = AsyncMock(return_value=fake_response)
+    fake_http_client.__aenter__ = AsyncMock(return_value=fake_http_client)
+    fake_http_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.db_client.get_user_by_id",
+        AsyncMock(return_value=fake_user),
+    ), patch(
+        "api.services.telephony.providers.twilio.dialer_number_assignment.httpx.AsyncClient",
+        return_value=fake_http_client,
+    ):
+        result = await user_owns_dialer_number(42, "+15559998888", "telnyx")
+
+    assert result is True
+    assert fake_http_client.post.call_args.kwargs["json"] == {
+        "p_user_id": "00000000-0000-0000-0000-000000000001",
+        "p_phone_number": "+15559998888",
+        "p_provider": "telnyx",
+    }
 
 
 async def test_is_manager_or_admin_returns_true_for_manager(monkeypatch):

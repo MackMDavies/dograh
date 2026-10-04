@@ -26,6 +26,9 @@ class DialerCredentials:
     token: str
     identity: str
     destination: str
+    # Telnyx takes caller ID on each WebRTC call; SignalWire resolves it in
+    # SWML and Twilio resolves it in the signed Voice URL.
+    caller_number: str = ""
 
 
 class DialerProvider(Protocol):
@@ -50,6 +53,10 @@ def get_dialer_provider(name: str) -> DialerProvider:
         )
 
         return SignalWireDialerProvider()
+    if normalized == "telnyx":
+        from api.services.telephony.dialer.telnyx_dialer import TelnyxDialerProvider
+
+        return TelnyxDialerProvider()
     raise UnknownDialerProvider(f"No dialer provider implementation for {name!r}")
 
 

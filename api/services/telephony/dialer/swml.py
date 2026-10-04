@@ -37,6 +37,7 @@ def build_dialer_swml(
     caller_id: str,
     recording_webhook: str,
     call_state_webhook: str = "",
+    connect_status_webhook: str = "",
     tap_websocket: str = "",
 ) -> dict:
     """Record the call, then bridge the rep to the lead.
@@ -69,9 +70,10 @@ def build_dialer_swml(
     connect: dict = {
         "to": lead_number,
         "from": caller_id,
-        # Default is 60s; shorter so a rep working a list is not left waiting, and short
-        # of most voicemail pickups so "no answer" stays "no answer".
-        "timeout": 30,
+        # Match SignalWire's documented 60-second default. This is ring time
+        # only; it does not limit the conversation duration.
+        "timeout": 60,
+        "max_duration": 14400,
     }
     # Two parameters are deliberately absent, both removed after breaking live calls:
     #
@@ -94,6 +96,8 @@ def build_dialer_swml(
         # which is why sw-call-status has never once fired despite being configured.
         connect["call_state_url"] = call_state_webhook
         connect["call_state_events"] = ["created", "ringing", "answered", "ended"]
+    if connect_status_webhook:
+        connect["status_url"] = connect_status_webhook
     steps.append({"connect": connect})
     return {"sections": {"main": steps}}
 
