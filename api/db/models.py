@@ -373,6 +373,27 @@ class PlatformTelnyxDialerCredentialsModel(Base):
     )
 
 
+class PlatformTelnyxUserCredentialModel(Base):
+    """On-demand Telnyx WebRTC credential assigned to one Sysevo rep."""
+
+    __tablename__ = "platform_telnyx_user_credentials"
+
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    connection_id = Column(String(100), nullable=False)
+    telephony_credential_id = Column(String(100), nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+    __table_args__ = (
+        UniqueConstraint(
+            "telephony_credential_id",
+            name="uq_platform_telnyx_user_credentials_credential_id",
+        ),
+    )
+
+
 class IntegrationModel(Base):
     __tablename__ = "integrations"
 
