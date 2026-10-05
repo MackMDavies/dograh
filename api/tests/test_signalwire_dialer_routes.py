@@ -555,6 +555,28 @@ async def test_status_tolerates_float_duration(status_update):
     assert status_update.call_args.kwargs["duration_seconds"] == 42
 
 
+@pytest.mark.parametrize(
+    "end_source,expected",
+    [("none", "failed"), ("outbound", "completed"), ("inbound", "completed")],
+)
+async def test_status_does_not_misclassify_unconnected_leg_as_completed(
+    status_update, end_source, expected
+):
+    await handle_sw_call_status(
+        _authed(
+            {
+                "params": {
+                    "call_id": "sw-1",
+                    "call_state": "ended",
+                    "end_reason": "hangup",
+                    "end_source": end_source,
+                }
+            }
+        )
+    )
+    assert status_update.call_args.kwargs["status"] == expected
+
+
 async def test_status_tolerates_unparseable_duration(status_update):
     await handle_sw_call_status(
         _authed({"call_id": "sw-1", "state": "ended", "duration": "soon"})
