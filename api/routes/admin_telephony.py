@@ -4,6 +4,7 @@ Superuser endpoints for platform-level managed telephony.
 import asyncio
 import os
 from typing import Literal, Optional
+from urllib.parse import urljoin, urlparse
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException
@@ -23,9 +24,18 @@ from api.db.models import (
     WorkflowModel,
     WorkflowRunModel,
 )
-from api.services.auth.depends import get_superuser
+from api.services.auth.depends import get_superuser, get_user
 
 router = APIRouter(prefix="/admin/telephony", tags=["admin-telephony"])
+
+
+def _provider_page_url(base_url: str, path: Optional[str]) -> Optional[str]:
+    if not path:
+        return None
+    page_url = urljoin(base_url, path)
+    if urlparse(page_url).netloc != urlparse(base_url).netloc:
+        raise RuntimeError("Provider returned a pagination URL outside its API host.")
+    return page_url
 
 # Approx Twilio monthly rental for a local number, in USD cents — standard
 # published rates (admins can confirm exact amounts in the Twilio console).
@@ -140,6 +150,18 @@ class TelnyxDialerCredentialsResponse(BaseModel):
     connection_id: Optional[str] = None
     telephony_credential_id: Optional[str] = None
     updated_at: Optional[str] = None
+
+
+class VonageDialerCredentialsRequest(BaseModel):
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    application_id: Optional[str] = None
+
+
+class SignalWireDialerCredentialsRequest(BaseModel):
+    space_url: str
+    project_id: str
+    api_token: Optional[str] = None
 
 
 def _mask_key(value: Optional[str]) -> Optional[str]:
@@ -479,6 +501,350 @@ async def sync_telnyx_dialer_numbers(_user: UserModel = Depends(get_superuser)):
                 logger.error(f"[admin_telephony] Telnyx inventory upsert failed: HTTP {response.status_code}")
                 raise HTTPException(status_code=502, detail="Could not save Telnyx numbers to the dialer inventory.")
     return {"synced": len(numbers), "connection_id": connection_id}
+
+
+async def _require_dialer_manager(user: UserModel) -> UserModel:
+    """Managers may refresh number inventory; only superusers edit connections."""
+    if user.is_superuser:
+        return user
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=403, detail="Manager access could not be verified.")
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.get(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/user_roles",
+                params={
+                    "user_id": f"eq.{user.provider_id}",
+                    "role": "in.(super_admin,sales_manager)",
+                    "select": "role",
+                    "limit": "1",
+                },
+                headers={
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                },
+            )
+        if response.is_success and response.json():
+            return user
+    except httpx.RequestError as exc:
+        logger.error(f"Dialer manager role lookup failed: {type(exc).__name__}")
+    raise HTTPException(status_code=403, detail="Manager privileges are required.")
+
+
+@router.get("/dialer-providers")
+async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
+    """Safe connection status for the unified provider manager."""
+    signalwire = await db_client.get_platform_signalwire_dialer_credentials() or {}
+    signalwire_space = signalwire.get("space_url") or os.environ.get("SIGNALWIRE_SPACE_URL")
+    signalwire_project = signalwire.get("project_id") or os.environ.get("SIGNALWIRE_PROJECT_ID")
+    signalwire_token = signalwire.get("api_token") or os.environ.get("SIGNALWIRE_API_TOKEN")
+    signalwire_missing = [
+        field for field, value in (
+            ("space_url", signalwire_space),
+            ("project_id", signalwire_project),
+            ("api_token", signalwire_token),
+        ) if not (value or "").strip()
+    ]
+    telnyx = await _telnyx_dialer_credentials()
+    twilio_accounts = await db_client.list_platform_twilio_accounts()
+    vonage = await db_client.get_platform_vonage_dialer_credentials()
+    return {
+        "active_provider": (os.environ.get("SYSEVO_DIALER_PROVIDER") or "twilio").strip().lower(),
+        "signalwire": {
+            "configured": not signalwire_missing,
+            "source": "database" if signalwire.get("api_token") else "environment",
+            "missing": signalwire_missing,
+        },
+        "telnyx": {
+            "configured": bool(telnyx and telnyx.get("api_key") and telnyx.get("connection_id")),
+            "source": "database" if telnyx and telnyx.get("api_key") else "environment",
+        },
+        "twilio": {
+            "configured": bool(twilio_accounts or (
+                os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
+                and os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+            )),
+            "source": "database" if twilio_accounts else "environment",
+            "account_count": len(twilio_accounts),
+            "active_dialer_configured": any(
+                account.get("is_active") and account.get("dialer_configured")
+                for account in twilio_accounts
+            ),
+        },
+        "vonage": {
+            "configured": bool(vonage and vonage.get("api_key") and vonage.get("api_secret")),
+            "application_id": (vonage or {}).get("application_id"),
+            "source": "database" if vonage else None,
+        },
+    }
+
+
+@router.get("/signalwire-dialer")
+async def get_signalwire_dialer_settings(_user: UserModel = Depends(get_superuser)):
+    saved = await db_client.get_platform_signalwire_dialer_credentials() or {}
+    space = str(saved.get("space_url") or os.environ.get("SIGNALWIRE_SPACE_URL") or "")
+    project = str(saved.get("project_id") or os.environ.get("SIGNALWIRE_PROJECT_ID") or "")
+    token = str(saved.get("api_token") or os.environ.get("SIGNALWIRE_API_TOKEN") or "")
+    return {
+        "configured": bool(space.strip() and project.strip() and token.strip()),
+        "source": "database" if saved.get("api_token") else "environment",
+        "space_url": space,
+        "project_id": project,
+        "api_token_preview": _mask_key(token),
+        "managed": bool(saved.get("api_token")),
+    }
+
+
+@router.put("/signalwire-dialer")
+async def save_signalwire_dialer_settings(
+    body: SignalWireDialerCredentialsRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    current = await db_client.get_platform_signalwire_dialer_credentials() or {}
+    space = body.space_url.strip().removeprefix("https://").removeprefix("http://").rstrip("/")
+    project = body.project_id.strip()
+    token = (body.api_token or current.get("api_token") or "").strip()
+    if not (space and project and token):
+        raise HTTPException(status_code=422, detail="Enter the SignalWire space URL, project ID, and API token.")
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(
+                f"https://{space}/api/laml/2010-04-01/Accounts/{project}/IncomingPhoneNumbers.json?PageSize=1",
+                auth=httpx.BasicAuth(project, token),
+            )
+    except httpx.RequestError as exc:
+        logger.error(f"SignalWire credential check failed: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail="Could not reach SignalWire to check the credentials.") from exc
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=422, detail="SignalWire rejected the project ID or API token.")
+    if not response.is_success:
+        raise HTTPException(status_code=502, detail=f"SignalWire could not validate this account (HTTP {response.status_code}).")
+    await db_client.save_platform_signalwire_dialer_credentials({
+        "space_url": space,
+        "project_id": project,
+        "api_token": token,
+    })
+    return await get_signalwire_dialer_settings(_user)
+
+
+@router.get("/vonage-dialer")
+async def get_vonage_dialer_settings(_user: UserModel = Depends(get_superuser)):
+    saved = await db_client.get_platform_vonage_dialer_credentials() or {}
+    api_key = (saved.get("api_key") or "").strip()
+    return {
+        "configured": bool(api_key and saved.get("api_secret")),
+        "api_key_preview": _mask_key(api_key),
+        "application_id": saved.get("application_id") or "",
+        "updated_at": saved.get("updated_at").isoformat() if saved.get("updated_at") else None,
+    }
+
+
+@router.put("/vonage-dialer")
+async def save_vonage_dialer_settings(
+    body: VonageDialerCredentialsRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    current = await db_client.get_platform_vonage_dialer_credentials() or {}
+    api_key = (body.api_key or current.get("api_key") or "").strip()
+    api_secret = (body.api_secret or current.get("api_secret") or "").strip()
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=422, detail="Enter the Vonage API key and secret.")
+    application_id = (body.application_id or "").strip()
+    try:
+        async with httpx.AsyncClient(timeout=12.0) as client:
+            response = await client.get(
+                "https://rest.nexmo.com/account/numbers",
+                params={"size": 1, "index": 1},
+                auth=httpx.BasicAuth(api_key, api_secret),
+            )
+    except httpx.RequestError as exc:
+        logger.error(f"Vonage credential check failed: {type(exc).__name__}")
+        raise HTTPException(status_code=502, detail="Could not reach Vonage to check the credentials.") from exc
+    if response.status_code in (401, 403):
+        raise HTTPException(status_code=422, detail="Vonage rejected the API key or secret.")
+    if not response.is_success:
+        raise HTTPException(status_code=502, detail="Vonage could not validate this account.")
+    await db_client.save_platform_vonage_dialer_credentials({
+        "api_key": api_key,
+        "api_secret": api_secret,
+        "application_id": application_id,
+    })
+    return await get_vonage_dialer_settings(_user)
+
+
+@router.post("/dialer-providers/sync-numbers")
+async def sync_all_dialer_provider_numbers(user: UserModel = Depends(get_user)):
+    """Sync all four provider inventories independently and return per-provider outcomes."""
+    await _require_dialer_manager(user)
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Dialer inventory sync is not configured on the server.")
+
+    results: list[dict] = []
+    async with httpx.AsyncClient(timeout=25.0) as client:
+        async def sync_signalwire() -> list[dict]:
+            managed = await db_client.get_platform_signalwire_dialer_credentials() or {}
+            space = (managed.get("space_url") or os.environ.get("SIGNALWIRE_SPACE_URL") or "").strip()
+            space = space.removeprefix("https://").removeprefix("http://").rstrip("/")
+            project = (managed.get("project_id") or os.environ.get("SIGNALWIRE_PROJECT_ID") or "").strip()
+            token = (managed.get("api_token") or os.environ.get("SIGNALWIRE_API_TOKEN") or "").strip()
+            if not (space and project and token):
+                raise RuntimeError("SignalWire connection is not configured.")
+            auth = httpx.BasicAuth(project, token)
+            base = f"https://{space}/api/laml"
+            page_url = f"{base}/2010-04-01/Accounts/{project}/IncomingPhoneNumbers.json?PageSize=100"
+            rows: list[dict] = []
+            while page_url:
+                response = await client.get(page_url, auth=auth)
+                if not response.is_success:
+                    raise RuntimeError(f"SignalWire API returned HTTP {response.status_code}.")
+                payload = response.json()
+                rows.extend({
+                    "phone_number": number["phone_number"],
+                    "friendly_name": number.get("friendly_name") or None,
+                    "twilio_sid": number.get("sid"),
+                    "provider": "signalwire",
+                } for number in payload.get("incoming_phone_numbers", []) if number.get("phone_number"))
+                page_url = _provider_page_url(base, payload.get("next_page_uri"))
+            return rows
+
+        async def sync_twilio() -> list[dict]:
+            accounts = await db_client.list_platform_twilio_accounts()
+            credentials = []
+            for account in accounts:
+                secret = await db_client.get_platform_twilio_credentials_by_id(account["id"])
+                if secret:
+                    credentials.append(secret)
+            if not credentials:
+                sid = (os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID") or "").strip()
+                token = (os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN") or "").strip()
+                if sid and token:
+                    credentials.append({"account_sid": sid, "auth_token": token})
+            if not credentials:
+                raise RuntimeError("No Twilio platform account is connected.")
+            rows: list[dict] = []
+            for account in credentials:
+                account_sid = account["account_sid"]
+                base = "https://api.twilio.com"
+                page_url = f"{base}/2010-04-01/Accounts/{account_sid}/IncomingPhoneNumbers.json?PageSize=100"
+                while page_url:
+                    response = await client.get(
+                        page_url,
+                        auth=httpx.BasicAuth(account_sid, account["auth_token"]),
+                    )
+                    if not response.is_success:
+                        raise RuntimeError(f"Twilio API returned HTTP {response.status_code} for account {_mask_sid(account_sid)}.")
+                    payload = response.json()
+                    rows.extend({
+                        "phone_number": number["phone_number"],
+                        "friendly_name": number.get("friendly_name") or None,
+                        "twilio_sid": number.get("sid"),
+                        "provider": "twilio",
+                    } for number in payload.get("incoming_phone_numbers", []) if number.get("phone_number"))
+                    page_url = _provider_page_url(base, payload.get("next_page_uri"))
+            return rows
+
+        async def sync_telnyx() -> list[dict]:
+            config = await _telnyx_dialer_credentials()
+            api_key = (config.get("api_key") or "").strip()
+            connection_id = (config.get("connection_id") or "").strip()
+            if not (api_key and connection_id):
+                raise RuntimeError("Telnyx connection is not configured.")
+            rows: list[dict] = []
+            page = 1
+            while True:
+                response = await client.get(
+                    "https://api.telnyx.com/v2/phone_numbers",
+                    params={"page[number]": page, "page[size]": 250, "filter[connection_id]": connection_id},
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                if not response.is_success:
+                    raise RuntimeError(f"Telnyx API returned HTTP {response.status_code}.")
+                payload = response.json()
+                rows.extend({
+                    "phone_number": number["phone_number"],
+                    "friendly_name": number.get("connection_name") or None,
+                    "twilio_sid": None,
+                    "provider": "telnyx",
+                } for number in payload.get("data", [])
+                    if number.get("phone_number") and number.get("connection_id") == connection_id)
+                total_pages = (payload.get("meta") or {}).get("total_pages", page)
+                if page >= total_pages:
+                    break
+                page += 1
+            return rows
+
+        async def sync_vonage() -> list[dict]:
+            config = await db_client.get_platform_vonage_dialer_credentials() or {}
+            api_key = (config.get("api_key") or "").strip()
+            api_secret = (config.get("api_secret") or "").strip()
+            if not (api_key and api_secret):
+                raise RuntimeError("Vonage connection is not configured.")
+            rows: list[dict] = []
+            index = 1
+            while True:
+                response = await client.get(
+                    "https://rest.nexmo.com/account/numbers",
+                    params={"size": 100, "index": index},
+                    auth=httpx.BasicAuth(api_key, api_secret),
+                )
+                if not response.is_success:
+                    raise RuntimeError(f"Vonage API returned HTTP {response.status_code}.")
+                payload = response.json()
+                numbers = payload.get("numbers", [])
+                rows.extend({
+                    "phone_number": (
+                        f"+{number['msisdn']}" if number.get("msisdn") and not str(number["msisdn"]).startswith("+")
+                        else number.get("msisdn")
+                    ),
+                    "friendly_name": None,
+                    "twilio_sid": None,
+                    "provider": "vonage",
+                } for number in numbers if number.get("msisdn"))
+                if len(numbers) < 100 or len(rows) >= int(payload.get("count", 0)):
+                    break
+                index += 1
+            return rows
+
+        provider_syncs = [
+            ("signalwire", sync_signalwire),
+            ("telnyx", sync_telnyx),
+            ("twilio", sync_twilio),
+            ("vonage", sync_vonage),
+        ]
+        for provider, sync_provider in provider_syncs:
+            try:
+                rows = await sync_provider()
+                # Group rows to avoid sending null labels that could overwrite a
+                # manually chosen display name on an existing inventory record.
+                for named in (True, False):
+                    batch = [
+                        {key: value for key, value in row.items() if key != "friendly_name" or named}
+                        for row in rows if bool(row.get("friendly_name")) is named
+                    ]
+                    if not batch:
+                        continue
+                    response = await client.post(
+                        f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_phone_numbers?on_conflict=phone_number",
+                        json=batch,
+                        headers={
+                            "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                            "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                            "Content-Type": "application/json",
+                            "Prefer": "resolution=merge-duplicates,return=minimal",
+                        },
+                    )
+                    if not response.is_success:
+                        raise RuntimeError(f"Inventory save returned HTTP {response.status_code}.")
+                results.append({"provider": provider, "status": "synced", "synced_count": len(rows)})
+            except (RuntimeError, httpx.RequestError, KeyError, ValueError) as exc:
+                detail = str(exc)
+                status = "not_configured" if "not configured" in detail else "error"
+                results.append({"provider": provider, "status": status, "synced_count": 0, "detail": detail})
+            except Exception as exc:  # noqa: BLE001
+                logger.exception(f"Unexpected {provider} inventory sync failure")
+                results.append({"provider": provider, "status": "error", "synced_count": 0, "detail": "Unexpected provider sync error."})
+
+    return {"results": results}
 
 
 def _mask_sid(sid: Optional[str]) -> Optional[str]:

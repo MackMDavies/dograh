@@ -373,6 +373,34 @@ class PlatformTelnyxDialerCredentialsModel(Base):
     )
 
 
+class PlatformVonageDialerCredentialsModel(Base):
+    """Platform Vonage account used by the unified dialer number inventory."""
+
+    __tablename__ = "platform_vonage_dialer_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
+class PlatformSignalWireDialerCredentialsModel(Base):
+    """Platform SignalWire credentials managed by the provider area."""
+
+    __tablename__ = "platform_signalwire_dialer_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class PlatformTelnyxUserCredentialModel(Base):
     """On-demand Telnyx WebRTC credential assigned to one Sysevo rep."""
 

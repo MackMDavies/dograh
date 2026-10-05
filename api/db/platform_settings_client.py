@@ -19,12 +19,47 @@ from api.db.base_client import BaseDBClient
 from api.db.models import (
     PlatformTelnyxDialerCredentialsModel,
     PlatformTelnyxUserCredentialModel,
+    PlatformSignalWireDialerCredentialsModel,
     PlatformTwilioCredentialsModel,
+    PlatformVonageDialerCredentialsModel,
 )
 from api.services.crypto import decrypt_secret, encrypt_secret
 
 
 class PlatformSettingsClient(BaseDBClient):
+    async def get_platform_signalwire_dialer_credentials(self) -> Optional[dict]:
+        async with self.async_session() as session:
+            row = await session.get(PlatformSignalWireDialerCredentialsModel, 1)
+        if not row:
+            return None
+        return {**(row.credentials or {}), "updated_at": row.updated_at}
+
+    async def save_platform_signalwire_dialer_credentials(self, credentials: dict) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformSignalWireDialerCredentialsModel, 1)
+            if row is None:
+                session.add(PlatformSignalWireDialerCredentialsModel(id=1, credentials=credentials))
+            else:
+                row.credentials = credentials
+            await session.commit()
+
+    async def get_platform_vonage_dialer_credentials(self) -> Optional[dict]:
+        async with self.async_session() as session:
+            row = await session.get(PlatformVonageDialerCredentialsModel, 1)
+        if not row:
+            return None
+        return {**(row.credentials or {}), "updated_at": row.updated_at}
+
+    async def save_platform_vonage_dialer_credentials(self, credentials: dict) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformVonageDialerCredentialsModel, 1)
+            if row is None:
+                row = PlatformVonageDialerCredentialsModel(id=1, credentials=credentials)
+                session.add(row)
+            else:
+                row.credentials = credentials
+            await session.commit()
+
     async def get_platform_telnyx_user_credential(self, user_id: int) -> Optional[dict]:
         async with self.async_session() as session:
             row = await session.get(PlatformTelnyxUserCredentialModel, user_id)

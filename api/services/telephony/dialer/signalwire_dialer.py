@@ -4,7 +4,7 @@ Mints a Fabric *subscriber* token, which is what the browser SDK registers
 with. Verified empirically against the live space:
 
     POST https://{space}/api/fabric/subscribers/tokens
-    HTTP Basic (SIGNALWIRE_PROJECT_ID, SIGNALWIRE_API_TOKEN)
+    HTTP Basic (managed platform credentials, with environment fallback)
     body {"reference": "<stable string>"}
     -> 200 {"subscriber_id": "...", "token": "..."}
 
@@ -25,6 +25,7 @@ import os
 import httpx
 from loguru import logger
 
+from api.db import db_client
 from api.services.telephony.dialer.provider import DialerCredentials
 
 # The browser dials this resource address. Overridable so the SignalWire
@@ -115,9 +116,16 @@ class SignalWireDialerProvider:
     name = "signalwire"
 
     async def mint_credentials(self, *, user_id: int) -> DialerCredentials:
-        space = _space_host()
-        project_id = (os.environ.get("SIGNALWIRE_PROJECT_ID") or "").strip()
-        api_token = (os.environ.get("SIGNALWIRE_API_TOKEN") or "").strip()
+        managed = await db_client.get_platform_signalwire_dialer_credentials() or {}
+        space_value = managed.get("space_url") or os.environ.get("SIGNALWIRE_SPACE_URL") or ""
+        space = str(space_value).strip()
+        for scheme in ("https://", "http://"):
+            if space.startswith(scheme):
+                space = space[len(scheme):]
+                break
+        space = space.rstrip("/")
+        project_id = str(managed.get("project_id") or os.environ.get("SIGNALWIRE_PROJECT_ID") or "").strip()
+        api_token = str(managed.get("api_token") or os.environ.get("SIGNALWIRE_API_TOKEN") or "").strip()
 
         missing = [
             name
