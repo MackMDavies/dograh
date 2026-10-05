@@ -990,7 +990,7 @@ class DeepgramTTSConfiguration(BaseServiceConfiguration):
             return "aura-2"
 
 
-ELEVENLABS_TTS_MODELS = ["eleven_flash_v2_5"]
+ELEVENLABS_TTS_MODELS = ["eleven_v4", "eleven_flash_v2_5"]
 
 
 @register_tts
