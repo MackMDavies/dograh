@@ -1,7 +1,7 @@
 """Store the platform Vonage account used by number management.
 
 Revision ID: cc20261003
-Revises: bb20261003
+Revises: dd20261005
 """
 from typing import Sequence, Union
 
@@ -9,7 +9,7 @@ from alembic import op
 import sqlalchemy as sa
 
 revision: str = "cc20261003"
-down_revision: Union[str, Sequence[str], None] = "bb20261003"
+down_revision: Union[str, Sequence[str], None] = "dd20261005"
 branch_labels = None
 depends_on = None
 
