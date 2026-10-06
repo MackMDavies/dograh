@@ -379,11 +379,9 @@ class PlatformVonageDialerCredentialsModel(Base):
     __tablename__ = "platform_vonage_dialer_credentials"
 
     id = Column(Integer, primary_key=True, default=1)
-    application_id = Column(String(100), nullable=False)
-    api_key = Column(String(32), nullable=False)
-    api_secret = Column(EncryptedString, nullable=True)
-    private_key = Column(EncryptedString, nullable=False)
-    signature_secret = Column(EncryptedString, nullable=False)
+    # Keep the existing platform settings table contract. EncryptedJSON reads
+    # the legacy plaintext JSON during migration, then encrypts every write.
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)
     updated_at = Column(
         DateTime(timezone=True),
         default=lambda: datetime.now(UTC),

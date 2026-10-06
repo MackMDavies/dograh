@@ -31,12 +31,13 @@ class PlatformSettingsClient(BaseDBClient):
             row = await session.get(PlatformVonageDialerCredentialsModel, 1)
         if not row:
             return None
+        credentials = row.credentials or {}
         return {
-            "application_id": row.application_id,
-            "api_key": row.api_key,
-            "api_secret": row.api_secret,
-            "private_key": row.private_key,
-            "signature_secret": row.signature_secret,
+            "application_id": credentials.get("application_id"),
+            "api_key": credentials.get("api_key"),
+            "api_secret": credentials.get("api_secret"),
+            "private_key": credentials.get("private_key"),
+            "signature_secret": credentials.get("signature_secret"),
             "updated_at": row.updated_at,
         }
 
@@ -48,19 +49,23 @@ class PlatformSettingsClient(BaseDBClient):
             if row is None:
                 row = PlatformVonageDialerCredentialsModel(
                     id=1,
-                    application_id=application_id,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    private_key=private_key,
-                    signature_secret=signature_secret,
+                    credentials={
+                        "application_id": application_id,
+                        "api_key": api_key,
+                        "api_secret": api_secret,
+                        "private_key": private_key,
+                        "signature_secret": signature_secret,
+                    },
                 )
                 session.add(row)
             else:
-                row.application_id = application_id
-                row.api_key = api_key
-                row.api_secret = api_secret
-                row.private_key = private_key
-                row.signature_secret = signature_secret
+                row.credentials = {
+                    "application_id": application_id,
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "private_key": private_key,
+                    "signature_secret": signature_secret,
+                }
             await session.commit()
 
     async def get_platform_telnyx_user_credential(self, user_id: int) -> Optional[dict]:
