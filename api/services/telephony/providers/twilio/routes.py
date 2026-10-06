@@ -124,6 +124,14 @@ class TelnyxDialerCallStatusRequest(BaseModel):
     duration_seconds: int | None = Field(default=None, ge=0, le=86400)
 
 
+class VonageDialerCallStartRequest(TelnyxDialerCallStartRequest):
+    pass
+
+
+class VonageDialerCallStatusRequest(TelnyxDialerCallStatusRequest):
+    pass
+
+
 class TelnyxInboundCallRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=200)
     from_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
@@ -149,7 +157,7 @@ async def get_voice_token(
     assigned_provider = str((assigned or {}).get("provider") or "").strip().lower()
     provider_name = (
         assigned_provider
-        if assigned_provider in {"twilio", "signalwire", "telnyx"}
+        if assigned_provider in {"twilio", "signalwire", "telnyx", "vonage"}
         else resolve_active_dialer_provider()
     )
     try:
@@ -165,7 +173,7 @@ async def get_voice_token(
         provider=provider.name,
         destination=creds.destination,
         caller_number=(assigned or {}).get("phone_number", "")
-        if provider.name == "telnyx"
+        if provider.name in {"telnyx", "vonage"}
         else "",
         next_rotation_at=(assigned or {}).get("next_rotation_at"),
     )
@@ -220,6 +228,50 @@ async def update_telnyx_dialer_call_status(
         duration_seconds=body.duration_seconds,
         rep_user_id=user.provider_id,
         provider="telnyx",
+    )
+    return None
+
+
+@router.post("/dialer/vonage/calls/start", status_code=201)
+async def start_vonage_dialer_call(
+    body: VonageDialerCallStartRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    """Persist the call before Vonage starts billing for the PSTN leg."""
+    assigned = await _get_assigned_dialer_number_or_503(user.id)
+    if not assigned or assigned.get("provider") != "vonage":
+        raise HTTPException(status_code=409, detail="This rep has no active Vonage number assigned.")
+    if assigned.get("direction") not in {"outbound", "both"}:
+        raise HTTPException(status_code=409, detail="The assigned Vonage number is not enabled for outbound calls.")
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    created = await create_dialer_call(
+        parent_call_sid=str(body.call_id),
+        rep_user_id=user.provider_id,
+        entry_id=str(body.entry_id) if body.entry_id else None,
+        from_number=str(assigned["phone_number"]),
+        to_number=body.to_number,
+        provider="vonage",
+    )
+    if not created:
+        raise HTTPException(status_code=503, detail="Could not save this call to dialer history.")
+    return {"call_id": str(body.call_id), "from_number": str(assigned["phone_number"])}
+
+
+@router.post("/dialer/vonage/calls/status", status_code=204)
+async def update_vonage_dialer_call_status(
+    body: VonageDialerCallStatusRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    await update_dialer_call_status(
+        parent_call_sid=str(body.call_id),
+        child_call_sid=None,
+        status="in-progress" if body.status == "answered" else body.status,
+        duration_seconds=body.duration_seconds,
+        rep_user_id=user.provider_id,
+        provider="vonage",
     )
     return None
 

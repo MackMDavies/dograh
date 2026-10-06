@@ -57,6 +57,10 @@ def get_dialer_provider(name: str) -> DialerProvider:
         from api.services.telephony.dialer.telnyx_dialer import TelnyxDialerProvider
 
         return TelnyxDialerProvider()
+    if normalized == "vonage":
+        from api.services.telephony.dialer.vonage_dialer import VonageDialerProvider
+
+        return VonageDialerProvider()
     raise UnknownDialerProvider(f"No dialer provider implementation for {name!r}")
 
 

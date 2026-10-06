@@ -10,6 +10,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy import func, select
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
@@ -142,10 +145,50 @@ class TelnyxDialerCredentialsResponse(BaseModel):
     updated_at: Optional[str] = None
 
 
+class VonageDialerCredentialsRequest(BaseModel):
+    application_id: str
+    api_key: Optional[str] = None
+    api_secret: Optional[str] = None
+    private_key: Optional[str] = None
+    signature_secret: Optional[str] = None
+
+
+class VonageDialerCredentialsResponse(BaseModel):
+    configured: bool
+    purchasing_configured: bool = False
+    application_id: Optional[str] = None
+    api_key_preview: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class DialerNumberSearchRequest(BaseModel):
+    provider: Literal["twilio", "vonage"] = "twilio"
+    country_code: str
+    number_type: Literal["local", "toll-free", "mobile"] = "local"
+    area_code: Optional[str] = None
+    contains: Optional[str] = None
+
+
+class DialerNumberPurchaseRequest(DialerNumberSearchRequest):
+    phone_number: str
+
+
 def _mask_key(value: Optional[str]) -> Optional[str]:
     if not value:
         return None
     return f"{value[:5]}…{value[-4:]}" if len(value) > 12 else "••••••••"
+
+
+async def _active_twilio_dialer_client() -> Client:
+    """Resolve the active platform Twilio account used by the browser dialer."""
+    credentials = await db_client.get_platform_twilio_credentials()
+    if credentials:
+        return Client(credentials["account_sid"], credentials["auth_token"])
+    account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
+    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+    if not account_sid or not auth_token:
+        raise HTTPException(status_code=503, detail="No active platform Twilio account is configured.")
+    return Client(account_sid, auth_token)
 
 
 async def _telnyx_request(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
@@ -167,6 +210,63 @@ async def _telnyx_dialer_credentials() -> dict:
     }
 
 
+@router.get("/dialer-providers")
+async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
+    """Report readiness for rep-dialer carriers, apart from AI voice configs."""
+    from api.services.telephony.dialer.provider import resolve_active_dialer_provider
+
+    active_provider = resolve_active_dialer_provider()
+    twilio_accounts = await db_client.list_platform_twilio_accounts()
+    twilio_dialer = await db_client.get_platform_dialer_credentials()
+    twilio_env = all(os.environ.get(key) for key in (
+        "SYSEVO_TWILIO_ACCOUNT_SID", "TWILIO_API_KEY_SID",
+        "TWILIO_API_KEY_SECRET", "TWILIO_TWIML_APP_SID",
+    ))
+    telnyx = await _telnyx_dialer_credentials()
+    try:
+        vonage = await db_client.get_platform_vonage_dialer_credentials()
+    except Exception:
+        vonage = None
+    vonage = vonage or {}
+    vonage_env = all(os.environ.get(key) for key in (
+        "VONAGE_DIALER_APPLICATION_ID", "VONAGE_DIALER_API_KEY",
+        "VONAGE_DIALER_PRIVATE_KEY", "VONAGE_DIALER_SIGNATURE_SECRET",
+    ))
+    signalwire_missing = [
+        label for env, label in (
+            ("SIGNALWIRE_SPACE_URL", "space URL"),
+            ("SIGNALWIRE_PROJECT_ID", "project ID"),
+            ("SIGNALWIRE_API_TOKEN", "API token"),
+        ) if not os.environ.get(env)
+    ]
+    return {
+        "active_provider": active_provider,
+        "signalwire": {
+            "configured": not signalwire_missing,
+            "source": "environment",
+            "missing": signalwire_missing,
+        },
+        "telnyx": {
+            "configured": bool(telnyx.get("api_key") and (telnyx.get("connection_id") or telnyx.get("telephony_credential_id"))),
+            "source": "database" if await db_client.get_platform_telnyx_dialer_credentials() else "environment",
+        },
+        "twilio": {
+            "configured": bool(twilio_dialer or twilio_env),
+            "source": "database" if twilio_dialer else ("environment" if twilio_env else None),
+            "account_count": len(twilio_accounts),
+            "active_dialer_configured": bool(twilio_dialer or twilio_env),
+        },
+        "vonage": {
+            "configured": bool(
+                (vonage.get("application_id") and vonage.get("api_key")
+                 and vonage.get("private_key") and vonage.get("signature_secret"))
+                or vonage_env
+            ),
+            "source": "database" if vonage else ("environment" if vonage_env else None),
+        },
+    }
+
+
 def _telnyx_credentials_response(saved: Optional[dict]) -> TelnyxDialerCredentialsResponse:
     saved = saved or {}
     key = saved.get("api_key") or ""
@@ -179,6 +279,192 @@ def _telnyx_credentials_response(saved: Optional[dict]) -> TelnyxDialerCredentia
         telephony_credential_id=saved.get("telephony_credential_id") or None,
         updated_at=(saved.get("updated_at").isoformat() if saved.get("updated_at") else None),
     )
+
+
+def _vonage_credentials_response(saved: Optional[dict]) -> VonageDialerCredentialsResponse:
+    saved = saved or {}
+    api_key = saved.get("api_key") or ""
+    return VonageDialerCredentialsResponse(
+        configured=bool(
+            saved.get("application_id") and api_key
+            and saved.get("private_key") and saved.get("signature_secret")
+        ),
+        purchasing_configured=bool(api_key and saved.get("api_secret")),
+        application_id=saved.get("application_id") or None,
+        api_key_preview=_mask_key(api_key),
+        updated_at=saved.get("updated_at").isoformat() if saved.get("updated_at") else None,
+    )
+
+
+@router.get("/vonage-dialer", response_model=VonageDialerCredentialsResponse)
+async def get_vonage_dialer_settings(_user: UserModel = Depends(get_superuser)):
+    saved = await db_client.get_platform_vonage_dialer_credentials()
+    return _vonage_credentials_response(saved)
+
+
+@router.put("/vonage-dialer", response_model=VonageDialerCredentialsResponse)
+async def save_vonage_dialer_settings(
+    body: VonageDialerCredentialsRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    current = await db_client.get_platform_vonage_dialer_credentials() or {}
+    application_id = body.application_id.strip()
+    api_key = (body.api_key or current.get("api_key") or "").strip()
+    api_secret = (body.api_secret or current.get("api_secret") or "").strip() or None
+    private_key = (body.private_key or current.get("private_key") or "").replace("\\n", "\n").strip()
+    signature_secret = (body.signature_secret or current.get("signature_secret") or "").strip()
+    if not application_id or not api_key or not private_key or not signature_secret:
+        raise HTTPException(status_code=422, detail="Application ID, API key, private key, and signature secret are required.")
+    if len(signature_secret) < 32:
+        raise HTTPException(status_code=422, detail="Use the Vonage webhook signature secret (at least 32 characters).")
+    try:
+        key = serialization.load_pem_private_key(private_key.encode(), password=None)
+        if not isinstance(key, rsa.RSAPrivateKey):
+            raise ValueError("Vonage requires an RSA private key.")
+        key.sign(b"sysevo-vonage-dialer-check", padding.PKCS1v15(), hashes.SHA256())
+    except Exception as exc:  # noqa: BLE001 - don't persist unusable signing keys
+        raise HTTPException(status_code=422, detail="The Vonage private key must be a valid RSA PEM key.") from exc
+    await db_client.save_platform_vonage_dialer_credentials(
+        application_id=application_id,
+        api_key=api_key,
+        api_secret=api_secret,
+        private_key=private_key,
+        signature_secret=signature_secret,
+    )
+    return _vonage_credentials_response(await db_client.get_platform_vonage_dialer_credentials())
+
+
+def _number_type_resource(client: Client, country_code: str, number_type: str):
+    country = client.available_phone_numbers(country_code.upper())
+    return {
+        "toll-free": country.toll_free,
+        "mobile": country.mobile,
+    }.get(number_type, country.local)
+
+
+async def _sync_dialer_number(*, provider: str, phone_number: str, friendly_name: Optional[str] = None, sid: Optional[str] = None):
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Dialer number inventory sync is not configured.")
+    number_row = {"provider": provider, "phone_number": phone_number}
+    if friendly_name:
+        number_row["friendly_name"] = friendly_name
+    if sid or provider != "twilio":
+        number_row["twilio_sid"] = sid
+    async with httpx.AsyncClient(timeout=10) as client:
+        response = await client.post(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_phone_numbers?on_conflict=phone_number",
+            json=number_row,
+            headers={
+                "apikey": SUPABASE_ANON_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=minimal",
+            },
+        )
+    if not response.is_success:
+        logger.error(f"Dialer number inventory sync failed ({response.status_code}): {response.text[:250]}")
+        raise HTTPException(status_code=502, detail="Carrier number succeeded, but its dialer inventory sync failed.")
+
+
+@router.post("/dialer-numbers/search")
+async def search_dialer_numbers(body: DialerNumberSearchRequest, _user: UserModel = Depends(get_superuser)):
+    # Both browser adapters are selected from the rep's assigned number, so
+    # admins can manage an account without switching the global fallback.
+    provider = body.provider
+    country = body.country_code.strip().upper()
+    if len(country) != 2 or not country.isalpha():
+        raise HTTPException(status_code=422, detail="country_code must be a two-letter ISO country code.")
+    area_code = "".join(c for c in (body.area_code or "") if c.isdigit())[:6]
+    contains = "".join(c for c in (body.contains or "") if c.isdigit())[:8]
+    if provider == "twilio":
+        client = await _active_twilio_dialer_client()
+        params = {"voice_enabled": True, "limit": 20}
+        if area_code: params["area_code"] = area_code
+        if contains: params["contains"] = contains
+        try:
+            available = await asyncio.to_thread(lambda: _number_type_resource(client, country, body.number_type).list(**params))
+        except TwilioRestException as exc:
+            raise HTTPException(status_code=400, detail=f"Twilio number search failed: {exc.msg}") from exc
+        offers = [{"phone_number": item.phone_number, "country_code": country, "number_type": body.number_type,
+                   "capabilities": [name for name, enabled in (item.capabilities or {}).items() if enabled], "monthly_cost": None, "currency": None} for item in available]
+        return {"provider": provider, "offers": offers}
+
+    credentials = await db_client.get_platform_vonage_dialer_credentials()
+    if not credentials or not credentials.get("api_secret"):
+        raise HTTPException(status_code=503, detail="Save the Vonage account API secret to search and purchase dialer numbers.")
+    params = {"country": country, "features": "VOICE", "size": 20,
+              "type": {"local": "landline", "toll-free": "landline-toll-free", "mobile": "mobile-lvn"}[body.number_type]}
+    pattern = area_code or contains
+    if pattern:
+        params["pattern"] = pattern
+        # Vonage patterns are matched against E.164 digits including the
+        # country prefix; use contains for national area codes to avoid
+        # incorrectly requiring the pattern to start before that prefix.
+        params["search_pattern"] = "1"
+    async with httpx.AsyncClient(timeout=15) as client:
+        response = await client.get("https://rest.nexmo.com/number/search", params=params, auth=(credentials["api_key"], credentials["api_secret"]))
+    result = response.json()
+    if not response.is_success:
+        raise HTTPException(status_code=400, detail=str(result.get("error-code-label") or "Vonage number search failed."))
+    offers = [{"phone_number": f"+{item['msisdn']}", "country_code": item.get("country", country),
+               "number_type": body.number_type, "capabilities": item.get("features", []),
+               "monthly_cost": item.get("cost"), "currency": "EUR"} for item in result.get("numbers", [])]
+    return {"provider": provider, "offers": offers}
+
+
+@router.post("/dialer-numbers/purchase")
+async def purchase_dialer_number(body: DialerNumberPurchaseRequest, _user: UserModel = Depends(get_superuser)):
+    provider = body.provider
+    if not body.phone_number.startswith("+") or not body.phone_number[1:].isdigit():
+        raise HTTPException(status_code=422, detail="phone_number must be E.164 formatted.")
+    # Re-run the exact same search immediately before the paid action.
+    offers = await search_dialer_numbers(body, _user)
+    if not any(item["phone_number"] == body.phone_number for item in offers["offers"]):
+        raise HTTPException(status_code=409, detail="That number is no longer available. Search again before purchasing.")
+    if provider == "twilio":
+        client = await _active_twilio_dialer_client()
+        try:
+            purchased = await asyncio.to_thread(lambda: client.incoming_phone_numbers.create(phone_number=body.phone_number))
+        except TwilioRestException as exc:
+            raise HTTPException(status_code=400, detail=f"Twilio could not purchase this number: {exc.msg}") from exc
+        await _sync_dialer_number(provider=provider, phone_number=purchased.phone_number, friendly_name=purchased.friendly_name, sid=purchased.sid)
+        return {"purchased": {"phone_number": purchased.phone_number, "provider": provider, "status": "active"}, "sync_required": False}
+
+    credentials = await db_client.get_platform_vonage_dialer_credentials()
+    if not credentials or not credentials.get("api_secret"):
+        raise HTTPException(status_code=503, detail="Save the Vonage account API secret to purchase dialer numbers.")
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post("https://rest.nexmo.com/number/buy", data={"country": body.country_code.upper(), "msisdn": body.phone_number.lstrip("+")}, auth=(credentials["api_key"], credentials["api_secret"]))
+    result = response.json()
+    if not response.is_success or str(result.get("error-code")) != "200":
+        raise HTTPException(status_code=400, detail=str(result.get("error-code-label") or "Vonage could not purchase this number."))
+    await _sync_dialer_number(provider=provider, phone_number=body.phone_number, friendly_name="Vonage dialer number")
+    return {"purchased": {"phone_number": body.phone_number, "provider": provider, "status": "active"}, "sync_required": False}
+
+
+@router.post("/vonage-dialer/sync-numbers")
+async def sync_vonage_dialer_numbers(_user: UserModel = Depends(get_superuser)):
+    credentials = await db_client.get_platform_vonage_dialer_credentials()
+    if not credentials or not credentials.get("api_secret"):
+        raise HTTPException(status_code=503, detail="Save the Vonage account API secret before syncing numbers.")
+    numbers = []
+    async with httpx.AsyncClient(timeout=15) as client:
+        for page in range(1, 101):
+            response = await client.get(
+                "https://rest.nexmo.com/account/numbers",
+                params={"size": 100, "index": page},
+                auth=(credentials["api_key"], credentials["api_secret"]),
+            )
+            result = response.json()
+            if not response.is_success:
+                raise HTTPException(status_code=502, detail="Vonage could not list owned numbers.")
+            numbers.extend(result.get("numbers", []))
+            if len(numbers) >= int(result.get("count", len(numbers))) or not result.get("numbers"):
+                break
+    for number in numbers:
+        if "VOICE" in str(number.get("features", "")).upper():
+            await _sync_dialer_number(provider="vonage", phone_number=f"+{number['msisdn']}", friendly_name="Vonage dialer number")
+    return {"synced": sum("VOICE" in str(number.get("features", "")).upper() for number in numbers)}
 
 
 @router.get("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)

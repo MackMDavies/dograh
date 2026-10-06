@@ -373,6 +373,22 @@ class PlatformTelnyxDialerCredentialsModel(Base):
     )
 
 
+class PlatformVonageDialerCredentialsModel(Base):
+    """Platform Vonage Client SDK credentials for the rep dialer only."""
+
+    __tablename__ = "platform_vonage_dialer_credentials"
+
+    id = Column(Integer, primary_key=True, default=1)
+    # Keep the existing platform settings table contract. EncryptedJSON reads
+    # the legacy plaintext JSON during migration, then encrypts every write.
+    credentials = Column(EncryptedJSON, nullable=False, default=dict)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class PlatformTelnyxUserCredentialModel(Base):
     """On-demand Telnyx WebRTC credential assigned to one Sysevo rep."""
 
