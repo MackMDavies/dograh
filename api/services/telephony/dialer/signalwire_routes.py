@@ -845,9 +845,10 @@ async def handle_sw_call_status(request: Request):
         # busy or declined -- the difference between a call worth retrying and one that
         # was actively refused.
         end_reason = _extract(payload, query, _END_REASON_KEYS)
+        end_source = _extract(payload, query, _END_SOURCE_KEYS)
         ended_by = _ended_by(
             state or "",
-            _extract(payload, query, _END_SOURCE_KEYS) or "",
+            end_source,
             _extract(payload, query, _END_REASON_KEYS) or "",
         )
 
@@ -865,10 +866,25 @@ async def handle_sw_call_status(request: Request):
             except (TypeError, ValueError):
                 logger.warning(f"sw-call-status duration {raw_duration!r} is not a number")
 
+        status = _map_call_state(state, end_reason)
+        # SignalWire's observed `connect` rejection (HTTP 400: "No valid devices")
+        # ends the SWML leg as hangup with end_source=none. That is not a human
+        # completing a conversation. Mapping it to completed made the dialer treat
+        # failed outbound attempts like successful calls with a missing recording.
+        if (
+            (state or "").strip().lower() == "ended"
+            and re.sub(r"[^a-z]", "", (end_reason or "").strip().lower()) == "hangup"
+            and (end_source or "").strip().lower() == "none"
+        ):
+            status = "failed"
+            logger.warning(
+                f"SignalWire call {call_id} ended without a connected peer; recording as failed"
+            )
+
         await update_dialer_call_status(
             parent_call_sid=call_id,
             child_call_sid=None,
-            status=_map_call_state(state, end_reason),
+            status=status,
             duration_seconds=duration,
             ended_by=ended_by,
         )
