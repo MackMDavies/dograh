@@ -5,9 +5,12 @@ provider registry — see ProviderSpec.router.
 """
 
 import json
+import os
+import re
 from typing import Optional
 
-from fastapi import APIRouter, Request
+import jwt
+from fastapi import APIRouter, HTTPException, Request
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
 
@@ -19,6 +22,64 @@ from api.services.telephony.status_processor import (
 )
 
 router = APIRouter()
+
+
+async def _verify_dialer_webhook(request: Request) -> None:
+    """Accept dialer webhooks only when signed for the configured application."""
+    try:
+        saved = await db_client.get_platform_vonage_dialer_credentials()
+    except Exception as exc:  # noqa: BLE001 - fail closed if credentials can't be verified
+        raise HTTPException(status_code=503, detail="Could not verify Vonage webhook settings.") from exc
+    saved = saved or {}
+    api_key = (saved.get("api_key") or os.getenv("VONAGE_DIALER_API_KEY") or "").strip()
+    signature_secret = saved.get("signature_secret") or os.getenv("VONAGE_DIALER_SIGNATURE_SECRET") or ""
+    authorization = request.headers.get("authorization", "")
+    token = authorization.removeprefix("Bearer ").strip()
+    if not api_key or not signature_secret or not token:
+        raise HTTPException(status_code=401, detail="Invalid Vonage webhook authorization.")
+    try:
+        claims = jwt.decode(
+            token,
+            signature_secret,
+            algorithms=["HS256"],
+            options={"require": ["api_key", "iat", "exp"]},
+            leeway=60,
+        )
+    except Exception as exc:  # noqa: BLE001 - reject any malformed/unsigned webhook
+        raise HTTPException(status_code=401, detail="Invalid Vonage webhook signature.") from exc
+    if claims.get("api_key") != api_key:
+        raise HTTPException(status_code=401, detail="Vonage webhook is not for this application.")
+
+
+@router.get("/vonage/dialer/answer", include_in_schema=False)
+async def handle_dialer_answer(request: Request):
+    """Return the NCCO for a rep's Vonage Client SDK PSTN call."""
+    await _verify_dialer_webhook(request)
+    try:
+        payload = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=422, detail="Vonage call metadata is invalid.")
+    custom_data = payload.get("custom_data")
+    if isinstance(custom_data, str):
+        try:
+            custom_data = json.loads(custom_data)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="Vonage call metadata is invalid.")
+    if not isinstance(custom_data, dict):
+        custom_data = {}
+    to_number = str(custom_data.get("to") or payload.get("to") or "")
+    from_number = str(custom_data.get("from") or payload.get("from") or "")
+    if not re.fullmatch(r"\+?[1-9]\d{7,14}", to_number):
+        raise HTTPException(status_code=422, detail="Vonage call destination is invalid.")
+    if not re.fullmatch(r"\+?[1-9]\d{7,14}", from_number):
+        raise HTTPException(status_code=422, detail="Vonage caller ID is invalid.")
+    return [{
+        "action": "connect",
+        "from": from_number.removeprefix("+"),
+        "endpoint": [{"type": "phone", "number": to_number.removeprefix("+")}],
+    }]
 
 
 @router.get("/ncco", include_in_schema=False)

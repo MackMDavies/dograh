@@ -373,6 +373,24 @@ class PlatformTelnyxDialerCredentialsModel(Base):
     )
 
 
+class PlatformVonageDialerCredentialsModel(Base):
+    """Platform Vonage Client SDK credentials for the rep dialer only."""
+
+    __tablename__ = "platform_vonage_dialer_credentials"
+
+    id = Column(Integer, primary_key=True, default=1)
+    application_id = Column(String(100), nullable=False)
+    api_key = Column(String(32), nullable=False)
+    api_secret = Column(EncryptedString, nullable=True)
+    private_key = Column(EncryptedString, nullable=False)
+    signature_secret = Column(EncryptedString, nullable=False)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class PlatformTelnyxUserCredentialModel(Base):
     """On-demand Telnyx WebRTC credential assigned to one Sysevo rep."""
 
