@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
 
 from api.db.base_client import BaseDBClient
 from api.db.models import VoiceLibraryModel
@@ -95,6 +95,19 @@ class VoiceLibraryClient(BaseDBClient):
                 )
             )
             return result.scalars().first()
+
+    async def count_org_clones(self, organization_id: int) -> int:
+        """Cloned voices the org holds (any status: a failed clone still used a slot until deleted)."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(func.count(VoiceLibraryModel.id)).where(
+                    and_(
+                        VoiceLibraryModel.organization_id == organization_id,
+                        VoiceLibraryModel.provider.in_(("dograh_clone", "xai")),
+                    )
+                )
+            )
+            return int(result.scalar() or 0)
 
     async def list_voices(
         self,

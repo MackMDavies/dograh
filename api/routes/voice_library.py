@@ -12,6 +12,7 @@ from loguru import logger
 
 from api.db import db_client
 from api.db.models import UserModel
+from api.enums import OrganizationConfigurationKey
 from api.schemas.voice_library import (
     ElevenLabsCatalogVoiceSchema,
     ElevenLabsImportRequestSchema,
@@ -910,6 +911,29 @@ async def clone_voice(
         raise HTTPException(status_code=400, detail="Audio file too small — minimum 1 second of audio required")
 
     org_id = user.selected_organization_id
+
+    # Plan cap on custom voices (5 / 15 / 35 on Launch / Growth / Command), synced from
+    # Sysevo into the org's CUSTOM_VOICE_LIMIT. No configured limit = no cap; superusers
+    # (Sysevo staff) are never capped.
+    if not getattr(user, "is_superuser", False):
+        try:
+            limit_cfg = await db_client.get_configuration(
+                org_id, OrganizationConfigurationKey.CUSTOM_VOICE_LIMIT.value
+            )
+            limit = (limit_cfg.value or {}).get("value") if limit_cfg else None
+        except Exception as e:
+            logger.warning(f"[voice-clone] custom voice limit lookup failed for org {org_id}: {e}")
+            limit = None
+        if limit is not None:
+            used = await db_client.count_org_clones(org_id)
+            if used >= int(limit):
+                raise HTTPException(
+                    status_code=403,
+                    detail=(
+                        f"Your plan includes {int(limit)} custom voice{'s' if int(limit) != 1 else ''}. "
+                        "Delete one or upgrade your plan to add more."
+                    ),
+                )
 
     # Auto-detect cloning provider. Prefer ElevenLabs — it's the reliable instant
     # voice-cloning path and is resolvable across the caller's config / org / (for
