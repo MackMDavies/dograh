@@ -986,7 +986,16 @@ def create_llm_service_from_provider(
         from api.services.pipecat.anthropic_llm import DograhAnthropicLLMService
         from pipecat.services.anthropic.llm import AnthropicLLMSettings
         _anthr_is_v4 = "-4" in model.split("/")[-1].lower()
-        _anthr_settings = AnthropicLLMSettings(model=model) if _anthr_is_v4 else AnthropicLLMSettings(model=model, temperature=0.1)
+        _anthr_kwargs = {"model": model} if _anthr_is_v4 else {"model": model, "temperature": 0.1}
+        # Prompt caching: every turn of a call re-sends the same system prompt, tools and
+        # conversation so far. Claude only caches when asked, and a cache read costs 10% of
+        # the input price (a write 125%), so this cuts the model cost of a Claude call-minute
+        # by about 70%. pipecat marks the cache points; prompts under Claude's minimum
+        # (4,096 tokens on Haiku 4.5 / Opus 4.5) are simply not cached, at no charge.
+        # Guarded so an older pipecat without the setting still builds the service.
+        if "enable_prompt_caching" in getattr(AnthropicLLMSettings, "__dataclass_fields__", {}):
+            _anthr_kwargs["enable_prompt_caching"] = True
+        _anthr_settings = AnthropicLLMSettings(**_anthr_kwargs)
         return DograhAnthropicLLMService(
             api_key=api_key,
             settings=_anthr_settings,
