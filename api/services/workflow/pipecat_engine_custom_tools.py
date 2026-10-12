@@ -97,7 +97,7 @@ class CustomToolManager:
     async def _execute_sandbox_booking_action(
         self, tool: Any, arguments: dict[str, Any] | None
     ) -> dict[str, Any]:
-        """Route only Sysevo's canonical booking tool to its isolated calendar adapter."""
+        """Route only allowlisted provider actions to Sysevo's isolated adapters."""
         workflow_run_id = getattr(self._engine, "_workflow_run_id", None)
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
         context = sandbox_test_run_context(workflow_run) if workflow_run else None
@@ -107,10 +107,18 @@ class CustomToolManager:
         config = (getattr(tool, "definition", None) or {}).get("config", {})
         parsed = urlparse(str(config.get("url", "")))
         query = parse_qs(parsed.query)
-        action = query.get("action", [""])[0]
-        if parsed.hostname != "rdiwzxtibglitvtextzs.supabase.co" or \
-            parsed.path != "/functions/v1/agent-memory-lookup" or \
-            action not in {"check_availability", "book_appointment"}:
+        configured_action = query.get("action", [""])[0]
+        method = str(config.get("method", "GET")).upper()
+        if parsed.hostname == "rdiwzxtibglitvtextzs.supabase.co" and \
+            parsed.path == "/functions/v1/agent-memory-lookup" and \
+            configured_action in {"check_availability", "book_appointment"}:
+            action = configured_action
+        elif parsed.hostname == "api.resend.com" and parsed.path == "/emails" and method == "POST":
+            action = "send_test_email"
+        elif parsed.hostname == "api.twilio.com" and \
+            re.fullmatch(r"/2010-04-01/Accounts/AC[0-9a-fA-F]{32}/Messages\.json", parsed.path) and method == "POST":
+            action = "send_test_sms"
+        else:
             return self._sandbox_action_blocked("unsupported_sandbox_adapter")
 
         endpoint = "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
@@ -128,7 +136,7 @@ class CustomToolManager:
                         "workflow_id": int(getattr(workflow_run, "workflow_id", 0) or 0),
                         "workflow_run_id": int(workflow_run_id),
                         "action": action,
-                        "arguments": arguments or {},
+                        "arguments": {} if action in {"send_test_email", "send_test_sms"} else (arguments or {}),
                     },
                 )
             result = response.json()
@@ -136,7 +144,7 @@ class CustomToolManager:
                 return {
                     "status": result.get("status", "blocked"),
                     "code": result.get("code", "sandbox_action_rejected"),
-                    "message": result.get("message", "The isolated calendar action could not be verified."),
+                    "message": result.get("message", "The isolated provider action could not be verified."),
                     "client_integration_called": False,
                 }
             return result
