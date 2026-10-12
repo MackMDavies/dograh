@@ -345,7 +345,12 @@ def _remove_test_markers(value, path: str = "$") -> list[str]:
     if isinstance(value, dict):
         for key, child in list(value.items()):
             child_path = f"{path}.{key}"
-            marker_key = key.lower() in _TEST_MARKER_KEYS and child not in (False, None, "")
+            marker_key = (
+                key.lower() in _TEST_MARKER_KEYS
+                and child is not False
+                and child is not None
+                and child != ""
+            )
             marker_value = isinstance(child, str) and bool(_TEST_MARKER_VALUE.search(child))
             if marker_key or marker_value:
                 del value[key]

@@ -606,3 +606,60 @@ class TestRunDefinitionBinding:
         )
 
         assert run.definition_id == draft.id
+
+
+class TestSandboxRepairVersioning:
+    async def test_repair_candidate_is_created_only_without_an_existing_draft(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, _ = workflow_with_v1
+        candidate = {**GRAPH_V2, "sysevo_internal_test": True}
+
+        draft = await db_session.create_test_repair_draft(
+            workflow.id, 1, candidate
+        )
+        assert draft.version_number == 2
+        assert draft.status == "draft"
+
+        with pytest.raises(ValueError, match="existing draft"):
+            await db_session.create_test_repair_draft(workflow.id, 1, candidate)
+
+    async def test_repair_candidate_promotes_only_when_both_versions_and_hash_match(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, _ = workflow_with_v1
+        candidate_json = {**GRAPH_V2, "sysevo_internal_test": True}
+        draft = await db_session.create_test_repair_draft(workflow.id, 1, candidate_json)
+        candidate_hash = db_session._test_repair_hash(candidate_json)
+
+        with pytest.raises(ValueError, match="Candidate changed"):
+            await db_session.promote_test_repair_draft(
+                workflow.id, 1, draft.version_number, "0" * 64
+            )
+
+        promoted = await db_session.promote_test_repair_draft(
+            workflow.id, 1, draft.version_number, candidate_hash
+        )
+        versions = await db_session.get_workflow_versions(workflow.id)
+        assert promoted.status == "published"
+        assert next(v for v in versions if v.version_number == 1).status == "archived"
+
+    async def test_repair_candidate_discard_restores_legacy_workflow_to_published(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, _ = workflow_with_v1
+        candidate_json = {**GRAPH_V2, "sysevo_internal_test": True}
+        draft = await db_session.create_test_repair_draft(workflow.id, 1, candidate_json)
+        candidate_hash = db_session._test_repair_hash(candidate_json)
+
+        with pytest.raises(ValueError, match="Draft changed"):
+            await db_session.discard_test_repair_draft(
+                workflow.id, draft.version_number, "0" * 64
+            )
+        discarded_version = await db_session.discard_test_repair_draft(
+            workflow.id, draft.version_number, candidate_hash
+        )
+
+        assert discarded_version == draft.version_number
+        current = await db_session.get_workflow_by_id(workflow.id)
+        assert current.workflow_definition == GRAPH_V1
