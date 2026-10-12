@@ -1,8 +1,9 @@
 from datetime import datetime
+import os
 from typing import Any, Dict
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pipecat.utils.run_context import set_current_run_id
 from pydantic import BaseModel, Field
 
@@ -25,6 +26,10 @@ from api.services.workflow.text_chat_session_service import (
     normalize_text_chat_session_data,
     rewind_text_chat_session_state,
 )
+from api.services.workflow.test_sandbox_mode import (
+    build_run_annotations,
+    sandbox_secret_matches,
+)
 
 router = APIRouter(prefix="/workflow", tags=["workflow-text-chat"])
 
@@ -33,6 +38,9 @@ class CreateTextChatSessionRequest(BaseModel):
     name: str | None = None
     initial_context: Dict[str, Any] | None = None
     annotations: Dict[str, Any] | None = None
+    sandbox_mode: bool = False
+    published_version_number: int | None = Field(default=None, ge=1)
+    candidate_draft_version_number: int | None = Field(default=None, ge=1)
 
 
 class AppendTextChatMessageRequest(BaseModel):
@@ -159,7 +167,23 @@ async def create_text_chat_session(
     workflow_id: int,
     request: CreateTextChatSessionRequest,
     user: UserModel = Depends(get_user),
+    x_sysevo_secret: str | None = Header(None, alias="x-sysevo-secret"),
 ) -> WorkflowRunTextSessionResponse:
+    sandbox_authorized = False
+    if request.sandbox_mode:
+        expected_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+        if not sandbox_secret_matches(x_sysevo_secret, expected_secret):
+            raise HTTPException(status_code=403, detail="Sandbox test authorization required")
+        test_run_id = (request.annotations or {}).get("agent_test_run_id")
+        scenario_id = (request.annotations or {}).get("scenario_id")
+        if not isinstance(test_run_id, str) or len(test_run_id) != 36 or not isinstance(scenario_id, str):
+            raise HTTPException(status_code=400, detail="Sandbox test run and scenario identifiers are required")
+        if (request.published_version_number is None) == (request.candidate_draft_version_number is None):
+            raise HTTPException(status_code=400, detail="Sandbox test sessions must bind to exactly one published or candidate draft version")
+        sandbox_authorized = True
+    elif request.published_version_number is not None or request.candidate_draft_version_number is not None:
+        raise HTTPException(status_code=403, detail="Published version pinning is reserved for authenticated sandbox tests")
+
     organization_id = _require_selected_organization_id(user)
     await _ensure_text_chat_quota(user, workflow_id)
 
@@ -171,22 +195,27 @@ async def create_text_chat_session(
             mode=WorkflowRunMode.TEXTCHAT.value,
             user_id=user.id,
             initial_context=request.initial_context,
-            use_draft=True,
+            use_draft=not sandbox_authorized,
+            definition_version_number=(request.published_version_number or request.candidate_draft_version_number) if sandbox_authorized else None,
+            definition_version_status="draft" if request.candidate_draft_version_number is not None else "published",
             organization_id=organization_id,
         )
     except ValueError as e:
-        raise HTTPException(status_code=404, detail=str(e))
+        status_code = 409 if "no longer available" in str(e) else 404
+        raise HTTPException(status_code=status_code, detail=str(e))
 
     set_current_run_id(workflow_run.id)
 
-    annotations = {
-        "tester": {
-            "source": "workflow_editor",
-            "modality": "text",
-        }
-    }
-    if request.annotations:
-        annotations = {**annotations, **request.annotations}
+    annotations = build_run_annotations(
+        {
+            "tester": {
+                "source": "workflow_editor",
+                "modality": "text",
+            }
+        },
+        request.annotations,
+        sandbox_authorized=sandbox_authorized,
+    )
     workflow_run = await db_client.update_workflow_run(
         workflow_run.id,
         annotations=annotations,

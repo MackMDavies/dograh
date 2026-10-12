@@ -110,6 +110,22 @@ async def workflow_with_v1(db_session, org_and_user):
 
 
 class TestWorkflowCreation:
+    async def test_create_workflow_can_start_deactivated_for_provisioning(
+        self, db_session, org_and_user
+    ):
+        org, user = org_and_user
+        workflow = await db_session.create_workflow(
+            name="Unreleased Candidate",
+            workflow_definition=GRAPH_V1,
+            user_id=user.id,
+            organization_id=org.id,
+            status="deactivated",
+        )
+        assert workflow.status == "deactivated"
+        versions = await db_session.get_workflow_versions(workflow.id)
+        assert len(versions) == 1
+        assert versions[0].status == "published"
+
     async def test_create_workflow_produces_published_v1(
         self, db_session, org_and_user
     ):
@@ -606,3 +622,68 @@ class TestRunDefinitionBinding:
         )
 
         assert run.definition_id == draft.id
+
+    async def test_sandbox_run_can_pin_exact_published_version_with_draft_present(
+        self, db_session, workflow_with_v1
+    ):
+        """Agent QA must test the plan's published version, not an editor draft."""
+        workflow, user = workflow_with_v1
+        await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+        versions = await db_session.get_workflow_versions(workflow.id)
+        published = next(v for v in versions if v.status == "published")
+
+        run = await db_session.create_workflow_run(
+            name="Pinned Agent QA",
+            workflow_id=workflow.id,
+            mode="textchat",
+            user_id=user.id,
+            definition_version_number=published.version_number,
+        )
+
+        assert run.definition_id == published.id
+
+    async def test_sandbox_run_can_pin_exact_candidate_draft_for_regression(
+        self, db_session, workflow_with_v1
+    ):
+        """A repair regression binds to its exact draft without publishing it."""
+        workflow, user = workflow_with_v1
+        draft = await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+
+        run = await db_session.create_workflow_run(
+            name="Repair Candidate Regression",
+            workflow_id=workflow.id,
+            mode="textchat",
+            user_id=user.id,
+            definition_version_number=draft.version_number,
+            definition_version_status="draft",
+        )
+
+        assert run.definition_id == draft.id
+
+    async def test_sandbox_run_rejects_version_that_is_no_longer_published(
+        self, db_session, workflow_with_v1
+    ):
+        """A publish racing a queued test fails closed instead of testing a stale plan."""
+        workflow, user = workflow_with_v1
+        old_versions = await db_session.get_workflow_versions(workflow.id)
+        old_published = next(v for v in old_versions if v.status == "published")
+        await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+        await db_session.publish_workflow_draft(workflow.id)
+
+        with pytest.raises(ValueError, match="no longer available"):
+            await db_session.create_workflow_run(
+                name="Stale Agent QA",
+                workflow_id=workflow.id,
+                mode="textchat",
+                user_id=user.id,
+                definition_version_number=old_published.version_number,
+            )

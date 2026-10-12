@@ -37,6 +37,7 @@ from api.services.workflow.disposition_shape import normalize_disposition_codes
 from api.services.workflow.dto import ReactFlowDTO, sanitize_workflow_definition
 from api.services.workflow.duplicate import duplicate_workflow
 from api.services.workflow.errors import ItemKind, WorkflowError
+from api.services.workflow.test_sandbox_mode import sandbox_secret_matches
 from api.services.workflow.trigger_paths import (
     TriggerPathIssue,
     ensure_trigger_paths,
@@ -49,6 +50,12 @@ from api.services.workflow.workflow_graph import WorkflowGraph
 from api.utils.artifacts import artifact_url
 
 router = APIRouter(prefix="/workflow")
+
+
+@router.get("/capabilities")
+async def workflow_capabilities(user: UserModel = Depends(get_user)):
+    """Expose workflow lifecycle support so provisioning can fail closed on old servers."""
+    return {"supports_deactivated_creation": True}
 
 
 class ValidateWorkflowResponse(BaseModel):
@@ -246,6 +253,9 @@ class WorkflowTemplateResponse(BaseModel):
 class CreateWorkflowRequest(BaseModel):
     name: str
     workflow_definition: dict
+    # Provisioning creates a non-callable candidate until verification and
+    # release gates complete. Existing API callers retain the active default.
+    status: Literal["active", "deactivated"] = "active"
 
 
 class DuplicateTemplateRequest(BaseModel):
@@ -401,6 +411,7 @@ async def create_workflow(
         workflow_definition,
         user.id,
         user.selected_organization_id,
+        status=request.status,
     )
 
     capture_event(
@@ -867,6 +878,137 @@ async def create_workflow_draft(
         ),
         template_context_variables=draft.template_context_variables,
     )
+
+
+class DiscardCandidateDraftRequest(BaseModel):
+    expected_version_number: int = Field(ge=1)
+    expected_workflow_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class PrepareTestRepairDraftRequest(BaseModel):
+    expected_published_version_number: int = Field(ge=1)
+    operation: Literal["remove_sandbox_markers"]
+
+
+class PromoteTestRepairDraftRequest(BaseModel):
+    expected_published_version_number: int = Field(ge=1)
+    expected_draft_version_number: int = Field(ge=1)
+    expected_workflow_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+@router.post("/{workflow_id}/create-test-repair-draft")
+async def create_test_repair_draft(
+    workflow_id: int,
+    request: PrepareTestRepairDraftRequest,
+    user: UserModel = Depends(get_user),
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+) -> dict:
+    """Prepare a marker-cleaned candidate draft for regression; never publish it."""
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, expected):
+        raise HTTPException(status_code=403, detail="Internal test repair access required")
+    workflow = (
+        await db_client.get_workflow_by_id(workflow_id)
+        if user.is_superuser
+        else await db_client.get_workflow(workflow_id, organization_id=user.selected_organization_id)
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    try:
+        draft, changed_paths, candidate_hash = await db_client.create_sandbox_repair_draft(
+            workflow_id,
+            request.expected_published_version_number,
+            request.operation,
+        )
+    except ValueError as exc:
+        message = str(exc)
+        status = 409 if "changed" in message or "draft" in message else 422
+        raise HTTPException(status_code=status, detail=message)
+    return {
+        "workflow_id": workflow_id,
+        "candidate_version_number": draft.version_number,
+        "changed_paths": changed_paths,
+        "candidate_hash": candidate_hash,
+        "status": "draft",
+    }
+
+
+@router.post("/{workflow_id}/promote-test-repair-draft")
+async def promote_test_repair_draft(
+    workflow_id: int,
+    request: PromoteTestRepairDraftRequest,
+    user: UserModel = Depends(get_user),
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+) -> dict:
+    """Publish an exact candidate only after the caller's regression gate."""
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, expected):
+        raise HTTPException(status_code=403, detail="Internal test repair access required")
+    workflow = (
+        await db_client.get_workflow_by_id(workflow_id)
+        if user.is_superuser
+        else await db_client.get_workflow(workflow_id, organization_id=user.selected_organization_id)
+    )
+    if workflow is None:
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    draft = await db_client.get_draft_version(workflow_id)
+    if draft is None or draft.version_number != request.expected_draft_version_number:
+        raise HTTPException(status_code=409, detail="Candidate draft version changed after regression")
+    errors = await _validate_workflow_definition(draft.workflow_json, exclude_workflow_id=workflow_id)
+    if errors:
+        raise _validation_errors_http_exception(errors)
+    try:
+        published = await db_client.publish_sandbox_repair_draft(
+            workflow_id,
+            request.expected_published_version_number,
+            request.expected_draft_version_number,
+            request.expected_workflow_hash,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "workflow_id": workflow_id,
+        "promoted_version_number": published.version_number,
+        "status": published.status,
+        "published_at": published.published_at,
+    }
+
+
+@router.delete("/{workflow_id}/discard-draft")
+async def discard_candidate_draft(
+    workflow_id: int,
+    request: DiscardCandidateDraftRequest,
+    user: UserModel = Depends(get_user),
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+) -> dict:
+    """Discard only the exact draft version supplied by an isolated candidate."""
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, expected):
+        raise HTTPException(status_code=403, detail="Internal test repair access required")
+    if user.is_superuser:
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+    else:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=user.selected_organization_id
+        )
+    if workflow is None:
+        raise HTTPException(
+            status_code=404, detail=f"Workflow with id {workflow_id} not found"
+        )
+
+    try:
+        discarded = await db_client.discard_workflow_draft(
+            workflow_id,
+            expected_version_number=request.expected_version_number,
+            expected_workflow_hash=request.expected_workflow_hash,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
+    return {
+        "workflow_id": workflow_id,
+        "discarded_version_number": request.expected_version_number,
+        "already_discarded": not discarded,
+    }
 
 
 @router.get("/summary")

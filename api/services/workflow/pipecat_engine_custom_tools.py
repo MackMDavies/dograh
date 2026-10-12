@@ -7,10 +7,14 @@ during workflow execution.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import parse_qs, urlparse
+
+import httpx
 
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
@@ -32,6 +36,8 @@ from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
     tool_to_function_schema,
 )
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
+from api.services.workflow.test_sandbox_mode import sandbox_test_run_context
 
 if TYPE_CHECKING:
     from api.services.workflow.mcp_tool_session import McpToolSession
@@ -73,6 +79,79 @@ class CustomToolManager:
 
     def __init__(self, engine: "PipecatEngine") -> None:
         self._engine = engine
+        self._sandbox_mode: bool | None = None
+
+    async def _is_sandbox_test_run(self) -> bool:
+        """Read the server-owned run marker before any tool can cause side effects."""
+        if self._sandbox_mode is not None:
+            return self._sandbox_mode
+        run_id = getattr(self._engine, "_workflow_run_id", None)
+        if not run_id:
+            return False
+        workflow_run = await db_client.get_workflow_run_by_id(run_id)
+        if workflow_run is None:
+            raise RuntimeError("Cannot verify test sandbox mode for this workflow run")
+        self._sandbox_mode = is_sandbox_test_run(workflow_run)
+        return self._sandbox_mode
+
+    async def _execute_sandbox_booking_action(
+        self, tool: Any, arguments: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Route only Sysevo's canonical booking tool to its isolated calendar adapter."""
+        workflow_run_id = getattr(self._engine, "_workflow_run_id", None)
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+        context = sandbox_test_run_context(workflow_run) if workflow_run else None
+        if not context:
+            return self._sandbox_action_blocked("missing_test_context")
+
+        config = (getattr(tool, "definition", None) or {}).get("config", {})
+        parsed = urlparse(str(config.get("url", "")))
+        query = parse_qs(parsed.query)
+        action = query.get("action", [""])[0]
+        if parsed.hostname != "rdiwzxtibglitvtextzs.supabase.co" or \
+            parsed.path != "/functions/v1/agent-memory-lookup" or \
+            action not in {"check_availability", "book_appointment"}:
+            return self._sandbox_action_blocked("unsupported_sandbox_adapter")
+
+        endpoint = "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
+        secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+        if not secret:
+            return self._sandbox_action_blocked("sandbox_service_auth_unavailable")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={"x-sysevo-secret": secret},
+                    json={
+                        "test_run_id": context["agent_test_run_id"],
+                        "scenario_id": context["scenario_id"],
+                        "workflow_id": int(getattr(workflow_run, "workflow_id", 0) or 0),
+                        "workflow_run_id": int(workflow_run_id),
+                        "action": action,
+                        "arguments": arguments or {},
+                    },
+                )
+            result = response.json()
+            if response.status_code >= 400:
+                return {
+                    "status": result.get("status", "blocked"),
+                    "code": result.get("code", "sandbox_action_rejected"),
+                    "message": result.get("message", "The isolated calendar action could not be verified."),
+                    "client_integration_called": False,
+                }
+            return result
+        except Exception as error:
+            logger.warning("Isolated calendar action failed: {}", type(error).__name__)
+            return self._sandbox_action_blocked("sandbox_adapter_unavailable")
+
+    @staticmethod
+    def _sandbox_action_blocked(action: str) -> dict[str, str]:
+        return {
+            "status": "blocked",
+            "code": "sandbox_adapter_unavailable",
+            "action": action,
+            "message": "No isolated action adapter is connected. The client integration was not called.",
+        }
 
     async def _play_config_message(
         self, config: dict, *, append_to_context: bool = False
@@ -337,9 +416,18 @@ class CustomToolManager:
             function_call_params: FunctionCallParams,
         ) -> None:
             logger.info(f"HTTP Tool EXECUTED: {function_name}")
-            logger.info(f"Arguments: {function_call_params.arguments}")
 
             try:
+                if await self._is_sandbox_test_run():
+                    await function_call_params.result_callback(
+                        await self._execute_sandbox_booking_action(
+                            tool, function_call_params.arguments
+                        )
+                    )
+                    return
+
+                logger.info(f"Arguments: {function_call_params.arguments}")
+
                 # Queue custom message before executing the API call
                 # Queue custom message (text or audio) before executing the API call
                 config = tool.definition.get("config", {}) if tool.definition else {}
@@ -411,8 +499,13 @@ class CustomToolManager:
             function_call_params: FunctionCallParams,
         ) -> None:
             logger.info(f"MCP Tool EXECUTED: {function_name}")
-            logger.info(f"Arguments: {function_call_params.arguments}")
             try:
+                if await self._is_sandbox_test_run():
+                    await function_call_params.result_callback(
+                        self._sandbox_action_blocked(function_name)
+                    )
+                    return
+                logger.info(f"Arguments: {function_call_params.arguments}")
                 result = await session.call(
                     function_name, function_call_params.arguments or {}
                 )
@@ -521,6 +614,12 @@ class CustomToolManager:
                 workflow_run = await db_client.get_workflow_run_by_id(
                     self._engine._workflow_run_id
                 )
+                if is_sandbox_test_run(workflow_run):
+                    await function_call_params.result_callback(
+                        self._sandbox_action_blocked(function_name),
+                        properties=properties,
+                    )
+                    return
                 if workflow_run.mode == WorkflowRunMode.TEXTCHAT.value:
                     textchat_error_result = {
                         "status": "failed",

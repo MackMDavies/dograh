@@ -34,6 +34,8 @@ class WorkflowRunClient(BaseDBClient):
         campaign_id: int = None,
         queued_run_id: int = None,
         use_draft: bool = False,
+        definition_version_number: int | None = None,
+        definition_version_status: str = "published",
         organization_id: int | None = None,
         bypass_user_check: bool = False,
         api_key_id: int | None = None,
@@ -57,7 +59,24 @@ class WorkflowRunClient(BaseDBClient):
             # Resolve which definition to bind to this run
             target_def = None
 
-            if use_draft:
+            if definition_version_number is not None:
+                if use_draft:
+                    raise ValueError("An exact workflow version cannot be combined with draft selection")
+                if definition_version_status not in {"published", "draft"}:
+                    raise ValueError("An exact workflow version must be published or a candidate draft")
+                version_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.workflow_id == workflow.id,
+                        WorkflowDefinitionModel.version_number == definition_version_number,
+                        WorkflowDefinitionModel.status == definition_version_status,
+                    )
+                )
+                target_def = version_result.scalars().first()
+                if target_def is None:
+                    raise ValueError(
+                        f"{definition_version_status.title()} workflow version {definition_version_number} is no longer available"
+                    )
+            elif use_draft:
                 # For test calls: prefer draft if it exists, fall back to published
                 draft_result = await session.execute(
                     select(WorkflowDefinitionModel).where(
