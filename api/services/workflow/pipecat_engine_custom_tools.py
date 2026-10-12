@@ -30,6 +30,7 @@ from api.services.telephony.transfer_event_protocol import TransferContext
 from api.services.workflow.tools.calculator import get_calculator_tools, safe_calculator
 from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
+    sysevo_sandbox_action,
     tool_to_function_schema,
 )
 
@@ -148,6 +149,16 @@ class CustomToolManager:
 
             schemas: list[FunctionSchema] = []
             for tool in tools:
+                if self._engine._sysevo_test_sandbox is not None:
+                    if tool.category == ToolCategory.MCP.value:
+                        logger.info("Sandbox mode suppressed customer MCP tool '{}'", tool.name)
+                        continue
+                    if tool.category not in {ToolCategory.CALCULATOR.value, ToolCategory.END_CALL.value, ToolCategory.HTTP_API.value}:
+                        logger.info("Sandbox mode suppressed unsupported tool '{}' ({})", tool.name, tool.category)
+                        continue
+                    if tool.category == ToolCategory.HTTP_API.value and sysevo_sandbox_action(tool) is None:
+                        logger.info("Sandbox mode suppressed HTTP tool without an isolated adapter: '{}'", tool.name)
+                        continue
                 if tool.category == ToolCategory.CALCULATOR.value:
                     # Built-in calculator: return pre-defined schemas
                     for tool_def in get_calculator_tools():
@@ -226,6 +237,13 @@ class CustomToolManager:
             tools = await db_client.get_tools_by_uuids(tool_uuids, organization_id)
 
             for tool in tools:
+                if self._engine._sysevo_test_sandbox is not None:
+                    if tool.category == ToolCategory.MCP.value:
+                        continue
+                    if tool.category not in {ToolCategory.CALCULATOR.value, ToolCategory.END_CALL.value, ToolCategory.HTTP_API.value}:
+                        continue
+                    if tool.category == ToolCategory.HTTP_API.value and sysevo_sandbox_action(tool) is None:
+                        continue
                 if tool.category == ToolCategory.CALCULATOR.value:
                     self._register_calculator_handler()
                     logger.debug(
@@ -384,6 +402,8 @@ class CustomToolManager:
                     call_context_vars=self._engine._call_context_vars,
                     gathered_context_vars=self._engine._gathered_context,
                     organization_id=await self.get_organization_id(),
+                    sysevo_test_sandbox=self._engine._sysevo_test_sandbox,
+                    workflow_id=(self._engine._sysevo_test_sandbox or {}).get("workflow_id"),
                 )
 
                 await function_call_params.result_callback(result)

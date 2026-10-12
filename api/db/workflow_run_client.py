@@ -34,6 +34,7 @@ class WorkflowRunClient(BaseDBClient):
         campaign_id: int = None,
         queued_run_id: int = None,
         use_draft: bool = False,
+        definition_id: int | None = None,
         organization_id: int | None = None,
         bypass_user_check: bool = False,
         api_key_id: int | None = None,
@@ -57,7 +58,18 @@ class WorkflowRunClient(BaseDBClient):
             # Resolve which definition to bind to this run
             target_def = None
 
-            if use_draft:
+            if definition_id is not None:
+                exact_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.id == definition_id,
+                        WorkflowDefinitionModel.workflow_id == workflow.id,
+                    )
+                )
+                target_def = exact_result.scalars().first()
+                if target_def is None:
+                    raise ValueError("Pinned workflow definition not found")
+
+            if target_def is None and use_draft:
                 # For test calls: prefer draft if it exists, fall back to published
                 draft_result = await session.execute(
                     select(WorkflowDefinitionModel).where(

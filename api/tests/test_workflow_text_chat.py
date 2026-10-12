@@ -6,6 +6,7 @@ import pytest
 from api.db.models import OrganizationModel, UserModel
 from api.schemas.user_configuration import UserConfiguration
 from api.tests.integrations._run_pipeline_helpers import USER_CONFIGURATION
+from api.routes.workflow_text_chat import get_test_sandbox_capabilities
 from pipecat.tests import MockLLMService
 
 
@@ -49,6 +50,40 @@ async def _create_user_and_workflow(
     )
 
     return user, workflow
+
+
+@pytest.mark.asyncio
+async def test_sandbox_text_chat_requires_internal_secret(
+    db_session,
+    async_session,
+    test_client_factory,
+):
+    user, workflow = await _create_user_and_workflow(
+        db_session,
+        async_session,
+        workflow_definition={"nodes": [], "edges": []},
+        suffix="sandbox-auth",
+    )
+    async with test_client_factory(user) as client:
+        response = await client.post(
+            f"/api/v1/workflow/{workflow.id}/text-chat/sessions",
+            json={
+                "sandbox_mode": True,
+                "published_version_number": 1,
+                "annotations": {"agent_test_run_id": "12345678-1234-4234-8234-123456789abc", "scenario_id": "auth"},
+            },
+        )
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_sandbox_capability_endpoint_rejects_invalid_secret(monkeypatch):
+    from fastapi import HTTPException
+
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "expected")
+    with pytest.raises(HTTPException) as error:
+        await get_test_sandbox_capabilities("incorrect")
+    assert error.value.status_code == 401
 
 
 @pytest.mark.asyncio

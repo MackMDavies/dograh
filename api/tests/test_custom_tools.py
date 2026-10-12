@@ -29,6 +29,7 @@ from pipecat.services.llm_service import FunctionCallParams
 from api.services.workflow.pipecat_engine_custom_tools import get_function_schema
 from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
+    sysevo_sandbox_action,
     tool_to_function_schema,
 )
 from pipecat.tests import MockLLMService, run_test
@@ -248,6 +249,56 @@ class TestToolToFunctionSchema:
 
 class TestExecuteHttpTool:
     """Tests for execute_http_tool function."""
+
+    @pytest.mark.asyncio
+    async def test_sandbox_blocks_unknown_http_destination_without_network_call(self):
+        tool = MockToolModel(
+            tool_uuid="client-webhook", name="Create lead", description="", category="http_api",
+            definition={"config": {"method": "POST", "url": "https://client.example.com/leads"}},
+        )
+        with patch("api.services.workflow.tools.custom_tool.httpx.AsyncClient") as client_class:
+            result = await execute_http_tool(
+                tool, {"email": "client@example.com"},
+                sysevo_test_sandbox={"run_id": "run", "scenario_id": "lead"}, workflow_id=7,
+            )
+            client_class.assert_not_called()
+        assert result["status"] == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_sandbox_proxies_known_resend_tool_without_calling_client_destination(self):
+        tool = MockToolModel(
+            tool_uuid="resend-tool", name="Send email", description="", category="http_api",
+            definition={"config": {"method": "POST", "url": "https://api.resend.com/emails"}},
+        )
+        response = Mock()
+        response.is_success = True
+        response.json.return_value = {"status": "success", "provider": "resend"}
+        with (
+            patch.dict("os.environ", {"SUPABASE_URL": "https://project.supabase.co", "SYSEVO_MEMORY_SECRET": "internal-secret"}),
+            patch("api.services.workflow.tools.custom_tool.httpx.AsyncClient") as client_class,
+        ):
+            client = AsyncMock()
+            client.post.return_value = response
+            client_class.return_value.__aenter__.return_value = client
+            result = await execute_http_tool(
+                tool, {"to": "client@example.com", "subject": "Client data"},
+                sysevo_test_sandbox={"run_id": "run", "scenario_id": "email", "workflow_run_id": 42}, workflow_id=7,
+            )
+        assert result["provider"] == "resend"
+        client.post.assert_awaited_once()
+        call = client.post.await_args
+        assert call.args[0] == "https://project.supabase.co/functions/v1/agent-test-sandbox-execute"
+        assert call.kwargs["headers"] == {"x-sysevo-secret": "internal-secret"}
+        assert call.kwargs["json"]["action"] == "send_test_email"
+        assert call.kwargs["json"]["arguments"]["to"] == "client@example.com"
+
+    def test_sandbox_adapter_recognizes_only_supported_actions(self):
+        def tool(url, method="POST"):
+            return MockToolModel("id", "name", "", "http_api", {"config": {"url": url, "method": method}})
+
+        assert sysevo_sandbox_action(tool("https://api.resend.com/emails")) == "send_test_email"
+        assert sysevo_sandbox_action(tool("https://client.example.com/emails")) is None
+        assert sysevo_sandbox_action(tool("http://api.resend.com/emails")) is None
 
     @pytest.mark.asyncio
     async def test_post_request_sends_json_body(self):

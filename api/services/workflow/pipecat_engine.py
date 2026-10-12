@@ -88,6 +88,7 @@ class PipecatEngine:
         workflow: WorkflowGraph,
         call_context_vars: dict,
         workflow_run_id: Optional[int] = None,
+        sysevo_test_sandbox: Optional[dict] = None,
         node_transition_callback: Optional[
             Callable[[str, str, Optional[str], Optional[str], bool], Awaitable[None]]
         ] = None,
@@ -109,6 +110,7 @@ class PipecatEngine:
         self.workflow = workflow
         self._call_context_vars = call_context_vars
         self._workflow_run_id = workflow_run_id
+        self._sysevo_test_sandbox = sysevo_test_sandbox
         self._node_transition_callback = node_transition_callback
         self._initialized = False
         self._call_disposed = False
@@ -1147,6 +1149,9 @@ class PipecatEngine:
     async def _open_mcp_sessions(self) -> None:
         """Connect every MCP-category tool referenced by any workflow node.
         Failures degrade (session marked unavailable); never raises."""
+        if self._sysevo_test_sandbox is not None:
+            logger.info("Sandbox mode suppressed MCP connections for workflow run {}", self._workflow_run_id)
+            return
         from api.services.workflow.tools.mcp_tool import (
             McpDefinitionError,
             validate_mcp_definition,
