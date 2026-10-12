@@ -1,4 +1,6 @@
 import json
+import hashlib
+import hmac
 import os
 import re
 import uuid
@@ -295,6 +297,72 @@ class CreateWorkflowTemplateRequest(BaseModel):
     call_type: Literal[CallType.INBOUND.value, CallType.OUTBOUND.value]
     use_case: str
     activity_description: str
+
+
+class TestRepairDraftRequest(BaseModel):
+    expected_published_version_number: int = Field(ge=1)
+    operation: Literal["remove_sandbox_markers"]
+
+
+class TestRepairDraftDiscardRequest(BaseModel):
+    expected_version_number: int = Field(ge=1)
+    expected_workflow_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class TestRepairDraftPromoteRequest(BaseModel):
+    expected_published_version_number: int = Field(ge=1)
+    expected_draft_version_number: int = Field(ge=1)
+    expected_workflow_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+def _test_repair_secret(secret: Optional[str]) -> None:
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or not secret or not hmac.compare_digest(secret, expected):
+        raise HTTPException(status_code=401, detail="Internal repair authentication required")
+
+
+def _test_repair_hash(workflow_json: dict) -> str:
+    payload = json.dumps(workflow_json, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+_TEST_MARKER_KEYS = {
+    "sysevo_internal_test",
+    "agent_test_run_id",
+    "agent_test_sandbox_token",
+    "x-sysevo-test-token",
+    "sysevo_test_mode",
+}
+_TEST_MARKER_VALUE = re.compile(
+    r"(?:agent-test-sandbox-execute|x-sysevo-test-token|sysevo-qa-[a-z0-9_-]+)",
+    re.IGNORECASE,
+)
+
+
+def _remove_test_markers(value, path: str = "$") -> list[str]:
+    """Remove the same temporary routing markers detected by Sysevo's release check."""
+    changed: list[str] = []
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            child_path = f"{path}.{key}"
+            marker_key = key.lower() in _TEST_MARKER_KEYS and child not in (False, None, "")
+            marker_value = isinstance(child, str) and bool(_TEST_MARKER_VALUE.search(child))
+            if marker_key or marker_value:
+                del value[key]
+                changed.append(child_path)
+            else:
+                changed.extend(_remove_test_markers(child, child_path))
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            child_path = f"{path}[{index}]"
+            if isinstance(child, str) and _TEST_MARKER_VALUE.search(child):
+                value[index] = ""
+                changed.append(child_path)
+            else:
+                changed.extend(_remove_test_markers(child, child_path))
+    elif isinstance(value, str) and _TEST_MARKER_VALUE.search(value):
+        changed.append(path)
+    return changed
 
 
 @router.post("/{workflow_id}/validate")
@@ -744,6 +812,98 @@ async def get_workflow_versions(
         for v in versions
         if v.version_number is not None
     ]
+
+
+@router.post("/{workflow_id}/create-test-repair-draft")
+async def create_test_repair_draft(
+    workflow_id: int,
+    request: TestRepairDraftRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    """Create a narrowly scoped, secret-authenticated candidate for test repair."""
+    _test_repair_secret(x_sysevo_secret)
+    versions = await db_client.get_workflow_versions(workflow_id)
+    published = next((v for v in versions if v.status == "published"), None)
+    if not published:
+        raise HTTPException(status_code=404, detail="Published workflow not found")
+    if published.version_number != request.expected_published_version_number:
+        raise HTTPException(status_code=409, detail="Published workflow changed; rerun tests")
+    candidate_json = json.loads(json.dumps(published.workflow_json))
+    changed_paths = _remove_test_markers(candidate_json)
+    if not changed_paths:
+        raise HTTPException(status_code=409, detail="No supported test markers were found")
+    try:
+        draft = await db_client.create_test_repair_draft(
+            workflow_id,
+            request.expected_published_version_number,
+            candidate_json,
+        )
+    except ValueError as exc:
+        status_code = 404 if str(exc) == "Workflow not found" else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {
+        "workflow_id": workflow_id,
+        "candidate_version_number": draft.version_number,
+        "candidate_hash": _test_repair_hash(draft.workflow_json),
+        "changed_paths": changed_paths,
+        "status": "draft",
+    }
+
+
+@router.delete("/{workflow_id}/discard-draft")
+async def discard_test_repair_draft(
+    workflow_id: int,
+    request: TestRepairDraftDiscardRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    _test_repair_secret(x_sysevo_secret)
+    try:
+        version_number = await db_client.discard_test_repair_draft(
+            workflow_id,
+            request.expected_version_number,
+            request.expected_workflow_hash,
+        )
+    except ValueError as exc:
+        status_code = 404 if str(exc) in {"Workflow not found", "Draft not found"} else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {"workflow_id": workflow_id, "discarded_version_number": version_number}
+
+
+@router.post("/{workflow_id}/promote-test-repair-draft")
+async def promote_test_repair_draft(
+    workflow_id: int,
+    request: TestRepairDraftPromoteRequest,
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+):
+    _test_repair_secret(x_sysevo_secret)
+    versions = await db_client.get_workflow_versions(workflow_id)
+    published = next((v for v in versions if v.status == "published"), None)
+    draft = await db_client.get_draft_version(workflow_id)
+    if not published or not draft:
+        raise HTTPException(status_code=404, detail="Published workflow or candidate draft not found")
+    if published.version_number != request.expected_published_version_number:
+        raise HTTPException(status_code=409, detail="Published workflow changed; refusing to promote candidate")
+    if draft.version_number != request.expected_draft_version_number or _test_repair_hash(draft.workflow_json) != request.expected_workflow_hash:
+        raise HTTPException(status_code=409, detail="Candidate changed; refusing to promote it")
+    errors = await _validate_workflow_definition(draft.workflow_json, exclude_workflow_id=workflow_id)
+    if errors:
+        raise _validation_errors_http_exception(errors)
+    try:
+        promoted = await db_client.promote_test_repair_draft(
+            workflow_id,
+            request.expected_published_version_number,
+            request.expected_draft_version_number,
+            request.expected_workflow_hash,
+        )
+    except ValueError as exc:
+        status_code = 404 if str(exc) == "Workflow not found" else 409
+        raise HTTPException(status_code=status_code, detail=str(exc)) from exc
+    return {
+        "workflow_id": workflow_id,
+        "promoted_version_number": promoted.version_number,
+        "status": promoted.status,
+        "published_at": promoted.published_at.isoformat() if promoted.published_at else "",
+    }
 
 
 @router.post("/{workflow_id}/publish")
