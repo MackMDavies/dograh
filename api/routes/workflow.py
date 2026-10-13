@@ -887,7 +887,7 @@ class DiscardCandidateDraftRequest(BaseModel):
 
 class PrepareTestRepairDraftRequest(BaseModel):
     expected_published_version_number: int = Field(ge=1)
-    operation: Literal["remove_sandbox_markers"]
+    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance"]
 
 
 class PromoteTestRepairDraftRequest(BaseModel):
@@ -903,7 +903,7 @@ async def create_test_repair_draft(
     user: UserModel = Depends(get_user),
     x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
 ) -> dict:
-    """Prepare a marker-cleaned candidate draft for regression; never publish it."""
+    """Prepare a bounded candidate draft for regression; never publish it."""
     expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
     if not sandbox_secret_matches(x_sysevo_secret, expected):
         raise HTTPException(status_code=403, detail="Internal test repair access required")

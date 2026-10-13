@@ -1,13 +1,16 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from api.routes.workflow_text_chat import router as text_chat_router
 from api.services.auth.depends import get_user
 from api.services.workflow.test_sandbox_mode import (
     build_run_annotations,
     is_sandbox_test_run,
+    sandbox_post_call_policy,
     sandbox_secret_matches,
 )
 
@@ -129,3 +132,78 @@ def test_trusted_test_session_gets_a_server_owned_marker():
 def test_enabled_server_marker_without_valid_action_context_still_fails_closed():
     run = SimpleNamespace(annotations={"sysevo_test_sandbox": {"enabled": True}})
     assert is_sandbox_test_run(run)
+    assert sandbox_post_call_policy(run) == {
+        "status": "blocked",
+        "reason": "sandbox_marker_has_incomplete_run_identity",
+        "agent_test_run_id": None,
+        "scenario_id": None,
+        "blocked_surfaces": [
+            "workflow_webhooks",
+            "completion_handlers",
+            "caller_memory",
+            "wallet_debit",
+            "client_live_call_notifications",
+        ],
+    }
+
+
+def test_valid_sandbox_context_blocks_post_call_surfaces_without_customer_data():
+    annotations = build_run_annotations(
+        {},
+        {
+            "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+            "scenario_id": "calendar-booking",
+        },
+        sandbox_authorized=True,
+    )
+
+    policy = sandbox_post_call_policy(SimpleNamespace(annotations=annotations))
+
+    assert policy == {
+        "status": "blocked",
+        "reason": "post_call_side_effects_are_disabled_for_agent_tests",
+        "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+        "scenario_id": "calendar-booking",
+        "blocked_surfaces": [
+            "workflow_webhooks",
+            "completion_handlers",
+            "caller_memory",
+            "wallet_debit",
+            "client_live_call_notifications",
+        ],
+    }
+
+
+def test_malformed_sandbox_run_id_still_blocks_side_effects():
+    run = SimpleNamespace(
+        annotations={
+            "sysevo_test_sandbox": {
+                "enabled": True,
+                "agent_test_run_id": "x" * 36,
+                "scenario_id": "scenario",
+            }
+        }
+    )
+    assert is_sandbox_test_run(run)
+    assert sandbox_post_call_policy(run)["reason"] == "sandbox_marker_has_incomplete_run_identity"
+
+
+@pytest.mark.asyncio
+async def test_live_call_webhook_blocks_any_server_sandbox_marker(monkeypatch):
+    from api.services import call_live_webhook
+
+    monkeypatch.setenv("SYSEVO_CALL_LIVE_URL", "https://sysevo.test/live")
+    run = SimpleNamespace(
+        annotations={"sysevo_test_sandbox": {"enabled": True}}
+    )
+    with (
+        patch.object(
+            call_live_webhook.db_client,
+            "get_workflow_run_by_id",
+            new=AsyncMock(return_value=run),
+        ),
+        patch.object(call_live_webhook.httpx, "AsyncClient") as http_client,
+    ):
+        await call_live_webhook.fire_call_live("started", 123)
+
+    http_client.assert_not_called()

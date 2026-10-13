@@ -10,6 +10,7 @@ from api.services.memory_webhook import fire_post_call_memory
 from api.services.wallet_webhook import fire_post_call_wallet_debit
 from api.services.pricing.workflow_run_cost import calculate_workflow_run_cost
 from api.services.storage import get_current_storage_backend, storage_fs
+from api.services.workflow.test_sandbox_mode import sandbox_post_call_policy
 from api.tasks.run_integrations import run_integrations_post_workflow_run
 
 
@@ -95,6 +96,36 @@ async def process_workflow_completion(
     set_current_run_id(run_id)
 
     logger.info(f"Processing workflow completion for run {workflow_run_id}")
+
+    # Test audio and transcripts must never land in tenant-owned object storage.
+    # This worker is also the common entry point for all post-call side effects.
+    workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    sandbox_policy = sandbox_post_call_policy(workflow_run) if workflow_run else None
+    if sandbox_policy:
+        for temp_path in (audio_temp_path, transcript_temp_path):
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError as exc:
+                    logger.error(
+                        f"Could not remove sandbox test artifact for run {workflow_run_id}: {exc}"
+                    )
+        from api.services.telephony.call_concurrency import release_call_slot
+
+        await release_call_slot(workflow_run_id)
+        await db_client.update_workflow_run(
+            run_id=workflow_run_id,
+            annotations={
+                "agent_test_post_call_policy": {
+                    **sandbox_policy,
+                    "audio_artifacts": "discarded_no_private_test_store_configured",
+                }
+            },
+        )
+        logger.info(
+            f"Sandbox test run {workflow_run_id}: discarded artifacts and skipped all client side effects"
+        )
+        return
 
     storage_backend = get_current_storage_backend()
 

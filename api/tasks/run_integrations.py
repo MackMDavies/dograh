@@ -25,6 +25,7 @@ from api.services.workflow.dto import (
     WebhookNodeData,
     WebhookRFNode,
 )
+from api.services.workflow.test_sandbox_mode import sandbox_post_call_policy
 from api.services.workflow.qa import run_per_node_qa_analysis
 from api.utils.credential_auth import build_auth_header
 from api.utils.template_renderer import render_template
@@ -188,6 +189,19 @@ async def run_integrations_post_workflow_run(_ctx, workflow_run_id: int):
 
         if not workflow_run or not workflow_run.workflow:
             logger.warning("Workflow run or workflow not found")
+            return
+
+        sandbox_policy = sandbox_post_call_policy(workflow_run)
+        if sandbox_policy:
+            # Do not mint public artifact tokens, run tenant integrations, or
+            # execute arbitrary workflow webhooks for an agent test.
+            await db_client.update_workflow_run(
+                workflow_run_id,
+                annotations={"agent_test_post_call_policy": sandbox_policy},
+            )
+            logger.info(
+                f"Skipping post-call integrations for sandbox test run {workflow_run_id}"
+            )
             return
 
         if not organization_id:

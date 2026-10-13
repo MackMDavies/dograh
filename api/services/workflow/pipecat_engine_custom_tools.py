@@ -94,7 +94,7 @@ class CustomToolManager:
         self._sandbox_mode = is_sandbox_test_run(workflow_run)
         return self._sandbox_mode
 
-    async def _execute_sandbox_booking_action(
+    async def _execute_sandbox_action(
         self, tool: Any, arguments: dict[str, Any] | None
     ) -> dict[str, Any]:
         """Route only allowlisted provider actions to Sysevo's isolated adapters."""
@@ -118,6 +118,12 @@ class CustomToolManager:
         elif parsed.hostname == "api.twilio.com" and \
             re.fullmatch(r"/2010-04-01/Accounts/AC[0-9a-fA-F]{32}/Messages\.json", parsed.path) and method == "POST":
             action = "send_test_sms"
+        elif parsed.scheme == "https" and parsed.hostname and method in {"POST", "PUT", "PATCH"}:
+            # Arbitrary mutating HTTP tools are never sent to their configured
+            # URL in a sandbox session. They are reduced to a synthetic event
+            # and routed to Sysevo's internal test ledger, which can verify
+            # required field mapping without contacting a customer endpoint.
+            action = "send_test_webhook"
         else:
             return self._sandbox_action_blocked("unsupported_sandbox_adapter")
 
@@ -137,6 +143,13 @@ class CustomToolManager:
                         "workflow_run_id": int(workflow_run_id),
                         "action": action,
                         "arguments": {} if action in {"send_test_email", "send_test_sms"} else (arguments or {}),
+                        "required_fields": [
+                            str(parameter.get("name"))
+                            for parameter in (config.get("parameters", []) or [])
+                            if isinstance(parameter, dict)
+                            and parameter.get("required") is True
+                            and isinstance(parameter.get("name"), str)
+                        ] if action == "send_test_webhook" else [],
                     },
                 )
             result = response.json()
@@ -149,7 +162,7 @@ class CustomToolManager:
                 }
             return result
         except Exception as error:
-            logger.warning("Isolated calendar action failed: {}", type(error).__name__)
+            logger.warning("Isolated provider action failed: {}", type(error).__name__)
             return self._sandbox_action_blocked("sandbox_adapter_unavailable")
 
     @staticmethod
@@ -428,7 +441,7 @@ class CustomToolManager:
             try:
                 if await self._is_sandbox_test_run():
                     await function_call_params.result_callback(
-                        await self._execute_sandbox_booking_action(
+                        await self._execute_sandbox_action(
                             tool, function_call_params.arguments
                         )
                     )

@@ -283,9 +283,18 @@ class WorkflowClient(BaseDBClient):
         self, workflow_id: int, expected_published_version_number: int, operation: str
     ) -> tuple[WorkflowDefinitionModel, list[str], str]:
         """Create a bounded repair draft from an exact published version."""
-        from api.services.workflow.sandbox_repair import remove_sandbox_markers, workflow_snapshot_hash
+        from api.services.workflow.sandbox_repair import (
+            append_conciseness_guidance,
+            remove_sandbox_markers,
+            workflow_snapshot_hash,
+        )
 
-        if operation != "remove_sandbox_markers":
+        repair_operations = {
+            "remove_sandbox_markers": remove_sandbox_markers,
+            "append_conciseness_guidance": append_conciseness_guidance,
+        }
+        apply_repair = repair_operations.get(operation)
+        if apply_repair is None:
             raise ValueError("Unsupported sandbox repair operation")
         async with self.async_session() as session:
             workflow_result = await session.execute(
@@ -312,7 +321,7 @@ class WorkflowClient(BaseDBClient):
             )
             if draft_result.scalars().first() is not None:
                 raise ValueError("An existing draft must be resolved before preparing a test repair")
-            candidate_json, changed_paths = remove_sandbox_markers(published.workflow_json)
+            candidate_json, changed_paths = apply_repair(published.workflow_json)
             if not changed_paths:
                 raise ValueError("The published workflow contains no supported sandbox markers")
             draft = WorkflowDefinitionModel(
