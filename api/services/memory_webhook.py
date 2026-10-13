@@ -17,6 +17,7 @@ import httpx
 from loguru import logger
 
 from api.db import db_client
+from api.services.workflow.test_sandbox_mode import sandbox_post_call_policy
 from api.utils.transcript import generate_transcript_text
 
 _TIMEOUT = 30.0
@@ -44,6 +45,12 @@ async def fire_post_call_memory(workflow_run_id: int) -> bool:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
         if not workflow_run:
             logger.warning(f"[memory-post-call] run {workflow_run_id} not found")
+            return True
+
+        if sandbox_post_call_policy(workflow_run):
+            logger.info(
+                f"[memory-post-call] sandbox run {workflow_run_id}; caller memory is disabled"
+            )
             return True
 
         initial_ctx: dict[str, Any] = workflow_run.initial_context or {}

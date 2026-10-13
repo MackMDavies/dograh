@@ -8,6 +8,7 @@ from api.services.auth.depends import get_user
 from api.services.workflow.test_sandbox_mode import (
     build_run_annotations,
     is_sandbox_test_run,
+    sandbox_post_call_policy,
     sandbox_secret_matches,
 )
 
@@ -128,4 +129,45 @@ def test_trusted_test_session_gets_a_server_owned_marker():
 
 def test_enabled_server_marker_without_valid_action_context_still_fails_closed():
     run = SimpleNamespace(annotations={"sysevo_test_sandbox": {"enabled": True}})
-    assert is_sandbox_test_run(run)
+    assert not is_sandbox_test_run(run)
+
+
+def test_valid_sandbox_context_blocks_post_call_surfaces_without_customer_data():
+    annotations = build_run_annotations(
+        {},
+        {
+            "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+            "scenario_id": "calendar-booking",
+        },
+        sandbox_authorized=True,
+    )
+
+    policy = sandbox_post_call_policy(SimpleNamespace(annotations=annotations))
+
+    assert policy == {
+        "status": "blocked",
+        "reason": "post_call_side_effects_are_disabled_for_agent_tests",
+        "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+        "scenario_id": "calendar-booking",
+        "blocked_surfaces": [
+            "workflow_webhooks",
+            "completion_handlers",
+            "caller_memory",
+            "wallet_debit",
+            "client_live_call_notifications",
+        ],
+    }
+
+
+def test_malformed_sandbox_run_id_does_not_enable_sandbox_policy():
+    run = SimpleNamespace(
+        annotations={
+            "sysevo_test_sandbox": {
+                "enabled": True,
+                "agent_test_run_id": "x" * 36,
+                "scenario_id": "scenario",
+            }
+        }
+    )
+    assert not is_sandbox_test_run(run)
+    assert sandbox_post_call_policy(run) is None

@@ -60,6 +60,7 @@ from api.services.pipecat.tracing_config import (
 from api.services.pipecat.transport_setup import create_webrtc_transport
 from api.services.pipecat.voicemail_gating import should_run_voicemail_detection
 from api.services.workflow.voicemail_routing import find_voicemail_node_id
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
@@ -609,13 +610,15 @@ async def _run_pipeline(
     )
 
     workflow_graph = WorkflowGraph(ReactFlowDTO.model_validate(run_workflow_json))
+    is_agent_test_sandbox = is_sandbox_test_run(workflow_run)
 
     # Pre-call fetch: fire early so it runs concurrently with remaining setup
     pre_call_fetch_task = None
     pre_call_fetch_is_memory = False
     start_node = workflow_graph.nodes.get(workflow_graph.start_node_id)
     if (
-        start_node
+        not is_agent_test_sandbox
+        and start_node
         and start_node.pre_call_fetch_enabled
         and start_node.pre_call_fetch_url
     ):
@@ -638,7 +641,11 @@ async def _run_pipeline(
     # as SYSEVO_MEMORY_PRE_CALL_URL is configured on this server and the
     # workflow's start node hasn't already claimed the pre_call_fetch slot.
     # Never for Syra's voice: the person is her user, not a caller to look up.
-    _sysevo_memory_url = None if run_configs.get("syra_voice") else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    _sysevo_memory_url = (
+        None
+        if is_agent_test_sandbox or run_configs.get("syra_voice")
+        else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    )
     _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
     # Gate on the LEAD's number, not on caller_number. On an outbound run
     # caller_number is our own outbound caller ID, and 13 telephony runs carry
@@ -669,7 +676,11 @@ async def _run_pipeline(
     # concurrent calls (e.g. a campaign dialer) each get their own live row. The row
     # is removed by the matching "ended" signal at call completion. Non-fatal.
     # Not for Syra's voice: a person talking to their own assistant is not a live call.
-    if os.getenv("SYSEVO_CALL_LIVE_URL") and not run_configs.get("syra_voice"):
+    if (
+        os.getenv("SYSEVO_CALL_LIVE_URL")
+        and not run_configs.get("syra_voice")
+        and not is_agent_test_sandbox
+    ):
         asyncio.create_task(
             fire_call_live(
                 event="started",
