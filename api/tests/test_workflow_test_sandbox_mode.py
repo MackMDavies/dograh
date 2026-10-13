@@ -1,7 +1,9 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+import pytest
 
 from api.routes.workflow_text_chat import router as text_chat_router
 from api.services.auth.depends import get_user
@@ -172,7 +174,7 @@ def test_valid_sandbox_context_blocks_post_call_surfaces_without_customer_data()
     }
 
 
-def test_malformed_sandbox_run_id_does_not_enable_sandbox_policy():
+def test_malformed_sandbox_run_id_still_blocks_side_effects():
     run = SimpleNamespace(
         annotations={
             "sysevo_test_sandbox": {
@@ -184,3 +186,24 @@ def test_malformed_sandbox_run_id_does_not_enable_sandbox_policy():
     )
     assert is_sandbox_test_run(run)
     assert sandbox_post_call_policy(run)["reason"] == "sandbox_marker_has_incomplete_run_identity"
+
+
+@pytest.mark.asyncio
+async def test_live_call_webhook_blocks_any_server_sandbox_marker(monkeypatch):
+    from api.services import call_live_webhook
+
+    monkeypatch.setenv("SYSEVO_CALL_LIVE_URL", "https://sysevo.test/live")
+    run = SimpleNamespace(
+        annotations={"sysevo_test_sandbox": {"enabled": True}}
+    )
+    with (
+        patch.object(
+            call_live_webhook.db_client,
+            "get_workflow_run_by_id",
+            new=AsyncMock(return_value=run),
+        ),
+        patch.object(call_live_webhook.httpx, "AsyncClient") as http_client,
+    ):
+        await call_live_webhook.fire_call_live("started", 123)
+
+    http_client.assert_not_called()
