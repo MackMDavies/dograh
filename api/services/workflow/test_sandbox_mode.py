@@ -34,9 +34,13 @@ def build_run_annotations(
 
 
 def is_sandbox_test_run(workflow_run: Any) -> bool:
-    # A partially written marker must not activate sandbox behavior, and a
-    # marker without run/scenario identity must not let a request opt into it.
-    return sandbox_test_run_context(workflow_run) is not None
+    # The marker is server-owned; any enabled marker must suppress side effects.
+    # Callers that need run/scenario identity validate it separately.
+    annotations = getattr(workflow_run, "annotations", None)
+    if not isinstance(annotations, dict):
+        return False
+    marker = annotations.get(SANDBOX_ANNOTATION)
+    return isinstance(marker, dict) and marker.get("enabled") is True
 
 
 def sandbox_post_call_policy(workflow_run: Any) -> dict[str, Any] | None:
@@ -46,14 +50,16 @@ def sandbox_post_call_policy(workflow_run: Any) -> dict[str, Any] | None:
     memory, billing notifications, or client live-call events. The run itself
     can retain this summary as evidence that those paths were held.
     """
-    context = sandbox_test_run_context(workflow_run)
-    if context is None:
+    if not is_sandbox_test_run(workflow_run):
         return None
+    context = sandbox_test_run_context(workflow_run)
     return {
         "status": "blocked",
-        "reason": "post_call_side_effects_are_disabled_for_agent_tests",
-        "agent_test_run_id": context["agent_test_run_id"],
-        "scenario_id": context["scenario_id"],
+        "reason": "post_call_side_effects_are_disabled_for_agent_tests"
+        if context
+        else "sandbox_marker_has_incomplete_run_identity",
+        "agent_test_run_id": context["agent_test_run_id"] if context else None,
+        "scenario_id": context["scenario_id"] if context else None,
         "blocked_surfaces": [
             "workflow_webhooks",
             "completion_handlers",

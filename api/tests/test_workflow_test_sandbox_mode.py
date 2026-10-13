@@ -129,7 +129,20 @@ def test_trusted_test_session_gets_a_server_owned_marker():
 
 def test_enabled_server_marker_without_valid_action_context_still_fails_closed():
     run = SimpleNamespace(annotations={"sysevo_test_sandbox": {"enabled": True}})
-    assert not is_sandbox_test_run(run)
+    assert is_sandbox_test_run(run)
+    assert sandbox_post_call_policy(run) == {
+        "status": "blocked",
+        "reason": "sandbox_marker_has_incomplete_run_identity",
+        "agent_test_run_id": None,
+        "scenario_id": None,
+        "blocked_surfaces": [
+            "workflow_webhooks",
+            "completion_handlers",
+            "caller_memory",
+            "wallet_debit",
+            "client_live_call_notifications",
+        ],
+    }
 
 
 def test_valid_sandbox_context_blocks_post_call_surfaces_without_customer_data():
@@ -169,5 +182,5 @@ def test_malformed_sandbox_run_id_does_not_enable_sandbox_policy():
             }
         }
     )
-    assert not is_sandbox_test_run(run)
-    assert sandbox_post_call_policy(run) is None
+    assert is_sandbox_test_run(run)
+    assert sandbox_post_call_policy(run)["reason"] == "sandbox_marker_has_incomplete_run_identity"
