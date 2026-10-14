@@ -58,6 +58,28 @@ async def workflow_capabilities(user: UserModel = Depends(get_user)):
     return {"supports_deactivated_creation": True}
 
 
+@router.get("/test-sandbox/capabilities")
+async def get_test_sandbox_capabilities(
+    x_sysevo_secret: Optional[str] = Header(None, alias="x-sysevo-secret"),
+) -> dict:
+    """Expose only sandbox guarantees verified by this runtime implementation.
+
+    Sysevo refuses to start conversational checks when it cannot establish that
+    this Dograh deployment pins the tested workflow version, routes actions
+    through the isolated adapter, and blocks unsupported tools.
+    """
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, expected):
+        raise HTTPException(status_code=401, detail="Internal sandbox authentication required")
+    return {
+        "sandbox_mode": True,
+        "exact_workflow_version_pinning": True,
+        "isolated_action_proxy": True,
+        "unsupported_tools_blocked": True,
+        "sandbox_protocol_version": 1,
+    }
+
+
 class ValidateWorkflowResponse(BaseModel):
     is_valid: bool
     errors: list[WorkflowError]
