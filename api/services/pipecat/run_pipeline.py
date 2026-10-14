@@ -1,5 +1,6 @@
 import asyncio
 import os
+from contextlib import suppress
 from typing import Optional
 
 from fastapi import HTTPException
@@ -1077,6 +1078,19 @@ async def _run_pipeline(
 
     register_audio_data_handler(audio_buffer, workflow_run_id, in_memory_audio_buffer)
 
+    # Whisper / Take over from the portal (services/supervisor/live_control.py). Best-effort:
+    # if Redis is down the call runs exactly as before, just without supervisor controls.
+    supervisor = None
+    try:
+        from api.services.supervisor.live_control import SupervisorControl
+
+        supervisor = SupervisorControl(
+            engine, workflow_run_id, workflow.organization_id if workflow else None
+        )
+        supervisor.start()
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"supervisor controls unavailable for run {workflow_run_id}: {e}")
+
     try:
         # Run the pipeline
         loop = asyncio.get_running_loop()
@@ -1086,5 +1100,8 @@ async def _run_pipeline(
     except asyncio.CancelledError:
         logger.warning("Received CancelledError in _run_pipeline")
     finally:
+        if supervisor:
+            with suppress(Exception):
+                await supervisor.stop()
         await feedback_observer.cleanup()
         logger.debug(f"Cleaned up context providers for workflow run {workflow_run_id}")
