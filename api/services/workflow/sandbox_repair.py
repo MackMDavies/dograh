@@ -24,6 +24,12 @@ CONCISENESS_GUIDANCE = (
     "for the current step, ask one question at a time, and avoid repeating information. Be complete "
     "when the caller's request requires more detail."
 )
+GOAL_COMPLETION_GUIDANCE = (
+    "Guide the caller toward the configured outcome for this agent. Ask only for information needed "
+    "to complete the next step, use configured tools for actions, and confirm completion only when "
+    "the tool or system result verifies it. If the action cannot be completed, explain the limitation "
+    "and offer the configured next step. Do not invent commitments, availability, prices, or outcomes."
+)
 
 
 def workflow_snapshot_hash(workflow_json: Any, workflow_configurations: Any, template_context_variables: Any) -> str:
@@ -82,5 +88,22 @@ def append_conciseness_guidance(value: Any) -> tuple[Any, list[str]]:
         if not isinstance(prompt, str) or not prompt.strip() or CONCISENESS_GUIDANCE in prompt:
             continue
         node["data"]["prompt"] = f"{prompt.rstrip()}\n\n{CONCISENESS_GUIDANCE}"
+        changed_paths.append(f"$.nodes[{index}].data.prompt")
+    return candidate, changed_paths
+
+
+def append_goal_completion_guidance(value: Any) -> tuple[Any, list[str]]:
+    """Add bounded configured-outcome guidance to prompted workflow nodes."""
+    if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
+        return value, []
+    candidate = copy.deepcopy(value)
+    changed_paths: list[str] = []
+    for index, node in enumerate(candidate["nodes"]):
+        if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
+            continue
+        prompt = node["data"].get("prompt")
+        if not isinstance(prompt, str) or not prompt.strip() or GOAL_COMPLETION_GUIDANCE in prompt:
+            continue
+        node["data"]["prompt"] = f"{prompt.rstrip()}\n\n{GOAL_COMPLETION_GUIDANCE}"
         changed_paths.append(f"$.nodes[{index}].data.prompt")
     return candidate, changed_paths

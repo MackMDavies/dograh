@@ -285,6 +285,7 @@ class WorkflowClient(BaseDBClient):
         """Create a bounded repair draft from an exact published version."""
         from api.services.workflow.sandbox_repair import (
             append_conciseness_guidance,
+            append_goal_completion_guidance,
             remove_sandbox_markers,
             workflow_snapshot_hash,
         )
@@ -292,6 +293,7 @@ class WorkflowClient(BaseDBClient):
         repair_operations = {
             "remove_sandbox_markers": remove_sandbox_markers,
             "append_conciseness_guidance": append_conciseness_guidance,
+            "append_goal_completion_guidance": append_goal_completion_guidance,
         }
         apply_repair = repair_operations.get(operation)
         if apply_repair is None:

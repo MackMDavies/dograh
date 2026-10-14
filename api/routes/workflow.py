@@ -909,7 +909,7 @@ class DiscardCandidateDraftRequest(BaseModel):
 
 class PrepareTestRepairDraftRequest(BaseModel):
     expected_published_version_number: int = Field(ge=1)
-    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance"]
+    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance", "append_goal_completion_guidance"]
 
 
 class PromoteTestRepairDraftRequest(BaseModel):
