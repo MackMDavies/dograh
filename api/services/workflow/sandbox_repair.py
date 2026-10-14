@@ -30,6 +30,11 @@ GOAL_COMPLETION_GUIDANCE = (
     "the tool or system result verifies it. If the action cannot be completed, explain the limitation "
     "and offer the configured next step. Do not invent commitments, availability, prices, or outcomes."
 )
+SUPPORTED_TEST_REPAIR_OPERATIONS = (
+    "append_conciseness_guidance",
+    "append_goal_completion_guidance",
+    "remove_sandbox_markers",
+)
 
 
 def workflow_snapshot_hash(workflow_json: Any, workflow_configurations: Any, template_context_variables: Any) -> str:
