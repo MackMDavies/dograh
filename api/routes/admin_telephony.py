@@ -962,6 +962,14 @@ async def delete_twilio_account(
     return await list_twilio_accounts(_user)
 
 
+@router.get("/dialer-protected-numbers")
+async def list_dialer_protected_numbers(_user: UserModel = Depends(get_superuser)):
+    """List active Twilio numbers currently assigned to voice-agent workflows."""
+    numbers = await db_client.list_active_workflow_assigned_phone_numbers_for_provider(
+        "twilio"
+    )
+    return {"numbers": numbers}
+
 @router.get("/numbers", response_model=ManagedNumbersResponse)
 async def list_managed_numbers(_user: UserModel = Depends(get_superuser)):
     """List all Sysevo-managed phone numbers across every org."""
