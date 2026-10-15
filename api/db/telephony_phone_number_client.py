@@ -50,6 +50,31 @@ def _decrypted_credentials(config) -> dict:
 
 
 class TelephonyPhoneNumberClient(BaseDBClient):
+    async def list_active_workflow_assigned_phone_numbers_for_provider(
+        self, provider: str
+    ) -> List[str]:
+        """List active provider numbers attached to inbound or outbound workflows."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(TelephonyPhoneNumberModel.address_normalized)
+                .join(
+                    TelephonyConfigurationModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id
+                    == TelephonyConfigurationModel.id,
+                )
+                .where(
+                    func.lower(TelephonyConfigurationModel.provider)
+                    == provider.lower(),
+                    TelephonyPhoneNumberModel.is_active.is_(True),
+                    or_(
+                        TelephonyPhoneNumberModel.inbound_workflow_id.isnot(None),
+                        TelephonyPhoneNumberModel.outbound_workflow_id.isnot(None),
+                    ),
+                )
+                .order_by(TelephonyPhoneNumberModel.address_normalized)
+            )
+            return [row[0] for row in result.all()]
+
     async def list_phone_numbers_for_config(
         self, telephony_configuration_id: int
     ) -> List[TelephonyPhoneNumberModel]:
