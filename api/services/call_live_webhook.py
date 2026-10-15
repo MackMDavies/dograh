@@ -13,7 +13,7 @@ URL is not configured, and never raises (the caller in s3_upload also guards it)
 """
 
 import os
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 from loguru import logger
@@ -24,11 +24,19 @@ from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 _TIMEOUT = 15.0
 
 
-async def fire_call_live(event: str, workflow_run_id: int) -> None:
-    """POST a live-call lifecycle event to the Sysevo edge function.
+async def fire_call_live(
+    event: str,
+    workflow_run_id: int,
+    workflow_id: Optional[int] = None,
+    caller_number: Optional[str] = None,
+) -> None:
+    """POST a live-call lifecycle event to the Sysevo edge function (dograh-call-live).
 
-    Currently only "ended" is fired (from post-call processing) to clear the
-    active_calls row. No-ops if SYSEVO_CALL_LIVE_URL is unset, so an unwired
+    "started" (from run_pipeline, with workflow_id + caller_number so the row can be
+    attributed) upserts the active_calls row; "ended" (from post-call processing)
+    clears it. run_pipeline called this with those two extra arguments while the
+    signature had none, so a set SYSEVO_CALL_LIVE_URL raised TypeError at pipeline
+    start. No-ops if SYSEVO_CALL_LIVE_URL is unset, so an unwired
     deployment behaves exactly as before (rows reaped by the TTL sweeper).
     """
     try:
@@ -56,6 +64,10 @@ async def fire_call_live(event: str, workflow_run_id: int) -> None:
         "workflow_run_id": workflow_run_id,
         "run_id": workflow_run_id,
     }
+    if workflow_id is not None:
+        payload["workflow_id"] = workflow_id
+    if caller_number:
+        payload["caller_number"] = caller_number
 
     headers = {"Content-Type": "application/json"}
     if secret:
