@@ -1,6 +1,8 @@
 from api.services.workflow.sandbox_repair import (
     CONCISENESS_GUIDANCE,
+    GOAL_COMPLETION_GUIDANCE,
     append_conciseness_guidance,
+    append_goal_completion_guidance,
     remove_sandbox_markers,
     workflow_snapshot_hash,
 )
@@ -67,3 +69,21 @@ def test_append_conciseness_guidance_changes_only_prompted_nodes_and_is_idempote
 
 def test_append_conciseness_guidance_fails_closed_without_json_nodes():
     assert append_conciseness_guidance({"graph": []}) == ({"graph": []}, [])
+
+
+def test_append_goal_completion_guidance_is_bounded_and_idempotent():
+    source = {"nodes": [{"id": "agent", "data": {"prompt": "Book qualified callers."}}, {"id": "tool", "data": {"url": "https://safe.test"}}]}
+    candidate, paths = append_goal_completion_guidance(source)
+    assert paths == ["$.nodes[0].data.prompt"]
+    assert source["nodes"][0]["data"]["prompt"] == "Book qualified callers."
+    prompt = candidate["nodes"][0]["data"]["prompt"]
+    assert prompt.endswith(GOAL_COMPLETION_GUIDANCE)
+    assert "confirm completion only when" in prompt
+    assert candidate["nodes"][1] == source["nodes"][1]
+    unchanged, repeated_paths = append_goal_completion_guidance(candidate)
+    assert unchanged == candidate
+    assert repeated_paths == []
+
+
+def test_append_goal_completion_guidance_fails_closed_without_prompted_nodes():
+    assert append_goal_completion_guidance({"graph": []}) == ({"graph": []}, [])

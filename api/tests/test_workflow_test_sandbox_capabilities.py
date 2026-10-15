@@ -32,4 +32,9 @@ def test_test_sandbox_capabilities_reports_implemented_protocol(monkeypatch):
         "isolated_action_proxy": True,
         "unsupported_tools_blocked": True,
         "sandbox_protocol_version": 1,
+        "supported_test_repair_operations": [
+            "append_conciseness_guidance",
+            "append_goal_completion_guidance",
+            "remove_sandbox_markers",
+        ],
     }

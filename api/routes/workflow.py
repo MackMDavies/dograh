@@ -38,6 +38,7 @@ from api.services.workflow.dto import ReactFlowDTO, sanitize_workflow_definition
 from api.services.workflow.duplicate import duplicate_workflow
 from api.services.workflow.errors import ItemKind, WorkflowError
 from api.services.workflow.test_sandbox_mode import sandbox_secret_matches
+from api.services.workflow.sandbox_repair import SUPPORTED_TEST_REPAIR_OPERATIONS
 from api.services.workflow.trigger_paths import (
     TriggerPathIssue,
     ensure_trigger_paths,
@@ -77,6 +78,7 @@ async def get_test_sandbox_capabilities(
         "isolated_action_proxy": True,
         "unsupported_tools_blocked": True,
         "sandbox_protocol_version": 1,
+        "supported_test_repair_operations": list(SUPPORTED_TEST_REPAIR_OPERATIONS),
     }
 
 
@@ -909,7 +911,7 @@ class DiscardCandidateDraftRequest(BaseModel):
 
 class PrepareTestRepairDraftRequest(BaseModel):
     expected_published_version_number: int = Field(ge=1)
-    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance"]
+    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance", "append_goal_completion_guidance"]
 
 
 class PromoteTestRepairDraftRequest(BaseModel):

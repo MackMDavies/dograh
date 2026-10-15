@@ -40,7 +40,6 @@ from api.services.pipecat.pipeline_metrics_aggregator import (
     PipelineMetricsAggregator,
 )
 from api.services.pipecat.recording_audio_cache import create_recording_audio_fetcher
-from api.services.pipecat.service_factory import create_llm_service
 from api.services.pipecat.tracing_config import (
     build_remote_parent_context,
     get_trace_url,
@@ -423,6 +422,11 @@ async def execute_text_chat_pending_turn(
     user_config = resolve_effective_config(user_config, raw_overrides)
     if user_config.llm is None:
         raise ValueError("Text chat requires an LLM configuration")
+
+    # Loading the complete provider factory imports every optional speech and
+    # model SDK. Keep that cost on the execution path, not when route modules
+    # are imported for authorization checks or metadata-only sandbox requests.
+    from api.services.pipecat.service_factory import create_llm_service
 
     llm = create_llm_service(user_config)
     inference_llm = llm
