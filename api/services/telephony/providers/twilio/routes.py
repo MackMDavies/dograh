@@ -28,6 +28,7 @@ from api.services.telephony.dialer.provider import (
     UnknownDialerProvider,
     get_dialer_provider,
     resolve_active_dialer_provider,
+    resolve_configured_dialer_provider,
 )
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_listeners import (
@@ -158,7 +159,7 @@ async def get_voice_token(
     provider_name = (
         assigned_provider
         if assigned_provider in {"twilio", "signalwire", "telnyx", "vonage"}
-        else resolve_active_dialer_provider()
+        else await resolve_configured_dialer_provider()
     )
     try:
         provider = get_dialer_provider(provider_name)

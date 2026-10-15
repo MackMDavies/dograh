@@ -3,6 +3,7 @@ Superuser endpoints for platform-level managed telephony.
 """
 import asyncio
 import os
+from datetime import UTC, datetime
 from typing import Literal, Optional
 
 import httpx
@@ -210,12 +211,16 @@ async def _telnyx_dialer_credentials() -> dict:
     }
 
 
+class DialerMainProviderRequest(BaseModel):
+    provider: Literal["signalwire", "telnyx", "twilio"]
+
+
 @router.get("/dialer-providers")
 async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
     """Report readiness for rep-dialer carriers, apart from AI voice configs."""
-    from api.services.telephony.dialer.provider import resolve_active_dialer_provider
+    from api.services.telephony.dialer.provider import resolve_configured_dialer_provider
 
-    active_provider = resolve_active_dialer_provider()
+    active_provider = await resolve_configured_dialer_provider()
     twilio_accounts = await db_client.list_platform_twilio_accounts()
     twilio_dialer = await db_client.get_platform_dialer_credentials()
     twilio_env = all(os.environ.get(key) for key in (
@@ -471,6 +476,31 @@ async def sync_vonage_dialer_numbers(_user: UserModel = Depends(get_superuser)):
 async def get_telnyx_dialer_settings(_user: UserModel = Depends(get_superuser)):
     saved = await _telnyx_dialer_credentials()
     return _telnyx_credentials_response(saved)
+
+
+@router.put("/dialer-main-provider")
+async def set_dialer_main_provider(
+    body: DialerMainProviderRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    """Set the main fallback provider for the sales-rep dialer."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(status_code=503, detail="Provider settings storage is unavailable.")
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.patch(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_provider_settings",
+            params={"id": "eq.1"},
+            json={"main_provider": body.provider, "updated_at": datetime.now(UTC).isoformat()},
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Prefer": "return=representation",
+            },
+        )
+    if not response.is_success:
+        logger.error("Could not update dialer main provider: status=%s", response.status_code)
+        raise HTTPException(status_code=502, detail="Could not save the main dialer provider.")
+    return {"active_provider": body.provider}
 
 
 @router.put("/telnyx-dialer", response_model=TelnyxDialerCredentialsResponse)
