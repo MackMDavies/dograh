@@ -1046,7 +1046,8 @@ class TestProcessBatchEdgeCases:
         async with db_session_factory() as session:
             await session.execute(
                 text(
-                    "UPDATE queued_runs SET context_variables = context_variables || '{\"is_scheduled_callback\": true}'::jsonb "
+                    "UPDATE queued_runs SET context_variables = "
+                    "(context_variables::jsonb || '{\"is_scheduled_callback\": true}'::jsonb)::json "
                     "WHERE campaign_id = :campaign_id"
                 ),
                 {"campaign_id": campaign_test_data.campaign_id},
