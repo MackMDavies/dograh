@@ -181,15 +181,11 @@ def _mask_key(value: Optional[str]) -> Optional[str]:
 
 
 async def _active_twilio_dialer_client() -> Client:
-    """Resolve the active platform Twilio account used by the browser dialer."""
-    credentials = await db_client.get_platform_twilio_credentials()
-    if credentials:
-        return Client(credentials["account_sid"], credentials["auth_token"])
-    account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
-        raise HTTPException(status_code=503, detail="No active platform Twilio account is configured.")
-    return Client(account_sid, auth_token)
+    """Resolve only the independently configured sales-dialer Twilio account."""
+    credentials = await db_client.get_platform_dialer_credentials()
+    if not credentials:
+        raise HTTPException(status_code=503, detail="The sales dialer Twilio connection is not configured.")
+    return Client(credentials["account_sid"], credentials["auth_token"])
 
 
 async def _telnyx_request(client: httpx.AsyncClient, method: str, url: str, **kwargs) -> httpx.Response:
@@ -215,18 +211,22 @@ class DialerMainProviderRequest(BaseModel):
     provider: Literal["signalwire", "telnyx", "twilio"]
 
 
+class DialerTwilioConnectionRequest(BaseModel):
+    account_sid: str
+    api_key_sid: str
+    twiml_app_sid: str
+    auth_token: Optional[str] = None
+    api_key_secret: Optional[str] = None
+    default_caller_id: Optional[str] = None
+
+
 @router.get("/dialer-providers")
 async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
     """Report readiness for rep-dialer carriers, apart from AI voice configs."""
     from api.services.telephony.dialer.provider import resolve_configured_dialer_provider
 
     active_provider = await resolve_configured_dialer_provider()
-    twilio_accounts = await db_client.list_platform_twilio_accounts()
     twilio_dialer = await db_client.get_platform_dialer_credentials()
-    twilio_env = all(os.environ.get(key) for key in (
-        "SYSEVO_TWILIO_ACCOUNT_SID", "TWILIO_API_KEY_SID",
-        "TWILIO_API_KEY_SECRET", "TWILIO_TWIML_APP_SID",
-    ))
     telnyx = await _telnyx_dialer_credentials()
     try:
         vonage = await db_client.get_platform_vonage_dialer_credentials()
@@ -256,10 +256,10 @@ async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
             "source": "database" if await db_client.get_platform_telnyx_dialer_credentials() else "environment",
         },
         "twilio": {
-            "configured": bool(twilio_dialer or twilio_env),
-            "source": "database" if twilio_dialer else ("environment" if twilio_env else None),
-            "account_count": len(twilio_accounts),
-            "active_dialer_configured": bool(twilio_dialer or twilio_env),
+            "configured": bool(twilio_dialer),
+            "source": "dialer_database" if twilio_dialer else None,
+            "account_count": 1 if twilio_dialer else 0,
+            "active_dialer_configured": bool(twilio_dialer),
         },
         "vonage": {
             "configured": bool(
@@ -269,6 +269,89 @@ async def get_dialer_provider_status(_user: UserModel = Depends(get_superuser)):
             ),
             "source": "database" if vonage else ("environment" if vonage_env else None),
         },
+    }
+
+
+@router.get("/dialer-twilio")
+async def get_dialer_twilio_connection(_user: UserModel = Depends(get_superuser)):
+    """Return safe status and identifiers for the sales dialer Twilio account."""
+    return await db_client.get_platform_dialer_twilio_connection() or {
+        "configured": False,
+        "account_sid": None,
+        "account_sid_preview": None,
+        "api_key_sid": None,
+        "twiml_app_sid": None,
+        "default_caller_id": None,
+        "last_validated_at": None,
+    }
+
+
+@router.put("/dialer-twilio")
+async def save_dialer_twilio_connection(
+    body: DialerTwilioConnectionRequest,
+    _user: UserModel = Depends(get_superuser),
+):
+    """Validate and save the dialer's independent Twilio account credentials."""
+    current = await db_client.get_platform_dialer_credentials() or {}
+    account_sid = body.account_sid.strip()
+    api_key_sid = body.api_key_sid.strip()
+    twiml_app_sid = body.twiml_app_sid.strip()
+    auth_token = (body.auth_token or "").strip() or current.get("auth_token")
+    api_key_secret = (body.api_key_secret or "").strip() or current.get("api_key_secret")
+    if not account_sid.startswith("AC") or not api_key_sid.startswith("SK") or not twiml_app_sid.startswith("AP"):
+        raise HTTPException(status_code=422, detail="Enter valid Twilio Account SID, API Key SID, and TwiML App SID values.")
+    if not auth_token or not api_key_secret:
+        raise HTTPException(status_code=422, detail="Auth Token and API Key Secret are required to validate the separate dialer account.")
+
+    def validate() -> None:
+        Client(account_sid, auth_token).api.accounts(account_sid).fetch()
+        key_client = Client(api_key_sid, api_key_secret, account_sid=account_sid)
+        key_client.api.accounts(account_sid).fetch()
+        app = Client(account_sid, auth_token).applications(twiml_app_sid).fetch()
+        voice_url = (getattr(app, "voice_url", "") or "").split("?")[0].rstrip("/")
+        method = (getattr(app, "voice_method", "") or "").upper()
+        if not voice_url.endswith("/api/v1/telephony/voice-connect") or method != "POST":
+            raise ValueError("TwiML App Voice URL must point to /api/v1/telephony/voice-connect using POST.")
+
+    try:
+        await asyncio.to_thread(validate)
+    except TwilioRestException as exc:
+        logger.warning("Dialer Twilio validation rejected credentials: {}", exc)
+        raise HTTPException(status_code=400, detail="Twilio rejected the Dialer credentials or TwiML App SID.") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Could not validate Dialer Twilio credentials")
+        raise HTTPException(status_code=502, detail="Could not validate the Dialer Twilio connection.") from exc
+
+    await db_client.save_platform_dialer_twilio_credentials(
+        account_sid=account_sid,
+        auth_token=auth_token,
+        api_key_sid=api_key_sid,
+        api_key_secret=api_key_secret,
+        twiml_app_sid=twiml_app_sid,
+        default_caller_id=(body.default_caller_id or "").strip() or None,
+    )
+    return await db_client.get_platform_dialer_twilio_connection()
+
+
+@router.get("/dialer-twilio-inventory")
+async def list_dialer_twilio_inventory(_user: UserModel = Depends(get_superuser)):
+    """List owned numbers from the dedicated dialer Twilio account for sync."""
+    credentials = await db_client.get_platform_dialer_credentials()
+    if not credentials:
+        raise HTTPException(status_code=503, detail="The sales dialer Twilio connection is not configured.")
+    client = Client(credentials["account_sid"], credentials["auth_token"])
+    try:
+        numbers = await asyncio.to_thread(lambda: client.incoming_phone_numbers.list(page_size=1000))
+    except TwilioRestException as exc:
+        logger.warning("Dialer Twilio inventory read failed: {}", exc)
+        raise HTTPException(status_code=502, detail="Twilio could not list numbers from the dialer account.") from exc
+    return {
+        "numbers": [
+            {"sid": item.sid, "phone_number": item.phone_number, "friendly_name": item.friendly_name}
+            for item in numbers
+        ]
     }
 
 

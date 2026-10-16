@@ -9,7 +9,6 @@ in the sysevo repo.
 """
 
 import asyncio
-import os
 
 from loguru import logger
 from twilio.http.http_client import TwilioHttpClient
@@ -26,22 +25,18 @@ def parent_call_sid_from_conference_name(name: str) -> str | None:
     return name.removeprefix("call-")
 
 
-def _twilio_client() -> Client | None:
-    account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
-    if not account_sid or not auth_token:
-        return None
-    # An explicit timeout is required, not tidiness: twilio-python's default
-    # http client passes timeout=None to requests, i.e. wait forever. Both
-    # callers here run inside a Twilio webhook handler and inside an
-    # asyncio.to_thread worker, so a stalled Twilio API call would blow past
-    # Twilio's own 15s webhook timeout (earning a retry, and a duplicate
-    # side effect with it) while pinning a thread from a pool that is only
-    # ~8 threads wide on the 4-core prod box - starving dial_lead_into_
-    # conference, which is on the critical path of every single dial.
-    # 5s matches the timeout every Supabase call in dialer_call_log.py uses.
-    return Client(account_sid, auth_token, http_client=TwilioHttpClient(timeout=5))
+async def _twilio_client() -> Client | None:
+    from api.db import db_client
 
+    try:
+        credentials = await db_client.get_platform_dialer_credentials()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Dialer Twilio credential lookup failed: {exc}")
+        return None
+    if not credentials:
+        return None
+    # Explicit timeout: this is on the critical path of every outbound dial.
+    return Client(credentials["account_sid"], credentials["auth_token"], http_client=TwilioHttpClient(timeout=5))
 
 async def dial_lead_into_conference(
     *,
@@ -63,7 +58,7 @@ async def dial_lead_into_conference(
     blocking the FastAPI event loop (and every other concurrent request)
     for the time it takes Twilio to respond.
     """
-    client = _twilio_client()
+    client = await _twilio_client()
     if not client:
         logger.error("dial_lead_into_conference: Twilio credentials not configured")
         return None
@@ -122,7 +117,7 @@ async def cancel_call(*, call_sid: str) -> bool:
     Twilio's Python SDK is synchronous, so this is wrapped in
     asyncio.to_thread() for the same reason dial_lead_into_conference is.
     """
-    client = _twilio_client()
+    client = await _twilio_client()
     if not client:
         logger.error("cancel_call: Twilio credentials not configured")
         return False

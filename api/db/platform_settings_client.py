@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from api.db.base_client import BaseDBClient
 from api.db.models import (
+    PlatformDialerTwilioCredentialsModel,
     PlatformTelnyxDialerCredentialsModel,
     PlatformTelnyxUserCredentialModel,
     PlatformTwilioCredentialsModel,
@@ -187,33 +188,57 @@ class PlatformSettingsClient(BaseDBClient):
             return result.scalars().first()
 
     async def get_platform_dialer_credentials(self) -> Optional[dict]:
-        """
-        Return ``{"account_sid", "api_key_sid", "api_key_secret",
-        "twiml_app_sid", "default_caller_id"}`` for the active account, or
-        ``None`` if no account is active, the active account has no dialer
-        fields configured, or decryption fails. Callers should fall back to
-        env vars on ``None`` (see ``voice_sdk.py``).
-        """
+        """Return the dedicated sales dialer Twilio record, separate from AI Voice."""
         async with self.async_session() as session:
-            result = await session.execute(
-                select(PlatformTwilioCredentialsModel)
-                .where(PlatformTwilioCredentialsModel.is_active.is_(True))
-                .order_by(PlatformTwilioCredentialsModel.id.desc())
-                .limit(1)
-            )
-            row = result.scalars().first()
-        if not row or not row.dialer_api_key_sid or not row.dialer_api_key_secret_encrypted:
+            row = await session.get(PlatformDialerTwilioCredentialsModel, 1)
+        if not row:
             return None
         try:
-            api_key_secret = decrypt_secret(row.dialer_api_key_secret_encrypted)
+            api_key_secret = decrypt_secret(row.api_key_secret_encrypted)
+            auth_token = decrypt_secret(row.auth_token_encrypted)
         except Exception:
             return None
         return {
             "account_sid": row.account_sid,
-            "api_key_sid": row.dialer_api_key_sid,
+            "auth_token": auth_token,
+            "api_key_sid": row.api_key_sid,
             "api_key_secret": api_key_secret,
-            "twiml_app_sid": row.dialer_twiml_app_sid,
-            "default_caller_id": row.dialer_default_caller_id,
+            "twiml_app_sid": row.twiml_app_sid,
+            "default_caller_id": row.default_caller_id,
+            "last_validated_at": row.last_validated_at,
+        }
+
+    async def save_platform_dialer_twilio_credentials(
+        self, *, account_sid: str, auth_token: str, api_key_sid: str,
+        api_key_secret: str, twiml_app_sid: str, default_caller_id: Optional[str],
+    ) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformDialerTwilioCredentialsModel, 1)
+            if row is None:
+                row = PlatformDialerTwilioCredentialsModel(id=1)
+                session.add(row)
+            row.account_sid = account_sid
+            row.auth_token_encrypted = encrypt_secret(auth_token)
+            row.api_key_sid = api_key_sid
+            row.api_key_secret_encrypted = encrypt_secret(api_key_secret)
+            row.twiml_app_sid = twiml_app_sid
+            row.default_caller_id = default_caller_id
+            row.last_validated_at = datetime.now(UTC)
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+
+    async def get_platform_dialer_twilio_connection(self) -> Optional[dict]:
+        creds = await self.get_platform_dialer_credentials()
+        if not creds:
+            return None
+        return {
+            "configured": True,
+            "account_sid": creds["account_sid"],
+            "account_sid_preview": f'{creds["account_sid"][:7]}…{creds["account_sid"][-4:]}',
+            "api_key_sid": creds["api_key_sid"],
+            "twiml_app_sid": creds["twiml_app_sid"],
+            "default_caller_id": creds.get("default_caller_id"),
+            "last_validated_at": creds.get("last_validated_at"),
         }
 
     async def get_platform_dialer_auth_token(self) -> Optional[str]:
@@ -221,7 +246,7 @@ class PlatformSettingsClient(BaseDBClient):
         Return the active account's decrypted auth token, for verifying
         inbound Twilio webhook signatures on the dialer's voice-connect route.
         """
-        creds = await self.get_platform_twilio_credentials()
+        creds = await self.get_platform_dialer_credentials()
         return creds["auth_token"] if creds else None
 
     async def list_platform_twilio_accounts(self) -> list[dict]:

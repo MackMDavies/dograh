@@ -353,6 +353,26 @@ class PlatformTwilioCredentialsModel(Base):
     )
 
 
+class PlatformDialerTwilioCredentialsModel(Base):
+    """Twilio credentials dedicated to the sales dialer, separate from AI Voice."""
+
+    __tablename__ = "dialer_twilio_credentials"
+
+    id = Column(Integer, primary_key=True)
+    account_sid = Column(String(64), nullable=False)
+    auth_token_encrypted = Column(String, nullable=False)
+    api_key_sid = Column(String(64), nullable=False)
+    api_key_secret_encrypted = Column(String, nullable=False)
+    twiml_app_sid = Column(String(64), nullable=False)
+    default_caller_id = Column(String(32), nullable=True)
+    last_validated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+    )
+
+
 class PlatformTelnyxDialerCredentialsModel(Base):
     """Platform Telnyx credentials for the sales dialer only.
 
