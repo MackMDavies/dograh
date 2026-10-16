@@ -7,6 +7,7 @@ import { WorkflowValidationError } from "@/components/flow/types";
 import { useAppConfig } from "@/context/AppConfigContext";
 import logger from '@/lib/logger';
 
+import type { WorkflowRuntimeNodeTransition } from "../../../components/workflow-tester/types";
 import { sdpFilterCodec } from "../utils";
 import { useDeviceInputs } from "./useDeviceInputs";
 
@@ -15,6 +16,7 @@ interface UseWebSocketRTCProps {
     workflowRunId: number;
     accessToken: string | null;
     initialContextVariables?: Record<string, string> | null;
+    onNodeTransition?: (transition: WorkflowRuntimeNodeTransition) => void;
 }
 
 export interface FeedbackMessage {
@@ -37,7 +39,7 @@ export interface FeedbackMessage {
     fatal?: boolean;
 }
 
-export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initialContextVariables }: UseWebSocketRTCProps) => {
+export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initialContextVariables, onNodeTransition }: UseWebSocketRTCProps) => {
     const [connectionStatus, setConnectionStatus] = useState<'idle' | 'connecting' | 'connected' | 'failed'>('idle');
     const [connectionActive, setConnectionActive] = useState(false);
     const [isCompleted, setIsCompleted] = useState(false);
@@ -411,14 +413,23 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                         case 'rtf-node-transition': {
                             const { node_name, previous_node_name, allow_interrupt } = message.payload;
                             currentAllowInterruptRef.current = allow_interrupt;
-                            setFeedbackMessages(prev => [...prev, {
+                            const transition: WorkflowRuntimeNodeTransition = {
                                 id: `node-${Date.now()}`,
+                                kind: 'node-transition',
+                                nodeName: node_name,
+                                previousNodeName: previous_node_name,
+                                allowInterrupt: allow_interrupt,
+                                timestamp: new Date().toISOString(),
+                            };
+                            onNodeTransition?.(transition);
+                            setFeedbackMessages(prev => [...prev, {
+                                id: transition.id,
                                 type: 'node-transition',
                                 text: node_name,
                                 nodeName: node_name,
                                 previousNode: previous_node_name,
                                 allowInterrupt: allow_interrupt,
-                                timestamp: new Date().toISOString(),
+                                timestamp: transition.timestamp ?? new Date().toISOString(),
                             }]);
                             break;
                         }
@@ -487,7 +498,7 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                 }
             };
         });
-    }, [getWebSocketUrl, connectionActive, isCompleted]);
+    }, [getWebSocketUrl, connectionActive, isCompleted, onNodeTransition]);
 
     const negotiate = async () => {
         const pc = pcRef.current;

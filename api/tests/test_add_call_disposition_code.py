@@ -71,7 +71,7 @@ def test_disposition_code_new_value_is_not_same_reference(client):
 
     client.async_session = MagicMock(return_value=mock_session)
 
-    asyncio.get_event_loop().run_until_complete(
+    asyncio.run(
         client.add_call_disposition_code(workflow_id=1, disposition_code="new_code")
     )
 

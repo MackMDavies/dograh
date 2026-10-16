@@ -157,17 +157,19 @@ async def test_twiml_route_rejects_missing_signature():
             return_value=SimpleNamespace(id=123)
         )
 
-        with pytest.raises(HTTPException) as exc_info:
-            await handle_twiml_webhook(
-                workflow_id=7,
-                user_id=8,
-                workflow_run_id=123,
-                organization_id=11,
-                request=request,
-            )
+        response = await handle_twiml_webhook(
+            workflow_id=7,
+            user_id=8,
+            workflow_run_id=123,
+            organization_id=11,
+            request=request,
+        )
 
-    assert exc_info.value.status_code == 401
-    assert exc_info.value.detail == "Invalid webhook signature"
+    assert response.status_code == 200
+    assert (
+        response.body
+        == b'<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    )
 
 
 @pytest.mark.asyncio
