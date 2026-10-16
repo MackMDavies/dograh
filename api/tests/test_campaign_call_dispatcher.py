@@ -1015,8 +1015,12 @@ class TestProcessBatchEdgeCases:
                 "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
                 new=AsyncMock(return_value=(False, "outside_calling_hours", retry_at)),
             ),
-            patch.object(dispatcher, "dispatch_call", new=AsyncMock()) as mock_dispatch_call,
-            patch.object(dispatcher, "acquire_concurrent_slot", new=AsyncMock()) as mock_acquire_slot,
+            patch.object(
+                dispatcher, "dispatch_call", new=AsyncMock()
+            ) as mock_dispatch_call,
+            patch.object(
+                dispatcher, "acquire_concurrent_slot", new=AsyncMock()
+            ) as mock_acquire_slot,
         ):
             processed_count = await dispatcher.process_batch(
                 campaign_id=campaign_test_data.campaign_id, batch_size=10
@@ -1028,7 +1032,9 @@ class TestProcessBatchEdgeCases:
 
         async with db_session_factory() as session:
             result = await session.execute(
-                text("SELECT state, scheduled_for FROM queued_runs WHERE id = ANY(:ids)"),
+                text(
+                    "SELECT state, scheduled_for FROM queued_runs WHERE id = ANY(:ids)"
+                ),
                 {"ids": campaign_test_data.queued_run_ids},
             )
             rows = result.fetchall()
@@ -1061,11 +1067,21 @@ class TestProcessBatchEdgeCases:
                 "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
                 new=AsyncMock(return_value=(True, "", None)),
             ) as mock_check,
-            patch.object(dispatcher, "dispatch_call", new=AsyncMock(side_effect=lambda qr, c, s: MagicMock(id=1))),
-            patch.object(dispatcher, "acquire_concurrent_slot", new=AsyncMock(return_value="slot-1")),
+            patch.object(
+                dispatcher,
+                "dispatch_call",
+                new=AsyncMock(side_effect=lambda qr, c, s: MagicMock(id=1)),
+            ),
+            patch.object(
+                dispatcher,
+                "acquire_concurrent_slot",
+                new=AsyncMock(return_value="slot-1"),
+            ),
             patch.object(dispatcher, "apply_rate_limit", new=AsyncMock()),
         ):
-            await dispatcher.process_batch(campaign_id=campaign_test_data.campaign_id, batch_size=10)
+            await dispatcher.process_batch(
+                campaign_id=campaign_test_data.campaign_id, batch_size=10
+            )
 
         mock_check.assert_called()
         for call in mock_check.await_args_list:
@@ -1270,9 +1286,7 @@ class TestProcessBatchSuppressionHandling:
                 "get_provider_for_campaign",
                 AsyncMock(return_value=provider),
             ),
-            patch.object(
-                dispatcher, "apply_rate_limit", AsyncMock(return_value=None)
-            ),
+            patch.object(dispatcher, "apply_rate_limit", AsyncMock(return_value=None)),
             patch.object(
                 dispatcher,
                 "acquire_concurrent_slot",

@@ -293,6 +293,7 @@ class TestCallingHoursUpdate:
             mock_db.get_workflow_name = AsyncMock(return_value="Some Workflow")
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
+            mock_db.record_acknowledgement = AsyncMock()
 
             await _call_update_campaign(
                 41,
