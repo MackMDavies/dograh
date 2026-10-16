@@ -71,11 +71,13 @@ def test_memory_sourced_variable_leaves_its_slot_open_for_memory():
 
 
 def test_handles_none_initial_context():
-    assert build_call_context(
+    ctx = build_call_context(
         initial_context=None,
         extra_context_vars=None,
         template_context_variables={"a": "1"},
-    ) == {"a": "1"}
+    )
+    assert ctx["a"] == "1"
+    assert "current_date" in ctx
 
 
 # --- variable source selection -------------------------------------------------
