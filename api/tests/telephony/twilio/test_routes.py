@@ -166,7 +166,10 @@ async def test_twiml_route_rejects_missing_signature():
         )
 
     assert response.status_code == 200
-    assert response.body == b'<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    assert (
+        response.body
+        == b'<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    )
 
 
 @pytest.mark.asyncio
