@@ -59,6 +59,7 @@ jobs:
       ENVIRONMENT: test
       LOG_LEVEL: DEBUG
       PYTHONPATH: ${{ github.workspace }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
     steps:
       - name: Checkout repo (with pipecat submodule)
@@ -88,15 +89,20 @@ jobs:
         working-directory: api/mcp_server/ts_validator
         run: npm install
 
+      - name: Run agent sandbox tests
+        working-directory: api
+        run: |
+          pytest tests/test_workflow_test_sandbox_mode.py tests/test_sandbox_repair.py -xvs
+          pytest tests/test_custom_tools.py -k sandbox -xvs
+          pytest tests/test_workflow_versioning.py -k sandbox -xvs
+
       - name: Run pytest
         working-directory: api
         run: pytest tests/ -xvs
 
       - name: Send Slack notification - Failure
-        if: failure()
+        if: ${{ failure() && env.SLACK_WEBHOOK_URL != '' }}
         uses: slackapi/slack-github-action@v1.26.0
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         with:
           payload: |
             {
