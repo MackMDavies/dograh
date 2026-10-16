@@ -21,6 +21,8 @@ jobs:
     if: ${{ !startsWith(github.head_ref, 'release-please--') }}
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
     steps:
       - name: Checkout repo (with pipecat submodule)
         uses: actions/checkout@v4
@@ -51,24 +53,38 @@ jobs:
         working-directory: ui
         run: npm ci
 
+      - name: Record PR source files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" -- api pipecat | grep -E '\.py$' | sort -u > "$RUNNER_TEMP/changed-python-files"
+          git diff --name-only "$BASE_SHA...$HEAD_SHA" -- ui | sort -u > "$RUNNER_TEMP/changed-ui-files"
+
       - name: Run scripts/format.sh
         run: ./scripts/format.sh
 
       - name: Check for Python format/lint drift
         run: |
-          if ! git diff --exit-code api; then
-            echo "::error::Python files are not formatted. Run './scripts/format.sh' locally and commit the result before raising the PR."
+          git diff --name-only -- api pipecat | sort -u > "$RUNNER_TEMP/formatted-python-files"
+          comm -12 "$RUNNER_TEMP/changed-python-files" "$RUNNER_TEMP/formatted-python-files" > "$RUNNER_TEMP/python-format-drift"
+          if [ -s "$RUNNER_TEMP/python-format-drift" ]; then
+            cat "$RUNNER_TEMP/python-format-drift"
+            echo "::error::Changed Python files are not formatted. Run './scripts/format.sh' and commit formatting changes for the files touched by this PR."
             exit 1
           fi
-          echo "Python format/lint is clean."
+          echo "Changed Python files are formatted."
 
       - name: Check for UI lint drift
         run: |
-          if ! git diff --exit-code ui; then
-            echo "::error::UI files have outstanding lint fixes. Run 'npm run fix-lint' inside ui/ locally and commit the result before raising the PR."
+          git diff --name-only -- ui | sort -u > "$RUNNER_TEMP/formatted-ui-files"
+          comm -12 "$RUNNER_TEMP/changed-ui-files" "$RUNNER_TEMP/formatted-ui-files" > "$RUNNER_TEMP/ui-format-drift"
+          if [ -s "$RUNNER_TEMP/ui-format-drift" ]; then
+            cat "$RUNNER_TEMP/ui-format-drift"
+            echo "::error::Changed UI files have outstanding lint fixes. Run 'npm run fix-lint' inside ui/ and commit formatting changes for the files touched by this PR."
             exit 1
           fi
-          echo "UI lint is clean."
+          echo "Changed UI files have no lint drift."
 
       - name: Dump OpenAPI spec
         env:
@@ -89,10 +105,8 @@ jobs:
           echo "OpenAPI spec is in sync."
 
       - name: Send Slack notification - Failure
-        if: failure()
+        if: ${{ failure() && env.SLACK_WEBHOOK_URL != '' }}
         uses: slackapi/slack-github-action@v1.26.0
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
         with:
           payload: |
             {
