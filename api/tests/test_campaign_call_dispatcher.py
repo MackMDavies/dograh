@@ -696,10 +696,15 @@ class TestProcessBatchCancellation:
         campaign.id = 42
         campaign.state = "running"
         campaign.organization_id = 7
+        campaign.workflow_id = 55
         campaign.rate_limit_per_second = 1
         campaign.telephony_configuration_id = 170
 
-        queued_runs = [MagicMock(id=101), MagicMock(id=102), MagicMock(id=103)]
+        queued_runs = [
+            MagicMock(id=101, context_variables={}),
+            MagicMock(id=102, context_variables={}),
+            MagicMock(id=103, context_variables={}),
+        ]
         provider = MagicMock()
         provider.from_numbers = []
 
@@ -707,6 +712,18 @@ class TestProcessBatchCancellation:
             patch(
                 "api.services.campaign.campaign_call_dispatcher.db_client"
             ) as mock_db,
+            patch(
+                "api.services.workflow_active_check.check_workflow_active",
+                AsyncMock(return_value=(True, None)),
+            ),
+            patch(
+                "api.services.wallet_check.check_wallet_before_call",
+                AsyncMock(return_value=(True, "")),
+            ),
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.check_dial_permitted",
+                AsyncMock(return_value=(True, None, None)),
+            ),
             patch.object(
                 dispatcher,
                 "get_provider_for_campaign",

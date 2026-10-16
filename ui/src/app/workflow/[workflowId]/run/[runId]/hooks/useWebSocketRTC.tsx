@@ -7,9 +7,9 @@ import { WorkflowValidationError } from "@/components/flow/types";
 import { useAppConfig } from "@/context/AppConfigContext";
 import logger from '@/lib/logger';
 
+import type { WorkflowRuntimeNodeTransition } from "../../../components/workflow-tester/types";
 import { sdpFilterCodec } from "../utils";
 import { useDeviceInputs } from "./useDeviceInputs";
-import type { WorkflowRuntimeNodeTransition } from "../../../components/workflow-tester/types";
 
 interface UseWebSocketRTCProps {
     workflowId: number;
@@ -498,7 +498,7 @@ export const useWebSocketRTC = ({ workflowId, workflowRunId, accessToken, initia
                 }
             };
         });
-    }, [getWebSocketUrl, connectionActive, isCompleted]);
+    }, [getWebSocketUrl, connectionActive, isCompleted, onNodeTransition]);
 
     const negotiate = async () => {
         const pc = pcRef.current;
