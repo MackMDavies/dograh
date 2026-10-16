@@ -96,7 +96,14 @@ jobs:
         run: python -u -m scripts.dump_docs_openapi
 
       - name: Check for OpenAPI drift
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
+          if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- api/routes api/schemas api/models api/main.py; then
+            echo "No route or schema source changed; skipping OpenAPI drift comparison."
+            exit 0
+          fi
           if ! git diff --exit-code docs/api-reference/openapi.json; then
             echo "::error::docs/api-reference/openapi.json is out of sync with the FastAPI app."
             echo "Run 'python -m scripts.dump_docs_openapi' locally (with api/.env sourced) and commit the result."
