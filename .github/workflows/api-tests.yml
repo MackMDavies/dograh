@@ -96,7 +96,12 @@ jobs:
           pytest tests/test_custom_tools.py -k sandbox -xvs
           pytest tests/test_workflow_versioning.py -k sandbox -xvs
 
+      - name: Run TwiML webhook signature tests
+        working-directory: api
+        run: pytest tests/telephony/twilio/test_routes.py -k twiml_route -xvs
+
       - name: Run pytest
+        if: ${{ github.event_name == 'pull_request' }}
         working-directory: api
         run: pytest tests/ -xvs
 
