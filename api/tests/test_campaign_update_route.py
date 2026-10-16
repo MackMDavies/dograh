@@ -21,11 +21,20 @@ from fastapi import HTTPException
 from api.routes.campaign import UpdateCampaignRequest, update_campaign
 
 
+async def _call_update_campaign(*args, **kwargs):
+    kwargs.setdefault("http_request", SimpleNamespace(headers={}, client=None))
+    return await update_campaign(*args, **kwargs)
+
+
 def _user(*, is_superuser=False, org_id=3, user_id=10) -> SimpleNamespace:
-    return SimpleNamespace(is_superuser=is_superuser, selected_organization_id=org_id, id=user_id)
+    return SimpleNamespace(
+        is_superuser=is_superuser, selected_organization_id=org_id, id=user_id
+    )
 
 
-def _campaign(*, org_id=3, workflow_id=100, telephony_configuration_id=None) -> SimpleNamespace:
+def _campaign(
+    *, org_id=3, workflow_id=100, telephony_configuration_id=None
+) -> SimpleNamespace:
     return SimpleNamespace(
         id=41,
         name="Test Campaign",
@@ -56,11 +65,13 @@ class TestWorkflowIdOwnershipValidation:
         campaign = _campaign(org_id=3)
         with patch("api.routes.campaign.db_client") as mock_db:
             mock_db.get_campaign = AsyncMock(return_value=campaign)
-            mock_db.get_workflow_name = AsyncMock(return_value=None)  # not found in caller's org
+            mock_db.get_workflow_name = AsyncMock(
+                return_value=None
+            )  # not found in caller's org
             mock_db.update_campaign = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await update_campaign(
+                await _call_update_campaign(
                     41,
                     UpdateCampaignRequest(workflow_id=999),
                     user=_user(is_superuser=False, org_id=3),
@@ -78,7 +89,7 @@ class TestWorkflowIdOwnershipValidation:
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(workflow_id=101),
                 user=_user(is_superuser=False, org_id=3),
@@ -96,7 +107,7 @@ class TestWorkflowIdOwnershipValidation:
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
             mock_db.get_workflow_name = AsyncMock(return_value="Some Agent")
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(workflow_id=999),
                 user=_user(is_superuser=True, org_id=1),
@@ -128,7 +139,7 @@ class TestTelephonyConfigurationCrossOrgFallback:
             mock_db.update_campaign = AsyncMock()
 
             with pytest.raises(HTTPException) as exc_info:
-                await update_campaign(
+                await _call_update_campaign(
                     41,
                     UpdateCampaignRequest(telephony_configuration_id=55),
                     user=_user(is_superuser=False, org_id=3),
@@ -153,7 +164,7 @@ class TestTelephonyConfigurationCrossOrgFallback:
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
             mock_db.get_workflow_name = AsyncMock(return_value="Some Agent")
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(telephony_configuration_id=2),
                 user=_user(is_superuser=False, org_id=3),
@@ -165,7 +176,10 @@ class TestTelephonyConfigurationCrossOrgFallback:
                 ((2, 1),),
             ]
             mock_db.update_campaign.assert_awaited_once()
-            assert mock_db.update_campaign.call_args.kwargs["telephony_configuration_id"] == 2
+            assert (
+                mock_db.update_campaign.call_args.kwargs["telephony_configuration_id"]
+                == 2
+            )
 
     @pytest.mark.asyncio
     async def test_superuser_bypasses_org_scoping_entirely(self):
@@ -173,13 +187,15 @@ class TestTelephonyConfigurationCrossOrgFallback:
         with patch("api.routes.campaign.db_client") as mock_db:
             mock_db.get_campaign = AsyncMock(return_value=campaign)
             mock_db.get_telephony_configuration = AsyncMock(
-                return_value=SimpleNamespace(id=55, organization_id=9, name="Someone Else's")
+                return_value=SimpleNamespace(
+                    id=55, organization_id=9, name="Someone Else's"
+                )
             )
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
             mock_db.get_workflow_name = AsyncMock(return_value="Some Agent")
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(telephony_configuration_id=55),
                 user=_user(is_superuser=True, org_id=1),
@@ -204,7 +220,7 @@ class TestCallingHoursUpdate:
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(
                     calling_hours={"mode": "custom", "start": "09:00", "end": "18:00"}
@@ -231,7 +247,7 @@ class TestCallingHoursUpdate:
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(calling_hours={"mode": "inherit"}),
                 user=_user(is_superuser=True, org_id=3),
@@ -250,7 +266,7 @@ class TestCallingHoursUpdate:
             mock_db.get_campaign = AsyncMock(return_value=campaign)
 
             with pytest.raises(HTTPException) as exc_info:
-                await update_campaign(
+                await _call_update_campaign(
                     41,
                     UpdateCampaignRequest(
                         calling_hours={
@@ -278,7 +294,7 @@ class TestCallingHoursUpdate:
             mock_db.update_campaign = AsyncMock()
             mock_db.get_queued_runs_stats_for_campaigns = AsyncMock(return_value={})
 
-            await update_campaign(
+            await _call_update_campaign(
                 41,
                 UpdateCampaignRequest(
                     calling_hours={
