@@ -1,12 +1,19 @@
 from datetime import datetime
 from typing import List, Optional
 
+import httpx
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
-from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG, DEFAULT_ORG_CONCURRENCY_LIMIT
+from api.constants import (
+    DEFAULT_CAMPAIGN_RETRY_CONFIG,
+    DEFAULT_ORG_CONCURRENCY_LIMIT,
+    SUPABASE_SERVICE_ROLE_KEY,
+    SUPABASE_URL,
+)
 from api.db import db_client
 from api.db.models import UserModel
 from api.db.telephony_configuration_client import TelephonyConfigurationInUseError
@@ -43,6 +50,77 @@ from api.services.worker_sync.protocol import WorkerSyncEventType
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
+
+
+async def _twilio_claim_account_sid(config_id: int) -> Optional[str]:
+    """Return the account SID only when this is the shared Sysevo Twilio account."""
+    config = await db_client.get_telephony_configuration(config_id)
+    if not config or str(config.provider).lower() != "twilio":
+        return None
+    spec = telephony_registry.get_optional(config.provider)
+    account_field = spec.account_id_credential_field if spec else None
+    account_sid = (config.credentials or {}).get(account_field) if account_field else None
+    active_sid = await db_client.get_platform_twilio_sid()
+    account_sid = str(account_sid).strip() if account_sid else ""
+    active_sid = str(active_sid).strip() if active_sid else ""
+    return account_sid if account_sid and account_sid == active_sid else None
+
+
+async def _set_shared_twilio_voice_claim(
+    *, config_id: int, phone_number: str, owner_ref: str, claim: bool
+) -> None:
+    """Atomically reserve/release a shared Twilio number in Supabase."""
+    account_sid = await _twilio_claim_account_sid(config_id)
+    if not account_sid:
+        return
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Shared Twilio number ownership is unavailable; the Voice AI assignment was not changed.",
+        )
+    rpc = (
+        "twilio_claim_voice_agent_number"
+        if claim else "twilio_release_voice_agent_number"
+    )
+    payload = (
+        {
+            "p_account_sid": account_sid,
+            "p_twilio_sid": None,
+            "p_phone_number": phone_number,
+            "p_owner_ref": owner_ref,
+        }
+        if claim else {
+            "p_account_sid": account_sid,
+            "p_phone_number": phone_number,
+            "p_owner_ref": owner_ref,
+        }
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/rpc/{rpc}",
+                json=payload,
+                headers={
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.error(f"Shared Twilio ownership check failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify shared Twilio number ownership; the Voice AI assignment was not changed.",
+        ) from exc
+    if not response.is_success:
+        detail = "This Twilio number is already claimed by the dialer." if claim and response.status_code == 409 else "Could not update shared Twilio number ownership."
+        logger.warning(f"Shared Twilio claim RPC {rpc} failed ({response.status_code}).")
+        raise HTTPException(status_code=409 if claim else 503, detail=detail)
+
+
+def _shared_twilio_owner_ref(config_id: int, phone_number: str) -> str:
+    phone_key = re.sub(r"\D", "", phone_number)
+    return f"config:{config_id}:phone:{phone_key}"
 
 
 def _sensitive_fields(provider_name: str) -> List[str]:
@@ -551,6 +629,20 @@ async def create_phone_number(
                 ),
             )
 
+    shared_owner_ref = _shared_twilio_owner_ref(config_id, request.address)
+    claimed_shared_number = request.inbound_workflow_id is not None
+    if request.inbound_workflow_id is not None and not user.is_superuser:
+        await _ensure_workflow_belongs_to_org(
+            request.inbound_workflow_id, user.selected_organization_id
+        )
+    if claimed_shared_number:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=request.address,
+            owner_ref=shared_owner_ref,
+            claim=True,
+        )
+
     try:
         row = await db_client.create_phone_number(
             organization_id=user.selected_organization_id,
@@ -564,12 +656,35 @@ async def create_phone_number(
             extra_metadata=request.extra_metadata,
         )
     except IntegrityError:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
         raise HTTPException(
             status_code=409,
             detail="A phone number with this address already exists in the org.",
         )
     except ValueError as e:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
+        raise
 
     response = _phone_number_to_response(row)
     if request.inbound_workflow_id is not None:
@@ -614,6 +729,18 @@ async def update_phone_number(
     if not existing:
         raise HTTPException(status_code=404, detail="Phone number not found")
 
+    owner_ref = _shared_twilio_owner_ref(config_id, existing.address_normalized)
+    desired_inbound = (
+        None if request.clear_inbound_workflow
+        else request.inbound_workflow_id if request.inbound_workflow_id is not None
+        else existing.inbound_workflow_id
+    )
+    desired_outbound = (
+        None if request.clear_outbound_workflow
+        else request.outbound_workflow_id if request.outbound_workflow_id is not None
+        else existing.outbound_workflow_id
+    )
+    desired_voice_claim = desired_inbound is not None or desired_outbound is not None
     if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(
             request.inbound_workflow_id, effective_org_id
@@ -625,21 +752,53 @@ async def update_phone_number(
         await _ensure_workflow_belongs_to_org(
             request.outbound_workflow_id, effective_org_id
         )
+    if desired_voice_claim:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=existing.address_normalized,
+            owner_ref=owner_ref,
+            claim=True,
+        )
 
-    row = await db_client.update_phone_number(
-        phone_number_id=phone_number_id,
-        telephony_configuration_id=config_id,
-        label=request.label,
-        inbound_workflow_id=request.inbound_workflow_id,
-        outbound_workflow_id=request.outbound_workflow_id,
-        is_active=request.is_active,
-        country_code=request.country_code,
-        extra_metadata=request.extra_metadata,
-        clear_inbound_workflow=request.clear_inbound_workflow,
-        clear_outbound_workflow=request.clear_outbound_workflow,
-    )
+    try:
+        row = await db_client.update_phone_number(
+            phone_number_id=phone_number_id,
+            telephony_configuration_id=config_id,
+            label=request.label,
+            inbound_workflow_id=request.inbound_workflow_id,
+            outbound_workflow_id=request.outbound_workflow_id,
+            is_active=request.is_active,
+            country_code=request.country_code,
+            extra_metadata=request.extra_metadata,
+            clear_inbound_workflow=request.clear_inbound_workflow,
+            clear_outbound_workflow=request.clear_outbound_workflow,
+        )
+    except Exception:
+        if desired_voice_claim and existing.inbound_workflow_id is None and existing.outbound_workflow_id is None:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=existing.address_normalized,
+                owner_ref=owner_ref,
+                claim=False,
+            )
+        raise
     if not row:
+        if desired_voice_claim and existing.inbound_workflow_id is None and existing.outbound_workflow_id is None:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=existing.address_normalized,
+                owner_ref=owner_ref,
+                claim=False,
+            )
         raise HTTPException(status_code=404, detail="Phone number not found")
+
+    if not desired_voice_claim:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=existing.address_normalized,
+            owner_ref=owner_ref,
+            claim=False,
+        )
 
     response = _phone_number_to_response(row)
 
@@ -735,6 +894,17 @@ async def delete_phone_number(
     deleted = await db_client.delete_phone_number(phone_number_id, config_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Phone number not found")
+
+    # The Voice AI assignment has been removed from Dograh; release its
+    # shared-account claim only after the row deletion succeeds. A failed
+    # release is deliberately surfaced so the stale claim can be reconciled
+    # instead of making the number appear free while still assigned.
+    await _set_shared_twilio_voice_claim(
+        config_id=config_id,
+        phone_number=existing.address_normalized,
+        owner_ref=_shared_twilio_owner_ref(config_id, existing.address_normalized),
+        claim=False,
+    )
 
     return {"message": "Phone number deleted"}
 
