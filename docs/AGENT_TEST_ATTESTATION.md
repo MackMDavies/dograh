@@ -50,6 +50,12 @@ On 18 October 2026 the 38 focused runtime checks passed. Disabling the execution
 binding check caused the configuration-drift test to fail; restoring it returned
 that test to passing. A wider regression run passed 80 non-database checks;
 local database tests initially could not open a socket inside the sandbox.
+After granting the test process access to the local database and installing its
+missing vector extension, all ten text-session integration tests passed. All 32
+workflow-versioning integration tests also passed, including actual draft-row
+mutation rejection, unchanged publication after rejection, organization
+isolation, and idempotent publication of the exact candidate. No LLM, provider,
+customer endpoint, or production database was used by these database tests.
 
 The production capability probe did not yet advertise
 `exact_candidate_hash_pinning`. The running API image and the dirty host checkout
