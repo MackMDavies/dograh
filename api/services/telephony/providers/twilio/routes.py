@@ -67,10 +67,8 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     mark_dialer_lead_joined_conference,
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
-    update_dialer_call_parallel_winner,
     update_dialer_call_recording_by_conference_sid,
     update_dialer_call_status,
-    update_dialer_call_parallel_target,
 )
 from api.services.telephony.providers.twilio.dialer_conference import (
     _twilio_client,
@@ -923,6 +921,7 @@ async def handle_voice_connect(request: Request):
                 # controls the aggregate row and all outbound PSTN destinations.
                 to_number = parallel_targets[0]["phone"]
                 entry_id = parallel_targets[0]["entry_id"]
+                caller_id = caller_ids_by_entry[entry_id]
             call_row_created = await create_dialer_call(
                 parent_call_sid=parent_call_sid,
                 rep_user_id=user.provider_id,
@@ -1371,13 +1370,8 @@ async def handle_dialer_conference_join(
                     account_sid=str(form_data.get("AccountSid") or ""),
                 )
             else:
-                background_tasks.add_task(
-                    update_dialer_call_parallel_winner,
-                    parent_call_sid=parent_call_sid,
-                    child_call_sid=parallel_call_sid,
-                    entry_id=parallel_entry_id,
-                    to_number=str(form_data.get("To") or ""),
-                )
+                # The claim RPC has already linked entry, destination, caller ID
+                # and status atomically. No delayed PATCH may revive this parent.
                 # Return winner TwiML immediately; cancel siblings off the
                 # critical webhook path after Twilio joins this conference.
                 background_tasks.add_task(

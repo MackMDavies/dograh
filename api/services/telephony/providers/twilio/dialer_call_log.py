@@ -248,63 +248,6 @@ async def update_dialer_call_child_sid(*, parent_call_sid: str, child_call_sid: 
         logger.error(f"Failed to update dialer_calls child_call_sid for {parent_call_sid}: {exc}")
 
 
-async def update_dialer_call_parallel_winner(
-    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
-) -> None:
-    """Point the aggregate call row at the first verified human in a fanout."""
-    await update_dialer_call_parallel_target(
-        parent_call_sid=parent_call_sid,
-        child_call_sid=child_call_sid,
-        entry_id=entry_id,
-        to_number=to_number,
-    )
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot record parallel winner")
-        return
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}"},
-                json={"status": "in-progress"},
-                headers=_headers(),
-                timeout=5.0,
-            )
-            response.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 - preserve the live call if history write fails
-        logger.error(f"Failed to record parallel winner for {parent_call_sid}: {exc}")
-
-
-async def update_signalwire_parallel_winner(
-    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
-) -> bool:
-    """Link a SignalWire browser batch to its first human prospect leg."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        return False
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.patch(
-                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={
-                    "parent_call_sid": f"eq.{parent_call_sid}",
-                    "provider": "eq.signalwire",
-                },
-                json={
-                    "child_call_sid": child_call_sid,
-                    "entry_id": entry_id,
-                    "to_number": to_number,
-                    "status": "in-progress",
-                },
-                headers={**_headers(), "Prefer": "return=representation"},
-            )
-            response.raise_for_status()
-            rows = response.json()
-        return isinstance(rows, list) and len(rows) == 1
-    except Exception as exc:  # noqa: BLE001 - only close the prospect if the batch cannot be linked
-        logger.error(f"Failed to link SignalWire batch winner for {parent_call_sid}: {exc}")
-        return False
-
-
 async def update_signalwire_dialer_amd(
     *, parent_call_sid: str, amd_result: str | None = None,
     voicemail_started: bool = False, voicemail_sent: bool = False,
@@ -343,31 +286,6 @@ async def update_signalwire_dialer_amd(
     except Exception as exc:  # noqa: BLE001 - a history write must not interrupt provider media
         logger.error(f"Failed to persist SignalWire AMD for {parent_call_sid}: {exc}")
         return False
-
-
-async def update_dialer_call_parallel_target(
-    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
-) -> None:
-    """Attach the aggregate row to the specific entry answered by a line."""
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot record parallel target")
-        return
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.patch(
-                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}"},
-                json={
-                    "child_call_sid": child_call_sid,
-                    "entry_id": entry_id,
-                    "to_number": to_number,
-                },
-                headers=_headers(),
-                timeout=5.0,
-            )
-            response.raise_for_status()
-    except Exception as exc:  # noqa: BLE001 - preserve the live call if history write fails
-        logger.error(f"Failed to record parallel target for {parent_call_sid}: {exc}")
 
 
 async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:

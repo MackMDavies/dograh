@@ -33,7 +33,7 @@ async def start_parallel_session(
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
-                f"{SUPABASE_URL}/rest/v1/rpc/dialer_start_parallel_session",
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_start_parallel_session_v2",
                 json={
                     "p_parent_call_sid": parent_call_sid,
                     "p_rep_user_id": rep_user_id,

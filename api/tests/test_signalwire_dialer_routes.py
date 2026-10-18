@@ -1586,7 +1586,6 @@ async def test_machine_pass_to_rep_is_only_available_for_single_screened_calls(l
         patch(f"{_MODULE}.signalwire_parallel_store.claim_winner", new=AsyncMock(return_value=True)) as winner,
         patch(f"{_MODULE}.signalwire_parallel_store.record_outcome", new=AsyncMock(return_value=True)) as outcome,
         patch(f"{_MODULE}._load_signalwire_parallel_entries", new=AsyncMock(return_value=[{"id": "entry", "phone": "+14155550123"}])),
-        patch(f"{_MODULE}.update_signalwire_parallel_winner", new=AsyncMock(return_value=True)),
         patch(f"{_MODULE}.update_signalwire_dialer_amd", new=AsyncMock()),
         patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.test", ""))),
     ):

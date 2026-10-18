@@ -342,8 +342,8 @@ def test_voice_connect_parallel_fans_out_only_server_validated_targets(monkeypat
     ), patch(
         "api.services.telephony.providers.twilio.routes.choose_parallel_caller_ids",
         return_value={
-            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "+15551234567",
-            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": "+15557654321",
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "+15557654321",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": "+15551234567",
         },
     ), patch(
         "api.services.telephony.providers.twilio.routes.dialer_parallel.assign_parallel_caller_id",
@@ -357,7 +357,7 @@ def test_voice_connect_parallel_fans_out_only_server_validated_targets(monkeypat
     ), patch(
         "api.services.telephony.providers.twilio.routes.create_dialer_call",
         return_value=True,
-    ), patch(
+    ) as create_call, patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
     ), patch(
@@ -392,6 +392,8 @@ def test_voice_connect_parallel_fans_out_only_server_validated_targets(monkeypat
         "+15551234567", "+15557654321"
     }
     assert persist_caller_id.await_count == 2
+    assert create_call.await_args.kwargs["from_number"] == "+15557654321"
+    assert create_call.await_args.kwargs["entry_id"] == targets[0]["entry_id"]
 
 
 def test_voice_connect_blocks_suppressed_number_before_creating_or_originating_call(monkeypatch):
@@ -598,8 +600,6 @@ def test_parallel_join_bridges_only_atomic_human_winner(monkeypatch, amd_answer)
             {"child_call_sid": loser_sid, "status": "ringing"},
         ],
     ), patch(
-        "api.services.telephony.providers.twilio.routes.update_dialer_call_parallel_winner"
-    ) as save_winner, patch(
         "api.services.telephony.providers.twilio.routes.cancel_call_if_ringing", return_value=True
     ) as cancel:
         response = client.post(
@@ -632,7 +632,6 @@ def test_parallel_join_bridges_only_atomic_human_winner(monkeypatch, amd_answer)
         child_call_sid=winner_sid,
         leg_id=leg_id,
     )
-    save_winner.assert_awaited_once()
     cancel.assert_awaited_once_with(call_sid=loser_sid)
 
 

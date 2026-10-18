@@ -90,7 +90,6 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
     update_dialer_call_recording_url,
     update_dialer_call_status,
-    update_signalwire_parallel_winner,
     update_signalwire_dialer_amd,
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
@@ -1563,13 +1562,8 @@ async def handle_sw_parallel_decision(request: Request):
                 )
                 if not winner:
                     return _swml(build_hangup_swml())
-                entry_rows = await _load_signalwire_parallel_entries([str(leg["entry_id"])])
-                if len(entry_rows) != 1 or not await update_signalwire_parallel_winner(
-                    parent_call_sid=str(session["rep_call_id"]),
-                    child_call_sid=provider_call_id,
-                    entry_id=str(leg["entry_id"]), to_number=entry_rows[0]["phone"],
-                ):
-                    return _swml(build_hangup_swml())
+                # The winning claim transaction already linked the parent to
+                # this exact PSTN leg and its independently selected caller ID.
                 await update_signalwire_dialer_amd(
                     parent_call_sid=provider_call_id, amd_result="fax" if amd_result == "fax" else "machine_start"
                 )
@@ -1668,28 +1662,8 @@ async def handle_sw_parallel_decision(request: Request):
                 provider_call_id=provider_call_id, outcome="overflow_unrouted",
             )
             return _swml(build_hangup_swml())
-        winner_entry_id = str(leg.get("entry_id") or "")
-        winner_entries = await _load_signalwire_parallel_entries([winner_entry_id])
-        if len(winner_entries) != 1:
-            logger.error("SignalWire parallel winner could not resolve its lead record")
-            return _swml(build_hangup_swml())
-        linked = await update_signalwire_parallel_winner(
-            parent_call_sid=str(session.get("rep_call_id") or ""),
-            child_call_sid=provider_call_id,
-            entry_id=winner_entry_id,
-            to_number=winner_entries[0]["phone"],
-        )
-        if not linked:
-            logger.error("SignalWire parallel winner was claimed but parent call history link failed")
-            from api.services.telephony.dialer.signalwire_calling import end_call
-            try:
-                await end_call(call_id=provider_call_id, reason="error")
-            except Exception as exc:  # noqa: BLE001
-                logger.error(f"Could not end unlinked parallel winner leg: {exc}")
-            await signalwire_parallel_store.finish_session(
-                session_id=session_id, status="failed"
-            )
-            return _swml(build_hangup_swml())
+        # Identity, caller ID and status were committed with the winning
+        # claim. A second network write cannot invalidate a verified winner.
         # Provider cancellation and history reconciliation must not make the
         # winning human wait for all other PSTN requests to finish.
         _spawn_background(_cancel_signalwire_ringing_siblings(

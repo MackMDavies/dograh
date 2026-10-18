@@ -48,6 +48,8 @@ async def test_parallel_rpc_returns_database_claim(monkeypatch, operation):
     assert result is True
     assert client.post.await_count == 1
     assert client.post.await_args.args[0].startswith("https://db.example/rest/v1/rpc/")
+    if operation == "start_parallel_session":
+        assert client.post.await_args.args[0].endswith("/dialer_start_parallel_session_v2")
 
 
 async def test_register_parallel_leg_writes_provider_child_identity(monkeypatch):

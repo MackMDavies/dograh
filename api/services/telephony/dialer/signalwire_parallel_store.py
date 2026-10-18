@@ -57,7 +57,7 @@ async def start_session(
     line_count: int,
 ) -> list[dict[str, Any]]:
     rows = await _rpc(
-        "dialer_signalwire_parallel_start",
+        "dialer_signalwire_parallel_start_v2",
         {
             "p_session_id": session_id,
             "p_rep_user_id": rep_user_id,
@@ -82,7 +82,7 @@ async def start_screened_single_session(
 ) -> list[dict[str, Any]]:
     """Reserve one queue entry for a SignalWire AMD-screened single call."""
     rows = await _rpc(
-        "dialer_signalwire_screened_single_start",
+        "dialer_signalwire_screened_single_start_v2",
         {
             "p_session_id": session_id,
             "p_rep_user_id": rep_user_id,
