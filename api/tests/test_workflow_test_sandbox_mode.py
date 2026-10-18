@@ -1,12 +1,17 @@
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-import pytest
 
+from api.routes import workflow_text_chat
 from api.routes.workflow_text_chat import router as text_chat_router
 from api.services.auth.depends import get_user
+from api.services.workflow.test_sandbox_binding import (
+    validate_sandbox_execution_binding,
+)
 from api.services.workflow.test_sandbox_mode import (
     build_run_annotations,
     is_sandbox_test_run,
@@ -89,6 +94,166 @@ def test_published_version_pinning_is_not_available_to_regular_text_sessions():
     )
     assert response.status_code == 403
     assert response.json()["detail"] == "Published version pinning is reserved for authenticated sandbox tests"
+
+
+def test_candidate_hash_mismatch_is_rejected_before_quota_or_runtime_creation(
+    monkeypatch,
+):
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "synthetic-test-secret")
+    app = FastAPI()
+    app.include_router(text_chat_router)
+    app.dependency_overrides[get_user] = lambda: SimpleNamespace(
+        id=1, selected_organization_id=11
+    )
+    candidate = SimpleNamespace(
+        workflow_id=42,
+        version_number=4,
+        status="draft",
+        workflow_json={"nodes": []},
+        workflow_configurations={},
+        template_context_variables={},
+    )
+    with (
+        patch.object(
+            workflow_text_chat.db_client,
+            "get_workflow",
+            new=AsyncMock(return_value=SimpleNamespace(id=42)),
+        ),
+        patch.object(
+            workflow_text_chat.db_client,
+            "get_workflow_versions",
+            new=AsyncMock(return_value=[candidate]),
+        ),
+        patch.object(
+            workflow_text_chat, "_ensure_text_chat_quota", new=AsyncMock()
+        ) as quota,
+        patch.object(
+            workflow_text_chat.db_client, "create_workflow_run", new=AsyncMock()
+        ) as create,
+    ):
+        response = TestClient(app).post(
+            "/workflow/42/text-chat/sessions",
+            json={
+                "sandbox_mode": True,
+                "candidate_draft_version_number": 4,
+                "expected_workflow_hash": "0" * 64,
+                "annotations": {
+                    "agent_test_run_id": "11111111-1111-4111-8111-111111111111",
+                    "scenario_id": "qa",
+                },
+            },
+            headers={"x-sysevo-secret": "synthetic-test-secret"},
+        )
+    assert response.status_code == 409
+    quota.assert_not_awaited()
+    create.assert_not_awaited()
+
+
+def test_runtime_response_contains_server_signed_binding_instead_of_caller_marker(
+    monkeypatch,
+):
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "synthetic-test-secret")
+    app = FastAPI()
+    app.include_router(text_chat_router)
+    app.dependency_overrides[get_user] = lambda: SimpleNamespace(
+        id=1, selected_organization_id=11
+    )
+    candidate = SimpleNamespace(
+        workflow_id=42,
+        version_number=4,
+        status="draft",
+        workflow_json={"nodes": []},
+        workflow_configurations={},
+        template_context_variables={},
+    )
+    run = SimpleNamespace(
+        id=7,
+        workflow_id=42,
+        name="qa",
+        mode="text_chat",
+        state="running",
+        is_completed=False,
+        initial_context={},
+        gathered_context={},
+        annotations={},
+    )
+    text_session = SimpleNamespace(
+        workflow_run=run,
+        revision=1,
+        session_data={},
+        checkpoint={},
+        created_at=datetime.now(UTC),
+        updated_at=None,
+    )
+
+    async def annotate(_run_id, *, annotations):
+        run.annotations = annotations
+        return run
+
+    with (
+        patch.object(
+            workflow_text_chat.db_client,
+            "get_workflow",
+            new=AsyncMock(return_value=SimpleNamespace(id=42)),
+        ),
+        patch.object(
+            workflow_text_chat.db_client,
+            "get_workflow_versions",
+            new=AsyncMock(return_value=[candidate]),
+        ),
+        patch.object(workflow_text_chat, "_ensure_text_chat_quota", new=AsyncMock()),
+        patch.object(
+            workflow_text_chat.db_client,
+            "create_workflow_run",
+            new=AsyncMock(return_value=run),
+        ),
+        patch.object(
+            workflow_text_chat.db_client,
+            "update_workflow_run",
+            new=AsyncMock(side_effect=annotate),
+        ),
+        patch.object(
+            workflow_text_chat.db_client,
+            "ensure_workflow_run_text_session",
+            new=AsyncMock(return_value=text_session),
+        ),
+        patch.object(
+            workflow_text_chat,
+            "initialize_text_chat_session",
+            new=AsyncMock(return_value=text_session),
+        ),
+        patch.object(
+            workflow_text_chat,
+            "_execute_pending_turn_response",
+            new=AsyncMock(
+                side_effect=lambda **_: workflow_text_chat._build_response(text_session)
+            ),
+        ),
+    ):
+        response = TestClient(app).post(
+            "/workflow/42/text-chat/sessions",
+            json={
+                "sandbox_mode": True,
+                "candidate_draft_version_number": 4,
+                "expected_workflow_hash": "3a6c5731f42967f3150ec663339ec161bf6f849595fe2bcea0127693ff5c194b",
+                "annotations": {
+                    "agent_test_run_id": "11111111-1111-4111-8111-111111111111",
+                    "scenario_id": "qa",
+                    "sysevo_test_sandbox": {
+                        "enabled": False,
+                        "workflow_binding": {"signature": "forged"},
+                    },
+                },
+            },
+            headers={"x-sysevo-secret": "synthetic-test-secret"},
+        )
+    assert response.status_code == 200
+    binding = response.json()["annotations"]["sysevo_test_sandbox"]["workflow_binding"]
+    assert (
+        binding["signature"]
+        == "3cd799beea0f2a6a421a64752cddc72d31dc4162a9b50c3a3e9efb754fd591a6"
+    )
+    validate_sandbox_execution_binding(run, candidate, "synthetic-test-secret")
 
 
 def test_sandbox_secret_requires_both_matching_values():

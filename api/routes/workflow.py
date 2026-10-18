@@ -20,14 +20,15 @@ from api.enums import CallType, PostHogEvent, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.sdk_expose import sdk_expose
 from api.services.auth.depends import get_user
-from api.utils.transcript import generate_transcript_text
 from api.services.configuration.masking import (
     mask_workflow_configurations,
     mask_workflow_definition,
     merge_workflow_api_keys,
 )
 from api.services.configuration.merge import merge_workflow_configuration_secrets
-from api.services.configuration.org_provider_resolver import enrich_overrides_with_org_api_keys
+from api.services.configuration.org_provider_resolver import (
+    enrich_overrides_with_org_api_keys,
+)
 from api.services.configuration.resolve import enrich_overrides_with_api_keys
 from api.services.mps_service_key_client import mps_service_key_client
 from api.services.posthog_client import capture_event
@@ -37,6 +38,7 @@ from api.services.workflow.disposition_shape import normalize_disposition_codes
 from api.services.workflow.dto import ReactFlowDTO, sanitize_workflow_definition
 from api.services.workflow.duplicate import duplicate_workflow
 from api.services.workflow.errors import ItemKind, WorkflowError
+from api.services.workflow.sandbox_repair import SUPPORTED_TEST_REPAIR_OPERATIONS
 from api.services.workflow.test_sandbox_mode import sandbox_secret_matches
 from api.services.workflow.trigger_paths import (
     TriggerPathIssue,
@@ -48,6 +50,7 @@ from api.services.workflow.trigger_paths import (
 )
 from api.services.workflow.workflow_graph import WorkflowGraph
 from api.utils.artifacts import artifact_url
+from api.utils.transcript import generate_transcript_text
 
 router = APIRouter(prefix="/workflow")
 
@@ -70,13 +73,17 @@ async def get_test_sandbox_capabilities(
     """
     expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
     if not sandbox_secret_matches(x_sysevo_secret, expected):
-        raise HTTPException(status_code=401, detail="Internal sandbox authentication required")
+        raise HTTPException(
+            status_code=401, detail="Internal sandbox authentication required"
+        )
     return {
         "sandbox_mode": True,
         "exact_workflow_version_pinning": True,
         "isolated_action_proxy": True,
         "unsupported_tools_blocked": True,
         "sandbox_protocol_version": 1,
+        "exact_candidate_hash_pinning": True,
+        "supported_test_repair_operations": list(SUPPORTED_TEST_REPAIR_OPERATIONS),
     }
 
 
@@ -909,7 +916,11 @@ class DiscardCandidateDraftRequest(BaseModel):
 
 class PrepareTestRepairDraftRequest(BaseModel):
     expected_published_version_number: int = Field(ge=1)
-    operation: Literal["remove_sandbox_markers", "append_conciseness_guidance"]
+    operation: Literal[
+        "remove_sandbox_markers",
+        "append_conciseness_guidance",
+        "append_goal_completion_guidance",
+    ]
 
 
 class PromoteTestRepairDraftRequest(BaseModel):

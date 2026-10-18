@@ -1,10 +1,57 @@
 """Trusted test-sandbox markers shared by workflow routes and tool execution."""
 
 import hmac
+import re
 import uuid
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 SANDBOX_ANNOTATION = "sysevo_test_sandbox"
+
+
+def resolve_sandbox_http_action(url: str, method: str) -> str | None:
+    """Classify intercepted operations without ever contacting the configured URL."""
+    try:
+        parsed = urlparse(url)
+        if parsed.scheme != "https" or parsed.username or parsed.password:
+            return None
+        method = method.upper()
+        if (
+            parsed.hostname == "rdiwzxtibglitvtextzs.supabase.co"
+            and parsed.path == "/functions/v1/agent-memory-lookup"
+        ):
+            if method != "POST":
+                return None
+            action = parse_qs(parsed.query).get("action", [""])[0]
+            return {
+                "save": "test_memory_save",
+                "lookup": "test_memory_lookup",
+                "check_availability": "check_availability",
+                "book_appointment": "book_appointment",
+            }.get(action)
+        if parsed.hostname == "api.resend.com":
+            return (
+                "send_test_email"
+                if parsed.path == "/emails" and method == "POST"
+                else None
+            )
+        if parsed.hostname == "api.twilio.com":
+            return (
+                "send_test_sms"
+                if method == "POST"
+                and re.fullmatch(
+                    r"/2010-04-01/Accounts/AC[0-9a-fA-F]{32}/Messages\.json",
+                    parsed.path,
+                )
+                else None
+            )
+        return (
+            "send_test_webhook"
+            if parsed.hostname and method in {"POST", "PUT", "PATCH"}
+            else None
+        )
+    except (ValueError, TypeError, AttributeError):
+        return None
 
 
 def sandbox_secret_matches(supplied: str | None, expected: str | None) -> bool:

@@ -12,10 +12,8 @@ import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
 
 import httpx
-
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
@@ -31,13 +29,16 @@ from api.services.pipecat.audio_playback import play_audio, play_audio_loop
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.transfer_event_protocol import TransferContext
+from api.services.workflow.test_sandbox_mode import (
+    is_sandbox_test_run,
+    resolve_sandbox_http_action,
+    sandbox_test_run_context,
+)
 from api.services.workflow.tools.calculator import get_calculator_tools, safe_calculator
 from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
     tool_to_function_schema,
 )
-from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
-from api.services.workflow.test_sandbox_mode import sandbox_test_run_context
 
 if TYPE_CHECKING:
     from api.services.workflow.mcp_tool_session import McpToolSession
@@ -105,26 +106,11 @@ class CustomToolManager:
             return self._sandbox_action_blocked("missing_test_context")
 
         config = (getattr(tool, "definition", None) or {}).get("config", {})
-        parsed = urlparse(str(config.get("url", "")))
-        query = parse_qs(parsed.query)
-        configured_action = query.get("action", [""])[0]
         method = str(config.get("method", "GET")).upper()
-        if parsed.hostname == "rdiwzxtibglitvtextzs.supabase.co" and \
-            parsed.path == "/functions/v1/agent-memory-lookup" and \
-            configured_action in {"check_availability", "book_appointment"}:
-            action = configured_action
-        elif parsed.hostname == "api.resend.com" and parsed.path == "/emails" and method == "POST":
-            action = "send_test_email"
-        elif parsed.hostname == "api.twilio.com" and \
-            re.fullmatch(r"/2010-04-01/Accounts/AC[0-9a-fA-F]{32}/Messages\.json", parsed.path) and method == "POST":
-            action = "send_test_sms"
-        elif parsed.scheme == "https" and parsed.hostname and method in {"POST", "PUT", "PATCH"}:
-            # Arbitrary mutating HTTP tools are never sent to their configured
-            # URL in a sandbox session. They are reduced to a synthetic event
-            # and routed to Sysevo's internal test ledger, which can verify
-            # required field mapping without contacting a customer endpoint.
-            action = "send_test_webhook"
-        else:
+        action = resolve_sandbox_http_action(str(config.get("url", "")), method)
+        # Generic mutating HTTP tools go to the internal field-mapping ledger;
+        # the configured client URL is never contacted in a sandbox session.
+        if action is None:
             return self._sandbox_action_blocked("unsupported_sandbox_adapter")
 
         endpoint = "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
@@ -139,17 +125,23 @@ class CustomToolManager:
                     json={
                         "test_run_id": context["agent_test_run_id"],
                         "scenario_id": context["scenario_id"],
-                        "workflow_id": int(getattr(workflow_run, "workflow_id", 0) or 0),
+                        "workflow_id": int(
+                            getattr(workflow_run, "workflow_id", 0) or 0
+                        ),
                         "workflow_run_id": int(workflow_run_id),
                         "action": action,
-                        "arguments": {} if action in {"send_test_email", "send_test_sms"} else (arguments or {}),
+                        "arguments": {}
+                        if action in {"send_test_email", "send_test_sms"}
+                        else (arguments or {}),
                         "required_fields": [
                             str(parameter.get("name"))
                             for parameter in (config.get("parameters", []) or [])
                             if isinstance(parameter, dict)
                             and parameter.get("required") is True
                             and isinstance(parameter.get("name"), str)
-                        ] if action == "send_test_webhook" else [],
+                        ]
+                        if action == "send_test_webhook"
+                        else [],
                     },
                 )
             result = response.json()
@@ -157,7 +149,9 @@ class CustomToolManager:
                 return {
                     "status": result.get("status", "blocked"),
                     "code": result.get("code", "sandbox_action_rejected"),
-                    "message": result.get("message", "The isolated provider action could not be verified."),
+                    "message": result.get(
+                        "message", "The isolated provider action could not be verified."
+                    ),
                     "client_integration_called": False,
                 }
             return result

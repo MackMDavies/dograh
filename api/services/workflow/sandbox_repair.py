@@ -1,11 +1,10 @@
 """Deterministic, bounded changes used only by approved QA repair candidates."""
 
-import re
+import copy
 import hashlib
 import json
-import copy
+import re
 from typing import Any
-
 
 SANDBOX_MARKER_KEYS = {
     "sysevo_internal_test",
@@ -23,6 +22,17 @@ CONCISENESS_GUIDANCE = (
     "During spoken dialogue, keep each reply concise and natural. Give only the information needed "
     "for the current step, ask one question at a time, and avoid repeating information. Be complete "
     "when the caller's request requires more detail."
+)
+GOAL_COMPLETION_GUIDANCE = (
+    "[Sysevo testing guidance] Keep the caller's stated goal in view. "
+    "When a next step is needed, explain it briefly and ask for the required "
+    "confirmation. Before ending, confirm the outcome or clearly state what "
+    "remains to be done."
+)
+SUPPORTED_TEST_REPAIR_OPERATIONS = (
+    "remove_sandbox_markers",
+    "append_conciseness_guidance",
+    "append_goal_completion_guidance",
 )
 
 
@@ -71,6 +81,14 @@ def remove_sandbox_markers(value: Any) -> tuple[Any, list[str]]:
 
 def append_conciseness_guidance(value: Any) -> tuple[Any, list[str]]:
     """Add bounded speaking guidance to prompted workflow nodes, without altering other data."""
+    return _append_prompt_guidance(value, CONCISENESS_GUIDANCE)
+
+
+def append_goal_completion_guidance(value: Any) -> tuple[Any, list[str]]:
+    return _append_prompt_guidance(value, GOAL_COMPLETION_GUIDANCE)
+
+
+def _append_prompt_guidance(value: Any, guidance: str) -> tuple[Any, list[str]]:
     if not isinstance(value, dict) or not isinstance(value.get("nodes"), list):
         return value, []
     candidate = copy.deepcopy(value)
@@ -79,8 +97,8 @@ def append_conciseness_guidance(value: Any) -> tuple[Any, list[str]]:
         if not isinstance(node, dict) or not isinstance(node.get("data"), dict):
             continue
         prompt = node["data"].get("prompt")
-        if not isinstance(prompt, str) or not prompt.strip() or CONCISENESS_GUIDANCE in prompt:
+        if not isinstance(prompt, str) or not prompt.strip() or guidance in prompt:
             continue
-        node["data"]["prompt"] = f"{prompt.rstrip()}\n\n{CONCISENESS_GUIDANCE}"
+        node["data"]["prompt"] = f"{prompt.rstrip()}\n\n{guidance}"
         changed_paths.append(f"$.nodes[{index}].data.prompt")
     return candidate, changed_paths

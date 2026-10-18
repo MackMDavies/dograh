@@ -7,7 +7,14 @@ from sqlalchemy.future import select
 from sqlalchemy.orm import load_only, selectinload
 
 from api.db.base_client import BaseDBClient
-from api.db.models import CampaignModel, OrganizationModel, UserModel, WorkflowDefinitionModel, WorkflowModel, WorkflowRunModel
+from api.db.models import (
+    CampaignModel,
+    OrganizationModel,
+    UserModel,
+    WorkflowDefinitionModel,
+    WorkflowModel,
+    WorkflowRunModel,
+)
 from api.services.workflow.disposition_shape import (
     append_disposition_code,
     normalize_disposition_codes,
@@ -240,7 +247,9 @@ class WorkflowClient(BaseDBClient):
             draft = result.scalars().first()
             if not draft:
                 if expected_version_number is not None and expected_workflow_hash is not None:
-                    from api.services.workflow.sandbox_repair import workflow_snapshot_hash
+                    from api.services.workflow.sandbox_repair import (
+                        workflow_snapshot_hash,
+                    )
 
                     archived_result = await session.execute(
                         select(WorkflowDefinitionModel).where(
@@ -285,6 +294,7 @@ class WorkflowClient(BaseDBClient):
         """Create a bounded repair draft from an exact published version."""
         from api.services.workflow.sandbox_repair import (
             append_conciseness_guidance,
+            append_goal_completion_guidance,
             remove_sandbox_markers,
             workflow_snapshot_hash,
         )
@@ -292,13 +302,16 @@ class WorkflowClient(BaseDBClient):
         repair_operations = {
             "remove_sandbox_markers": remove_sandbox_markers,
             "append_conciseness_guidance": append_conciseness_guidance,
+            "append_goal_completion_guidance": append_goal_completion_guidance,
         }
         apply_repair = repair_operations.get(operation)
         if apply_repair is None:
             raise ValueError("Unsupported sandbox repair operation")
         async with self.async_session() as session:
             workflow_result = await session.execute(
-                select(WorkflowModel).where(WorkflowModel.id == workflow_id).with_for_update()
+                select(WorkflowModel)
+                .where(WorkflowModel.id == workflow_id)
+                .with_for_update()
             )
             workflow = workflow_result.scalars().first()
             if workflow is None:
@@ -311,8 +324,13 @@ class WorkflowClient(BaseDBClient):
                 )
             )
             published = published_result.scalars().first()
-            if published is None or published.version_number != expected_published_version_number:
-                raise ValueError("Published workflow version changed; rerun the test before repairing")
+            if (
+                published is None
+                or published.version_number != expected_published_version_number
+            ):
+                raise ValueError(
+                    "Published workflow version changed; rerun the test before repairing"
+                )
             draft_result = await session.execute(
                 select(WorkflowDefinitionModel).where(
                     WorkflowDefinitionModel.workflow_id == workflow_id,
@@ -320,10 +338,14 @@ class WorkflowClient(BaseDBClient):
                 )
             )
             if draft_result.scalars().first() is not None:
-                raise ValueError("An existing draft must be resolved before preparing a test repair")
+                raise ValueError(
+                    "An existing draft must be resolved before preparing a test repair"
+                )
             candidate_json, changed_paths = apply_repair(published.workflow_json)
             if not changed_paths:
-                raise ValueError("The published workflow contains no supported sandbox markers")
+                raise ValueError(
+                    "The published workflow contains no supported sandbox markers"
+                )
             draft = WorkflowDefinitionModel(
                 workflow_id=workflow_id,
                 workflow_json=candidate_json,
