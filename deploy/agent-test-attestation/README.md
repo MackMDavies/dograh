@@ -8,8 +8,11 @@ before any image file is changed; a different base requires a fresh review.
 1. Push this canonical commit to the production repository's incoming branch.
 2. Create an isolated clean worktree and fast-forward it to incoming. Keep the
    existing production working tree and compose files intact.
-3. Build with this Dockerfile, the immutable current API image ID as `BASE_IMAGE`,
-   and the clean commit SHA as `SOURCE_REVISION`.
+3. Assign a dedicated local tag to the verified immutable current API image ID.
+   Build with that tag as `BASE_IMAGE` and the clean commit SHA as
+   `SOURCE_REVISION`. Docker's `FROM` requires an image reference, not a bare
+   configuration ID. The build installs files as root, then restores the inspected
+   base image's `dograh` runtime user.
 4. Run `verify_image.py` inside the candidate image with networking disabled.
    It uses synthetic fixtures and mocks before any quota, model or database work.
 5. Verify that the existing API/worker environment, volumes and compose services
