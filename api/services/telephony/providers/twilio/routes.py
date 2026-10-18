@@ -7,16 +7,18 @@ provider registry — see ProviderSpec.router.
 import json
 import os
 import re
+import asyncio
 from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape, quoteattr
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, WebSocket
 import httpx
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
 from pydantic import BaseModel, Field
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 from starlette.responses import HTMLResponse
 from twilio.request_validator import RequestValidator
@@ -24,6 +26,19 @@ from twilio.request_validator import RequestValidator
 from api.db import db_client
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.auth.sysevo_roles import require_sales_dialer_role
+from api.services.telephony.dialer.parallel_auth import issue_parallel_auth_token
+from api.services.telephony.dialer.inbound_call_log import (
+    bind_inbound_rep_leg,
+    close_inbound_call,
+    evaluate_overflow_guard,
+    expire_unanswered_inbound_call,
+    is_claimed_inbound_conference,
+    notify_inbound_call,
+    record_overflow_join,
+)
+from api.services.telephony.dialer.compliance import (
+    phone_block_reason,
+)
 from api.services.telephony.dialer.provider import (
     UnknownDialerProvider,
     get_dialer_provider,
@@ -36,23 +51,47 @@ from api.services.telephony.providers.twilio.dialer_call_listeners import (
 )
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    consume_double_dial_authorization,
+    check_dialer_calling_hours,
+    check_dialer_calling_hours_with_state,
+    get_auto_voicemail_settings,
+    attach_voicemail_drop_to_call,
+    get_dialer_phone_block_reason,
+    get_team_voicemail_policy,
     get_dialer_call_child_leg,
+    mark_auto_voicemail_sent,
+    update_dialer_call_amd_result,
+    request_manual_voicemail_drop,
+    claim_manual_voicemail_playback,
+    release_manual_voicemail_playback,
+    mark_dialer_lead_joined_conference,
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
+    update_dialer_call_parallel_winner,
     update_dialer_call_recording_by_conference_sid,
     update_dialer_call_status,
+    update_dialer_call_parallel_target,
 )
 from api.services.telephony.providers.twilio.dialer_conference import (
+    _twilio_client,
     cancel_call,
+    cancel_call_if_ringing,
     conference_name_for,
     dial_lead_into_conference,
     parent_call_sid_from_conference_name,
 )
+from api.services.telephony.providers.twilio import dialer_parallel
+from api.services.telephony.providers.twilio import dialer_agent_handoff
+from api.services.telephony.providers.twilio import dialer_hold
+from api.services.telephony.providers.twilio.dialer_twiml import conference_telemetry_attributes as _conference_telemetry_attributes
+from api.services.telephony.providers.twilio import dialer_overflow_recovery
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     DialerNumberAssignmentUnavailable,
     DialerNumberProviderMismatch,
     _parse_rep_id_from_identity,
     is_manager_or_admin,
+    parallel_caller_id_candidates,
+    choose_parallel_caller_ids,
     resolve_assigned_caller_id,
     resolve_assigned_dialer_number,
     user_owns_dialer_number,
@@ -64,6 +103,32 @@ from api.services.telephony.status_processor import (
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
+
+
+def _twilio_event_time(value: str | None) -> str | None:
+    """Parse Twilio's signed RFC 2822 event timestamp as a UTC ISO value."""
+    if not value:
+        return None
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC).isoformat()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+_PARALLEL_TERMINAL_LEG_STATES = frozenset({
+    "completed", "busy", "no-answer", "failed", "cancelled", "abandoned_early",
+})
+
+
+def _parallel_batch_has_settled(legs: list[dict]) -> bool:
+    """Whether every parallel destination has a durable terminal result."""
+    return bool(legs) and all(
+        leg.get("status") in _PARALLEL_TERMINAL_LEG_STATES
+        or (leg.get("status") == "voicemail" and leg.get("auto_voicemail_sent") is True)
+        for leg in legs
+    )
 
 
 async def _get_assigned_dialer_number_or_503(rep_id: int):
@@ -110,6 +175,10 @@ class VoiceTokenResponse(BaseModel):
     # TwiML App's fixed Voice URL. Defaulted so older callers keep working.
     destination: str = ""
     caller_number: str = ""
+    parallel_auth_token: str | None = None
+    # The browser uses this boundary to move to the provider selected by the
+    # next rotation slot while idle. It is derived server-side from the same
+    # atomic assignment RPC used before outbound calls.
     next_rotation_at: datetime | None = None
 
 
@@ -150,6 +219,11 @@ class TelnyxInboundCallAnswerRequest(BaseModel):
     call_id: str = Field(min_length=1, max_length=200)
 
 
+class ManualVoicemailDropRequest(BaseModel):
+    parent_call_sid: str = Field(pattern=r"^CA[0-9a-f]{32}$")
+    action: Literal["send", "cancel"] = "send"
+
+
 @router.get("/voice-token")
 async def get_voice_token(
     user=Depends(require_sales_dialer_role),
@@ -176,8 +250,168 @@ async def get_voice_token(
         caller_number=(assigned or {}).get("phone_number", "")
         if provider.name in {"telnyx", "vonage"}
         else "",
+        parallel_auth_token=(
+            issue_parallel_auth_token(str(user.provider_id))
+            if provider.name == "signalwire"
+            else None
+        ),
         next_rotation_at=(assigned or {}).get("next_rotation_at"),
     )
+
+
+def _manual_drop_state(call_row: dict | None) -> str:
+    if not call_row:
+        return "idle"
+    if call_row.get("auto_voicemail_sent") is True:
+        return "sent"
+    if call_row.get("voicemail_drop_started_at"):
+        return "playing"
+    if not call_row.get("manual_voicemail_requested_at"):
+        return "idle"
+    amd_result = call_row.get("amd_result")
+    if amd_result is None:
+        return "waiting"
+    return "rejected" if amd_result not in {"machine_end_beep", "machine_end_silence", "machine_end_other"} else "waiting"
+
+
+def _voicemail_playback_twiml(
+    *, endpoint_root: str, parent_call_sid: str, playback_url: str, pause_seconds: int = 0
+) -> str:
+    complete_url = f"{endpoint_root}/dialer-auto-voicemail-complete?parent_call_sid={parent_call_sid}"
+    pause = f'<Pause length="{max(0, min(10, int(pause_seconds)))}"/>' if pause_seconds else ""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response>{pause}<Play>" + escape(playback_url) + "</Play>"
+        f"<Redirect method=\"POST\">{escape(complete_url)}</Redirect></Response>"
+    )
+
+
+async def _redirect_twilio_child_to_voicemail(*, child_call_sid: str, twiml: str) -> bool:
+    client = await _twilio_client()
+    if not client:
+        return False
+    try:
+        await asyncio.to_thread(client.calls(child_call_sid).update, twiml=twiml)
+        return True
+    except Exception as exc:  # noqa: BLE001 - caller handles retryable failure
+        logger.error(f"Could not redirect Twilio call {child_call_sid} to voicemail: {exc}")
+        return False
+
+
+@router.post("/dialer/manual-voicemail-drop")
+async def control_manual_voicemail_drop(
+    body: ManualVoicemailDropRequest,
+    request: Request,
+    user=Depends(require_sales_dialer_role),
+):
+    """Queue/cancel a server-side Twilio voicemail drop for this rep's own call.
+
+    The browser never gets Twilio credentials or a carrier SID other than its own
+    authenticated call. A signed AMD callback gates playback on a confirmed machine
+    greeting end; human and uncertain results cannot trigger a voicemail.
+    """
+    rep_user_id = getattr(user, "provider_id", None)
+    if not isinstance(rep_user_id, str) or not rep_user_id:
+        raise HTTPException(status_code=503, detail="Your account is missing its dialer user mapping.")
+
+    call_row = await get_dialer_call_child_leg(parent_call_sid=body.parent_call_sid)
+    if not call_row or call_row.get("provider") != "twilio" or call_row.get("rep_user_id") != rep_user_id:
+        raise HTTPException(status_code=404, detail="This active Twilio call was not found for your account.")
+    child_call_sid = call_row.get("child_call_sid")
+    if not isinstance(child_call_sid, str) or not _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid):
+        raise HTTPException(status_code=409, detail="The called party's line is not ready for a voicemail drop.")
+
+    if body.action == "cancel":
+        result = await request_manual_voicemail_drop(
+            parent_call_sid=body.parent_call_sid,
+            rep_user_id=rep_user_id,
+            cancel=True,
+        )
+        if not result or result.get("accepted") is not True:
+            raise HTTPException(status_code=409, detail="The voicemail has already started and can no longer be cancelled.")
+        return {"state": "cancelled"}
+
+    enabled, playback_url, drop_id = await get_auto_voicemail_settings(
+        user_id=rep_user_id,
+        allow_manual_when_disabled=True,
+        parent_call_sid=body.parent_call_sid,
+    )
+    del enabled  # manual sends work whether automatic drop is on or off
+    if not playback_url or not playback_url.split("?", 1)[0].lower().endswith(".wav"):
+        raise HTTPException(status_code=409, detail="Record a WAV voicemail before sending one from Twilio.")
+    if drop_id:
+        await attach_voicemail_drop_to_call(
+            parent_call_sid=body.parent_call_sid,
+            child_call_sid=child_call_sid,
+            drop_id=drop_id,
+        )
+
+    result = await request_manual_voicemail_drop(
+        parent_call_sid=body.parent_call_sid,
+        rep_user_id=rep_user_id,
+    )
+    if not result:
+        raise HTTPException(status_code=503, detail="Could not safely queue this voicemail. The call was left unchanged.")
+    if result.get("accepted") is not True:
+        reason = result.get("reason")
+        detail = {
+            "not_voicemail": "Twilio did not confirm that a voicemail greeting had ended, so the message was not sent.",
+            "call_ended": "The call has already ended.",
+            "already_sent": "A voicemail has already been sent on this call.",
+            "not_found": "This active Twilio call was not found for your account.",
+        }.get(reason, "The voicemail could not be safely queued.")
+        raise HTTPException(status_code=409, detail=detail)
+
+    current = await get_dialer_call_child_leg(parent_call_sid=body.parent_call_sid)
+    state = _manual_drop_state(current)
+    if state == "idle" and result.get("state") in {"waiting", "ready"}:
+        # The atomic request RPC is the authoritative write. Preserve its
+        # accepted state if a read replica has not observed the timestamp yet.
+        state = "waiting"
+    if state == "sent" or state == "playing":
+        return {"state": state}
+
+    if current and current.get("amd_result") in {"machine_end_beep", "machine_end_silence", "machine_end_other"} and current.get("lead_joined_at"):
+        claimed = await claim_manual_voicemail_playback(
+            parent_call_sid=body.parent_call_sid,
+            child_call_sid=child_call_sid,
+        )
+        if claimed:
+            endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
+            twiml = _voicemail_playback_twiml(
+                endpoint_root=endpoint_root,
+                parent_call_sid=body.parent_call_sid,
+                playback_url=playback_url,
+                pause_seconds=6 if current.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+            )
+            if not await _redirect_twilio_child_to_voicemail(child_call_sid=child_call_sid, twiml=twiml):
+                await release_manual_voicemail_playback(
+                    parent_call_sid=body.parent_call_sid,
+                    child_call_sid=child_call_sid,
+                )
+                raise HTTPException(status_code=502, detail="Twilio could not start the message. Try again or speak instead.")
+            return {"state": "playing"}
+
+    return {"state": state}
+
+
+@router.get("/dialer/manual-voicemail-drop/{parent_call_sid}")
+async def manual_voicemail_drop_status(
+    parent_call_sid: str,
+    user=Depends(require_sales_dialer_role),
+):
+    if not _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid):
+        raise HTTPException(status_code=400, detail="Invalid call id.")
+    rep_user_id = getattr(user, "provider_id", None)
+    call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+    if not call_row or call_row.get("provider") != "twilio" or call_row.get("rep_user_id") != rep_user_id:
+        raise HTTPException(status_code=404, detail="This Twilio call was not found for your account.")
+    child_call_sid = call_row.get("child_call_sid")
+    return {
+        "state": _manual_drop_state(call_row),
+        "amd_result": call_row.get("amd_result"),
+        "ready": isinstance(child_call_sid, str) and bool(_TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid)),
+    }
 
 
 @router.post("/dialer/telnyx/calls/start", status_code=201)
@@ -196,6 +430,14 @@ async def start_telnyx_dialer_call(
         )
     if not user.provider_id:
         raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    block_reason = await phone_block_reason(body.to_number)
+    if block_reason:
+        raise HTTPException(status_code=403, detail=f"Call blocked by compliance check ({block_reason}).")
+    allowed, reason, phone_us_state = await check_dialer_calling_hours_with_state(
+        body.to_number, str(body.entry_id) if body.entry_id else None
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"Call blocked by calling-hours check ({reason}).")
     created = await create_dialer_call(
         parent_call_sid=str(body.call_id),
         rep_user_id=user.provider_id,
@@ -203,6 +445,7 @@ async def start_telnyx_dialer_call(
         from_number=str(assigned["phone_number"]),
         to_number=body.to_number,
         provider="telnyx",
+        phone_us_state=phone_us_state,
     )
     if not created:
         raise HTTPException(status_code=503, detail="Could not save this call to dialer history.")
@@ -229,50 +472,6 @@ async def update_telnyx_dialer_call_status(
         duration_seconds=body.duration_seconds,
         rep_user_id=user.provider_id,
         provider="telnyx",
-    )
-    return None
-
-
-@router.post("/dialer/vonage/calls/start", status_code=201)
-async def start_vonage_dialer_call(
-    body: VonageDialerCallStartRequest,
-    user=Depends(require_sales_dialer_role),
-):
-    """Persist the call before Vonage starts billing for the PSTN leg."""
-    assigned = await _get_assigned_dialer_number_or_503(user.id)
-    if not assigned or assigned.get("provider") != "vonage":
-        raise HTTPException(status_code=409, detail="This rep has no active Vonage number assigned.")
-    if assigned.get("direction") not in {"outbound", "both"}:
-        raise HTTPException(status_code=409, detail="The assigned Vonage number is not enabled for outbound calls.")
-    if not user.provider_id:
-        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
-    created = await create_dialer_call(
-        parent_call_sid=str(body.call_id),
-        rep_user_id=user.provider_id,
-        entry_id=str(body.entry_id) if body.entry_id else None,
-        from_number=str(assigned["phone_number"]),
-        to_number=body.to_number,
-        provider="vonage",
-    )
-    if not created:
-        raise HTTPException(status_code=503, detail="Could not save this call to dialer history.")
-    return {"call_id": str(body.call_id), "from_number": str(assigned["phone_number"])}
-
-
-@router.post("/dialer/vonage/calls/status", status_code=204)
-async def update_vonage_dialer_call_status(
-    body: VonageDialerCallStatusRequest,
-    user=Depends(require_sales_dialer_role),
-):
-    if not user.provider_id:
-        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
-    await update_dialer_call_status(
-        parent_call_sid=str(body.call_id),
-        child_call_sid=None,
-        status="in-progress" if body.status == "answered" else body.status,
-        duration_seconds=body.duration_seconds,
-        rep_user_id=user.provider_id,
-        provider="vonage",
     )
     return None
 
@@ -482,46 +681,6 @@ async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
     return validator.validate(str(request.url), form_data, signature)
 
 
-def _conference_telemetry_attributes(*, events_url: str, recording_url: str) -> str:
-    """The conference-level attributes that must be identical on EVERY leg.
-
-    Twilio applies conference-level attributes only from the TwiML of the
-    participant that CREATES the conference, and ignores them on everyone
-    who joins afterwards. The rep normally creates it - calls.create returns
-    as soon as the lead's call is queued, and the lead still has to ring -
-    but "normally" is a race, not a guarantee: an instantly-answering
-    voicemail, a SIP endpoint, or an unusually slow rep leg can put the lead
-    in first. If that happens and only the rep's leg carried these, the
-    conference comes up with no recording, no recording callback and no
-    conference-start event at all - which also leaves conference_sid NULL,
-    so update_dialer_call_recording_by_conference_sid would have nothing to
-    match even if a recording did appear. So both legs carry them, from this
-    one definition, and whichever leg wins the race the conference is
-    recorded and reporting.
-
-    Repeating them cannot double-record: recording is a property of the
-    conference, not of a participant, so only the creator's copy takes
-    effect and the loser's is discarded.
-
-    Returns "" (attributes omitted entirely) unless BOTH URLs are absolute.
-    That is the guard for an unresolved backend endpoint, which yields a
-    relative "/api/v1/..." rather than an empty string: Twilio rejects a
-    relative callback URL, and a rejected TwiML document costs the whole
-    leg - silence for the lead - which is strictly worse than a conference
-    that merely isn't reporting.
-    """
-    if not events_url.startswith(("http://", "https://")):
-        return ""
-    if not recording_url.startswith(("http://", "https://")):
-        return ""
-    return (
-        f"statusCallback={quoteattr(events_url)} "
-        'statusCallbackEvent="start end join leave" '
-        'record="record-from-start" '
-        f"recordingStatusCallback={quoteattr(recording_url)} "
-    )
-
-
 @router.post("/voice-connect", include_in_schema=False)
 async def handle_voice_connect(request: Request):
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
@@ -553,10 +712,85 @@ async def handle_voice_connect(request: Request):
     if str(form_data.get("ListenParentCallSid", "")).strip():
         return await _serve_listen_in_twiml(form_data)
 
+    # A claimed inbound call (including a parallel second-pickup handoff) is
+    # already a PSTN leg waiting in a conference. The browser originates only
+    # its own WebRTC leg; dialing the conference name as a phone number would
+    # fail or, worse, fall through to the ordinary outbound call path.
+    inbound_conference = str(
+        form_data.get("conference") or form_data.get("Conference") or ""
+    ).strip()
+    if inbound_conference:
+        raw_from = str(form_data.get("From") or "")
+        rep_id = _parse_rep_id_from_identity(raw_from)
+        parent_call_sid = parent_call_sid_from_conference_name(inbound_conference)
+        if (
+            not rep_id
+            or not parent_call_sid
+            or not _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid)
+            or inbound_conference != conference_name_for(parent_call_sid)
+        ):
+            logger.warning("Rejected malformed Twilio inbound conference join")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        rep = await db_client.get_user_by_id(rep_id)
+        rep_user_id = str(getattr(rep, "provider_id", "") or "")
+        if not rep_user_id or not await is_claimed_inbound_conference(
+            conference_name=inbound_conference, rep_user_id=rep_user_id
+        ):
+            logger.warning("Rejected Twilio conference join without an inbound claim for this rep")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        rep_call_sid = str(form_data.get("CallSid") or "")
+        if not _TWILIO_CALL_SID_PATTERN.fullmatch(rep_call_sid) or not await bind_inbound_rep_leg(
+            conference_name=inbound_conference, rep_user_id=rep_user_id,
+            provider="twilio", rep_call_id=rep_call_sid,
+        ):
+            logger.warning("Rejected an unbound/replaced Twilio inbound rep leg")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        try:
+            backend_endpoint, _ = await get_backend_endpoints()
+        except Exception as exc:  # noqa: BLE001 - keep the call but omit optional telemetry
+            logger.warning(f"Could not resolve inbound conference callback URLs: {exc}")
+            backend_endpoint = ""
+        endpoint = str(backend_endpoint or "").rstrip("/")
+        telemetry_attributes = _conference_telemetry_attributes(
+            events_url=f"{endpoint}/api/v1/telephony/dialer-conference-events",
+            recording_url=f"{endpoint}/api/v1/telephony/dialer-recording-callback",
+        )
+        twiml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            "<Response>"
+            "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+            "<Dial><Conference "
+            + telemetry_attributes
+            + 'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">'
+            + escape(inbound_conference)
+            + "</Conference></Dial></Response>"
+        )
+        return HTMLResponse(content=twiml, media_type="application/xml")
+
     to_number = form_data.get("To", "").strip()
     raw_from = form_data.get("From", "")
     entry_id = form_data.get("EntryId", "").strip() or None
+    double_dial_authorization_id = str(form_data.get("DoubleDialAuthorization") or "").strip()
     parent_call_sid = form_data.get("CallSid", "")
+    parallel_requested = str(form_data.get("DialMode", "")).strip().lower() == "parallel"
+    parallel_entry_ids: list[str] = []
+    phone_us_state: str | None = None
+    parallel_line_count = 0
+    if parallel_requested:
+        try:
+            raw_entry_ids = json.loads(str(form_data.get("ParallelEntryIds", "")))
+            parallel_line_count = int(str(form_data.get("ParallelLineCount", "")))
+            if parallel_line_count not in {2, 3, 5, 10} or not isinstance(raw_entry_ids, list):
+                raise ValueError("invalid parallel request")
+            parallel_entry_ids = [str(UUID(str(value))) for value in raw_entry_ids]
+            if len(parallel_entry_ids) != parallel_line_count or len(set(parallel_entry_ids)) != parallel_line_count:
+                raise ValueError("parallel entries do not match the selected line count")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            logger.warning("voice-connect rejected malformed parallel dial request")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+    if double_dial_authorization_id and (parallel_requested or not entry_id):
+        logger.warning("voice-connect rejected double-dial authorization without one queue entry")
+        return HTMLResponse(content=hangup, media_type="application/xml")
     # Three-tier resolution, most specific first:
     #   1. the number assigned to THIS rep (dialer_phone_numbers), then
     #   2. the active platform Twilio account's default_caller_id from the
@@ -577,23 +811,147 @@ async def handle_voice_connect(request: Request):
     caller_id = assigned_caller_id or (
         "" if provider_mismatch else (await _resolve_dialer_caller_id() or "")
     )
-    if not to_number or not caller_id or not parent_call_sid:
+    if (not parallel_requested and not to_number) or not caller_id or not parent_call_sid:
         logger.error(
             "voice-connect missing To number, a resolvable default caller id, or CallSid"
         )
         return HTMLResponse(content=hangup, media_type="application/xml")
 
+    if parallel_requested:
+        candidate_numbers = await dialer_parallel.candidate_phones(parallel_entry_ids)
+        if len(candidate_numbers) != parallel_line_count:
+            logger.warning("voice-connect could not load every parallel destination for compliance preflight")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        for candidate_entry_id, candidate_phone in candidate_numbers.items():
+            allowed, reason = await check_dialer_calling_hours(candidate_phone, candidate_entry_id)
+            if not allowed:
+                logger.warning(
+                    f"voice-connect blocked parallel batch by calling-hours check ({reason})"
+                )
+                return HTMLResponse(content=hangup, media_type="application/xml")
+    else:
+        block_reason = await get_dialer_phone_block_reason(to_number)
+        if block_reason:
+            logger.warning(
+                f"voice-connect blocked outbound dial by server compliance check ({block_reason})"
+            )
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        allowed, reason, phone_us_state = await check_dialer_calling_hours_with_state(
+            to_number, entry_id
+        )
+        if not allowed:
+            logger.warning(
+                f"voice-connect blocked outbound dial by calling-hours check ({reason})"
+            )
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
     rep_id = _parse_rep_id_from_identity(raw_from)
+    team_voicemail_policy: dict[str, Any] | None = None
+    rep_user_id: str | None = None
+    parallel_targets: list[dict] = []
     if rep_id is not None:
         user = await db_client.get_user_by_id(rep_id)
         if user and user.provider_id:
-            await create_dialer_call(
+            rep_user_id = str(user.provider_id)
+            double_dial_retry_of: str | None = None
+            if double_dial_authorization_id:
+                try:
+                    authorization_uuid = str(UUID(double_dial_authorization_id))
+                except (ValueError, TypeError):
+                    logger.warning("voice-connect rejected malformed double-dial authorization id")
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                consumed_authorization = await consume_double_dial_authorization(
+                    authorization_id=authorization_uuid,
+                    rep_user_id=rep_user_id,
+                    entry_id=entry_id or "",
+                    to_number=to_number,
+                    call_sid=parent_call_sid,
+                )
+                if not consumed_authorization:
+                    logger.warning("voice-connect rejected expired, used or mismatched double-dial authorization")
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                # Pin the exact caller ID that rang on the original attempt.
+                caller_id = consumed_authorization["from_number"]
+                double_dial_retry_of = consumed_authorization["retry_of_call_id"]
+            if parallel_requested:
+                created = await dialer_parallel.start_parallel_session(
+                    parent_call_sid=parent_call_sid,
+                    rep_user_id=rep_user_id,
+                    entry_ids=parallel_entry_ids,
+                    line_count=parallel_line_count,
+                )
+                if not created:
+                    logger.warning(f"voice-connect could not validate parallel session for {parent_call_sid}")
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                parallel_targets = await dialer_parallel.parallel_targets(
+                    parent_call_sid=parent_call_sid,
+                    rep_user_id=rep_user_id,
+                )
+                if len(parallel_targets) != parallel_line_count:
+                    logger.error(f"voice-connect loaded incomplete parallel targets for {parent_call_sid}")
+                    await dialer_parallel.finish_parallel_session(
+                        parent_call_sid=parent_call_sid, status="failed"
+                    )
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                candidate_caller_ids = await parallel_caller_id_candidates(rep_id, caller_id)
+                caller_ids_by_entry = choose_parallel_caller_ids(
+                    parallel_targets, candidate_caller_ids, caller_id
+                )
+                if len(caller_ids_by_entry) != parallel_line_count:
+                    await dialer_parallel.finish_parallel_session(
+                        parent_call_sid=parent_call_sid, status="failed"
+                    )
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                for target in parallel_targets:
+                    selected_caller_id = caller_ids_by_entry[target["entry_id"]]
+                    persisted = await dialer_parallel.assign_parallel_caller_id(
+                        parent_call_sid=parent_call_sid,
+                        leg_id=target["leg_id"],
+                        rep_user_id=rep_user_id,
+                        caller_id=selected_caller_id,
+                    )
+                    if not persisted:
+                        logger.error(
+                            f"voice-connect could not persist the caller ID for parallel leg {target['leg_id']}"
+                        )
+                        await dialer_parallel.finish_parallel_session(
+                            parent_call_sid=parent_call_sid, status="failed"
+                        )
+                        return HTMLResponse(content=hangup, media_type="application/xml")
+                    target["caller_id"] = selected_caller_id
+                # Server-resolved entry data, not the custom Voice SDK To value,
+                # controls the aggregate row and all outbound PSTN destinations.
+                to_number = parallel_targets[0]["phone"]
+                entry_id = parallel_targets[0]["entry_id"]
+            call_row_created = await create_dialer_call(
                 parent_call_sid=parent_call_sid,
                 rep_user_id=user.provider_id,
                 entry_id=entry_id,
                 from_number=caller_id,
                 to_number=to_number,
+                phone_us_state=phone_us_state,
+                double_dial_retry_of=double_dial_retry_of,
+                double_dial_authorization_id=authorization_uuid if double_dial_authorization_id else None,
             )
+            if not call_row_created:
+                logger.error(
+                    f"voice-connect could not reserve dialer call {parent_call_sid}; refusing PSTN origination"
+                )
+                if parallel_requested:
+                    await dialer_parallel.finish_parallel_session(
+                        parent_call_sid=parent_call_sid, status="failed"
+                    )
+                return HTMLResponse(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>We could not verify this call. Please try again.</Say><Hangup/></Response>',
+                    media_type="application/xml",
+                )
+            team_voicemail_policy = await get_team_voicemail_policy(
+                user_id=user.provider_id, parent_call_sid=parent_call_sid,
+                entry_id=entry_id,
+            )
+    if parallel_requested and (rep_user_id is None or not parallel_targets):
+        logger.warning(f"voice-connect rejected parallel request from an unresolved rep identity")
+        return HTMLResponse(content=hangup, media_type="application/xml")
 
     # Reuse the same publicly-reachable backend URL resolution every other
     # telephony provider webhook in this codebase uses (env var, falling
@@ -612,6 +970,18 @@ async def handle_voice_connect(request: Request):
     except Exception as exc:  # noqa: BLE001 - deliberate: must never break call setup
         logger.error(f"voice-connect could not resolve backend endpoint for callbacks: {exc}")
         backend_endpoint = ""
+
+    if parallel_requested and not backend_endpoint:
+        await dialer_parallel.finish_parallel_session(
+            parent_call_sid=parent_call_sid, status="failed"
+        )
+        await update_dialer_call_status(
+            parent_call_sid=parent_call_sid,
+            child_call_sid=None,
+            status="failed",
+            duration_seconds=0,
+        )
+        return HTMLResponse(content=hangup, media_type="application/xml")
 
     conference_name = conference_name_for(parent_call_sid)
     conference_events_url = f"{backend_endpoint}/api/v1/telephony/dialer-conference-events"
@@ -641,67 +1011,127 @@ async def handle_voice_connect(request: Request):
     #
     # urlencode, not concatenation: these values are absolute URLs whose "/"
     # and ":" would otherwise land raw in a query string.
-    lead_join_url = (
-        f"{backend_endpoint}/api/v1/telephony/dialer-conference-join?"
-        + urlencode(
-            {
-                "conference_name": conference_name,
-                "muted": "false",
-                "end_on_exit": "true",
-                "start_on_enter": "true",
-                "events_url": conference_events_url,
-                "recording_url": recording_callback_url,
-            }
-        )
-    )
-    lead_status_callback_url = (
-        f"{backend_endpoint}/api/v1/telephony/dialer-call-status"
-        f"?parent_call_sid={parent_call_sid}"
-    )
+    common_join_fields = {
+        "conference_name": conference_name,
+        "muted": "false",
+        "end_on_exit": "true",
+        "start_on_enter": "true",
+        "events_url": conference_events_url,
+        "recording_url": recording_callback_url,
+        "parent_call_sid": parent_call_sid,
+    }
+    status_callback_base = f"{backend_endpoint}/api/v1/telephony/dialer-call-status"
 
-    # Dial the lead into the same conference the rep is about to join.
-    # dial_lead_into_conference fails soft (logs, returns None) rather than
-    # raising - but None means no lead leg exists at all (missing creds or a
-    # rejected/failed calls.create), never a partial success. Putting the rep
-    # into a conference nobody will ever join would just be silence and a
-    # running timer, so say what happened and hang up instead.
-    child_call_sid = await dial_lead_into_conference(
-        parent_call_sid=parent_call_sid,
-        lead_number=to_number,
-        caller_id=caller_id,
-        join_conference_url=lead_join_url,
-        status_callback_url=lead_status_callback_url,
-    )
-    if not child_call_sid:
-        logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
-        # create_dialer_call already inserted this row as "initiated" above,
-        # and the ONLY thing that ever moves it on is the dialer-call-status
-        # webhook - whose URL is attached solely to the lead's leg, which was
-        # never created. Without this the row is stranded at "initiated"
-        # forever. (A no-op PATCH matching zero rows is fine on the path
-        # where no row was created because the rep wasn't recognized.)
-        await update_dialer_call_status(
+    if parallel_requested:
+        async def originate_parallel_target(target: dict) -> str | None:
+            leg_id = target["leg_id"]
+            target_entry_id = target["entry_id"]
+            join_url = (
+                f"{backend_endpoint}/api/v1/telephony/dialer-conference-join?"
+                + urlencode({
+                    **common_join_fields,
+                    "parallel_leg_id": leg_id,
+                    "parallel_entry_id": target_entry_id,
+                })
+            )
+            status_url = status_callback_base + "?" + urlencode({
+                "parent_call_sid": parent_call_sid,
+                "parallel_leg_id": leg_id,
+            })
+            sid = await dial_lead_into_conference(
+                parent_call_sid=parent_call_sid,
+                lead_number=target["phone"],
+                caller_id=target["caller_id"],
+                join_conference_url=join_url,
+                status_callback_url=status_url,
+                ringing_timeout_seconds=30,
+                # Parallel dialing must screen every line before any lead is
+                # allowed into the conference, even when auto-drop is off.
+                machine_detection=(
+                    True if parallel_requested else
+                    (team_voicemail_policy or {}).get("machine_detection_enabled") is not False
+                ),
+                machine_detection_preset=str((team_voicemail_policy or {}).get("machine_detection_preset") or "balanced"),
+            )
+            if not sid:
+                await dialer_parallel.update_parallel_leg(
+                    child_call_sid=None, leg_id=leg_id, status="failed"
+                )
+                return None
+            if not await dialer_parallel.register_parallel_leg(leg_id=leg_id, child_call_sid=sid):
+                # A faster answered leg may already have won while this
+                # originate request was returning. Do not leave this call
+                # ringing after its session is no longer accepting legs.
+                await cancel_call(call_sid=sid)
+                await dialer_parallel.update_parallel_leg(
+                    child_call_sid=sid, leg_id=leg_id, status="cancelled"
+                )
+                return None
+            return sid
+
+        parallel_results = await asyncio.gather(
+            *(originate_parallel_target(target) for target in parallel_targets),
+            return_exceptions=True,
+        )
+        child_call_sids = [value for value in parallel_results if isinstance(value, str)]
+        if len(child_call_sids) != parallel_line_count:
+            session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
+            if not (session or {}).get("winning_child_call_sid"):
+                logger.error(f"voice-connect could not create a usable parallel batch for {parent_call_sid}")
+                await dialer_parallel.finish_parallel_session(
+                    parent_call_sid=parent_call_sid, status="failed"
+                )
+                await asyncio.gather(*(cancel_call(call_sid=sid) for sid in child_call_sids))
+                await update_dialer_call_status(
+                    parent_call_sid=parent_call_sid,
+                    child_call_sid=None,
+                    status="failed",
+                    duration_seconds=0,
+                )
+                return HTMLResponse(
+                    content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>We could not connect that call. Please try again.</Say><Hangup/></Response>',
+                    media_type="application/xml",
+                )
+            logger.warning(
+                f"Parallel batch {parent_call_sid} was partial, but its first human already won; keeping that call alive"
+            )
+    else:
+        lead_join_url = (
+            f"{backend_endpoint}/api/v1/telephony/dialer-conference-join?"
+            + urlencode(common_join_fields)
+        )
+        lead_status_callback_url = status_callback_base + "?" + urlencode({
+            "parent_call_sid": parent_call_sid,
+        })
+        child_call_sid = await dial_lead_into_conference(
             parent_call_sid=parent_call_sid,
-            child_call_sid=None,
-            status="failed",
-            duration_seconds=0,
+            lead_number=to_number,
+            caller_id=caller_id,
+            join_conference_url=lead_join_url,
+            status_callback_url=lead_status_callback_url,
+            # Detect on every Twilio outbound call so a rep can request a
+            # server-side manual drop while it is still ringing. The saved
+            # auto-drop preference controls PLAYBACK, not whether we identify
+            # a mailbox; playback requires a confirmed beep or greeting-ending
+            # silence (with a six-second grace period for the latter).
+            machine_detection=(team_voicemail_policy or {}).get("machine_detection_enabled") is not False,
+            machine_detection_preset=str((team_voicemail_policy or {}).get("machine_detection_preset") or "balanced"),
         )
-        return HTMLResponse(
-            content=(
-                '<?xml version="1.0" encoding="UTF-8"?><Response>'
-                "<Say>We could not connect that call. Please try again.</Say>"
-                "<Hangup/></Response>"
-            ),
-            media_type="application/xml",
+        if not child_call_sid:
+            logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
+            await update_dialer_call_status(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=None,
+                status="failed",
+                duration_seconds=0,
+            )
+            return HTMLResponse(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>We could not connect that call. Please try again.</Say><Hangup/></Response>',
+                media_type="application/xml",
+            )
+        await update_dialer_call_child_sid(
+            parent_call_sid=parent_call_sid, child_call_sid=child_call_sid
         )
-
-    # Persist the lead leg's SID now, while we're holding it, rather than
-    # waiting for the lead's own "initiated" status callback to write it.
-    # The conference-end orphan cleanup needs this SID to end a still-ringing
-    # lead, and a rep who hangs up immediately can beat that callback.
-    await update_dialer_call_child_sid(
-        parent_call_sid=parent_call_sid, child_call_sid=child_call_sid
-    )
 
     # No <Say> on the rep's leg: the disclosure belongs on the lead's leg
     # (see handle_dialer_conference_join), both so the called party actually
@@ -725,15 +1155,109 @@ async def handle_voice_connect(request: Request):
     return HTMLResponse(content=twiml, media_type="application/xml")
 
 
+async def _cancel_parallel_siblings(
+    *, parent_call_sid: str, winning_child_call_sid: str
+) -> None:
+    """Cancel known losing lines after Twilio receives the winner's bridge TwiML."""
+    try:
+        siblings = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+        await asyncio.gather(*(
+            cancel_call_if_ringing(call_sid=str(leg["child_call_sid"]))
+            for leg in siblings
+            if leg.get("child_call_sid")
+            and leg.get("child_call_sid") != winning_child_call_sid
+            and leg.get("status") not in {
+                "completed", "busy", "no-answer", "failed", "cancelled", "machine",
+                "voicemail", "abandoned_early",
+            }
+        ), return_exceptions=True)
+    except Exception as exc:  # noqa: BLE001 - webhook cleanup must not strand the winner
+        logger.error(f"Could not cancel losing lines for parallel call {parent_call_sid}: {exc}")
+
+
+async def _expire_parallel_overflow_offer(
+    *, child_call_sid: str, parent_call_sid: str = "", leg_id: str = "", account_sid: str = "",
+) -> None:
+    """After eight seconds, an unclaimed teammate offer falls back to the agent."""
+    await asyncio.sleep(8)
+    try:
+        await dialer_overflow_recovery.recover_overflow_offers(child_call_sid=child_call_sid)
+    except Exception as exc:
+        logger.warning(f"Parallel overflow timer deferred to recovery worker: {type(exc).__name__}")
+
+
+@router.websocket("/dialer-agent-media/{workflow_run_id}")
+async def handle_dialer_agent_media(websocket: WebSocket, workflow_run_id: int):
+    await websocket.accept()
+    await dialer_agent_handoff.serve_agent_media(websocket, workflow_run_id)
+
+
+@router.get("/dialer/parallel-agent-capability")
+async def get_parallel_agent_capability(user=Depends(require_sales_dialer_role)):
+    client = await _twilio_client()
+    return await dialer_agent_handoff.agent_handoff_capability(
+        rep_user_id=str(user.provider_id or ""),account_sid=str(client.account_sid if client else ""),
+    )
+
+
+@router.post("/dialer-agent-stream-status", include_in_schema=False)
+async def handle_dialer_agent_stream_status(request: Request, workflow_run_id: int):
+    form_data = dict(await request.form())
+    if not await _verify_twilio_signature(request, form_data):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    if form_data.get("StreamEvent") != "stream-started":
+        return {"status": "ignored"}
+    try:
+        # Stream callbacks use ISO 8601, unlike call/conference RFC timestamps.
+        stamp = datetime.fromisoformat(str(form_data.get("Timestamp") or "").replace("Z", "+00:00"))
+        if stamp.tzinfo is None:
+            raise ValueError("Timestamp must include its timezone")
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Missing provider stream timestamp")
+    call_id = str(form_data.get("CallSid") or "")
+    if not _TWILIO_CALL_SID_PATTERN.fullmatch(call_id):
+        raise HTTPException(status_code=400, detail="Invalid provider call")
+    try:
+        recorded = await dialer_agent_handoff.record_handoff_event(
+            call_id=call_id,event="started",event_at=stamp.astimezone(UTC).isoformat(),
+            workflow_run_id=str(workflow_run_id),
+        )
+    except dialer_agent_handoff.AgentHandoffUnavailable:
+        raise HTTPException(status_code=503, detail="Could not persist the agent connection")
+    if not recorded:
+        raise HTTPException(status_code=409, detail="The stream does not match a reserved handoff")
+    return {"status": "success"}
+
+
+@router.post("/dialer-parallel-hold-next",include_in_schema=False)
+async def handle_parallel_hold_next(request: Request,parent_call_sid: str,leg_id: UUID):
+    form = dict(await request.form())
+    if not await _verify_twilio_signature(request,form):
+        raise HTTPException(status_code=401,detail="Invalid webhook signature")
+    child = str(form.get("CallSid") or "")
+    if not _TWILIO_CALL_SID_PATTERN.fullmatch(child) or not _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid):
+        raise HTTPException(status_code=400,detail="Invalid Hold call identity")
+    try:
+        twiml = await dialer_hold.hold_twiml(parent_call_sid=parent_call_sid,child_call_sid=child,
+            leg_id=str(leg_id),account_sid=str(form.get("AccountSid") or ""))
+    except dialer_agent_handoff.AgentHandoffUnavailable:
+        raise HTTPException(status_code=503,detail="Could not resolve the held call")
+    return HTMLResponse(content=twiml or dialer_hold.HANGUP,media_type="application/xml")
+
+
 @router.post("/dialer-conference-join", include_in_schema=False)
 async def handle_dialer_conference_join(
     request: Request,
+    background_tasks: BackgroundTasks,
     conference_name: str = "",
     muted: str = "false",
     end_on_exit: str = "true",
     start_on_enter: str = "true",
     events_url: str = "",
     recording_url: str = "",
+    parent_call_sid: str = "",
+    parallel_leg_id: str = "",
+    parallel_entry_id: str = "",
 ):
     """Default end_on_exit="true" is deliberately the fail-SAFE default, even
     though voice-connect (its only caller) always passes it explicitly. If
@@ -751,6 +1275,226 @@ async def handle_dialer_conference_join(
 
     if not conference_name:
         logger.error("dialer-conference-join missing conference_name")
+        return HTMLResponse(content=hangup, media_type="application/xml")
+
+    # Twilio's synchronous DetectMessageEnd result arrives on the signed
+    # TwiML request. Only a confirmed beep, explicit rep opt-in and a current
+    # WAV recording can divert the call into automatic playback.
+    answered_by = str(form_data.get("AnsweredBy") or "").strip().lower()
+    parallel_call_sid = str(form_data.get("CallSid") or "")
+    if parallel_leg_id:
+        try:
+            UUID(parallel_leg_id)
+            UUID(parallel_entry_id)
+        except (ValueError, TypeError):
+            return HTMLResponse(content=hangup, media_type="application/xml")
+        if (
+            not parent_call_sid
+            or not _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid)
+            or parent_call_sid_from_conference_name(conference_name) != parent_call_sid
+            or not _TWILIO_CALL_SID_PATTERN.fullmatch(parallel_call_sid)
+        ):
+            logger.warning("Rejected parallel conference join with mismatched call identity")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+        # Twilio can return `unknown` when AMD times out without confidence.
+        # The dialer policy is to prefer a real connect over hiding a person,
+        # so an unknown result gets the same atomic human-claim path. Keep the
+        # stored leg classification as human because it has now been admitted
+        # to the rep/teammate bridge.
+        parallel_answered_by = "human" if answered_by in {"human", "unknown"} else answered_by
+        if parallel_answered_by == "human":
+            won = await dialer_parallel.claim_parallel_winner(
+                parent_call_sid=parent_call_sid,
+                entry_id=parallel_entry_id,
+                child_call_sid=parallel_call_sid,
+                leg_id=parallel_leg_id,
+            )
+            if not won:
+                overflow_conference = conference_name_for(parallel_call_sid)
+                overflow = await dialer_parallel.route_parallel_to_teammate(
+                    parent_call_sid=parent_call_sid,
+                    child_call_sid=parallel_call_sid,
+                    conference_name=overflow_conference,
+                    entry_id=parallel_entry_id,
+                    leg_id=parallel_leg_id,
+                )
+                if not overflow:
+                    # The prospect already answered: adopt this exact call into
+                    # the account's agent runtime; never call their phone again.
+                    await dialer_parallel.update_parallel_leg(
+                        child_call_sid=parallel_call_sid,leg_id=parallel_leg_id,
+                        status="answered",answered_by="human",
+                    )
+                    try:
+                        held = await dialer_hold.hold_twiml(
+                            parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,leg_id=parallel_leg_id,
+                            account_sid=str(form_data.get("AccountSid") or ""),begin=True,
+                        )
+                        if held:
+                            return HTMLResponse(content=held,media_type="application/xml")
+                        prepared = await dialer_agent_handoff.prepare_agent_handoff(
+                            parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,
+                            leg_id=parallel_leg_id,account_sid=str(form_data.get("AccountSid") or ""),
+                            allow_fallback=True,
+                        )
+                        if prepared:
+                            return HTMLResponse(content=prepared.twiml,media_type="application/xml")
+                    except dialer_agent_handoff.AgentHandoffUnavailable as exc:
+                        if exc.retryable:
+                            raise HTTPException(status_code=503,detail="Could not persist the parallel handoff")
+                        logger.warning(f"Parallel agent handoff unavailable: {exc}")
+                    # Fail closed if account policy, availability or persistence
+                    # prevents a real handoff; never leave the prospect alone.
+                    await dialer_parallel.update_parallel_leg(
+                        child_call_sid=parallel_call_sid,
+                        leg_id=parallel_leg_id,
+                        status="cancelled",
+                        answered_by=parallel_answered_by,
+                    )
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+                conference_name = overflow_conference
+                try:
+                    scheduled = await dialer_overflow_recovery.schedule_overflow(
+                        parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,
+                        leg_id=parallel_leg_id,account_sid=str(form_data.get("AccountSid") or ""),
+                    )
+                except dialer_agent_handoff.AgentHandoffUnavailable:
+                    scheduled = False
+                if not scheduled:
+                    raise HTTPException(status_code=503,detail="Could not persist the teammate fallback deadline")
+                notify_inbound_call(str(overflow["inbound_call_id"]))
+                background_tasks.add_task(
+                    _expire_parallel_overflow_offer,
+                    child_call_sid=parallel_call_sid,
+                    parent_call_sid=parent_call_sid,leg_id=parallel_leg_id,
+                    account_sid=str(form_data.get("AccountSid") or ""),
+                )
+            else:
+                background_tasks.add_task(
+                    update_dialer_call_parallel_winner,
+                    parent_call_sid=parent_call_sid,
+                    child_call_sid=parallel_call_sid,
+                    entry_id=parallel_entry_id,
+                    to_number=str(form_data.get("To") or ""),
+                )
+                # Return winner TwiML immediately; cancel siblings off the
+                # critical webhook path after Twilio joins this conference.
+                background_tasks.add_task(
+                    _cancel_parallel_siblings,
+                    parent_call_sid=parent_call_sid,
+                    winning_child_call_sid=parallel_call_sid,
+                )
+        elif answered_by.startswith("machine"):
+            await dialer_parallel.update_parallel_leg(
+                child_call_sid=parallel_call_sid,
+                leg_id=parallel_leg_id,
+                status="machine",
+                answered_by=answered_by,
+            )
+            if answered_by not in {"machine_end_beep", "machine_end_silence", "machine_end_other"}:
+                return HTMLResponse(content=hangup, media_type="application/xml")
+        else:
+            # No AMD classification means it is not safe to bridge this leg.
+            await dialer_parallel.update_parallel_leg(
+                child_call_sid=parallel_call_sid,
+                leg_id=parallel_leg_id,
+                status="failed",
+                answered_by=answered_by or "unknown",
+            )
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
+    elif answered_by:
+        # CallSid is present on Twilio's signed answer webhook, so write it
+        # before AMD state. A very fast answer can beat the calls.create
+        # response that ordinarily fills child_call_sid.
+        lead_sid = str(form_data.get("CallSid") or "")
+        if parent_call_sid and lead_sid and _TWILIO_CALL_SID_PATTERN.fullmatch(lead_sid):
+            await update_dialer_call_child_sid(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=lead_sid,
+            )
+            await update_dialer_call_amd_result(
+                parent_call_sid=parent_call_sid,
+                answered_by=answered_by,
+            )
+
+    if (
+        answered_by in {"machine_end_beep", "machine_end_silence", "machine_end_other"}
+        and parent_call_sid
+        and _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid)
+        and parent_call_sid_from_conference_name(conference_name) == parent_call_sid
+    ):
+        call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        rep_user_id = (call_row or {}).get("rep_user_id")
+        child_sid = str(form_data.get("CallSid") or "")
+        if isinstance(rep_user_id, str) and child_sid:
+            manual_requested = bool((call_row or {}).get("manual_voicemail_requested_at"))
+            policy = await get_team_voicemail_policy(
+                user_id=rep_user_id, parent_call_sid=parent_call_sid,
+            )
+            on_machine = str((policy or {}).get("on_machine") or "drop_vm")
+            enabled, playback_url, drop_id = await get_auto_voicemail_settings(
+                user_id=rep_user_id,
+                allow_manual_when_disabled=manual_requested,
+                parent_call_sid=parent_call_sid,
+            )
+            # Twilio <Play> supports WAV/MP3. Old recordings in browser
+            # containers must continue into the conference rather than
+            # pretending a silent message was sent.
+            is_wav = bool(playback_url and playback_url.split("?", 1)[0].lower().endswith(".wav"))
+            should_play = manual_requested or (enabled and on_machine == "drop_vm")
+            if should_play and playback_url and is_wav:
+                # One database claim covers both paths: when the API request
+                # and this signed answer callback race, exactly one can start
+                # the recording. Auto and manual requests have separate
+                # predicates so an opt-in does not masquerade as a rep press.
+                claimed = await claim_manual_voicemail_playback(
+                    parent_call_sid=parent_call_sid,
+                    child_call_sid=child_sid,
+                    manual=manual_requested,
+                )
+                if claimed:
+                    if drop_id:
+                        await attach_voicemail_drop_to_call(
+                            parent_call_sid=parent_call_sid,
+                            child_call_sid=child_sid,
+                            drop_id=drop_id,
+                        )
+                    if parallel_leg_id:
+                        await dialer_parallel.update_parallel_leg(
+                            child_call_sid=parallel_call_sid,
+                            leg_id=parallel_leg_id,
+                            status="voicemail",
+                            answered_by=answered_by,
+                        )
+                    endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
+                    complete_url = (
+                        f"{endpoint_root}/dialer-auto-voicemail-complete"
+                        f"?parent_call_sid={parent_call_sid}"
+                        + (f"&parallel_leg_id={parallel_leg_id}" if parallel_leg_id else "")
+                    )
+                    twiml = (
+                        '<?xml version="1.0" encoding="UTF-8"?>'
+                        + (f'<Response><Pause length="6"/>' if answered_by in {"machine_end_silence", "machine_end_other"} else "<Response>")
+                        + "<Play>" + escape(playback_url) + "</Play>"
+                        + f"<Redirect method=\"POST\">{escape(complete_url)}</Redirect></Response>"
+                    )
+                    return HTMLResponse(content=twiml, media_type="application/xml")
+            # A detected machine must never silently join the rep when the
+            # selected policy is Drop VM or Hang up. Passing a machine through
+            # is an explicit manager choice used for training.
+            if not manual_requested:
+                if on_machine in {"drop_vm", "hangup"}:
+                    return HTMLResponse(content=hangup, media_type="application/xml")
+
+    known_machine_answers = {
+        "machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax",
+    }
+    if parallel_leg_id and answered_by in known_machine_answers:
+        # A machine greeting without an opted-in, usable recording is never
+        # connected to a rep. The attempt remains separately recorded in the
+        # parallel leg ledger for disposition/reconciliation.
         return HTMLResponse(content=hangup, media_type="application/xml")
 
     # voice-connect passes these so this leg can repeat the conference-level
@@ -786,6 +1530,68 @@ async def handle_dialer_conference_join(
     return HTMLResponse(content=twiml, media_type="application/xml")
 
 
+@router.post("/dialer-auto-voicemail-complete", include_in_schema=False)
+async def handle_dialer_auto_voicemail_complete(
+    request: Request, parent_call_sid: str = "", parallel_leg_id: str = ""
+):
+    """Finish the lead leg and the rep's waiting conference after full playback."""
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    form_data = dict(await request.form())
+    if (
+        not await _verify_twilio_signature(request, form_data)
+        or not _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid)
+    ):
+        logger.warning("Rejected invalid automatic voicemail completion callback")
+        return HTMLResponse(content=hangup, media_type="application/xml", status_code=403)
+
+    child_call_sid = form_data.get("CallSid")
+    if parallel_leg_id:
+        try:
+            UUID(parallel_leg_id)
+        except (ValueError, TypeError):
+            return HTMLResponse(content=hangup, media_type="application/xml", status_code=403)
+        legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+        matching_leg = next((leg for leg in legs if leg.get("leg_id") == parallel_leg_id), None)
+        if not matching_leg or child_call_sid != matching_leg.get("child_call_sid"):
+            logger.warning("Rejected automatic voicemail completion for an unrelated parallel leg")
+            return HTMLResponse(content=hangup, media_type="application/xml", status_code=403)
+        await dialer_parallel.update_parallel_leg(
+            child_call_sid=child_call_sid, leg_id=parallel_leg_id, status="voicemail",
+        )
+    else:
+        call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        if not call_row or child_call_sid != call_row.get("child_call_sid"):
+            logger.warning("Rejected automatic voicemail completion for an unrelated Twilio call")
+            return HTMLResponse(content=hangup, media_type="application/xml", status_code=403)
+
+    # This endpoint is reached sequentially after the TwiML <Play> completes.
+    # Record that evidence before ending the rep's leg; neither a beep
+    # detection nor a failed playback reaches this callback.
+    await mark_auto_voicemail_sent(
+        parent_call_sid=parent_call_sid,
+        child_call_sid=str(child_call_sid) if parallel_leg_id and child_call_sid else None,
+    )
+    if parallel_leg_id:
+        session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
+        legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+        if (
+            session
+            and not session.get("winning_child_call_sid")
+            and _parallel_batch_has_settled(legs)
+        ):
+            await dialer_parallel.finish_parallel_session(parent_call_sid=parent_call_sid, status="failed")
+            await update_dialer_call_status(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=None,
+                status="failed",
+                duration_seconds=0,
+            )
+            await cancel_call(call_sid=parent_call_sid)
+    else:
+        await cancel_call(call_sid=parent_call_sid)
+    return HTMLResponse(content=hangup, media_type="application/xml")
+
+
 async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
     """End the lead's leg if the conference ended before they ever joined it.
 
@@ -804,6 +1610,22 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
     guarantee independent of either callee's future contract.
     """
     try:
+        parallel_session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
+        if parallel_session:
+            legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+            independent = await dialer_hold.independent_children(parent_call_sid)
+            winning_sid = parallel_session.get("winning_child_call_sid")
+            await asyncio.gather(*(
+                # Recheck provider state: a sibling can answer while this
+                # cleanup is reading its durable handoff reservation.
+                cancel_call_if_ringing(call_sid=str(leg["child_call_sid"]))
+                for leg in legs
+                if leg.get("child_call_sid")
+                and leg.get("child_call_sid") not in independent
+                and leg.get("child_call_sid") != winning_sid
+                and leg.get("status") not in {"completed", "busy", "no-answer", "failed", "cancelled", "machine"}
+            ))
+
         leg = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
 
         if leg is None:
@@ -819,6 +1641,11 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
 
         child_call_sid = leg.get("child_call_sid")
         lead_status = (leg.get("status") or "").strip().lower()
+
+        if parallel_session and child_call_sid == parallel_session.get("winning_child_call_sid"):
+            # Conference teardown ended the winning participant. Its status
+            # callback can arrive later; do not send a second REST hangup.
+            return
 
         if not child_call_sid:
             # The row EXISTS but has no lead SID. voice-connect persists that
@@ -859,23 +1686,129 @@ async def handle_dialer_conference_events(request: Request):
     conference_sid = form_data.get("ConferenceSid", "")
     parent_call_sid = parent_call_sid_from_conference_name(form_data.get("FriendlyName", ""))
 
-    # An event table, not a pipeline. participant-join/leave arrive here too
-    # (statusCallbackEvent is "start end join leave") and are deliberately
-    # unhandled: dialer-listen-connect records a manager's listen session
-    # itself, so nothing on this branch needs participant presence. They stay
-    # subscribed for whenever something does.
+    # A manual drop pressed while Twilio is still finishing the AMD answer
+    # webhook is picked up here after the lead has joined. This closes the
+    # answer-webhook/API race without ever guessing from transcript text.
     if event_type == "conference-start" and conference_sid and parent_call_sid:
         await update_dialer_call_conference_sid(
             parent_call_sid=parent_call_sid, conference_sid=conference_sid
         )
+    elif event_type in {"participant-join", "join"} and parent_call_sid:
+        child_call_sid = str(form_data.get("CallSid") or form_data.get("ParticipantCallSid") or "")
+        event_at = _twilio_event_time(form_data.get("Timestamp"))
+        if event_at and child_call_sid and _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid):
+            parallel_session = await dialer_parallel.parallel_session(
+                parent_call_sid=parent_call_sid
+            )
+            if parallel_session:
+                if child_call_sid == parent_call_sid:
+                    await dialer_parallel.record_parallel_timing(
+                        parent_call_sid=parent_call_sid,
+                        child_call_sid=child_call_sid,
+                        event_kind="rep_join",
+                        event_at=event_at,
+                    )
+                elif child_call_sid == parallel_session.get("winning_child_call_sid"):
+                    await dialer_parallel.record_parallel_timing(
+                        parent_call_sid=parent_call_sid,
+                        child_call_sid=child_call_sid,
+                        event_kind="lead_join",
+                        event_at=event_at,
+                    )
+            else:
+                recorded = await record_overflow_join(
+                    conference_name=str(form_data.get("FriendlyName") or ""),
+                    provider="twilio", participant_call_id=child_call_sid, event_at=event_at,
+                )
+                if recorded is None:
+                    raise HTTPException(status_code=503, detail="Could not persist conference timing")
+        call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        if (
+            call_row
+            and call_row.get("child_call_sid") == child_call_sid
+            and _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid)
+        ):
+            await mark_dialer_lead_joined_conference(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=child_call_sid,
+            )
+            call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+            if (
+                call_row
+                and call_row.get("amd_result") in {"machine_end_beep", "machine_end_silence", "machine_end_other"}
+                and call_row.get("manual_voicemail_requested_at")
+                and not call_row.get("voicemail_drop_started_at")
+                and call_row.get("auto_voicemail_sent") is not True
+            ):
+                rep_user_id = call_row.get("rep_user_id")
+                if isinstance(rep_user_id, str):
+                    _, playback_url, drop_id = await get_auto_voicemail_settings(
+                        user_id=rep_user_id,
+                        allow_manual_when_disabled=True,
+                        parent_call_sid=parent_call_sid,
+                    )
+                    if playback_url and playback_url.split("?", 1)[0].lower().endswith(".wav"):
+                        claimed = await claim_manual_voicemail_playback(
+                            parent_call_sid=parent_call_sid,
+                            child_call_sid=child_call_sid,
+                            manual=True,
+                        )
+                        if claimed:
+                            if drop_id:
+                                await attach_voicemail_drop_to_call(
+                                    parent_call_sid=parent_call_sid,
+                                    child_call_sid=child_call_sid,
+                                    drop_id=drop_id,
+                                )
+                            endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
+                            twiml = _voicemail_playback_twiml(
+                                endpoint_root=endpoint_root,
+                                parent_call_sid=parent_call_sid,
+                                playback_url=playback_url,
+                                pause_seconds=6 if call_row.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+                            )
+                            if not await _redirect_twilio_child_to_voicemail(
+                                child_call_sid=child_call_sid,
+                                twiml=twiml,
+                            ):
+                                await release_manual_voicemail_playback(
+                                    parent_call_sid=parent_call_sid,
+                                    child_call_sid=child_call_sid,
+                                )
     elif event_type == "conference-end" and parent_call_sid:
+        session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
+        if not session:
+            # A routed second-pickup conference is named from its child SID, so
+            # it has no parallel session of its own. Close its ring reservation.
+            await close_inbound_call(provider_call_id=parent_call_sid)
+            await evaluate_overflow_guard(provider_call_id=parent_call_sid, provider="twilio")
+        if session:
+            has_winner = bool(session.get("winning_child_call_sid"))
+            final_state = "completed" if has_winner else (
+                "failed" if session.get("status") == "failed" else "cancelled"
+            )
+            await dialer_parallel.finish_parallel_session(
+                parent_call_sid=parent_call_sid,
+                status=final_state,
+            )
+            call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+            preserve_completed_drop = (
+                not has_winner and (call_row or {}).get("status") == "completed"
+            )
+            if final_state in {"completed", "cancelled"} and not preserve_completed_drop:
+                await update_dialer_call_status(
+                    parent_call_sid=parent_call_sid,
+                    child_call_sid=session.get("winning_child_call_sid"),
+                    status="completed" if has_winner else "canceled",
+                    duration_seconds=None,
+                )
         await _cancel_orphaned_lead_leg(parent_call_sid)
 
     return {"status": "success"}
 
 
 async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
-    """Place a manager/admin into a live call's conference as a MUTED listener.
+    """Place an authorized manager in a live call as listener, coach or barge.
 
     Takes already-parsed, already-signature-verified form data, because it has
     TWO entry points (see handle_voice_connect's delegation and
@@ -883,13 +1816,12 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
     the body has been consumed once would yield nothing. Verifying the
     signature is the caller's job, done exactly once, at the route.
 
-    Everything about the returned TwiML is chosen so the two people already on
-    the call cannot tell anyone joined:
+    Listen mode is silent. Whisper mode uses Twilio's conference coaching
+    isolation so only the rep hears the manager. Barge is an explicit three-way
+    join. All modes suppress the join beep and leave the customer conference
+    alive when the manager disconnects.
 
-    - muted="true"                  - the manager can never be heard.
-    - beep="false"                  - Twilio's DEFAULT is beep="true", which
-      would play a join tone to BOTH the rep and the lead and announce the
-      silent monitor out loud. This attribute is the whole feature.
+    - beep="false"                  - joining must not inject an unrequested tone.
     - startConferenceOnEnter="false" - joining a conference that has already
       ended must not resurrect it.
     - endConferenceOnExit="false"   - the manager hanging up must not end the
@@ -938,6 +1870,11 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
             logger.warning("listen-in rejected malformed ListenParentCallSid")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
+        mode = str(form_data.get("MonitorMode", "listen")).strip().lower()
+        if mode not in {"listen", "whisper", "barge"}:
+            logger.warning("listen-in rejected unsupported monitor mode")
+            return HTMLResponse(content=hangup, media_type="application/xml")
+
         # Same "client:rep-{id}" Voice SDK identity a rep gets: /voice-token
         # issues that shape to everyone holding a sales dialer role, managers
         # and admins included. The helper only extracts a user id - the
@@ -967,7 +1904,9 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
             return HTMLResponse(content=hangup, media_type="application/xml")
 
         await create_dialer_call_listener(
-            parent_call_sid=parent_call_sid, manager_user_id=user.provider_id
+            parent_call_sid=parent_call_sid,
+            manager_user_id=user.provider_id,
+            mode=mode,
         )
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
         logger.error(f"listen-in failed: {exc}")
@@ -977,11 +1916,22 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
     # and stays for exactly that reason - it must not be the only thing
     # standing between a caller-supplied string and the TwiML document.
     conference_name = conference_name_for(parent_call_sid)
+    conference_attrs = {
+        "muted": "true" if mode == "listen" else "false",
+        "startConferenceOnEnter": "false",
+        "endConferenceOnExit": "false",
+        "beep": "false",
+    }
+    if mode == "whisper":
+        # The rep leg is the Conference SID used by this dialer's call model.
+        # Twilio rejects coaching when the target is not connected, which is
+        # fail-closed and preferable to accidentally opening a barge.
+        conference_attrs["coach"] = parent_call_sid
+    attrs = " ".join(f'{key}={quoteattr(value)}' for key, value in conference_attrs.items())
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response><Dial>"
-        '<Conference muted="true" startConferenceOnEnter="false" '
-        'endConferenceOnExit="false" beep="false">'
+        f"<Conference {attrs}>"
         f"{escape(conference_name)}</Conference>"
         "</Dial></Response>"
     )
@@ -1012,7 +1962,9 @@ async def handle_dialer_listen_connect(request: Request):
 
 
 @router.post("/dialer-call-status", include_in_schema=False)
-async def handle_dialer_call_status(request: Request, parent_call_sid: str = ""):
+async def handle_dialer_call_status(
+    request: Request, parent_call_sid: str = "", parallel_leg_id: str = ""
+):
     form_data = dict(await request.form())
 
     if not await _verify_twilio_signature(request, form_data):
@@ -1027,6 +1979,95 @@ async def handle_dialer_call_status(request: Request, parent_call_sid: str = "")
     call_status = form_data.get("CallStatus", "").strip().lower() or "initiated"
     raw_duration = form_data.get("CallDuration")
     duration_seconds = int(raw_duration) if raw_duration and raw_duration.isdigit() else None
+
+    if parallel_leg_id:
+        try:
+            UUID(parallel_leg_id)
+        except (ValueError, TypeError):
+            return {"status": "ignored", "reason": "invalid_parallel_leg_id"}
+        answered_by = str(form_data.get("AnsweredBy") or "").strip().lower()
+        machine_answers = {
+            "machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax",
+        }
+        mapped_status = {
+            "in-progress": "answered",
+            "canceled": "cancelled",
+        }.get(call_status, call_status)
+        event_at = _twilio_event_time(form_data.get("Timestamp"))
+        if mapped_status == "answered" and event_at and child_call_sid:
+            await dialer_parallel.record_parallel_timing(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=child_call_sid,
+                event_kind="answer",
+                event_at=event_at,
+                leg_id=parallel_leg_id,
+            )
+        if answered_by in machine_answers:
+            # AMD classification and provider call completion are separate
+            # signals. Persist a machine result first so it can disposition
+            # the lead, and wait for the completed callback before treating
+            # this line as finished.
+            if call_status not in {"completed", "busy", "no-answer", "failed", "cancelled", "canceled"}:
+                mapped_status = "machine"
+            elif call_status == "completed":
+                await dialer_parallel.update_parallel_leg(
+                    child_call_sid=child_call_sid,
+                    leg_id=parallel_leg_id,
+                    status="machine",
+                    answered_by=answered_by,
+                )
+                mapped_status = "completed"
+        allowed_statuses = {
+            "initiated", "ringing", "answered", "machine", "completed",
+            "busy", "no-answer", "failed", "cancelled",
+        }
+        if mapped_status not in allowed_statuses:
+            logger.warning(f"Ignoring unsupported parallel call status {call_status!r}")
+            return {"status": "ignored", "reason": "unsupported_parallel_status"}
+        await dialer_parallel.update_parallel_leg(
+            child_call_sid=child_call_sid,
+            leg_id=parallel_leg_id,
+            status=mapped_status,
+            answered_by=answered_by or None,
+        )
+        if child_call_sid and mapped_status in {"completed", "busy", "no-answer", "failed", "cancelled"}:
+            try:
+                await dialer_hold.record_ended(child_call_sid=child_call_sid,ended_at=event_at or datetime.now(UTC).isoformat())
+                await dialer_agent_handoff.record_handoff_event(
+                    call_id=child_call_sid,event="ended",event_at=event_at or datetime.now(UTC).isoformat(),
+                    duration_seconds=duration_seconds,
+                )
+            except dialer_agent_handoff.AgentHandoffUnavailable:
+                raise HTTPException(status_code=503, detail="Could not settle agent handoff history")
+            await close_inbound_call(provider_call_id=child_call_sid)
+            await evaluate_overflow_guard(provider_call_id=child_call_sid, provider="twilio")
+        legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+        session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
+        if (
+            session
+            and session.get("status") in {"completed", "failed", "cancelled"}
+            and _parallel_batch_has_settled(legs)
+        ):
+            await dialer_parallel.apply_parallel_abandon_guard(
+                parent_call_sid=parent_call_sid
+            )
+        if (
+            session
+            and not session.get("winning_child_call_sid")
+            and _parallel_batch_has_settled(legs)
+        ):
+            await dialer_parallel.finish_parallel_session(
+                parent_call_sid=parent_call_sid,
+                status="failed",
+            )
+            await update_dialer_call_status(
+                parent_call_sid=parent_call_sid,
+                child_call_sid=None,
+                status="failed",
+                duration_seconds=duration_seconds or 0,
+            )
+            await cancel_call(call_sid=parent_call_sid)
+        return {"status": "success"}
 
     await update_dialer_call_status(
         parent_call_sid=parent_call_sid,

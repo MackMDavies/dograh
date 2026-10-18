@@ -13,11 +13,17 @@ stale/unfilled, never a broken call.
 """
 
 from datetime import UTC, datetime
+from typing import Any
 
 import httpx
 from loguru import logger
 
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
+from api.services.telephony.dialer.compliance import (
+    calling_hours_allowed,
+    calling_hours_result,
+    phone_block_reason,
+)
 
 _DIALER_CALLS_URL_SUFFIX = "/rest/v1/dialer_calls"
 
@@ -49,6 +55,9 @@ async def create_dialer_call(
     from_number: str,
     to_number: str,
     provider: str = "twilio",
+    phone_us_state: str | None = None,
+    double_dial_retry_of: str | None = None,
+    double_dial_authorization_id: str | None = None,
 ) -> bool:
     """Create the initial dialer_calls row synchronously, before voice-connect
     returns TwiML - see the module docstring on why this can't wait for an
@@ -63,27 +72,75 @@ async def create_dialer_call(
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot create dialer_calls row")
         return False
+    payload = {
+        "parent_call_sid": parent_call_sid,
+        "rep_user_id": rep_user_id,
+        "entry_id": entry_id,
+        "from_number": from_number,
+        "to_number": to_number,
+        "status": "initiated",
+        "provider": provider,
+    }
+    if phone_us_state:
+        payload["phone_us_state"] = phone_us_state
+    if double_dial_retry_of:
+        payload["double_dial_retry_of"] = double_dial_retry_of
+    if double_dial_authorization_id:
+        payload["double_dial_authorization_id"] = double_dial_authorization_id
     try:
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                json=payload,
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return True
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to create dialer_calls row for {parent_call_sid}: {exc}")
+        return False
+
+
+async def consume_double_dial_authorization(
+    *,
+    authorization_id: str,
+    rep_user_id: str,
+    entry_id: str,
+    to_number: str,
+    call_sid: str,
+) -> dict[str, str] | None:
+    """Consume the one-time server grant and return its pinned number/source."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot validate double-dial authorization")
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_consume_double_dial_authorization",
                 json={
-                    "parent_call_sid": parent_call_sid,
-                    "rep_user_id": rep_user_id,
-                    "entry_id": entry_id,
-                    "from_number": from_number,
-                    "to_number": to_number,
-                    "status": "initiated",
-                    "provider": provider,
+                    "p_authorization_id": authorization_id,
+                    "p_rep_user_id": rep_user_id,
+                    "p_entry_id": entry_id,
+                    "p_phone": to_number,
+                    "p_call_sid": call_sid,
                 },
                 headers=_headers(),
                 timeout=5.0,
             )
             response.raise_for_status()
-        return True
-    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
-        logger.error(f"Failed to create dialer_calls row for {parent_call_sid}: {exc}")
-        return False
+            rows = response.json()
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                return None
+            row = rows[0]
+            from_number = row.get("from_number")
+            retry_of_call_id = row.get("retry_of_call_id")
+            if not isinstance(from_number, str) or not from_number or not isinstance(retry_of_call_id, str):
+                return None
+            return {"from_number": from_number, "retry_of_call_id": retry_of_call_id}
+    except Exception as exc:  # noqa: BLE001 - fail closed; this is call authorization
+        logger.error(f"Failed to consume double-dial authorization {authorization_id}: {exc}")
+        return None
 
 
 async def update_dialer_call_status(
@@ -191,6 +248,128 @@ async def update_dialer_call_child_sid(*, parent_call_sid: str, child_call_sid: 
         logger.error(f"Failed to update dialer_calls child_call_sid for {parent_call_sid}: {exc}")
 
 
+async def update_dialer_call_parallel_winner(
+    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
+) -> None:
+    """Point the aggregate call row at the first verified human in a fanout."""
+    await update_dialer_call_parallel_target(
+        parent_call_sid=parent_call_sid,
+        child_call_sid=child_call_sid,
+        entry_id=entry_id,
+        to_number=to_number,
+    )
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot record parallel winner")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                json={"status": "in-progress"},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - preserve the live call if history write fails
+        logger.error(f"Failed to record parallel winner for {parent_call_sid}: {exc}")
+
+
+async def update_signalwire_parallel_winner(
+    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
+) -> bool:
+    """Link a SignalWire browser batch to its first human prospect leg."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={
+                    "parent_call_sid": f"eq.{parent_call_sid}",
+                    "provider": "eq.signalwire",
+                },
+                json={
+                    "child_call_sid": child_call_sid,
+                    "entry_id": entry_id,
+                    "to_number": to_number,
+                    "status": "in-progress",
+                },
+                headers={**_headers(), "Prefer": "return=representation"},
+            )
+            response.raise_for_status()
+            rows = response.json()
+        return isinstance(rows, list) and len(rows) == 1
+    except Exception as exc:  # noqa: BLE001 - only close the prospect if the batch cannot be linked
+        logger.error(f"Failed to link SignalWire batch winner for {parent_call_sid}: {exc}")
+        return False
+
+
+async def update_signalwire_dialer_amd(
+    *, parent_call_sid: str, amd_result: str | None = None,
+    voicemail_started: bool = False, voicemail_sent: bool = False,
+) -> bool:
+    """Persist machine-detection and voicemail playback state for one leg."""
+    allowed = {
+        "human", "machine_start", "machine_end_beep", "machine_end_silence",
+        "machine_end_other", "fax", "unknown",
+    }
+    if (amd_result is not None and amd_result not in allowed) or not parent_call_sid:
+        return False
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    payload: dict[str, object] = {}
+    if amd_result is not None:
+        payload["amd_result"] = amd_result
+    if voicemail_started:
+        payload["voicemail_drop_started_at"] = datetime.now(UTC).isoformat()
+    if voicemail_sent:
+        payload["auto_voicemail_sent"] = True
+    if not payload:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={
+                    "parent_call_sid": f"eq.{parent_call_sid}",
+                    "provider": "eq.signalwire",
+                },
+                json=payload,
+                headers=_headers(),
+            )
+            response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 - a history write must not interrupt provider media
+        logger.error(f"Failed to persist SignalWire AMD for {parent_call_sid}: {exc}")
+        return False
+
+
+async def update_dialer_call_parallel_target(
+    *, parent_call_sid: str, child_call_sid: str, entry_id: str, to_number: str
+) -> None:
+    """Attach the aggregate row to the specific entry answered by a line."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot record parallel target")
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                json={
+                    "child_call_sid": child_call_sid,
+                    "entry_id": entry_id,
+                    "to_number": to_number,
+                },
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+    except Exception as exc:  # noqa: BLE001 - preserve the live call if history write fails
+        logger.error(f"Failed to record parallel target for {parent_call_sid}: {exc}")
+
+
 async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     """Read back the lead leg's SID and last-known status.
 
@@ -210,7 +389,7 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
             response = await client.get(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
                 params={
-                    "select": "child_call_sid,status",
+                    "select": "child_call_sid,status,rep_user_id,provider,amd_result,manual_voicemail_requested_at,voicemail_drop_started_at,auto_voicemail_sent,voicemail_drop_id,ended_at,lead_joined_at",
                     "parent_call_sid": f"eq.{parent_call_sid}",
                     "limit": "1",
                 },
@@ -235,6 +414,296 @@ async def get_dialer_call_child_leg(*, parent_call_sid: str) -> dict | None:
     if isinstance(rows, list) and rows and isinstance(rows[0], dict):
         return rows[0]
     return None
+
+
+async def get_team_voicemail_policy(
+    *, user_id: str, parent_call_sid: str | None = None, entry_id: str | None = None
+) -> dict[str, Any] | None:
+    """Read the server-owned account voicemail/AMD policy, failing closed."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_account_voicemail_policy",
+                json={
+                    "p_rep_user_id": user_id,
+                    "p_entry_id": entry_id,
+                    "p_parent_call_sid": parent_call_sid,
+                },
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            policy = response.json()
+            return policy if isinstance(policy, dict) else None
+    except Exception as exc:  # noqa: BLE001 - callers need safe defaults
+        logger.warning(f"Could not resolve team voicemail policy for {user_id}: {exc}")
+        return None
+
+
+async def get_dialer_phone_block_reason(phone: str) -> str | None:
+    """Use the server-owned suppression register before a provider originates."""
+    return await phone_block_reason(phone)
+
+
+async def check_dialer_calling_hours(phone: str, entry_id: str | None = None) -> tuple[bool, str | None]:
+    """Ask the server-owned timezone/rule engine before placing a PSTN leg.
+
+    The frontend's prospect clock is informational. Unknown timezone or an
+    unavailable compliance service must not turn into permission to call.
+    """
+    return await calling_hours_allowed(phone, entry_id)
+
+
+async def check_dialer_calling_hours_with_state(
+    phone: str, entry_id: str | None = None
+) -> tuple[bool, str | None, str | None]:
+    """Return the fail-closed dial decision and the resolved destination state."""
+    return await calling_hours_result(phone, entry_id)
+
+
+async def get_auto_voicemail_settings(
+    *,
+    user_id: str,
+    allow_manual_when_disabled: bool = False,
+    parent_call_sid: str | None = None,
+    entry_id: str | None = None,
+) -> tuple[bool, str | None, str | None]:
+    """Return team policy and the rep's short-lived default WAV URL.
+
+    The bucket is private. The URL is minted with the service role only after
+    checking the account-owned automatic-drop policy and rep-owned recording.
+    Automatic voicemail is locked by account managers; the old per-rep setting
+    is intentionally not used to make the carrier decision.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False, None, None
+    try:
+        team_policy = await get_team_voicemail_policy(
+            user_id=user_id, parent_call_sid=parent_call_sid, entry_id=entry_id
+        )
+        enabled = bool(team_policy and team_policy.get("auto_drop_enabled") is True)
+        if not enabled and not allow_manual_when_disabled:
+            return False, None, None
+        async with httpx.AsyncClient() as client:
+            headers = _headers()
+            drop = await client.get(
+                f"{SUPABASE_URL}/rest/v1/dialer_voicemail_drops",
+                params={
+                    "select": "id,storage_path",
+                    "user_id": f"eq.{user_id}",
+                    "is_default": "eq.true",
+                    "limit": "1",
+                },
+                headers=headers,
+                timeout=5.0,
+            )
+            drop.raise_for_status()
+            rows = drop.json()
+            path = rows[0].get("storage_path") if rows and isinstance(rows[0], dict) else None
+            drop_id = rows[0].get("id") if rows and isinstance(rows[0], dict) else None
+            if not isinstance(path, str) or not path.startswith(f"{user_id}/"):
+                return False, None, None
+
+            signed = await client.post(
+                f"{SUPABASE_URL}/storage/v1/object/sign/voicemail-drops/{path}",
+                json={"expiresIn": 1800},
+                headers=headers,
+                timeout=5.0,
+            )
+            signed.raise_for_status()
+            signed_path = signed.json().get("signedURL")
+            if not isinstance(signed_path, str) or not signed_path.startswith("/"):
+                return False, None, None
+            storage_path = signed_path if signed_path.startswith("/storage/v1/") else f"/storage/v1{signed_path}"
+            return True, f"{SUPABASE_URL}{storage_path}", str(drop_id) if drop_id else None
+    except Exception as exc:  # noqa: BLE001 - optional automation must fail closed
+        logger.warning(f"Could not resolve automatic voicemail for {user_id}: {exc}")
+        return False, None, None
+
+
+async def attach_voicemail_drop_to_call(
+    *, parent_call_sid: str, drop_id: str, child_call_sid: str | None = None,
+) -> bool:
+    """Persist which exact recording was selected for this playback attempt."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not parent_call_sid or not drop_id:
+        return False
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            headers = {**_headers(), "Prefer": "return=representation"}
+            rows_updated = 0
+            if child_call_sid:
+                for url in (
+                    f"{SUPABASE_URL}/rest/v1/dialer_parallel_legs",
+                    f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                ):
+                    response = await client.patch(
+                        url,
+                        params={
+                            "parent_call_sid": f"eq.{parent_call_sid}",
+                            "child_call_sid": f"eq.{child_call_sid}",
+                        },
+                        json={"voicemail_drop_id": drop_id},
+                        headers=headers,
+                    )
+                    response.raise_for_status()
+                    rows_updated += len(response.json()) if response.content else 0
+            else:
+                response = await client.patch(
+                    f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                    params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                    json={"voicemail_drop_id": drop_id},
+                    headers=headers,
+                )
+                response.raise_for_status()
+                rows_updated += len(response.json()) if response.content else 0
+        return rows_updated > 0
+    except Exception as exc:  # noqa: BLE001 - analytics linkage cannot block a valid call
+        logger.warning(f"Could not associate voicemail drop with {parent_call_sid}: {exc}")
+        return False
+
+
+async def update_dialer_call_amd_result(*, parent_call_sid: str, answered_by: str) -> bool:
+    """Persist the signed Twilio AMD result before deciding whether to bridge."""
+    allowed = {"human", "machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax", "unknown"}
+    value = answered_by.strip().lower()
+    if value not in allowed or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}", "provider": "eq.twilio"},
+                json={"amd_result": value},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 - AMD write failure must not break the signed call webhook
+        logger.error(f"Failed to persist AMD result for {parent_call_sid}: {exc}")
+        return False
+
+
+async def request_manual_voicemail_drop(
+    *, parent_call_sid: str, rep_user_id: str, cancel: bool = False
+) -> dict | None:
+    """Set or cancel the authenticated rep's pending Twilio voicemail request."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_request_manual_voicemail_drop",
+                json={
+                    "p_parent_call_sid": parent_call_sid,
+                    "p_rep_user_id": rep_user_id,
+                    "p_cancel": cancel,
+                },
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            result = response.json()
+        return result if isinstance(result, dict) else None
+    except Exception as exc:  # noqa: BLE001 - no ambiguous accept on a live call
+        logger.error(f"Could not request manual voicemail for {parent_call_sid}: {exc}")
+        return None
+
+
+async def claim_manual_voicemail_playback(
+    *, parent_call_sid: str, child_call_sid: str, manual: bool = True
+) -> bool:
+    """Atomically ensure the API and AMD webhook cannot both start the same drop."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_claim_manual_voicemail_playback",
+                json={
+                    "p_parent_call_sid": parent_call_sid,
+                    "p_child_call_sid": child_call_sid,
+                    "p_manual": manual,
+                },
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return response.json() is True
+    except Exception as exc:  # noqa: BLE001 - claim uncertainty must fail closed
+        logger.error(f"Could not claim manual voicemail playback for {parent_call_sid}: {exc}")
+        return False
+
+
+async def release_manual_voicemail_playback(*, parent_call_sid: str, child_call_sid: str) -> bool:
+    """Release the one-shot claim if Twilio rejected the requested redirect."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_release_manual_voicemail_playback",
+                json={"p_parent_call_sid": parent_call_sid, "p_child_call_sid": child_call_sid},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return response.json() is True
+    except Exception as exc:  # noqa: BLE001 - do not hide a failed retry release
+        logger.error(f"Could not release manual voicemail playback claim for {parent_call_sid}: {exc}")
+        return False
+
+
+async def mark_dialer_lead_joined_conference(*, parent_call_sid: str, child_call_sid: str) -> bool:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}/rest/v1/rpc/dialer_mark_lead_joined_conference",
+                json={"p_parent_call_sid": parent_call_sid, "p_child_call_sid": child_call_sid},
+                headers=_headers(),
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return response.json() is True
+    except Exception as exc:  # noqa: BLE001 - missing this signal only disables manual redirect fallback
+        logger.error(f"Could not mark lead conference join for {parent_call_sid}: {exc}")
+        return False
+
+
+async def mark_auto_voicemail_sent(*, parent_call_sid: str, child_call_sid: str | None = None) -> bool:
+    """Record completed playback on a single call or its parallel child leg."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            if child_call_sid:
+                response = await client.patch(
+                    f"{SUPABASE_URL}/rest/v1/dialer_parallel_legs",
+                    params={
+                        "parent_call_sid": f"eq.{parent_call_sid}",
+                        "child_call_sid": f"eq.{child_call_sid}",
+                    },
+                    json={"auto_voicemail_sent": True},
+                    headers=_headers(),
+                    timeout=5.0,
+                )
+            else:
+                response = await client.patch(
+                    f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                    params={"parent_call_sid": f"eq.{parent_call_sid}"},
+                    json={"auto_voicemail_sent": True},
+                    headers=_headers(),
+                    timeout=5.0,
+                )
+            response.raise_for_status()
+        return True
+    except Exception as exc:  # noqa: BLE001 - status evidence must not break webhook
+        logger.error(f"Failed to record automatic voicemail for {parent_call_sid}: {exc}")
+        return False
 
 
 async def update_dialer_call_recording_url(

@@ -7,15 +7,27 @@ provider registry — see ProviderSpec.router.
 import json
 import os
 import re
-from typing import Optional
+from typing import Literal, Optional
+from uuid import UUID
 
 import jwt
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
+from pydantic import BaseModel, Field
 
 from api.db import db_client
+from api.services.auth.sysevo_roles import require_sales_dialer_role
+from api.services.telephony.dialer.compliance import calling_hours_result, phone_block_reason
 from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.providers.twilio.dialer_call_log import (
+    create_dialer_call,
+    update_dialer_call_status,
+)
+from api.services.telephony.providers.twilio.dialer_number_assignment import (
+    DialerNumberAssignmentUnavailable,
+    resolve_assigned_dialer_number,
+)
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
     _process_status_update,
@@ -80,6 +92,83 @@ async def handle_dialer_answer(request: Request):
         "from": from_number.removeprefix("+"),
         "endpoint": [{"type": "phone", "number": to_number.removeprefix("+")}],
     }]
+
+
+class VonageDialerCallStartRequest(BaseModel):
+    call_id: UUID
+    to_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
+    entry_id: UUID | None = None
+
+
+class VonageDialerCallStatusRequest(BaseModel):
+    call_id: UUID
+    status: Literal["ringing", "answered", "completed", "failed", "no-answer"]
+    duration_seconds: int | None = Field(default=None, ge=0, le=86400)
+
+
+@router.post("/dialer/vonage/calls/start", status_code=201)
+async def start_vonage_dialer_call(
+    body: VonageDialerCallStartRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    """Persist and enforce compliance before the Vonage SDK originates a call."""
+    try:
+        assigned = await resolve_assigned_dialer_number(user.id)
+    except DialerNumberAssignmentUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify your assigned dialer number; no call was placed.",
+        ) from exc
+    if not assigned or assigned.get("provider") != "vonage":
+        raise HTTPException(status_code=409, detail="This rep has no active Vonage number assigned.")
+    if assigned.get("direction") not in {"outbound", "both"}:
+        raise HTTPException(status_code=409, detail="The assigned Vonage number is not enabled for outbound calls.")
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+
+    block_reason = await phone_block_reason(body.to_number)
+    if block_reason:
+        raise HTTPException(status_code=403, detail=f"Call blocked by compliance check ({block_reason}).")
+    allowed, reason, phone_us_state = await calling_hours_result(
+        body.to_number, str(body.entry_id) if body.entry_id else None
+    )
+    if not allowed:
+        raise HTTPException(status_code=403, detail=f"Call blocked by calling-hours check ({reason}).")
+
+    created = await create_dialer_call(
+        parent_call_sid=str(body.call_id),
+        rep_user_id=user.provider_id,
+        entry_id=str(body.entry_id) if body.entry_id else None,
+        from_number=str(assigned["phone_number"]),
+        to_number=body.to_number,
+        provider="vonage",
+        phone_us_state=phone_us_state,
+    )
+    if not created:
+        raise HTTPException(status_code=503, detail="Could not save this call to dialer history; no call was placed.")
+    return {
+        "call_id": str(body.call_id),
+        "status": "initiated",
+        "from_number": str(assigned["phone_number"]),
+    }
+
+
+@router.post("/dialer/vonage/calls/status", status_code=204)
+async def update_vonage_dialer_call_status(
+    body: VonageDialerCallStatusRequest,
+    user=Depends(require_sales_dialer_role),
+):
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    await update_dialer_call_status(
+        parent_call_sid=str(body.call_id),
+        child_call_sid=None,
+        status="in-progress" if body.status == "answered" else body.status,
+        duration_seconds=body.duration_seconds,
+        rep_user_id=user.provider_id,
+        provider="vonage",
+    )
+    return None
 
 
 @router.get("/ncco", include_in_schema=False)

@@ -32,6 +32,7 @@ import asyncio
 import hashlib
 import hmac
 from contextlib import suppress
+from datetime import datetime, timezone
 import json
 import os
 import re
@@ -39,6 +40,7 @@ import time
 import uuid
 from typing import Any
 from urllib.parse import parse_qsl, urlencode
+from urllib.parse import quote
 
 import httpx
 from fastapi import APIRouter, Depends, Request, WebSocket
@@ -55,6 +57,16 @@ from api.services.telephony.dialer.swml import (
     build_inbound_hold_swml,
     build_agent_overflow_swml,
     build_no_agents_swml,
+    build_signalwire_parallel_leg_swml,
+    build_signalwire_parallel_overflow_swml,
+    build_signalwire_parallel_rep_swml,
+    build_signalwire_parallel_voicemail_swml,
+)
+from api.services.telephony.dialer import signalwire_parallel_store
+from api.services.telephony.dialer.compliance import (
+    calling_hours_allowed,
+    calling_hours_result,
+    phone_block_reason,
 )
 from api.services.telephony.dialer.live_transcribe import LiveTranscriber
 from api.services.telephony.dialer.tap_relay import (
@@ -63,14 +75,23 @@ from api.services.telephony.dialer.tap_relay import (
     subscribe_stream,
 )
 from api.services.telephony.dialer.inbound_call_log import (
+    bind_inbound_rep_leg,
     close_inbound_call,
+    close_overflow_conference,
     create_inbound_call,
+    expire_unanswered_inbound_call,
+    is_claimed_inbound_conference,
+    notify_inbound_call,
+    record_overflow_join,
+    evaluate_overflow_guard,
     resolve_inbound_plan,
 )
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
     update_dialer_call_recording_url,
     update_dialer_call_status,
+    update_signalwire_parallel_winner,
+    update_signalwire_dialer_amd,
 )
 from api.services.telephony.providers.twilio.dialer_number_assignment import (
     DialerNumberAssignmentUnavailable,
@@ -93,6 +114,34 @@ from api.services.telephony.dialer.inbound_agent import current_inbound_agent, n
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+def _spawn_background(coro) -> None:
+    """Keep post-response call cleanup and notifications alive until completion."""
+    try:
+        task = asyncio.create_task(coro)
+    except RuntimeError:
+        coro.close()
+        return
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+
+
+async def _expire_signalwire_overflow_offer(provider_call_id: str) -> None:
+    """End a second caller only if their teammate invitation was never claimed."""
+    await asyncio.sleep(20)
+    if not await expire_unanswered_inbound_call(
+        provider_call_id=provider_call_id, provider="signalwire"
+    ):
+        return
+    try:
+        from api.services.telephony.dialer.signalwire_calling import end_call
+        await end_call(call_id=provider_call_id, reason="hangup")
+    except Exception as exc:  # noqa: BLE001 - an expired invitation must not crash a webhook
+        logger.error(f"Could not end unanswered SignalWire overflow caller {provider_call_id}: {exc}")
+    await evaluate_overflow_guard(provider_call_id=provider_call_id, provider="signalwire")
 
 # E.164. Deliberately strict: SignalWire rejects anything else anyway, and a
 # malformed number reaching the connect verb costs the rep a dead call with
@@ -221,6 +270,10 @@ def _extract(payload: dict, query: dict, keys: tuple[str, ...]) -> str:
     """First non-empty value for any of ``keys``. "" when there is none."""
     candidates = _candidates(payload, query, keys)
     return candidates[0] if candidates else ""
+
+
+def _truthy(value: str | None) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _extract_lead_number(payload: dict, query: dict) -> str | None:
@@ -447,19 +500,19 @@ async def _rep_supabase_id(identity: str) -> str | None:
     return user.provider_id if user and user.provider_id else None
 
 
-async def _inbound_agent_number() -> str:
+async def _inbound_agent_number(number: str | None = None, *, call_id: str | None = None) -> str:
     """The number of the agent that takes callers nobody can answer, or "" for none.
 
     Chosen on the dialer's Agents page (see inbound_agent); until an agent is picked there,
     the old SYSEVO_SAM_INBOUND_NUMBER setting still applies. Empty keeps the old behaviour --
     a spoken "nobody available" and a hangup.
     """
-    return (await current_inbound_agent()).number
+    return (await current_inbound_agent(number=number,call_id=call_id)).number
 
 
 async def _no_answer_swml(*, caller_number: str, rang_number: str) -> dict:
     """What a caller hears when no rep can take the call: the AI agent, or the message."""
-    agent = await _inbound_agent_number()
+    agent = await _inbound_agent_number(rang_number)
     if not agent:
         return build_no_agents_swml()
     if not await number_hands_to_agent(rang_number):
@@ -600,6 +653,1060 @@ def _tap_websocket_url(backend_endpoint: str, call_id: str) -> str:
     return "ws://" + http_url[len("http://"):]
 
 
+async def _start_signalwire_session(
+    *, request: Request, payload: dict, query: dict, identity: str,
+    screened_single: bool = False,
+) -> JSONResponse:
+    """Reserve and originate a SignalWire queue call through server-side AMD."""
+    from api.services.telephony.dialer.parallel_auth import verify_parallel_auth_token
+    token = _extract(payload, query, ("ParallelAuthToken", "parallel_auth_token"))
+    token_subject = verify_parallel_auth_token(token)
+    rep_subject = await _rep_supabase_id(identity)
+    if not token_subject or not rep_subject or not hmac.compare_digest(token_subject, rep_subject):
+        logger.warning("SignalWire screened call rejected: invalid rep authorization")
+        return _swml(build_hangup_swml())
+
+    browser_call_id = _extract(payload, query, _CALL_ID_KEYS)
+    try:
+        if screened_single:
+            entry_id = _extract(payload, query, _ENTRY_KEYS)
+            entry_ids = [str(uuid.UUID(str(entry_id)))]
+            line_count = 1
+        else:
+            raw_entries = _extract(payload, query, ("ParallelEntryIds", "parallel_entry_ids"))
+            raw_lines = _extract(payload, query, ("ParallelLineCount", "parallel_line_count"))
+            entry_ids = json.loads(raw_entries)
+            line_count = int(raw_lines)
+            if not isinstance(entry_ids, list) or line_count not in {2, 3, 5, 10}:
+                raise ValueError("unsupported line count")
+            entry_ids = [str(uuid.UUID(str(value))) for value in entry_ids]
+            if len(entry_ids) != line_count or len(set(entry_ids)) != line_count:
+                raise ValueError("entry count does not match selected lines")
+        if not browser_call_id or len(browser_call_id) > 128:
+            raise ValueError("missing browser call id")
+    except (ValueError, TypeError, json.JSONDecodeError) as exc:
+        logger.warning(f"SignalWire screened call rejected: invalid input ({exc})")
+        return _swml(build_hangup_swml())
+
+    caller_id = await _resolve_signalwire_caller_id(identity)
+    if not caller_id:
+        logger.warning("SignalWire screened call rejected: no verified caller ID")
+        return _swml(build_hangup_swml())
+
+    try:
+        backend_endpoint, _ = await get_backend_endpoints()
+        backend_endpoint = str(backend_endpoint or "").rstrip("/")
+        if not backend_endpoint.startswith("https://"):
+            raise RuntimeError("HTTPS backend endpoint is unavailable")
+        entries = await _load_signalwire_parallel_entries(entry_ids)
+        if len(entries) != line_count:
+            raise RuntimeError("one or more selected leads could not be verified")
+
+        session_id = str(uuid.uuid4())
+        conference_name = f"sysevo-par-{session_id}"
+        if screened_single:
+            reserved_legs = await signalwire_parallel_store.start_screened_single_session(
+                session_id=session_id,
+                rep_user_id=rep_subject,
+                rep_call_id=browser_call_id,
+                conference_name=conference_name,
+                entry_id=entry_ids[0],
+            )
+        else:
+            reserved_legs = await signalwire_parallel_store.start_session(
+                session_id=session_id,
+                rep_user_id=rep_subject,
+                rep_call_id=browser_call_id,
+                conference_name=conference_name,
+                entry_ids=entry_ids,
+                line_count=line_count,
+            )
+        # Reserve and authorize the exact rows before consulting compliance;
+        # an invalid or stolen entry id must not be usable to poll the policy
+        # service or create audit records on somebody else's lead.
+        try:
+            if screened_single:
+                caller_ids = {
+                    entries[0]["id"]: await _resolve_signalwire_parallel_caller_id(
+                        rep_user_id=rep_subject,
+                        entry_id=entries[0]["id"],
+                        to_number=entries[0]["phone"],
+                        fallback_number=caller_id,
+                    )
+                }
+            else:
+                caller_ids = await _resolve_signalwire_parallel_caller_ids(
+                    rep_user_id=rep_subject,
+                    entry_ids=entry_ids,
+                    fallback_number=caller_id,
+                )
+            for position, entry in enumerate(entries):
+                check_id = f"sw-preflight-{session_id}-{position}"
+                await _check_signalwire_parallel_compliance(
+                    phone=entry["phone"], provider_call_id=check_id,
+                    entry_id=entry["id"], rep_user_id=rep_subject,
+                )
+        except Exception:
+            await signalwire_parallel_store.finish_session(
+                session_id=session_id, status="failed"
+            )
+            raise
+
+        first = entries[0]
+        if not await create_dialer_call(
+            parent_call_sid=browser_call_id,
+            rep_user_id=rep_subject,
+            entry_id=first["id"],
+            from_number=caller_ids[first["id"]],
+            to_number=first["phone"],
+            provider="signalwire",
+        ):
+            await signalwire_parallel_store.finish_session(session_id=session_id, status="failed")
+            raise RuntimeError("could not persist the SignalWire parent call")
+
+        await _originate_signalwire_batch(
+            session_id=session_id, rep_user_id=rep_subject,
+            entries=entries, reserved_legs=reserved_legs,
+            caller_ids=caller_ids, backend_endpoint=backend_endpoint,
+        )
+
+        # The browser leg waits in this conference. Exactly `line_count` PSTN
+        # calls were accepted by SignalWire before the rep joins it.
+        return _swml(await _signalwire_parallel_join_swml(
+            conference_name=conference_name, session_id=session_id, leg_id="rep"
+        ))
+    except Exception as exc:  # noqa: BLE001 - never fall back to one call
+        logger.exception(f"SignalWire parallel batch failed closed: {exc}")
+        return _swml(build_hangup_swml())
+
+
+async def _originate_signalwire_batch(
+    *, session_id: str, rep_user_id: str, entries: list[dict],
+    reserved_legs: list[dict], caller_ids: dict[str, str], backend_endpoint: str,
+) -> None:
+    """Start all reserved lines concurrently and clean up every partial success."""
+    from api.services.telephony.dialer.signalwire_calling import end_call, originate_call
+
+    started: list[tuple[str, str]] = []
+
+    async def originate(entry: dict, reserved: dict) -> None:
+        leg_id = str(reserved["id"])
+        result = await originate_call(
+            from_number=caller_ids[entry["id"]], to_number=entry["phone"],
+            swml_url=_parallel_callback_url(backend_endpoint, "sw-parallel-leg", session_id, leg_id),
+            status_url=_parallel_callback_url(backend_endpoint, "sw-parallel-status", session_id, leg_id),
+        )
+        call_id = str(result["id"])
+        # Keep the provider handle before any later write can fail. This also
+        # catches a leg whose history or registration failed after origination.
+        started.append((leg_id, call_id))
+        if not await signalwire_parallel_store.register_provider_call(
+            session_id=session_id, leg_id=leg_id, provider_call_id=call_id,
+        ):
+            raise RuntimeError("could not persist a SignalWire call leg")
+        if not await create_dialer_call(
+            parent_call_sid=call_id, rep_user_id=rep_user_id,
+            entry_id=entry["id"], from_number=caller_ids[entry["id"]],
+            to_number=entry["phone"], provider="signalwire",
+        ):
+            raise RuntimeError("could not persist SignalWire per-line history")
+
+    # Wait for every worker even if one fails, so a late successful originate
+    # cannot escape cleanup after the first failure has returned.
+    results = await asyncio.gather(*(
+        originate(entry, leg) for entry, leg in zip(entries, reserved_legs, strict=True)
+    ), return_exceptions=True)
+    if not any(isinstance(result, BaseException) for result in results):
+        return
+
+    async def cleanup(leg_id: str, call_id: str) -> None:
+        try:
+            await end_call(call_id=call_id, reason="error")
+        except Exception:
+            logger.exception("Could not cancel partially originated SignalWire leg {}", call_id)
+        await signalwire_parallel_store.update_leg(
+            session_id=session_id, leg_id=leg_id, provider_call_id=call_id, status="failed",
+        )
+        await update_dialer_call_status(
+            parent_call_sid=call_id, child_call_sid=None, status="failed",
+            duration_seconds=None, rep_user_id=rep_user_id, provider="signalwire",
+        )
+
+    await asyncio.gather(*(cleanup(leg_id, call_id) for leg_id, call_id in started), return_exceptions=True)
+    await signalwire_parallel_store.finish_session(session_id=session_id, status="failed")
+    raise RuntimeError("SignalWire could not start the complete parallel batch")
+
+
+async def _load_signalwire_parallel_entries(entry_ids: list[str]) -> list[dict[str, str]]:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase server credentials are unavailable")
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/cold_call_entries",
+            params={"select": "id,phone", "id": f"in.({','.join(entry_ids)})"},
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+    if not isinstance(rows, list):
+        raise RuntimeError("Lead lookup returned an invalid response")
+    by_id: dict[str, dict[str, str]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        entry_id = str(row.get("id") or "")
+        phone = normalize_lead_number(str(row.get("phone") or ""))
+        if entry_id in entry_ids and phone:
+            by_id[entry_id] = {"id": entry_id, "phone": phone}
+    return [by_id[entry_id] for entry_id in entry_ids if entry_id in by_id]
+
+
+async def _cancel_signalwire_ringing_siblings(
+    *, session_id: str, winner_leg_id: str, rep_user_id: str,
+) -> None:
+    """Cancel only siblings still ringing when the database claims cleanup."""
+    from api.services.telephony.dialer.signalwire_calling import end_call
+
+    async def cancel(leg: dict) -> None:
+        call_id = str(leg.get("provider_call_id") or "")
+        if not call_id or leg.get("id") == winner_leg_id or leg.get("status") not in {"queued", "ringing"}:
+            return
+        try:
+            claimed = await signalwire_parallel_store.claim_ringing_cancel(
+                session_id=session_id, leg_id=str(leg["id"]), provider_call_id=call_id,
+            )
+            if not claimed:
+                return  # The person answered while the sibling list was in flight.
+            await end_call(call_id=call_id, reason="noAnswer")
+            await signalwire_parallel_store.record_outcome(
+                session_id=session_id, leg_id=str(leg["id"]),
+                provider_call_id=call_id, outcome="no_answer",
+            )
+            await update_dialer_call_status(
+                parent_call_sid=call_id, child_call_sid=None, status="no-answer",
+                duration_seconds=None, rep_user_id=rep_user_id, provider="signalwire",
+            )
+        except Exception:
+            logger.exception("Could not cancel losing SignalWire leg {}", call_id)
+
+    try:
+        legs = await signalwire_parallel_store.get_session_legs(session_id=session_id)
+        await asyncio.gather(*(cancel(leg) for leg in legs))
+    except Exception:
+        logger.exception("Could not enumerate losing SignalWire parallel legs")
+
+
+async def _resolve_signalwire_parallel_caller_id(
+    *, rep_user_id: str, entry_id: str, to_number: str, fallback_number: str
+) -> str:
+    """Resolve per-lead local presence with the rep line as the safe fallback."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase caller-ID lookup is unavailable")
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        response = await client.post(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/rpc/dialer_resolve_outbound_caller_id",
+            json={
+                "p_user_id": rep_user_id,
+                "p_to_number": to_number,
+                "p_provider": "signalwire",
+                "p_entry_id": entry_id,
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+    if not isinstance(rows, list) or len(rows) > 1:
+        raise RuntimeError("Caller-ID lookup returned an invalid result")
+    if not rows:
+        return fallback_number
+    row = rows[0]
+    number = normalize_lead_number(str(row.get("phone_number") or ""))
+    if not number or row.get("provider") != "signalwire":
+        raise RuntimeError("Caller-ID lookup returned a non-SignalWire number")
+    if number != fallback_number and not await _is_signalwire_owned_number(number):
+        raise RuntimeError("Local-presence caller ID is not verified as SignalWire-owned")
+    return number
+
+
+async def _resolve_signalwire_parallel_caller_ids(
+    *, rep_user_id: str, entry_ids: list[str], fallback_number: str
+) -> dict[str, str]:
+    """Resolve a whole batch together so available local DIDs are not reused."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase caller-ID lookup is unavailable")
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        response = await client.post(
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/rpc/dialer_resolve_parallel_caller_ids",
+            json={
+                "p_user_id": rep_user_id,
+                "p_entry_ids": entry_ids,
+                "p_provider": "signalwire",
+                "p_fallback_number": fallback_number,
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+    if not isinstance(rows, list) or len(rows) != len(entry_ids):
+        raise RuntimeError("Parallel caller-ID lookup returned an incomplete batch")
+
+    by_entry: dict[str, str] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            raise RuntimeError("Parallel caller-ID lookup returned an invalid row")
+        entry_id = str(row.get("entry_id") or "")
+        number = normalize_lead_number(str(row.get("phone_number") or ""))
+        if (
+            entry_id not in entry_ids
+            or entry_id in by_entry
+            or not number
+            or row.get("provider") != "signalwire"
+        ):
+            raise RuntimeError("Parallel caller-ID lookup returned an invalid assignment")
+        by_entry[entry_id] = number
+
+    if set(by_entry) != set(entry_ids):
+        raise RuntimeError("Parallel caller-ID lookup did not cover the selected leads")
+    unique_non_fallback = {number for number in by_entry.values() if number != fallback_number}
+    ownership = await asyncio.gather(*(
+        _is_signalwire_owned_number(number) for number in unique_non_fallback
+    ))
+    if not all(ownership):
+        raise RuntimeError("Parallel caller-ID pool contains a number SignalWire does not own")
+    return by_entry
+
+
+async def _check_signalwire_parallel_compliance(
+    *, phone: str, provider_call_id: str, entry_id: str, rep_user_id: str
+) -> None:
+    del provider_call_id, rep_user_id  # retained in the signature for existing audit call sites
+    block_reason = await phone_block_reason(phone)
+    if block_reason:
+        raise RuntimeError(f"Dial blocked by server suppression check: {block_reason}")
+    allowed, reason = await calling_hours_allowed(phone, entry_id)
+    if not allowed:
+        raise RuntimeError(f"Dial blocked by server calling-hours check: {reason}")
+
+
+async def _load_signalwire_parallel_default_drop(rep_user_id: str) -> dict[str, str] | None:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase voicemail credentials are unavailable")
+    async with httpx.AsyncClient(timeout=5.0) as client:
+        response = await client.get(
+            f"{SUPABASE_URL}/rest/v1/dialer_voicemail_drops",
+            params={
+                "select": "id,storage_path",
+                "user_id": f"eq.{rep_user_id}",
+                "is_default": "eq.true",
+                "limit": "1",
+            },
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+            },
+        )
+        response.raise_for_status()
+        rows = response.json()
+    if not isinstance(rows, list) or not rows:
+        return None
+    row = rows[0]
+    path = str(row.get("storage_path") or "")
+    drop_id = str(row.get("id") or "")
+    if not re.fullmatch(rf"{re.escape(rep_user_id)}/[^/]+", path):
+        return None
+    try:
+        uuid.UUID(drop_id)
+    except (ValueError, TypeError, AttributeError):
+        return None
+    return {"id": drop_id, "storage_path": path}
+
+
+async def _signed_signalwire_voicemail_url(storage_path: str) -> str:
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Supabase storage credentials are unavailable")
+    encoded_path = quote(storage_path, safe="/")
+    async with httpx.AsyncClient(timeout=8.0) as client:
+        response = await client.post(
+            f"{SUPABASE_URL.rstrip('/')}/storage/v1/object/sign/voicemail-drops/{encoded_path}",
+            json={"expiresIn": 180},
+            headers={
+                "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                "Content-Type": "application/json",
+            },
+        )
+        response.raise_for_status()
+        result = response.json()
+    signed = str(result.get("signedURL") or "") if isinstance(result, dict) else ""
+    if signed.startswith("https://"):
+        base = SUPABASE_URL.rstrip("/")
+        if signed.startswith(base + "/"):
+            return signed
+        raise RuntimeError("Voicemail storage returned an unexpected signed URL origin")
+    if signed.startswith("/object/"):
+        return f"{SUPABASE_URL.rstrip('/')}/storage/v1{signed}"
+    raise RuntimeError("Voicemail storage did not return a valid signed URL")
+
+
+def _parallel_callback_url(
+    backend_endpoint: str, path: str, session_id: str, leg_id: str
+) -> str:
+    nonce = f"sw-parallel:{session_id}:{leg_id}"
+    base = _webhook_url(backend_endpoint, path, nonce)
+    if not base:
+        raise RuntimeError("SignalWire callback URL could not be created")
+    separator = "&" if "?" in base else "?"
+    return f"{base}{separator}{urlencode({'session_id': session_id, 'leg_id': leg_id})}"
+
+
+async def _signalwire_parallel_join_swml(
+    *, conference_name: str, session_id: str, leg_id: str
+) -> dict:
+    """Attach an authenticated conference participant callback to a call leg."""
+    backend_endpoint, _ = await get_backend_endpoints()
+    callback_url = _parallel_callback_url(
+        str(backend_endpoint or "").rstrip("/"),
+        "sw-parallel-conference", session_id, leg_id,
+    )
+    return build_signalwire_parallel_rep_swml(
+        conference_name=conference_name, status_callback_url=callback_url
+    )
+
+
+def _signalwire_event_timestamp(payload: dict) -> str | None:
+    """Normalize SignalWire's documented Unix event timestamp to UTC ISO."""
+    raw = payload.get("timestamp")
+    if isinstance(raw, (int, float)) and 0 < raw < 10_000_000_000:
+        return datetime.fromtimestamp(raw, tz=timezone.utc).isoformat()
+    return None
+
+
+@router.post("/sw-parallel-conference", include_in_schema=False)
+async def handle_sw_parallel_conference(request: Request):
+    """Persist real rep/prospect conference joins for the parallel connect guard."""
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-parallel-conference", request, payload)
+        if not _secret_ok("sw-parallel-conference", request, allow_per_call_signature=True):
+            return JSONResponse({"ok": False}, status_code=403)
+        query = request.query_params
+        session_id = str(query.get("session_id") or "")
+        leg_id = str(query.get("leg_id") or "")
+        try:
+            uuid.UUID(session_id)
+            if leg_id != "rep":
+                uuid.UUID(leg_id)
+        except (ValueError, TypeError, AttributeError):
+            return JSONResponse({"ok": False}, status_code=400)
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        if params.get("status") != "participant-join":
+            return JSONResponse({"ok": True, "ignored": True})
+        provider_call_id = str(params.get("call_id") or "")
+        conference_name = str(params.get("name") or "")
+        event_at = _signalwire_event_timestamp(payload)
+        if not provider_call_id or not event_at:
+            return JSONResponse({"ok": False, "reason": "missing_event_identity_or_timestamp"}, status_code=400)
+
+        session = await signalwire_parallel_store.get_session(session_id=session_id)
+        if not session or session.get("conference_name") != conference_name:
+            return JSONResponse({"ok": False}, status_code=409)
+        if session.get("rep_call_id") == provider_call_id:
+            kind = "rep_join"
+            timing_leg_id = None
+        else:
+            legs = await signalwire_parallel_store.get_session_legs(session_id=session_id)
+            matching = next((row for row in legs if row.get("provider_call_id") == provider_call_id), None)
+            if not matching or str(matching.get("id")) != str(session.get("winner_leg_id")):
+                return JSONResponse({"ok": False}, status_code=409)
+            kind = "lead_join"
+            timing_leg_id = str(matching["id"])
+        recorded = await signalwire_parallel_store.record_parallel_timing(
+            session_id=session_id, leg_id=timing_leg_id,
+            provider_call_id=provider_call_id, event_kind=kind,
+            event_at=event_at,
+        )
+        return JSONResponse({"ok": recorded, "ignored": not recorded})
+    except Exception as exc:  # noqa: BLE001 - provider callbacks must be non-fatal
+        logger.exception(f"SignalWire parallel conference callback failed: {exc}")
+        return JSONResponse({"ok": False}, status_code=500)
+
+
+@router.post("/sw-overflow-conference", include_in_schema=False)
+async def handle_sw_overflow_conference(request: Request):
+    """Track a separate teammate conference using bound participant identities."""
+    try:
+        payload = await _read_payload(request)
+        if not _secret_ok("sw-overflow-conference", request, allow_per_call_signature=True):
+            return JSONResponse({"ok": False}, status_code=403)
+        params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+        conference_name = str(params.get("name") or "")
+        # The HMAC is scoped to this conference. A valid URL for another room
+        # cannot write its connection times or release its rep reservation.
+        if (
+            not re.fullmatch(r"sysevo-overflow-[0-9a-f-]{36}", conference_name)
+            or request.query_params.get("call_id") != conference_name
+        ):
+            return JSONResponse({"ok": False}, status_code=409)
+        participant = str(params.get("call_id") or "")
+        event = params.get("status")
+        if event == "participant-join":
+            event_at = _signalwire_event_timestamp(payload)
+            if not participant or not event_at:
+                return JSONResponse({"ok": False}, status_code=400)
+            recorded = await record_overflow_join(
+                conference_name=conference_name, provider="signalwire",
+                participant_call_id=participant, event_at=event_at,
+            )
+        elif event == "participant-leave" and participant:
+            recorded = await close_overflow_conference(
+                conference_name=conference_name, provider="signalwire",
+                participant_call_id=participant,
+            )
+        else:
+            return JSONResponse({"ok": True, "ignored": True})
+        if recorded is None:
+            return JSONResponse({"ok": False}, status_code=503)
+        return JSONResponse({"ok": recorded, "ignored": not recorded})
+    except Exception as exc:  # noqa: BLE001 - let the provider retry transient failures
+        logger.exception(f"SignalWire overflow conference callback failed: {exc}")
+        return JSONResponse({"ok": False}, status_code=500)
+
+
+async def _signalwire_overflow_callback_url(conference_name: str) -> str:
+    backend_endpoint, _ = await get_backend_endpoints()
+    return _webhook_url(
+        str(backend_endpoint or "").rstrip("/"), "sw-overflow-conference", conference_name,
+    )
+
+
+@router.post("/sw-parallel-leg", include_in_schema=False)
+async def handle_sw_parallel_leg(request: Request):
+    """Return AMD SWML only for a reserved, authenticated batch leg."""
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-parallel-leg", request, payload)
+        if not _secret_ok("sw-parallel-leg", request, allow_per_call_signature=True):
+            return _swml(build_hangup_swml())
+        query = request.query_params
+        session_id, leg_id = query.get("session_id", ""), query.get("leg_id", "")
+        try:
+            uuid.UUID(session_id)
+            uuid.UUID(leg_id)
+        except (ValueError, TypeError, AttributeError):
+            return _swml(build_hangup_swml())
+
+        provider_call_id = _extract(payload, dict(query), _CALL_ID_KEYS)
+        if not provider_call_id or provider_call_id.startswith("sw-parallel:"):
+            return _swml(build_hangup_swml())
+        context = await signalwire_parallel_store.get_leg_context(
+            session_id=session_id, leg_id=leg_id
+        )
+        # Other PSTN lines can answer after the first human has already made
+        # the batch connected. They still need AMD so the decision callback
+        # can route a second human to the configured overflow teammate. The
+        # decision handler performs the atomic winner/overflow claim; this
+        # bootstrap only rejects sessions that are already terminal.
+        if not context or context["session"].get("status") not in {"dialing", "connected"}:
+            return _swml(build_hangup_swml())
+        leg = context["leg"]
+        if leg.get("provider_call_id") is None:
+            registered = await signalwire_parallel_store.register_provider_call(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id,
+            )
+            if not registered:
+                return _swml(build_hangup_swml())
+        elif leg.get("provider_call_id") != provider_call_id:
+            return _swml(build_hangup_swml())
+
+        # Fetching this SWML means the prospect has already answered. Mark it
+        # before AMD so a simultaneous winner cannot claim it as ringing cleanup.
+        if leg.get("status") in {"reserved", "queued", "ringing"}:
+            if not await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="screening",
+            ):
+                return _swml(build_hangup_swml())
+
+        session = context["session"]
+        policy = await signalwire_parallel_store.get_voicemail_policy(
+            rep_user_id=str(session["rep_user_id"]),
+            entry_id=str(leg["entry_id"]),
+            parent_call_sid=str(session["rep_call_id"]),
+        )
+        if not policy:
+            logger.error("SignalWire parallel leg has no effective voicemail/AMD policy")
+            return _swml(build_hangup_swml())
+        preset_seconds = {
+            "fastest": 1.2,
+            "fast": 1.8,
+            "balanced": 2.4,
+            "accurate": 3.2,
+        }.get(str(policy.get("machine_detection_preset") or "balanced"), 2.4)
+
+        backend_endpoint, _ = await get_backend_endpoints()
+        decision_url = _parallel_callback_url(
+            str(backend_endpoint or "").rstrip("/"),
+            "sw-parallel-decide", session_id, leg_id,
+        )
+        return _swml(build_signalwire_parallel_leg_swml(
+            decision_url=decision_url,
+            amd_timeout_seconds=preset_seconds,
+            machine_detection_enabled=(
+                int(session.get("line_count") or 0) > 1
+                or policy.get("machine_detection_enabled") is True
+            ),
+        ))
+    except Exception as exc:  # noqa: BLE001 - a failed bootstrap must not bridge
+        logger.exception(f"SignalWire parallel leg bootstrap failed closed: {exc}")
+        return _swml(build_hangup_swml())
+
+
+@router.post("/sw-parallel-status", include_in_schema=False)
+async def handle_sw_parallel_status(request: Request):
+    """Persist provider status for a specific SignalWire parallel prospect leg."""
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-parallel-status", request, payload)
+        if not _secret_ok("sw-parallel-status", request, allow_per_call_signature=True):
+            return JSONResponse({"ok": False}, status_code=403)
+        query = request.query_params
+        session_id, leg_id = query.get("session_id", ""), query.get("leg_id", "")
+        try:
+            uuid.UUID(session_id)
+            uuid.UUID(leg_id)
+        except (ValueError, TypeError, AttributeError):
+            return JSONResponse({"ok": False}, status_code=400)
+        context = await signalwire_parallel_store.get_leg_context(
+            session_id=session_id, leg_id=leg_id
+        )
+        if not context:
+            return JSONResponse({"ok": False}, status_code=404)
+        session, leg = context["session"], context["leg"]
+        provider_call_id = _extract(payload, dict(query), _CALL_ID_KEYS)
+        if not provider_call_id or provider_call_id.startswith("sw-parallel:"):
+            return JSONResponse({"ok": False}, status_code=400)
+        if leg.get("provider_call_id") is None:
+            await signalwire_parallel_store.register_provider_call(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id,
+            )
+        elif leg.get("provider_call_id") != provider_call_id:
+            return JSONResponse({"ok": False}, status_code=409)
+
+        raw_state = (_extract(payload, dict(query), _STATE_KEYS) or "").strip().lower()
+        raw_reason = (_extract(payload, dict(query), _END_REASON_KEYS) or "").strip().lower()
+        if raw_state in {"created", "queued"}:
+            leg_status, call_status = "queued", "initiated"
+        elif raw_state in {"ringing", "ring"}:
+            leg_status, call_status = "ringing", "ringing"
+        elif raw_state in {"answered", "in-progress", "screening"}:
+            leg_status, call_status = "screening", "in-progress"
+        elif raw_state in {"canceled", "cancelled"}:
+            leg_status, call_status = "cancelled", "cancelled"
+        elif raw_state in {"failed", "error"}:
+            leg_status, call_status = "failed", "failed"
+        elif raw_state in {"ended", "completed", "hangup"}:
+            reason = re.sub(r"[^a-z]", "", raw_reason)
+            if leg.get("status") == "voicemail_playing":
+                # The play.status_url callback is authoritative for whether the
+                # recording finished. Do not let the subsequent call-ended
+                # callback erase a completed voicemail or guess delivery.
+                return JSONResponse({"ok": True, "awaiting_playback_result": True})
+            elif reason in {"busy", "userbusy"}:
+                leg_status, call_status = "busy", "busy"
+            elif reason in {"noanswer", "timeout"}:
+                leg_status, call_status = "no-answer", "no-answer"
+            elif reason in {"failed", "error"}:
+                leg_status, call_status = "failed", "failed"
+            else:
+                leg_status, call_status = "completed", "completed"
+        else:
+            return JSONResponse({"ok": True, "ignored": True})
+
+        if raw_state in {"answered", "in-progress", "screening"}:
+            event_at = _signalwire_event_timestamp(payload)
+            if event_at:
+                await signalwire_parallel_store.record_parallel_timing(
+                    session_id=session_id, leg_id=leg_id,
+                    provider_call_id=provider_call_id, event_kind="answer",
+                    event_at=event_at,
+                )
+
+        terminal_event = raw_state in {"ended", "completed", "hangup", "canceled", "cancelled", "failed", "error"}
+        if terminal_event:
+            # Overflow legs are already dispositioned when the offer is made.
+            # Their later end callback can be a no-op in the leg state machine,
+            # but it must still release the teammate's reservation.
+            await close_inbound_call(provider_call_id=provider_call_id)
+            await evaluate_overflow_guard(provider_call_id=provider_call_id, provider="signalwire")
+
+        leg_updated = await signalwire_parallel_store.update_leg(
+            session_id=session_id, leg_id=leg_id,
+            provider_call_id=provider_call_id, status=leg_status,
+        )
+        if not leg_updated:
+            # Provider status callbacks can arrive after AMD has already routed
+            # this human to a teammate. Do not let a stale `answered` event
+            # resurrect the terminal overflow leg or its call-history state.
+            if terminal_event:
+                await update_dialer_call_status(
+                    parent_call_sid=provider_call_id, child_call_sid=None,
+                    status=call_status, duration_seconds=None,
+                    rep_user_id=session.get("rep_user_id"), provider="signalwire",
+                )
+            return JSONResponse({"ok": True, "ignored": True, "reason": "stale_state"})
+        if leg_status in {"busy", "no-answer"}:
+            await signalwire_parallel_store.record_outcome(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id,
+                outcome="busy" if leg_status == "busy" else "no_answer",
+            )
+        await update_dialer_call_status(
+            parent_call_sid=provider_call_id,
+            child_call_sid=None,
+            status=call_status,
+            duration_seconds=None,
+            rep_user_id=session.get("rep_user_id"),
+            provider="signalwire",
+        )
+        all_legs = await signalwire_parallel_store.get_session_legs(
+            session_id=session_id
+        )
+        terminal_leg_states = {
+            "voicemail", "busy", "no-answer", "failed", "cancelled", "completed"
+        }
+        if all_legs and all(row.get("status") in terminal_leg_states for row in all_legs):
+            final_status = "completed" if session.get("winner_leg_id") else "failed"
+            await signalwire_parallel_store.finish_session(
+                session_id=session_id, status=final_status
+            )
+            # Ending the rep's conference leg closes the active call screen
+            # when every prospect leg is done, including an empty batch.
+            from api.services.telephony.dialer.signalwire_calling import end_call
+            try:
+                await end_call(call_id=str(session.get("rep_call_id") or ""), reason="hangup")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Could not close the rep leg after the parallel batch: {exc}")
+        return JSONResponse({"ok": True})
+    except Exception as exc:  # noqa: BLE001 - provider callbacks must not raise
+        logger.exception(f"SignalWire parallel status update failed: {exc}")
+        return JSONResponse({"ok": False}, status_code=500)
+
+
+@router.post("/sw-parallel-playback", include_in_schema=False)
+async def handle_sw_parallel_playback(request: Request):
+    """Record whether a machine voicemail drop actually finished playing."""
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-parallel-playback", request, payload)
+        if not _secret_ok("sw-parallel-playback", request, allow_per_call_signature=True):
+            return JSONResponse({"ok": False}, status_code=403)
+
+        query = request.query_params
+        session_id, leg_id = query.get("session_id", ""), query.get("leg_id", "")
+        try:
+            uuid.UUID(session_id)
+            uuid.UUID(leg_id)
+        except (ValueError, TypeError, AttributeError):
+            return JSONResponse({"ok": False}, status_code=400)
+        context = await signalwire_parallel_store.get_leg_context(
+            session_id=session_id, leg_id=leg_id
+        )
+        if not context:
+            return JSONResponse({"ok": False}, status_code=404)
+        session, leg = context["session"], context["leg"]
+        provider_call_id = _extract(payload, dict(query), _CALL_ID_KEYS)
+        if not provider_call_id or provider_call_id != leg.get("provider_call_id"):
+            return JSONResponse({"ok": False}, status_code=409)
+
+        playback_state = (_extract(
+            payload, dict(query), ("play_state", "playState", "play_status", "playStatus", "state", "status")
+        ) or "").strip().lower()
+        if playback_state in {"finished", "completed", "success"}:
+            completed = await signalwire_parallel_store.complete_voicemail_drop(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id,
+            )
+            if not completed:
+                return JSONResponse({"ok": False}, status_code=409)
+            await update_signalwire_dialer_amd(
+                parent_call_sid=provider_call_id,
+                voicemail_sent=True,
+            )
+            await update_dialer_call_status(
+                parent_call_sid=provider_call_id, child_call_sid=None,
+                status="completed", duration_seconds=None,
+                rep_user_id=session.get("rep_user_id"), provider="signalwire",
+            )
+        elif playback_state in {"error", "failed", "stopped"}:
+            await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="failed",
+            )
+            await update_dialer_call_status(
+                parent_call_sid=provider_call_id, child_call_sid=None,
+                status="failed", duration_seconds=None,
+                rep_user_id=session.get("rep_user_id"), provider="signalwire",
+            )
+        else:
+            return JSONResponse({"ok": True, "ignored": True})
+
+        all_legs = await signalwire_parallel_store.get_session_legs(
+            session_id=session_id
+        )
+        terminal_leg_states = {
+            "voicemail", "busy", "no-answer", "failed", "cancelled", "completed"
+        }
+        if all_legs and all(row.get("status") in terminal_leg_states for row in all_legs):
+            await signalwire_parallel_store.finish_session(
+                session_id=session_id,
+                status="completed" if session.get("winner_leg_id") else "failed",
+            )
+            from api.services.telephony.dialer.signalwire_calling import end_call
+            try:
+                await end_call(call_id=str(session.get("rep_call_id") or ""), reason="hangup")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Could not close the rep leg after voicemail playback: {exc}")
+        return JSONResponse({"ok": True})
+    except Exception as exc:  # noqa: BLE001 - provider callbacks must not raise
+        logger.exception(f"SignalWire voicemail playback callback failed: {exc}")
+        return JSONResponse({"ok": False}, status_code=500)
+
+
+@router.post("/sw-parallel-decide", include_in_schema=False)
+async def handle_sw_parallel_decision(request: Request):
+    """Persist AMD and atomically bridge or route each detected human.
+
+    A signed per-leg nonce authenticates this callback. The first human joins
+    the rep's private conference; a later human gets a separate teammate offer.
+    """
+    try:
+        payload = await _read_payload(request)
+        _log_payload("sw-parallel-decide", request, payload)
+        if not _secret_ok("sw-parallel-decide", request, allow_per_call_signature=True):
+            return _swml(build_hangup_swml())
+        query = request.query_params
+        session_id, leg_id = query.get("session_id", ""), query.get("leg_id", "")
+        try:
+            uuid.UUID(session_id)
+            uuid.UUID(leg_id)
+        except (ValueError, TypeError, AttributeError):
+            return _swml(build_hangup_swml())
+
+        context = await signalwire_parallel_store.get_leg_context(
+            session_id=session_id, leg_id=leg_id
+        )
+        if not context:
+            return _swml(build_hangup_swml())
+        session, leg = context["session"], context["leg"]
+        conference_name = str(session.get("conference_name") or "")
+        if not re.fullmatch(r"sysevo-par-[0-9a-f-]{36}", conference_name):
+            logger.error("SignalWire parallel decision refused an invalid conference name")
+            return _swml(build_hangup_swml())
+        provider_call_id = _extract(payload, dict(query), _CALL_ID_KEYS)
+        if not provider_call_id or provider_call_id != leg.get("provider_call_id"):
+            logger.warning("SignalWire parallel AMD callback rejected: leg call id mismatch")
+            return _swml(build_hangup_swml())
+
+        # Execute callbacks can be retried. Replaying the winner's decision
+        # must keep it connected; a late callback for a finished batch must
+        # never resurrect a conference leg.
+        if session.get("status") == "connected":
+            if session.get("winner_leg_id") == leg_id and leg.get("status") == "connected":
+                return _swml(await _signalwire_parallel_join_swml(
+                    conference_name=conference_name, session_id=session_id,
+                    leg_id=leg_id,
+                ))
+        if session.get("status") not in {"dialing", "connected"}:
+            return _swml(build_hangup_swml())
+
+        amd_result = (_extract(payload, dict(query), ("amd_result", "detect_result")) or "unknown").lower()
+        if amd_result not in {"human", "machine", "fax", "unknown", "error"}:
+            amd_result = "unknown"
+        raw_ms = _extract(payload, dict(query), ("amd_ms", "detect_ms"))
+        try:
+            amd_ms = max(0, min(int(raw_ms), 120_000))
+        except (TypeError, ValueError):
+            amd_ms = None
+
+        if amd_result in {"machine", "fax"}:
+            await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="machine",
+                amd_result=amd_result, amd_ms=amd_ms,
+            )
+            policy = await signalwire_parallel_store.get_voicemail_policy(
+                rep_user_id=str(session["rep_user_id"]),
+                entry_id=str(leg["entry_id"]),
+                parent_call_sid=str(session["rep_call_id"]),
+            )
+            if not policy:
+                return _swml(build_hangup_swml())
+            on_machine = str(policy.get("on_machine") or "hangup")
+            if on_machine == "pass_to_rep" and session.get("line_count") == 1:
+                winner = await signalwire_parallel_store.claim_winner(
+                    session_id=session_id, leg_id=leg_id,
+                    provider_call_id=provider_call_id, amd_ms=amd_ms,
+                    amd_result=amd_result,
+                )
+                if not winner:
+                    return _swml(build_hangup_swml())
+                entry_rows = await _load_signalwire_parallel_entries([str(leg["entry_id"])])
+                if len(entry_rows) != 1 or not await update_signalwire_parallel_winner(
+                    parent_call_sid=str(session["rep_call_id"]),
+                    child_call_sid=provider_call_id,
+                    entry_id=str(leg["entry_id"]), to_number=entry_rows[0]["phone"],
+                ):
+                    return _swml(build_hangup_swml())
+                await update_signalwire_dialer_amd(
+                    parent_call_sid=provider_call_id, amd_result="fax" if amd_result == "fax" else "machine_start"
+                )
+                return _swml(await _signalwire_parallel_join_swml(
+                    conference_name=conference_name, session_id=session_id,
+                    leg_id=leg_id,
+                ))
+
+            if on_machine == "drop_vm" and policy.get("auto_drop_enabled") is True:
+                drop = await _load_signalwire_parallel_default_drop(
+                    str(session["rep_user_id"])
+                )
+                if drop and await signalwire_parallel_store.claim_voicemail_drop(
+                    session_id=session_id, leg_id=leg_id,
+                    provider_call_id=provider_call_id, drop_id=drop["id"],
+                ):
+                    recording_url = await _signed_signalwire_voicemail_url(drop["storage_path"])
+                    backend_endpoint, _ = await get_backend_endpoints()
+                    playback_url = _parallel_callback_url(
+                        str(backend_endpoint or "").rstrip("/"),
+                        "sw-parallel-playback", session_id, leg_id,
+                    )
+                    call_amd = "machine_end_beep" if _truthy(_extract(payload, dict(query), ("beep",))) else "machine_end_silence"
+                    await update_signalwire_dialer_amd(
+                        parent_call_sid=provider_call_id,
+                        amd_result=call_amd,
+                        voicemail_started=True,
+                    )
+                    from api.services.telephony.dialer.swml import build_signalwire_parallel_voicemail_swml
+                    return _swml(build_signalwire_parallel_voicemail_swml(
+                        recording_url=recording_url,
+                        playback_status_url=playback_url,
+                    ))
+
+            # No policy, enabled drop, or usable default recording: record the
+            # detected voicemail and finish this prospect leg without playback.
+            await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="voicemail",
+                amd_result=amd_result, amd_ms=amd_ms,
+            )
+            await update_signalwire_dialer_amd(
+                parent_call_sid=provider_call_id,
+                amd_result="fax" if amd_result == "fax" else "machine_end_silence",
+            )
+            await signalwire_parallel_store.record_outcome(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, outcome="voicemail",
+            )
+            return _swml(build_hangup_swml())
+
+        await signalwire_parallel_store.update_leg(
+            session_id=session_id, leg_id=leg_id,
+            provider_call_id=provider_call_id, status="human",
+            amd_result=amd_result, amd_ms=amd_ms,
+        )
+        winner = await signalwire_parallel_store.claim_winner(
+            session_id=session_id, leg_id=leg_id,
+            provider_call_id=provider_call_id, amd_ms=amd_ms,
+            amd_result=amd_result,
+        )
+        if not winner:
+            # A second human cannot join the rep's winner room: that would put
+            # both prospects on the same call. Reserve a teammate and a new
+            # conference transactionally, then notify them off the webhook path.
+            overflow = await signalwire_parallel_store.route_to_teammate(
+                session_id=session_id,
+                leg_id=leg_id,
+                provider_call_id=provider_call_id,
+            )
+            if overflow:
+                notify_inbound_call(str(overflow["inbound_call_id"]))
+                _spawn_background(_expire_signalwire_overflow_offer(provider_call_id))
+                await update_dialer_call_status(
+                    parent_call_sid=provider_call_id,
+                    child_call_sid=None,
+                    status="in-progress",
+                    duration_seconds=None,
+                    rep_user_id=session.get("rep_user_id"),
+                    provider="signalwire",
+                )
+                return _swml(build_signalwire_parallel_overflow_swml(
+                    conference_name=str(overflow["conference_name"]),
+                    status_callback_url=await _signalwire_overflow_callback_url(str(overflow["conference_name"])),
+                ))
+
+            # No teammate was reachable or the configured route is unsupported.
+            # Do not leave a second live person listening to silence.
+            await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="completed",
+                amd_result=amd_result, amd_ms=amd_ms,
+            )
+            await signalwire_parallel_store.record_outcome(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, outcome="overflow_unrouted",
+            )
+            return _swml(build_hangup_swml())
+        winner_entry_id = str(leg.get("entry_id") or "")
+        winner_entries = await _load_signalwire_parallel_entries([winner_entry_id])
+        if len(winner_entries) != 1:
+            logger.error("SignalWire parallel winner could not resolve its lead record")
+            return _swml(build_hangup_swml())
+        linked = await update_signalwire_parallel_winner(
+            parent_call_sid=str(session.get("rep_call_id") or ""),
+            child_call_sid=provider_call_id,
+            entry_id=winner_entry_id,
+            to_number=winner_entries[0]["phone"],
+        )
+        if not linked:
+            logger.error("SignalWire parallel winner was claimed but parent call history link failed")
+            from api.services.telephony.dialer.signalwire_calling import end_call
+            try:
+                await end_call(call_id=provider_call_id, reason="error")
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"Could not end unlinked parallel winner leg: {exc}")
+            await signalwire_parallel_store.finish_session(
+                session_id=session_id, status="failed"
+            )
+            return _swml(build_hangup_swml())
+        # Provider cancellation and history reconciliation must not make the
+        # winning human wait for all other PSTN requests to finish.
+        _spawn_background(_cancel_signalwire_ringing_siblings(
+            session_id=session_id, winner_leg_id=leg_id,
+            rep_user_id=str(session.get("rep_user_id") or ""),
+        ))
+        return _swml(await _signalwire_parallel_join_swml(
+            conference_name=conference_name, session_id=session_id,
+            leg_id=leg_id,
+        ))
+    except Exception as exc:  # noqa: BLE001 - provider leg must fail closed
+        logger.exception(f"SignalWire parallel decision failed safely: {exc}")
+        return _swml(build_hangup_swml())
+
+
+
+
 @router.post("/sw-dialer-connect", include_in_schema=False)
 async def handle_sw_dialer_connect(request: Request):
     """Return SWML bridging the rep to the lead.
@@ -629,10 +1736,37 @@ async def handle_sw_dialer_connect(request: Request):
         # refuses a call that was not ringing for that rep.
         conference_name = _extract(payload, query, _CONFERENCE_KEYS)
         if conference_name:
+            rep_user_id = await _rep_supabase_id(identity)
+            if not rep_user_id or not await is_claimed_inbound_conference(
+                conference_name=conference_name, rep_user_id=rep_user_id,
+            ):
+                logger.warning("SignalWire conference join rejected: no matching inbound claim")
+                return _swml(build_hangup_swml())
+            rep_call_id = _extract(payload, query, _CALL_ID_KEYS)
+            if not rep_call_id or not await bind_inbound_rep_leg(
+                conference_name=conference_name, rep_user_id=rep_user_id,
+                provider="signalwire", rep_call_id=rep_call_id,
+            ):
+                logger.warning("SignalWire conference join rejected: unbound/replaced rep leg")
+                return _swml(build_hangup_swml())
             logger.info(
                 f"sw-dialer-connect joining conference {conference_name!r} for {identity!r}"
             )
-            return _swml(build_conference_join_swml(conference_name=conference_name))
+            callback_url = (
+                await _signalwire_overflow_callback_url(conference_name)
+                if conference_name.startswith("sysevo-overflow-") else None
+            )
+            return _swml(build_conference_join_swml(
+                conference_name=conference_name, status_callback_url=callback_url,
+            ))
+
+        requested_mode = _extract(payload, query, ("DialMode", "dial_mode"))
+        normalized_mode = (requested_mode or "").strip().lower()
+        if normalized_mode in {"parallel", "screened_single"}:
+            return await _start_signalwire_session(
+                request=request, payload=payload, query=query, identity=identity,
+                screened_single=normalized_mode == "screened_single",
+            )
 
         lead_number = _extract_lead_number(payload, query)
         if not lead_number:
@@ -657,28 +1791,36 @@ async def handle_sw_dialer_connect(request: Request):
 
         rep_user_id = await _rep_supabase_id(identity)
         if rep_user_id:
-            await create_dialer_call(
+            block_reason = await phone_block_reason(lead_number)
+            if block_reason:
+                logger.warning(f"SignalWire outbound call blocked by server suppression check ({block_reason})")
+                return _swml(build_hangup_swml())
+            allowed, reason, phone_us_state = await calling_hours_result(lead_number, entry_id)
+            if not allowed:
+                logger.warning(f"SignalWire outbound call blocked by calling-hours check ({reason})")
+                return _swml(build_hangup_swml())
+            if not await create_dialer_call(
                 parent_call_sid=call_id,
                 rep_user_id=rep_user_id,
                 entry_id=entry_id,
                 from_number=caller_id,
                 to_number=lead_number,
                 provider="signalwire",
-            )
+                phone_us_state=phone_us_state,
+            ):
+                logger.error("SignalWire outbound call rejected: call history could not be persisted")
+                return _swml(build_hangup_swml())
         elif (identity or "").strip():
-            # An identity that IS present and does not map is a real problem: a rep
-            # dialled and their call will not appear in Recent Calls.
+            # A supplied but unmappable identity is a failed dialer authorization.
+            # Only calls with no rep identity (agent/campaign calls) use this
+            # endpoint without dialer history or rep-level compliance checks.
             logger.warning(
-                f"sw-dialer-connect could not map identity {identity!r} to a Supabase "
-                "user - connecting the call anyway, but it will not appear in Recent Calls"
+                "sw-dialer-connect rejected: caller identity did not resolve to a dialer user"
             )
+            return _swml(build_hangup_swml())
         else:
             # No identity at all means no rep: an agent or campaign leg, which has
-            # never belonged in dialer_calls and is not a fault. It was logged at
-            # WARNING every time, and something places one every five minutes -- 288
-            # warnings a day, which is how three genuine errors in the same window
-            # came to be invisible. The distinction is the point: a missing identity
-            # is expected here, an unmappable one is not.
+            # never belonged in dialer_calls and is not a fault.
             logger.debug(
                 "sw-dialer-connect: no rep identity on this leg (agent or campaign "
                 "call) - connecting it, and not recording it in Recent Calls"
@@ -845,9 +1987,10 @@ async def handle_sw_call_status(request: Request):
         # busy or declined -- the difference between a call worth retrying and one that
         # was actively refused.
         end_reason = _extract(payload, query, _END_REASON_KEYS)
+        end_source = _extract(payload, query, _END_SOURCE_KEYS)
         ended_by = _ended_by(
             state or "",
-            _extract(payload, query, _END_SOURCE_KEYS) or "",
+            end_source,
             _extract(payload, query, _END_REASON_KEYS) or "",
         )
 
@@ -865,10 +2008,25 @@ async def handle_sw_call_status(request: Request):
             except (TypeError, ValueError):
                 logger.warning(f"sw-call-status duration {raw_duration!r} is not a number")
 
+        status = _map_call_state(state, end_reason)
+        # SignalWire's observed `connect` rejection (HTTP 400: "No valid devices")
+        # ends the SWML leg as hangup with end_source=none. That is not a human
+        # completing a conversation. Mapping it to completed made the dialer treat
+        # failed outbound attempts like successful calls with a missing recording.
+        if (
+            (state or "").strip().lower() == "ended"
+            and re.sub(r"[^a-z]", "", (end_reason or "").strip().lower()) == "hangup"
+            and (end_source or "").strip().lower() == "none"
+        ):
+            status = "failed"
+            logger.warning(
+                f"SignalWire call {call_id} ended without a connected peer; recording as failed"
+            )
+
         await update_dialer_call_status(
             parent_call_sid=call_id,
             child_call_sid=None,
-            status=_map_call_state(state, end_reason),
+            status=status,
             duration_seconds=duration,
             ended_by=ended_by,
         )
@@ -1081,7 +2239,7 @@ async def handle_sw_inbound(request: Request):
             # to the inbound agent instead of leaving them on hold until they give up. Set on
             # the dialer's Agents page (ring-first seconds, the agent, and per-number
             # hand-over); off when no timer is set or the number is switched off.
-            agent = await current_inbound_agent()
+            agent = await current_inbound_agent(number=to_number)
             wait = agent.ring_first_seconds
             if wait and agent.number and await number_hands_to_agent(to_number):
                 agent_url = _reroute_url(backend_endpoint, call_id, "agent")
@@ -1131,7 +2289,7 @@ async def handle_sw_inbound_reroute(request: Request):
             return _swml(build_hangup_swml())
         call_id = (request.query_params.get("call_id") or "").strip()
         mode = (request.query_params.get("mode") or "").strip()
-        agent = await _inbound_agent_number()
+        agent = await _inbound_agent_number(call_id=call_id)
         if mode in ("agent", "agent_back") and agent:
             return _swml(
                 build_agent_overflow_swml(
@@ -1171,7 +2329,7 @@ async def handle_inbound_agent_status(user: UserModel = Depends(get_user)):
     but not acted on is exactly the kind of thing that reads as working. Read fresh, not
     from the call-path cache, so a change shows up the moment it is made.
     """
-    agent = await current_inbound_agent(fresh=True)
+    agent = await current_inbound_agent(fresh=True,user_id=str(user.provider_id))
     return JSONResponse(
         {
             "live": bool(agent.number),

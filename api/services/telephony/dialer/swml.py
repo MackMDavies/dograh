@@ -232,7 +232,7 @@ def build_no_agents_swml(
     }
 
 
-def build_conference_join_swml(*, conference_name: str) -> dict:
+def build_conference_join_swml(*, conference_name: str, status_callback_url: str | None = None) -> dict:
     """Put an accepting rep into the caller's conference.
 
     The rep IS the main participant: the conference starts when they arrive and
@@ -243,15 +243,78 @@ def build_conference_join_swml(*, conference_name: str) -> dict:
     recorder would bill twice for one conversation and produce two files that
     have to be reconciled later.
     """
+    conference = {
+        "name": conference_name, "start_on_enter": True, "end_on_exit": True,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
     return {
         "sections": {
             "main": [
                 {
-                    "join_conference": {
-                        "name": conference_name,
-                        "start_on_enter": True,
-                        "end_on_exit": True,
-                    }
+                    "join_conference": conference
+                }
+            ]
+        }
+    }
+
+
+def build_signalwire_parallel_rep_swml(
+    *, conference_name: str, status_callback_url: str | None = None
+) -> dict:
+    """Hold the browser rep in the private conference for a parallel batch."""
+    if not conference_name.startswith("sysevo-par-"):
+        raise ValueError("invalid parallel conference name")
+    join_conference = {
+        "name": conference_name,
+        "start_on_enter": True,
+        "end_on_exit": True,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        join_conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
+    return {
+        "sections": {
+            "main": [
+                {
+                    "join_conference": join_conference
+                }
+            ]
+        }
+    }
+
+
+def build_signalwire_parallel_overflow_swml(*, conference_name: str, status_callback_url: str | None = None) -> dict:
+    """Park a second answered prospect in a private room for a teammate offer."""
+    if not conference_name.startswith("sysevo-overflow-"):
+        raise ValueError("invalid SignalWire overflow conference name")
+    conference = {
+        "name": conference_name, "start_on_enter": False, "end_on_exit": False,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
+    return {
+        "sections": {
+            "main": [
+                {
+                    "join_conference": conference
                 }
             ]
         }
@@ -321,3 +384,38 @@ def build_agent_overflow_swml(
         }
     )
     return {"sections": {"main": steps}}
+
+
+def build_signalwire_parallel_leg_swml(
+    *, decision_url: str, amd_timeout_seconds: float = 2.4,
+    machine_detection_enabled: bool = True,
+) -> dict:
+    """Screen a server-originated prospect leg before it can reach the rep."""
+    if not decision_url.startswith("https://"):
+        raise ValueError("SignalWire parallel decision handler must use HTTPS")
+    if not 1 <= amd_timeout_seconds <= 30:
+        raise ValueError("SignalWire AMD timeout must be between 1 and 30 seconds")
+    steps: list[dict] = []
+    if machine_detection_enabled:
+        steps.append({"detect_machine": {
+            "detectors": "amd,fax", "detect_message_end": True,
+            "timeout": amd_timeout_seconds, "wait": True,
+        }})
+    steps.append({"execute": {"dest": decision_url, "params": {
+        "amd_result": "${detect_result}" if machine_detection_enabled else "human",
+        "amd_ms": "${detect_ms}" if machine_detection_enabled else "0",
+        "beep": "${detect_machine_beep}" if machine_detection_enabled else "false",
+    }}})
+    return {"sections": {"main": steps}}
+
+
+def build_signalwire_parallel_voicemail_swml(
+    *, recording_url: str, playback_status_url: str
+) -> dict:
+    """Play a private voicemail recording and report the playback result."""
+    if not recording_url.startswith("https://") or not playback_status_url.startswith("https://"):
+        raise ValueError("SignalWire voicemail playback URLs must use HTTPS")
+    return {"sections": {"main": [
+        {"play": {"url": recording_url, "status_url": playback_status_url}},
+        {"hangup": {}},
+    ]}}

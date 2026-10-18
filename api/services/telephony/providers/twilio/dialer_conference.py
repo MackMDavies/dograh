@@ -45,6 +45,9 @@ async def dial_lead_into_conference(
     caller_id: str,
     join_conference_url: str,
     status_callback_url: str,
+    machine_detection: bool = False,
+    machine_detection_preset: str = "balanced",
+    ringing_timeout_seconds: int | None = None,
 ) -> str | None:
     """Places the outbound leg to the lead, joining them into the same
     conference as the rep, with status tracking attached the same way the
@@ -63,16 +66,43 @@ async def dial_lead_into_conference(
         logger.error("dial_lead_into_conference: Twilio credentials not configured")
         return None
     try:
-        call = await asyncio.to_thread(
-            client.calls.create,
-            to=lead_number,
-            from_=caller_id,
-            url=join_conference_url,
-            method="POST",
-            status_callback=status_callback_url,
-            status_callback_event=["initiated", "ringing", "answered", "completed"],
-            status_callback_method="POST",
-        )
+        params = {
+            "to": lead_number,
+            "from_": caller_id,
+            "url": join_conference_url,
+            "method": "POST",
+            "status_callback": status_callback_url,
+            "status_callback_event": ["initiated", "ringing", "answered", "completed"],
+            "status_callback_method": "POST",
+        }
+        if ringing_timeout_seconds is not None:
+            # Bound each destination in a parallel batch so an empty round
+            # cannot leave its parent conference open indefinitely.
+            params["timeout"] = max(5, min(60, int(ringing_timeout_seconds)))
+        if machine_detection:
+            # DetectMessageEnd holds the lead leg until a greeting ends. The
+            # join webhook then decides whether to play the saved message.
+            params["machine_detection"] = "DetectMessageEnd"
+            # Twilio exposes speech thresholds and an overall timeout rather
+            # than a single "speed" control. Keep all values within its API
+            # bounds; the preset influences classification latency/accuracy,
+            # while DetectMessageEnd still waits for a machine greeting.
+            amd_presets = {
+                "fastest": (3, 1000, 500, 2000),
+                "fast": (8, 1800, 900, 3000),
+                "balanced": (30, 2400, 1200, 5000),
+                "accurate": (45, 3200, 2000, 7000),
+            }
+            timeout, speech_threshold, speech_end_threshold, silence_timeout = amd_presets.get(
+                machine_detection_preset, amd_presets["balanced"]
+            )
+            params.update({
+                "machine_detection_timeout": timeout,
+                "machine_detection_speech_threshold": speech_threshold,
+                "machine_detection_speech_end_threshold": speech_end_threshold,
+                "machine_detection_silence_timeout": silence_timeout,
+            })
+        call = await asyncio.to_thread(client.calls.create, **params)
         return call.sid
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into voice-connect
         logger.error(f"Failed to dial lead into conference for {parent_call_sid}: {exc}")
@@ -126,4 +156,26 @@ async def cancel_call(*, call_sid: str) -> bool:
         return True
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
         logger.error(f"Failed to cancel call {call_sid}: {exc}")
+        return False
+
+
+async def cancel_call_if_ringing(*, call_sid: str) -> bool:
+    """Cancel a parallel sibling only while Twilio still reports it ringing.
+
+    Unlike ``cancel_call``, this must never end a second answered human: that
+    call may be routed to an overflow teammate. Twilio validates the transition
+    too, so a call that answers between fetch and update cannot be cancelled.
+    """
+    client = await _twilio_client()
+    if not client:
+        logger.error("cancel_call_if_ringing: Twilio credentials not configured")
+        return False
+    try:
+        call = await asyncio.to_thread(client.calls(call_sid).fetch)
+        if str(getattr(call, "status", "")).lower() not in {"queued", "ringing"}:
+            return False
+        await asyncio.to_thread(client.calls(call_sid).update, status="canceled")
+        return True
+    except Exception as exc:  # noqa: BLE001 - webhook cleanup must fail soft
+        logger.info(f"Parallel sibling {call_sid} was no longer cancellable: {exc}")
         return False

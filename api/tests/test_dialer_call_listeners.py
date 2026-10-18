@@ -38,7 +38,37 @@ async def test_create_dialer_call_listener_posts_expected_payload(monkeypatch):
     assert call.kwargs["json"] == {
         "parent_call_sid": "CA111",
         "manager_user_id": "00000000-0000-0000-0000-000000000001",
+        "mode": "listen",
     }
+
+
+async def test_create_dialer_call_listener_persists_monitor_mode(monkeypatch):
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_listeners.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.dialer_call_listeners.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = AsyncMock()
+    fake_client.post = AsyncMock(return_value=fake_response)
+    fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+    fake_client.__aexit__ = AsyncMock(return_value=False)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_listeners.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await create_dialer_call_listener(
+            parent_call_sid="CA111",
+            manager_user_id="00000000-0000-0000-0000-000000000001",
+            mode="whisper",
+        )
+
+    assert fake_client.post.await_args.kwargs["json"]["mode"] == "whisper"
 
 
 async def test_create_dialer_call_listener_swallows_errors(monkeypatch):

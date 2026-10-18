@@ -6,7 +6,10 @@ introducing a circular import on the routes module.
 """
 
 from datetime import UTC, datetime
+import os
 from typing import Optional
+
+import httpx
 
 from loguru import logger
 from pydantic import BaseModel
@@ -153,6 +156,31 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         run_id=workflow_run_id,
         logs={"telephony_status_callbacks": telephony_callback_logs},
     )
+
+    # Internal email-campaign prospect demos need the same provider-grounded
+    # call outcome as the workflow run. Only campaign-tagged runs are forwarded.
+    initial_context = workflow_run.initial_context or {}
+    reply_run_id = initial_context.get("sysevo_email_campaign_reply_run_id")
+    internal_secret = os.getenv("INTERNAL_API_SECRET", "")
+    supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+    if reply_run_id and internal_secret and supabase_url:
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.post(
+                    f"{supabase_url}/functions/v1/email-campaign-call-status",
+                    headers={"x-api-secret": internal_secret},
+                    json={
+                        "reply_run_id": str(reply_run_id),
+                        "status": status.status.lower(),
+                        "provider_call_id": status.call_id,
+                        "from_number": status.from_number,
+                        "to_number": status.to_number,
+                        "duration_seconds": int(status.duration) if status.duration and str(status.duration).isdigit() else None,
+                    },
+                )
+                response.raise_for_status()
+        except Exception as exc:
+            logger.warning(f"[run {workflow_run_id}] campaign call outcome callback failed: {exc}")
 
     if status.status == "completed":
         logger.info(

@@ -101,7 +101,7 @@ async def test_the_status_check_reports_what_the_server_resolved():
     from api.services.telephony.dialer.signalwire_routes import handle_inbound_agent_status
 
     with patch(f"{_MODULE}.current_inbound_agent", new=AsyncMock(return_value=_LIVE)) as resolve:
-        response = await handle_inbound_agent_status(user=MagicMock())
+        response = await handle_inbound_agent_status(user=MagicMock(provider_id='rep'))
     body = json.loads(response.body)
     assert body == {"live": True, "source": "app", "number": "+12393231195", "workflow_id": 214, "ring_first_seconds": 20, "problem": ""}
-    resolve.assert_awaited_with(fresh=True)
+    resolve.assert_awaited_with(fresh=True,user_id='rep')

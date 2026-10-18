@@ -9,6 +9,10 @@ from loguru import logger
 from api.services.telephony.providers.twilio.dialer_call_log import (
     _affected_row_count,
     create_dialer_call,
+    consume_double_dial_authorization,
+    check_dialer_calling_hours,
+    check_dialer_calling_hours_with_state,
+    get_auto_voicemail_settings,
     get_dialer_call_child_leg,
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
@@ -27,6 +31,14 @@ def _configure_supabase(monkeypatch) -> None:
         "api.services.telephony.providers.twilio.dialer_call_log.SUPABASE_SERVICE_ROLE_KEY",
         "test-service-role-key",
     )
+    monkeypatch.setattr(
+        "api.services.telephony.dialer.compliance.SUPABASE_URL",
+        "https://example.supabase.co",
+    )
+    monkeypatch.setattr(
+        "api.services.telephony.dialer.compliance.SUPABASE_SERVICE_ROLE_KEY",
+        "test-service-role-key",
+    )
 
 
 def _fake_client(response: MagicMock) -> AsyncMock:
@@ -37,6 +49,73 @@ def _fake_client(response: MagicMock) -> AsyncMock:
     fake_client.__aenter__ = AsyncMock(return_value=fake_client)
     fake_client.__aexit__ = AsyncMock(return_value=False)
     return fake_client
+
+
+async def test_check_dialer_calling_hours_posts_phone_and_entry(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = {"allowed": True, "timezone": "America/New_York"}
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        allowed, reason = await check_dialer_calling_hours("+12125551234", "entry-123")
+
+    assert (allowed, reason) == (True, None)
+    call = fake_client.post.await_args
+    assert call.args[0] == "https://example.supabase.co/functions/v1/dialer-calling-hours-check"
+    assert call.kwargs["json"] == {"phone": "+12125551234", "entry_id": "entry-123"}
+    assert call.kwargs["headers"]["Authorization"] == "Bearer test-service-role-key"
+
+
+async def test_check_dialer_calling_hours_with_state_returns_server_state(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = {
+        "allowed": True,
+        "timezone": "America/Los_Angeles",
+        "us_state": "CA",
+    }
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        result = await check_dialer_calling_hours_with_state("+14155551234")
+
+    assert result == (True, None, "CA")
+
+
+async def test_check_dialer_calling_hours_fails_closed_on_block(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = {"allowed": False, "reason": "outside_calling_hours"}
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        allowed, reason = await check_dialer_calling_hours("+442071234567")
+
+    assert (allowed, reason) == (False, "outside_calling_hours")
+
+
+async def test_check_dialer_calling_hours_fails_closed_when_service_unavailable(monkeypatch):
+    _configure_supabase(monkeypatch)
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        side_effect=httpx.ConnectError("offline"),
+    ):
+        allowed, reason = await check_dialer_calling_hours("+442071234567")
+
+    assert (allowed, reason) == (False, "compliance_unavailable")
 
 
 async def test_create_dialer_call_posts_expected_payload(monkeypatch):
@@ -102,6 +181,62 @@ async def test_create_dialer_call_records_an_explicit_provider(monkeypatch):
     assert fake_client.post.await_args.kwargs["json"]["provider"] == "signalwire"
 
 
+async def test_create_dialer_call_links_authorized_double_dial(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        await create_dialer_call(
+            parent_call_sid="CA" + "1" * 32,
+            rep_user_id="00000000-0000-0000-0000-000000000001",
+            entry_id="00000000-0000-0000-0000-000000000002",
+            from_number="+15551234567",
+            to_number="+15559876543",
+            double_dial_retry_of="00000000-0000-0000-0000-000000000003",
+            double_dial_authorization_id="00000000-0000-0000-0000-000000000004",
+        )
+
+    payload = fake_client.post.await_args.kwargs["json"]
+    assert payload["double_dial_retry_of"] == "00000000-0000-0000-0000-000000000003"
+    assert payload["double_dial_authorization_id"] == "00000000-0000-0000-0000-000000000004"
+
+
+async def test_consume_double_dial_authorization_is_fail_closed(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_response = MagicMock()
+    fake_response.raise_for_status = MagicMock()
+    fake_response.json.return_value = [{
+        "from_number": "+15551234567",
+        "retry_of_call_id": "00000000-0000-0000-0000-000000000003",
+    }]
+    fake_client = _fake_client(fake_response)
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        result = await consume_double_dial_authorization(
+            authorization_id="00000000-0000-0000-0000-000000000004",
+            rep_user_id="00000000-0000-0000-0000-000000000001",
+            entry_id="00000000-0000-0000-0000-000000000002",
+            to_number="+15559876543",
+            call_sid="CA" + "1" * 32,
+        )
+
+    assert result == {
+        "from_number": "+15551234567",
+        "retry_of_call_id": "00000000-0000-0000-0000-000000000003",
+    }
+    assert fake_client.post.await_args.args[0].endswith(
+        "/rpc/dialer_consume_double_dial_authorization"
+    )
+
+
 async def test_update_dialer_call_recording_url_patches_by_parent_call_sid(monkeypatch):
     _configure_supabase(monkeypatch)
     fake_response = MagicMock()
@@ -118,7 +253,7 @@ async def test_update_dialer_call_recording_url_patches_by_parent_call_sid(monke
 
     call = fake_client.patch.await_args
     assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
-    assert call.kwargs["params"] == {"parent_call_sid": "eq.sw-1"}
+    assert call.kwargs["params"] == {"parent_call_sid": "eq.sw-1", "select": "id"}
     # recording_url, not recording_sid: SignalWire hands back a playable URL,
     # where Twilio's SID has to go through the recording proxy.
     assert call.kwargs["json"] == {"recording_url": "https://rec.example/a.mp3"}
@@ -513,7 +648,7 @@ async def test_get_dialer_call_child_leg_returns_row(monkeypatch):
     fake_response = MagicMock()
     fake_response.raise_for_status = MagicMock()
     fake_response.json = MagicMock(
-        return_value=[{"child_call_sid": "CA222", "status": "ringing"}]
+        return_value=[{"child_call_sid": "CA222", "status": "ringing", "rep_user_id": "user-1"}]
     )
     fake_client = _fake_client(fake_response)
 
@@ -523,14 +658,89 @@ async def test_get_dialer_call_child_leg_returns_row(monkeypatch):
     ):
         row = await get_dialer_call_child_leg(parent_call_sid="CA111")
 
-    assert row == {"child_call_sid": "CA222", "status": "ringing"}
+    assert row == {"child_call_sid": "CA222", "status": "ringing", "rep_user_id": "user-1"}
     call = fake_client.get.await_args
     assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
     assert call.kwargs["params"] == {
-        "select": "child_call_sid,status",
+        "select": "child_call_sid,status,rep_user_id,provider,amd_result,manual_voicemail_requested_at,voicemail_drop_started_at,auto_voicemail_sent,voicemail_drop_id,ended_at,lead_joined_at",
         "parent_call_sid": "eq.CA111",
         "limit": "1",
     }
+
+
+async def test_get_auto_voicemail_settings_uses_team_policy_and_owned_wav(monkeypatch):
+    _configure_supabase(monkeypatch)
+    responses = []
+    for payload in (
+        {
+            "auto_drop_enabled": True,
+            "machine_detection_enabled": True,
+            "machine_detection_preset": "balanced",
+            "on_machine": "drop_vm",
+        },
+        [{"id": "drop-1", "storage_path": "user-1/message.wav"}],
+        {"signedURL": "/object/sign/voicemail-drops/user-1/message.wav?token=abc"},
+    ):
+        response = MagicMock()
+        response.raise_for_status = MagicMock()
+        response.json = MagicMock(return_value=payload)
+        responses.append(response)
+    fake_client = _fake_client(responses[-1])
+    fake_client.get.return_value = responses[1]
+    fake_client.post.side_effect = [responses[0], responses[2]]
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        enabled, url, drop_id = await get_auto_voicemail_settings(
+            user_id="user-1", parent_call_sid="CA111", entry_id="entry-1"
+        )
+
+    assert enabled is True
+    assert drop_id == "drop-1"
+    assert url == "https://example.supabase.co/storage/v1/object/sign/voicemail-drops/user-1/message.wav?token=abc"
+    assert fake_client.get.await_count == 1
+    policy_call = fake_client.post.await_args_list[0]
+    assert policy_call.args[0].endswith("/rest/v1/rpc/dialer_account_voicemail_policy")
+    assert policy_call.kwargs["json"] == {
+        "p_rep_user_id": "user-1",
+        "p_entry_id": "entry-1",
+        "p_parent_call_sid": "CA111",
+    }
+    assert fake_client.get.await_args.kwargs["params"] == {
+        "select": "id,storage_path",
+        "user_id": "eq.user-1",
+        "is_default": "eq.true",
+        "limit": "1",
+    }
+    assert fake_client.post.await_args.args[0].endswith(
+        "/storage/v1/object/sign/voicemail-drops/user-1/message.wav"
+    )
+
+
+async def test_get_auto_voicemail_settings_fails_closed_for_other_rep_path(monkeypatch):
+    _configure_supabase(monkeypatch)
+    policy = MagicMock()
+    policy.raise_for_status = MagicMock()
+    policy.json = MagicMock(return_value={"auto_drop_enabled": True})
+    drop = MagicMock()
+    drop.raise_for_status = MagicMock()
+    drop.json = MagicMock(return_value=[{"storage_path": "another-user/message.wav"}])
+    fake_client = _fake_client(drop)
+    fake_client.get.return_value = drop
+    fake_client.post.return_value = policy
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        enabled, url, drop_id = await get_auto_voicemail_settings(user_id="user-1", parent_call_sid="CA111")
+
+    assert enabled is False
+    assert url is None
+    assert drop_id is None
+    assert fake_client.post.await_count == 1
 
 
 async def test_get_dialer_call_child_leg_returns_none_for_no_rows(monkeypatch):

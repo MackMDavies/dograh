@@ -129,6 +129,12 @@ async def fire_post_call_memory(workflow_run_id: int) -> bool:
             "initial_context": initial_ctx,
             "call_type": getattr(workflow_run, "call_type", None),
         }
+        if initial_ctx.get("dialer_account_id"):
+            workflow = await db_client.get_workflow_by_id(workflow_run.workflow_id)
+            if not workflow:
+                return False
+            # Taken from the stored workflow, never from editable run context.
+            payload["workflow_uuid"] = str(workflow.workflow_uuid)
 
         headers = {
             "Content-Type": "application/json",

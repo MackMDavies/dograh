@@ -61,6 +61,29 @@ def _memory_url_configured(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_dialer_analysis_uses_actual_workflow_identity_not_context():
+    run = _make_run(initial_context={"dialer_account_id":"account", "called_number":"+14155550123", "workflow_uuid":"forged"})
+    client = _mock_post_client()
+    workflow = MagicMock(workflow_uuid="actual-workflow")
+    with patch.object(memory_webhook.db_client,"get_workflow_run_by_id",AsyncMock(return_value=run)), \
+         patch.object(memory_webhook.db_client,"get_workflow_by_id",AsyncMock(return_value=workflow)), \
+         patch("api.services.memory_webhook.httpx.AsyncClient",return_value=client):
+        assert await memory_webhook.fire_post_call_memory(101) is True
+    assert client.post.await_args.kwargs["json"]["workflow_uuid"] == "actual-workflow"
+
+
+@pytest.mark.asyncio
+async def test_missing_dialer_workflow_retries_instead_of_assigning_unverified_analysis():
+    run = _make_run(initial_context={"dialer_account_id":"account"})
+    client = _mock_post_client()
+    with patch.object(memory_webhook.db_client,"get_workflow_run_by_id",AsyncMock(return_value=run)), \
+         patch.object(memory_webhook.db_client,"get_workflow_by_id",AsyncMock(return_value=None)), \
+         patch("api.services.memory_webhook.httpx.AsyncClient",return_value=client):
+        assert await memory_webhook.fire_post_call_memory(101) is False
+    client.post.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_outbound_run_with_no_caller_number_key_still_posts():
     """The exact production shape: initial_context carries `called_number`
     (what the campaign dispatcher writes) but no `caller_number` key at all.

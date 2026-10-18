@@ -4,6 +4,7 @@ from api.services.telephony.dialer.swml import (
     build_dialer_swml,
     build_hangup_swml,
     build_inbound_hold_swml,
+    build_signalwire_parallel_rep_swml,
 )
 
 
@@ -307,3 +308,14 @@ def test_overflow_records_and_taps_when_asked():
     )
     kinds = [next(iter(s)) for s in doc["sections"]["main"]]
     assert kinds[:3] == ["record_call", "tap", "connect"]
+
+def test_parallel_rep_swml_subscribes_to_conference_join_events():
+    url = "https://api.example.test/api/v1/telephony/sw-parallel-conference?call_id=nonce"
+    doc = build_signalwire_parallel_rep_swml(
+        conference_name="sysevo-par-00000000-0000-0000-0000-000000000001",
+        status_callback_url=url,
+    )
+    join = doc["sections"]["main"][0]["join_conference"]
+    assert join["status_callback"] == url
+    assert join["status_callback_event"] == "join leave"
+    assert join["status_callback_event_type"] == "relay"

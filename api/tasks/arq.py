@@ -55,6 +55,8 @@ from api.tasks.wallet_reconciliation import reconcile_wallet_debits
 from api.tasks.memory_reconciliation import reconcile_memory
 from api.tasks.telephony_cost_reconciliation import reconcile_telephony_cost
 from api.tasks.dial_suppression_sync import sync_dial_suppression
+from api.tasks.dialer_overflow_reconciliation import reconcile_dialer_overflow
+from api.tasks.dialer_agent_history_reconciliation import reconcile_dialer_agent_history
 from api.services.api_usage_counter import flush_api_request_usage
 
 
@@ -68,6 +70,8 @@ class WorkerSettings:
         process_knowledge_base_document,
     ]
     cron_jobs = [
+        cron(reconcile_dialer_agent_history, second={10,40}, run_at_startup=True),
+        cron(reconcile_dialer_overflow, second=set(range(0,60,2)), run_at_startup=True),
         # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
         cron(flush_api_request_usage, minute=0),
         # Every 10 min: re-fire post-call wallet debits that never settled (crash / lost

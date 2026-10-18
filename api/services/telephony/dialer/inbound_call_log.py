@@ -5,6 +5,7 @@ while it runs, and a Supabase blip must cost us the record, never the call.
 """
 
 import asyncio
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -79,6 +80,88 @@ async def resolve_inbound_targets(to_number: str) -> list[str]:
         return []
 
 
+async def is_claimed_inbound_conference(*, conference_name: str, rep_user_id: str) -> bool:
+    """Fail closed unless this rep atomically claimed the conference invitation."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not conference_name or not rep_user_id:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}{_INBOUND_CALLS_URL}",
+                params={
+                    "select": "id",
+                    "conference_name": f"eq.{conference_name}",
+                    "status": "eq.answered",
+                    "answered_by": f"eq.{rep_user_id}",
+                    "limit": "1",
+                },
+                headers=_headers(),
+                timeout=3.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+        return isinstance(rows, list) and bool(rows)
+    except Exception as exc:  # noqa: BLE001 - no conference without an authoritative claim
+        logger.error(f"Could not validate claimed inbound conference: {exc}")
+        return False
+
+
+async def _inbound_rpc(name: str, body: dict[str, Any]) -> Any:
+    """Service-only conference bookkeeping; never grant a bridge on failure."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{SUPABASE_URL}{_RPC_URL}/{name}", json=body,
+                headers=_headers(), timeout=3.0,
+            )
+            response.raise_for_status()
+            return response.json()
+    except Exception as exc:  # noqa: BLE001 - signed callbacks can be retried
+        logger.error(f"Inbound conference bookkeeping failed ({name}): {exc}")
+        return None
+
+
+async def bind_inbound_rep_leg(
+    *, conference_name: str, rep_user_id: str, provider: str, rep_call_id: str,
+) -> bool:
+    """Bind only the provider leg of the rep who claimed this invitation."""
+    return await _inbound_rpc("dialer_bind_inbound_rep_leg", {
+        "p_conference_name": conference_name, "p_rep_user_id": rep_user_id,
+        "p_provider": provider, "p_rep_call_id": rep_call_id,
+    }) is True
+
+
+async def record_overflow_join(
+    *, conference_name: str, provider: str, participant_call_id: str, event_at: str,
+) -> bool | None:
+    """Measure the actual overflow connection, independently of invite acceptance."""
+    result = await _inbound_rpc("dialer_record_overflow_join", {
+        "p_conference_name": conference_name, "p_provider": provider,
+        "p_participant_call_id": participant_call_id, "p_event_at": event_at,
+    })
+    return result if isinstance(result, bool) else None
+
+
+async def evaluate_overflow_guard(*, provider_call_id: str, provider: str) -> None:
+    """Revisit the original batch when its separate teammate call settles."""
+    await _inbound_rpc("dialer_evaluate_overflow_guard", {
+        "p_provider_call_id": provider_call_id, "p_provider": provider,
+    })
+
+
+async def close_overflow_conference(
+    *, conference_name: str, provider: str, participant_call_id: str,
+) -> bool | None:
+    """Release a teammate reservation only for a stored conference participant."""
+    result = await _inbound_rpc("dialer_close_overflow_conference", {
+        "p_conference_name": conference_name, "p_provider": provider,
+        "p_participant_call_id": participant_call_id,
+    })
+    return result if isinstance(result, bool) else None
+
+
 async def create_inbound_call(
     *,
     provider_call_id: str,
@@ -136,7 +219,7 @@ async def create_inbound_call(
     # create_task, so it runs after the response has gone out. A push that fails now costs
     # a notification. Awaiting it cost the call.
     if row and row.get("id") and target_user_ids:
-        _spawn(_notify_targets(str(row["id"])))
+        notify_inbound_call(str(row["id"]))
     return row
 
 
@@ -160,6 +243,43 @@ def _spawn(coro) -> None:
         return
     _background.add(task)
     task.add_done_callback(_background.discard)
+
+
+def notify_inbound_call(inbound_call_id: str) -> None:
+    """Send a best-effort push after a durable ringing row has been written."""
+    if inbound_call_id:
+        _spawn(_notify_targets(inbound_call_id))
+
+
+async def expire_unanswered_inbound_call(*, provider_call_id: str, provider: str = "twilio") -> bool:
+    """Atomically expire a still-ringing invite; return true only for the winner.
+
+    This lets a timed overflow offer be safely torn down without racing a rep
+    who claims the call at the same time.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        now = datetime.now(UTC).isoformat()
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_INBOUND_CALLS_URL}",
+                params={
+                    "provider_call_id": f"eq.{provider_call_id}",
+                    "provider": f"eq.{provider}",
+                    "status": "eq.ringing",
+                    "answered_by": "is.null",
+                },
+                json={"status": "missed", "ended_at": now, "updated_at": now},
+                headers=_headers(),
+                timeout=3.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+        return isinstance(rows, list) and bool(rows)
+    except Exception as exc:  # noqa: BLE001 - a timeout is not permission to end the leg
+        logger.error(f"Could not safely expire inbound offer {provider_call_id}: {exc}")
+        return False
 
 
 async def _notify_targets(inbound_call_id: str) -> None:

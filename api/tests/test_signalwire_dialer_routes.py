@@ -11,11 +11,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from api.services.telephony.dialer.signalwire_routes import (
+    handle_sw_parallel_conference,
     handle_sw_connect_status,
     handle_sw_call_status,
     handle_sw_dialer_connect,
     handle_sw_recording,
     _redacted_query,
+    _map_call_state,
     _secret_ok,
     _webhook_signature,
     _webhook_url,
@@ -44,6 +46,65 @@ def _authed(body, *, query: dict | None = None) -> MagicMock:
 
 def _payload_of(response) -> dict:
     return json.loads(response.body)
+
+
+@pytest.fixture(autouse=True)
+def _dialer_compliance_env(monkeypatch):
+    monkeypatch.setenv("SIGNALWIRE_WEBHOOK_KEY", _SECRET)
+    monkeypatch.setenv("SIGNALWIRE_DEFAULT_CALLER_ID", "+12092669253")
+    monkeypatch.setattr(_MODULE + ".phone_block_reason", AsyncMock(return_value=None))
+    monkeypatch.setattr(_MODULE + ".calling_hours_result", AsyncMock(return_value=(True, None, "CA")))
+    yield
+
+
+@pytest.fixture
+def connect_deps():
+    """Patch every outbound dependency of /sw-dialer-connect at once."""
+    with patch(f"{_MODULE}.create_dialer_call", new=AsyncMock()) as create, patch(
+        f"{_MODULE}.resolve_assigned_caller_id", new=AsyncMock(return_value=None)
+    ) as assigned, patch(
+        f"{_MODULE}._is_signalwire_owned_number", new=AsyncMock(return_value=False)
+    ) as owned, patch(
+        f"{_MODULE}._rep_supabase_id",
+        new=AsyncMock(return_value="00000000-0000-0000-0000-000000000001"),
+    ) as rep, patch(
+        f"{_MODULE}.get_backend_endpoints",
+        new=AsyncMock(return_value=("https://api.sysevo.io", "wss://api.sysevo.io")),
+    ) as endpoints:
+        yield {
+            "create": create,
+            "assigned": assigned,
+            "owned": owned,
+            "rep": rep,
+            "endpoints": endpoints,
+        }
+
+
+def _connect_verb(document: dict) -> dict | None:
+    for step in document["sections"]["main"]:
+        if "connect" in step:
+            return step["connect"]
+    return None
+
+
+@pytest.mark.parametrize(
+    "reason,expected",
+    [
+        ("noAnswer", "no-answer"),
+        ("no_answer", "no-answer"),
+        ("NO-ANSWER", "no-answer"),
+        ("busy", "busy"),
+        ("declined", "canceled"),
+        ("decline", "canceled"),
+        ("abandoned", "canceled"),
+        ("not_found", "failed"),
+        ("max_duration", "completed"),
+        ("cancel", "canceled"),
+        ("error", "failed"),
+    ],
+)
+def test_signalwire_terminal_reason_aliases(reason, expected):
+    assert _map_call_state("ended", reason) == expected
 
 
 def test_dynamic_webhook_uses_call_scoped_signature_without_shared_key(monkeypatch):
@@ -100,6 +161,115 @@ def test_pre_redaction_callback_signature_is_no_longer_valid(monkeypatch):
     assert not _secret_ok(
         "sw-call-status", request, allow_per_call_signature=True
     )
+
+
+async def test_signalwire_parallel_conference_records_rep_join():
+    session_id = "00000000-0000-0000-0000-000000000010"
+    body = {
+        "event_type": "calling.conference",
+        "timestamp": 1_800_000_000.125,
+        "params": {
+            "status": "participant-join",
+            "call_id": "browser-call-0001",
+            "name": "sysevo-par-00000000-0000-0000-0000-000000000011",
+        },
+    }
+    with patch(
+        f"{_MODULE}.signalwire_parallel_store.get_session",
+        new=AsyncMock(return_value={
+            "rep_call_id": "browser-call-0001",
+            "conference_name": body["params"]["name"],
+        }),
+    ), patch(
+        f"{_MODULE}.signalwire_parallel_store.record_parallel_timing",
+        new=AsyncMock(return_value=True),
+    ) as record:
+        response = await handle_sw_parallel_conference(_authed(
+            body, query={"session_id": session_id, "leg_id": "rep"}
+        ))
+    assert response.status_code == 200
+    assert _payload_of(response) == {"ok": True, "ignored": False}
+    assert record.await_args.kwargs["event_kind"] == "rep_join"
+    assert record.await_args.kwargs["provider_call_id"] == "browser-call-0001"
+
+
+@pytest.mark.parametrize("event,dependency", [
+    ("participant-join", "record_overflow_join"),
+    ("participant-leave", "close_overflow_conference"),
+])
+async def test_overflow_conference_uses_bound_participant(event, dependency):
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_overflow_conference
+
+    conference = "sysevo-overflow-00000000-0000-0000-0000-000000000010"
+    body = {"timestamp": 1_800_000_000.125, "params": {
+        "name": conference, "status": event, "call_id": "bound-browser-call",
+    }}
+    with patch(f"{_MODULE}.{dependency}", new=AsyncMock(return_value=True)) as record:
+        response = await handle_sw_overflow_conference(_authed(body, query={"call_id": conference}))
+    assert response.status_code == 200
+    assert record.await_args.kwargs["conference_name"] == conference
+    assert record.await_args.kwargs["participant_call_id"] == "bound-browser-call"
+    assert record.await_args.kwargs["provider"] == "signalwire"
+    if event == "participant-join":
+        assert record.await_args.kwargs["event_at"] == "2027-01-15T08:00:00.125000+00:00"
+
+
+async def test_overflow_conference_rejects_callback_for_another_room():
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_overflow_conference
+
+    conference = "sysevo-overflow-00000000-0000-0000-0000-000000000010"
+    with patch(f"{_MODULE}.record_overflow_join", new=AsyncMock()) as record:
+        response = await handle_sw_overflow_conference(_authed({"params": {
+            "name": conference, "status": "participant-join", "call_id": "forged-participant",
+        }}, query={"call_id": "another-room"}))
+    assert response.status_code == 409
+    record.assert_not_awaited()
+
+
+async def test_overflow_conference_database_failure_is_retryable():
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_overflow_conference
+
+    conference = "sysevo-overflow-00000000-0000-0000-0000-000000000010"
+    with patch(f"{_MODULE}.record_overflow_join", new=AsyncMock(return_value=None)):
+        response = await handle_sw_overflow_conference(_authed({
+            "timestamp": 1_800_000_000.125, "params": {
+                "name": conference, "status": "participant-join", "call_id": "bound-participant",
+            },
+        }, query={"call_id": conference}))
+    assert response.status_code == 503
+
+
+async def test_signalwire_parallel_conference_records_winner_join():
+    session_id = "00000000-0000-0000-0000-000000000010"
+    leg_id = "00000000-0000-0000-0000-000000000012"
+    body = {
+        "event_type": "calling.conference",
+        "timestamp": 1_800_000_000.125,
+        "params": {
+            "status": "participant-join",
+            "call_id": "pstn-call-0001",
+            "name": "sysevo-par-00000000-0000-0000-0000-000000000011",
+        },
+    }
+    with patch(
+        f"{_MODULE}.signalwire_parallel_store.get_session",
+        new=AsyncMock(return_value={
+            "conference_name": body["params"]["name"],
+            "winner_leg_id": leg_id,
+        }),
+    ), patch(
+        f"{_MODULE}.signalwire_parallel_store.get_session_legs",
+        new=AsyncMock(return_value=[{"id": leg_id, "provider_call_id": "pstn-call-0001"}]),
+    ), patch(
+        f"{_MODULE}.signalwire_parallel_store.record_parallel_timing",
+        new=AsyncMock(return_value=True),
+    ) as record:
+        response = await handle_sw_parallel_conference(_authed(
+            body, query={"session_id": session_id, "leg_id": leg_id}
+        ))
+    assert response.status_code == 200
+    assert record.await_args.kwargs["event_kind"] == "lead_join"
+    assert record.await_args.kwargs["leg_id"] == leg_id
 
 
 def test_signed_callback_secret_is_redacted_from_logs():
@@ -365,6 +535,29 @@ async def test_row_is_created_with_provider_signalwire(connect_deps):
     assert kwargs["from_number"] == "+12092669253"
 
 
+async def test_signalwire_outbound_blocks_suppressed_number_before_call_record(connect_deps, monkeypatch):
+    monkeypatch.setattr(_MODULE + ".phone_block_reason", AsyncMock(return_value="do_not_call"))
+    response = await handle_sw_dialer_connect(
+        _authed({"params": {"lead": "+15559876543", "identity": "client:rep-9", "call_id": "blocked"}})
+    )
+
+    assert _payload_of(response) == {"sections": {"main": [{"hangup": {}}]}}
+    connect_deps["create"].assert_not_awaited()
+
+
+async def test_signalwire_outbound_blocks_outside_calling_hours_before_call_record(connect_deps, monkeypatch):
+    monkeypatch.setattr(
+        _MODULE + ".calling_hours_result",
+        AsyncMock(return_value=(False, "outside_calling_hours", "CA")),
+    )
+    response = await handle_sw_dialer_connect(
+        _authed({"params": {"lead": "+15559876543", "identity": "client:rep-9", "call_id": "blocked-hours"}})
+    )
+
+    assert _is_hangup(_payload_of(response))
+    connect_deps["create"].assert_not_awaited()
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -383,13 +576,15 @@ async def test_synthetic_call_id_when_payload_carries_none(connect_deps):
     assert connect_deps["create"].call_args.kwargs["parent_call_sid"].startswith("sw-")
 
 
-async def test_unmappable_rep_still_connects_the_call(connect_deps):
+async def test_unmappable_rep_fails_closed_before_call_record_or_origination(connect_deps):
     connect_deps["rep"].return_value = None
     document = _payload_of(
-        await handle_sw_dialer_connect(_authed({"params": {"lead": "+14155550123"}}))
+        await handle_sw_dialer_connect(
+            _authed({"params": {"lead": "+14155550123", "identity": "client:rep-9"}})
+        )
     )
-    assert _connect_verb(document)["to"] == "+14155550123"
-    connect_deps["create"].assert_not_called()
+    assert _is_hangup(document)
+    connect_deps["create"].assert_not_awaited()
 
 
 # --------------------------------------------------------------------------
@@ -555,6 +750,28 @@ async def test_status_tolerates_float_duration(status_update):
     assert status_update.call_args.kwargs["duration_seconds"] == 42
 
 
+@pytest.mark.parametrize(
+    "end_source,expected",
+    [("none", "failed"), ("outbound", "completed"), ("inbound", "completed")],
+)
+async def test_status_does_not_misclassify_unconnected_leg_as_completed(
+    status_update, end_source, expected
+):
+    await handle_sw_call_status(
+        _authed(
+            {
+                "params": {
+                    "call_id": "sw-1",
+                    "call_state": "ended",
+                    "end_reason": "hangup",
+                    "end_source": end_source,
+                }
+            }
+        )
+    )
+    assert status_update.call_args.kwargs["status"] == expected
+
+
 async def test_status_tolerates_unparseable_duration(status_update):
     await handle_sw_call_status(
         _authed({"call_id": "sw-1", "state": "ended", "duration": "soon"})
@@ -709,8 +926,18 @@ async def test_dialer_connect_joins_a_conference_instead_of_dialling():
     The conference branch must be checked before the lead lookup: falling through would
     hit the "no dialable lead number" hangup and drop a caller who is already on the line.
     """
-    response = await handle_sw_dialer_connect(
-        _authed({"vars": {"userVariables": {"rep": "rep-1", "conference": "inbound-abc"}}})
+    with (
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value="rep-user")),
+        patch(f"{_MODULE}.is_claimed_inbound_conference", new=AsyncMock(return_value=True)) as claim,
+        patch(f"{_MODULE}.bind_inbound_rep_leg", new=AsyncMock(return_value=True)) as bind,
+    ):
+        response = await handle_sw_dialer_connect(
+            _authed({"call_id": "rep-browser", "vars": {"userVariables": {"rep": "rep-1", "conference": "inbound-abc"}}})
+        )
+    claim.assert_awaited_once_with(conference_name="inbound-abc", rep_user_id="rep-user")
+    bind.assert_awaited_once_with(
+        conference_name="inbound-abc", rep_user_id="rep-user",
+        provider="signalwire", rep_call_id="rep-browser",
     )
     doc = _payload_of(response)
 
@@ -721,13 +948,27 @@ async def test_dialer_connect_joins_a_conference_instead_of_dialling():
     ]
 
 
-async def test_dialer_connect_still_dials_when_no_conference_is_given(connect_deps):
-    """The outbound path must be untouched by the inbound branch."""
-    connect_deps["rep"].return_value = None
-    connect_deps["endpoints"].return_value = ("", "")
-    response = await handle_sw_dialer_connect(
-        _authed({"vars": {"userVariables": {"rep": "rep-1", "lead": "+15550001111"}}})
-    )
+async def test_signalwire_cannot_join_someone_elses_conference_by_name():
+    with (
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value="different-rep")),
+        patch(f"{_MODULE}.is_claimed_inbound_conference", new=AsyncMock(return_value=False)),
+    ):
+        response = await handle_sw_dialer_connect(_authed({
+            "vars": {"userVariables": {"rep": "rep-2", "conference": "sysevo-overflow-private"}}
+        }))
+    assert _is_hangup(_payload_of(response))
+
+
+async def test_dialer_connect_still_dials_when_no_conference_is_given():
+    """Agent/campaign legs without a rep identity remain supported."""
+    with (
+        patch(f"{_MODULE}.create_dialer_call", new=AsyncMock()),
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value=None)),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("", ""))),
+    ):
+        response = await handle_sw_dialer_connect(
+            _authed({"vars": {"userVariables": {"lead": "+15550001111"}}})
+        )
     doc = _payload_of(response)
 
     assert any("connect" in step for step in doc["sections"]["main"])
@@ -1196,3 +1437,361 @@ async def test_end_source_is_ignored_before_the_call_ends(status_update):
     body = {"params": {"call_id": "far-leg", "call_state": "answered", "end_source": "inbound"}}
     await handle_sw_call_status(_request(body, query={"k": _SECRET, "call_id": "sw-1"}))
     assert status_update.call_args.kwargs["ended_by"] is None
+
+def test_signalwire_parallel_overflow_gets_a_private_waiting_room():
+    """A second lead must never be directed into the winner's live conference."""
+    from api.services.telephony.dialer.swml import build_signalwire_parallel_overflow_swml
+
+    document = build_signalwire_parallel_overflow_swml(
+        conference_name="sysevo-overflow-session-leg"
+    )
+    join = document["sections"]["main"][0]["join_conference"]
+    assert join == {
+        "name": "sysevo-overflow-session-leg",
+        "start_on_enter": False,
+        "end_on_exit": False,
+    }
+
+
+async def test_signalwire_second_human_routes_to_reserved_teammate():
+    """The callback returns an isolated conference only after durable routing succeeds."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_decision
+
+    session_id = "00000000-0000-0000-0000-000000000001"
+    leg_id = "00000000-0000-0000-0000-000000000002"
+    routed = {
+        "inbound_call_id": "00000000-0000-0000-0000-000000000003",
+        "rep_user_id": "00000000-0000-0000-0000-000000000004",
+        "caller_name": "Example Co",
+        "conference_name": f"sysevo-overflow-{leg_id}",
+    }
+
+    def _close_coro(coro):
+        coro.close()
+
+    with (
+        patch(f"{_MODULE}._secret_ok", return_value=True),
+        patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value={
+            "session": {"id": session_id, "rep_user_id": routed["rep_user_id"], "rep_call_id": "rep-call", "conference_name": f"sysevo-par-{session_id}", "status": "connected"},
+            "leg": {"id": leg_id, "entry_id": "entry", "provider_call_id": "prospect-call", "status": "human"},
+        })),
+        patch(f"{_MODULE}.signalwire_parallel_store.update_leg", new=AsyncMock(return_value=True)),
+        patch(f"{_MODULE}.signalwire_parallel_store.claim_winner", new=AsyncMock(return_value=False)),
+        patch(f"{_MODULE}.signalwire_parallel_store.route_to_teammate", new=AsyncMock(return_value=routed)) as route,
+        patch(f"{_MODULE}.notify_inbound_call") as notify,
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.com", "wss://api.example.com"))),
+        patch(f"{_MODULE}._spawn_background", side_effect=_close_coro),
+        patch(f"{_MODULE}.update_dialer_call_status", new=AsyncMock()) as update_call,
+    ):
+        response = await handle_sw_parallel_decision(_authed(
+            {"call": {"call_id": "prospect-call", "amd_result": "human", "amd_ms": 2400}},
+            query={"session_id": session_id, "leg_id": leg_id},
+        ))
+
+    route.assert_awaited_once()
+    notify.assert_called_once_with(routed["inbound_call_id"])
+    update_call.assert_awaited_once()
+    assert update_call.await_args.kwargs["status"] == "in-progress"
+    join = _payload_of(response)["sections"]["main"][0]["join_conference"]
+    assert join["name"] == routed["conference_name"]
+    assert join["name"] != f"sysevo-par-{session_id}"
+    assert "sw-overflow-conference" in join["status_callback"]
+    assert join["status_callback_event"] == "join leave"
+
+
+async def test_signalwire_parallel_leg_still_runs_amd_after_first_human_connects():
+    """A late second answer must reach AMD and then the overflow decision route."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_leg
+
+    session_id = "00000000-0000-0000-0000-000000000021"
+    leg_id = "00000000-0000-0000-0000-000000000022"
+    provider_call_id = "prospect-second-call"
+    context = {
+        "session": {
+            "id": session_id,
+            "rep_user_id": "00000000-0000-0000-0000-000000000004",
+            "rep_call_id": "rep-browser-call",
+            "conference_name": f"sysevo-par-{session_id}",
+            "status": "connected",
+            "winner_leg_id": "00000000-0000-0000-0000-000000000020",
+        },
+        "leg": {
+            "id": leg_id,
+            "entry_id": "00000000-0000-0000-0000-000000000023",
+            "provider_call_id": provider_call_id,
+            "status": "ringing",
+        },
+    }
+
+    with (
+        patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value=context)),
+        patch(f"{_MODULE}.signalwire_parallel_store.update_leg", new=AsyncMock(return_value=True)),
+        patch(f"{_MODULE}.signalwire_parallel_store.get_voicemail_policy", new=AsyncMock(return_value={
+            "machine_detection_enabled": True,
+            "machine_detection_preset": "balanced",
+        })),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=(
+            "https://api.sysevo.io", "wss://api.sysevo.io"
+        ))),
+    ):
+        response = await handle_sw_parallel_leg(_authed(
+            {"call": {"call_id": provider_call_id}},
+            query={"session_id": session_id, "leg_id": leg_id},
+        ))
+
+    document = _payload_of(response)
+    steps = document["sections"]["main"]
+    assert steps[0]["detect_machine"]["wait"] is True
+    assert "sw-parallel-decide" in steps[1]["execute"]["dest"]
+
+
+@pytest.mark.parametrize("line_count", [1, 3])
+async def test_parallel_always_screens_even_when_single_call_amd_is_disabled(line_count):
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_leg
+
+    session_id = "00000000-0000-0000-0000-000000000021"
+    leg_id = "00000000-0000-0000-0000-000000000022"
+    with (
+        patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value={
+            "session": {"status": "dialing", "rep_user_id": "rep", "rep_call_id": "browser", "line_count": line_count},
+            "leg": {"provider_call_id": "prospect-call", "entry_id": "entry", "status": "screening"},
+        })),
+        patch(f"{_MODULE}.signalwire_parallel_store.get_voicemail_policy", new=AsyncMock(return_value={
+            "machine_detection_enabled": False,
+        })),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.test", ""))),
+    ):
+        response = await handle_sw_parallel_leg(_authed(
+            {"call": {"call_id": "prospect-call"}},
+            query={"session_id": session_id, "leg_id": leg_id},
+        ))
+    steps = _payload_of(response)["sections"]["main"]
+    assert any("detect_machine" in step for step in steps) is (line_count > 1)
+
+
+@pytest.mark.parametrize("line_count", [1, 3])
+async def test_machine_pass_to_rep_is_only_available_for_single_screened_calls(line_count):
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_decision
+
+    session_id = "00000000-0000-0000-0000-000000000021"
+    leg_id = "00000000-0000-0000-0000-000000000022"
+    with (
+        patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value={
+            "session": {"status": "dialing", "rep_user_id": "rep", "rep_call_id": "browser", "line_count": line_count,
+                        "conference_name": f"sysevo-par-{session_id}"},
+            "leg": {"provider_call_id": "prospect-call", "entry_id": "entry", "status": "screening"},
+        })),
+        patch(f"{_MODULE}.signalwire_parallel_store.update_leg", new=AsyncMock(return_value=True)),
+        patch(f"{_MODULE}.signalwire_parallel_store.get_voicemail_policy", new=AsyncMock(return_value={"on_machine": "pass_to_rep"})),
+        patch(f"{_MODULE}.signalwire_parallel_store.claim_winner", new=AsyncMock(return_value=True)) as winner,
+        patch(f"{_MODULE}.signalwire_parallel_store.record_outcome", new=AsyncMock(return_value=True)) as outcome,
+        patch(f"{_MODULE}._load_signalwire_parallel_entries", new=AsyncMock(return_value=[{"id": "entry", "phone": "+14155550123"}])),
+        patch(f"{_MODULE}.update_signalwire_parallel_winner", new=AsyncMock(return_value=True)),
+        patch(f"{_MODULE}.update_signalwire_dialer_amd", new=AsyncMock()),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.test", ""))),
+    ):
+        response = await handle_sw_parallel_decision(_authed(
+            {"call": {"call_id": "prospect-call", "amd_result": "machine"}},
+            query={"session_id": session_id, "leg_id": leg_id},
+        ))
+    if line_count == 1:
+        winner.assert_awaited_once()
+        outcome.assert_not_awaited()
+        assert "join_conference" in _payload_of(response)["sections"]["main"][0]
+    else:
+        winner.assert_not_awaited()
+        outcome.assert_awaited_once()
+        assert _is_hangup(_payload_of(response))
+
+
+async def test_signalwire_parallel_caller_ids_are_resolved_in_one_batch():
+    from api.services.telephony.dialer.signalwire_routes import _resolve_signalwire_parallel_caller_ids
+
+    response = MagicMock()
+    response.raise_for_status = MagicMock()
+    response.json.return_value = [
+        {"entry_id": "lead-a", "phone_number": "+14155550101", "provider": "signalwire"},
+        {"entry_id": "lead-b", "phone_number": "+14155550102", "provider": "signalwire"},
+    ]
+    client = AsyncMock()
+    client.post = AsyncMock(return_value=response)
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+
+    with (
+        patch(f"{_MODULE}.SUPABASE_URL", "https://db.example.supabase.co"),
+        patch(f"{_MODULE}.SUPABASE_SERVICE_ROLE_KEY", "service-key"),
+        patch(f"{_MODULE}.httpx.AsyncClient", return_value=client),
+        patch(f"{_MODULE}._is_signalwire_owned_number", new=AsyncMock(return_value=True)) as owns,
+    ):
+        resolved = await _resolve_signalwire_parallel_caller_ids(
+            rep_user_id="rep-user",
+            entry_ids=["lead-a", "lead-b"],
+            fallback_number="+12095550100",
+        )
+
+    assert resolved == {"lead-a": "+14155550101", "lead-b": "+14155550102"}
+    client.post.assert_awaited_once()
+    request = client.post.await_args
+    assert request.args[0].endswith("/rpc/dialer_resolve_parallel_caller_ids")
+    assert request.kwargs["json"]["p_entry_ids"] == ["lead-a", "lead-b"]
+    assert request.kwargs["json"]["p_provider"] == "signalwire"
+    assert owns.await_count == 2
+
+
+@pytest.mark.parametrize("call_state,should_close", [("answered", False), ("ended", True)])
+async def test_stale_signalwire_answer_status_cannot_resurrect_routed_leg(call_state, should_close):
+    """A delayed provider answer event must not overwrite a routed/terminal leg."""
+    from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_status
+
+    session_id = "00000000-0000-0000-0000-000000000011"
+    leg_id = "00000000-0000-0000-0000-000000000012"
+    with (
+        patch(f"{_MODULE}._secret_ok", return_value=True),
+        patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value={
+            "session": {"id": session_id, "rep_user_id": "rep", "status": "connected"},
+            "leg": {"id": leg_id, "provider_call_id": "prospect-call", "status": "completed"},
+        })),
+        patch(f"{_MODULE}.signalwire_parallel_store.update_leg", new=AsyncMock(return_value=False)),
+        patch(f"{_MODULE}.update_dialer_call_status", new=AsyncMock()) as update_call,
+        patch(f"{_MODULE}.close_inbound_call", new=AsyncMock()) as close_inbound,
+        patch(f"{_MODULE}.evaluate_overflow_guard", new=AsyncMock()) as evaluate,
+    ):
+        response = await handle_sw_parallel_status(_authed(
+            {"call": {"call_id": "prospect-call", "call_state": call_state}},
+            query={"session_id": session_id, "leg_id": leg_id},
+        ))
+
+    assert _payload_of(response) == {"ok": True, "ignored": True, "reason": "stale_state"}
+    if should_close:
+        update_call.assert_awaited_once()
+        assert update_call.await_args.kwargs["status"] == "completed"
+        close_inbound.assert_awaited_once_with(provider_call_id="prospect-call")
+        evaluate.assert_awaited_once_with(provider_call_id="prospect-call", provider="signalwire")
+    else:
+        update_call.assert_not_awaited()
+        close_inbound.assert_not_awaited()
+        evaluate.assert_not_awaited()
+
+
+async def test_screened_single_signalwire_queue_call_uses_one_reserved_prospect_leg():
+    """Single queue dialing must use AMD without weakening Parallel's line contract."""
+    from api.services.telephony.dialer.signalwire_routes import _start_signalwire_session
+
+    rep_id = "00000000-0000-0000-0000-000000000021"
+    entry_id = "00000000-0000-0000-0000-000000000022"
+    leg_id = "00000000-0000-0000-0000-000000000023"
+    provider_call_id = "00000000-0000-0000-0000-000000000024"
+    conference_name = "sysevo-par-00000000-0000-0000-0000-000000000025"
+
+    with (
+        patch("api.services.telephony.dialer.parallel_auth.verify_parallel_auth_token", return_value=rep_id),
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value=rep_id)),
+        patch(f"{_MODULE}._resolve_signalwire_caller_id", new=AsyncMock(return_value="+12095550123")),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.com", ""))),
+        patch(f"{_MODULE}._load_signalwire_parallel_entries", new=AsyncMock(return_value=[{"id": entry_id, "phone": "+14155550123"}])),
+        patch(f"{_MODULE}.signalwire_parallel_store.start_screened_single_session", new=AsyncMock(return_value=[{"id": leg_id}] )) as reserve,
+        patch(f"{_MODULE}._resolve_signalwire_parallel_caller_id", new=AsyncMock(return_value="+12095550123")),
+        patch(f"{_MODULE}._check_signalwire_parallel_compliance", new=AsyncMock()),
+        patch(f"{_MODULE}.create_dialer_call", new=AsyncMock(return_value=True)),
+        patch("api.services.telephony.dialer.signalwire_calling.originate_call", new=AsyncMock(return_value={"id": provider_call_id})) as originate,
+        patch(f"{_MODULE}.signalwire_parallel_store.register_provider_call", new=AsyncMock(return_value=True)),
+    ):
+        response = await _start_signalwire_session(
+            request=_authed({}),
+            payload={},
+            query={
+                "ParallelAuthToken": "short-lived-token",
+                "EntryId": entry_id,
+                "RepId": rep_id,
+                "CallSid": "browser-call-0001",
+            },
+            identity=rep_id,
+            screened_single=True,
+        )
+
+    reserve.assert_awaited_once_with(
+        session_id=reserve.await_args.kwargs["session_id"],
+        rep_user_id=rep_id,
+        rep_call_id="browser-call-0001",
+        conference_name=reserve.await_args.kwargs["conference_name"],
+        entry_id=entry_id,
+    )
+    originate.assert_awaited_once()
+    assert _payload_of(response)["sections"]["main"][0]["join_conference"]["name"].startswith("sysevo-par-")
+
+
+async def test_signalwire_parallel_originates_every_selected_lead_with_batch_caller_ids():
+    """The server must fan out N accepted PSTN legs with the N selected leads."""
+    from api.services.telephony.dialer.signalwire_routes import _start_signalwire_session
+
+    rep_id = "00000000-0000-0000-0000-000000000031"
+    entry_ids = [
+        "00000000-0000-0000-0000-000000000032",
+        "00000000-0000-0000-0000-000000000033",
+    ]
+    entries = [
+        {"id": entry_ids[0], "phone": "+14155550101"},
+        {"id": entry_ids[1], "phone": "+16025550102"},
+    ]
+    caller_ids = {
+        entry_ids[0]: "+14155550991",
+        entry_ids[1]: "+16025550992",
+    }
+    originate = AsyncMock(side_effect=[{"id": "prospect-call-1"}, {"id": "prospect-call-2"}])
+
+    with (
+        patch("api.services.telephony.dialer.parallel_auth.verify_parallel_auth_token", return_value=rep_id),
+        patch(f"{_MODULE}._rep_supabase_id", new=AsyncMock(return_value=rep_id)),
+        patch(f"{_MODULE}._resolve_signalwire_caller_id", new=AsyncMock(return_value="+12095550100")),
+        patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.com", ""))),
+        patch(f"{_MODULE}._load_signalwire_parallel_entries", new=AsyncMock(return_value=entries)),
+        patch(f"{_MODULE}.signalwire_parallel_store.start_session", new=AsyncMock(return_value=[
+            {"id": "leg-one"}, {"id": "leg-two"},
+        ])) as reserve,
+        patch(f"{_MODULE}._resolve_signalwire_parallel_caller_ids", new=AsyncMock(return_value=caller_ids)) as resolve_batch,
+        patch(f"{_MODULE}._check_signalwire_parallel_compliance", new=AsyncMock()) as compliance,
+        patch(f"{_MODULE}.create_dialer_call", new=AsyncMock(return_value=True)) as save_call,
+        patch("api.services.telephony.dialer.signalwire_calling.originate_call", new=originate),
+        patch(f"{_MODULE}.signalwire_parallel_store.register_provider_call", new=AsyncMock(return_value=True)),
+    ):
+        response = await _start_signalwire_session(
+            request=_authed({}),
+            payload={},
+            query={
+                "ParallelAuthToken": "short-lived-token",
+                "ParallelEntryIds": json.dumps(entry_ids),
+                "ParallelLineCount": "2",
+                "CallSid": "browser-call-0002",
+            },
+            identity=rep_id,
+        )
+
+    reserve.assert_awaited_once()
+    resolve_batch.assert_awaited_once_with(
+        rep_user_id=rep_id, entry_ids=entry_ids, fallback_number="+12095550100"
+    )
+    assert compliance.await_count == 2
+    assert save_call.await_count == 3  # one parent history row plus both lead rows
+    assert originate.await_count == 2
+    originated = {
+        call.kwargs["to_number"]: call.kwargs["from_number"]
+        for call in originate.await_args_list
+    }
+    assert originated == {
+        "+14155550101": caller_ids[entry_ids[0]],
+        "+16025550102": caller_ids[entry_ids[1]],
+    }
+    assert _payload_of(response)["sections"]["main"][0]["join_conference"]["name"].startswith("sysevo-par-")
+
+
+async def test_screened_single_mode_dispatches_to_server_amd_flow():
+    expected = {"ok": True}
+    with patch(f"{_MODULE}._start_signalwire_session", new=AsyncMock(return_value=expected)) as start:
+        response = await handle_sw_dialer_connect(_authed(
+            {"params": {"rep": "rep-user", "DialMode": "screened_single"}}
+        ))
+
+    assert response is expected
+    start.assert_awaited_once()
+    assert start.await_args.kwargs["screened_single"] is True
