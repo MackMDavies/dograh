@@ -200,6 +200,11 @@ services:
       SYSEVO_DIAL_SUPPRESSION_LIST_URL: "${SYSEVO_DIAL_SUPPRESSION_LIST_URL:-}"
       SYSEVO_CAMPAIGN_NOTIFY_URL: "${SYSEVO_CAMPAIGN_NOTIFY_URL:-}"
       INTERNAL_API_SECRET: "${INTERNAL_API_SECRET:-}"
+      # HMAC key for the 5-minute rep proof that authorizes SignalWire parallel
+      # and screened dials (api/services/telephony/dialer/parallel_auth.py).
+      # Falls back to INTERNAL_API_SECRET; with neither set no proof is issued
+      # and the browser refuses every SignalWire parallel dial.
+      SIGNALWIRE_PARALLEL_AUTH_SECRET: "${SIGNALWIRE_PARALLEL_AUTH_SECRET:-}"
 
       # Sysevo Sales Power Dialer — browser softphone (Twilio Voice SDK).
       SYSEVO_TWILIO_ACCOUNT_SID: "${SYSEVO_TWILIO_ACCOUNT_SID:-}"

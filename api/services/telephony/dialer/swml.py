@@ -386,20 +386,48 @@ def build_agent_overflow_swml(
     return {"sections": {"main": steps}}
 
 
+# Classification tuning per account preset, in SignalWire's own units (seconds):
+# (machine_voice_threshold, end_silence_timeout, initial_timeout).
+#
+# These decide how fast a pickup is CLASSIFIED. They deliberately do not bound
+# the detector's total run time: with detect_message_end the detector keeps
+# running after a MACHINE verdict until the greeting's beep/end, and that wait is
+# what lets the drop land in the mailbox instead of over the greeting. "balanced"
+# is SignalWire's documented default set.
+SIGNALWIRE_AMD_PRESETS: dict[str, tuple[float, float, float]] = {
+    "fastest": (1.0, 0.6, 2.5),
+    "fast": (1.1, 0.8, 3.5),
+    "balanced": (1.25, 1.0, 4.5),
+    "accurate": (2.0, 1.2, 6.0),
+}
+
+# Upper bound on the whole detection, including the wait for the beep. A human
+# is classified within initial_timeout + end_silence_timeout regardless; only a
+# voicemail greeting runs this long. 30 s is SignalWire's default and covers
+# long greetings. The previous 1.2-3.2 s cap expired mid-greeting, so a
+# voicemail came back as `detecting`/`unknown` (and was bridged to the rep) or
+# as `machine` before the beep (and the drop played over the greeting).
+SIGNALWIRE_AMD_MAX_SECONDS = 30.0
+
+
 def build_signalwire_parallel_leg_swml(
-    *, decision_url: str, amd_timeout_seconds: float = 2.4,
+    *, decision_url: str, amd_preset: str = "balanced",
     machine_detection_enabled: bool = True,
 ) -> dict:
     """Screen a server-originated prospect leg before it can reach the rep."""
     if not decision_url.startswith("https://"):
         raise ValueError("SignalWire parallel decision handler must use HTTPS")
-    if not 1 <= amd_timeout_seconds <= 30:
-        raise ValueError("SignalWire AMD timeout must be between 1 and 30 seconds")
+    voice_threshold, end_silence, initial = SIGNALWIRE_AMD_PRESETS.get(
+        amd_preset, SIGNALWIRE_AMD_PRESETS["balanced"]
+    )
     steps: list[dict] = []
     if machine_detection_enabled:
         steps.append({"detect_machine": {
             "detectors": "amd,fax", "detect_message_end": True,
-            "timeout": amd_timeout_seconds, "wait": True,
+            "timeout": SIGNALWIRE_AMD_MAX_SECONDS, "wait": True,
+            "machine_voice_threshold": voice_threshold,
+            "end_silence_timeout": end_silence,
+            "initial_timeout": initial,
         }})
     steps.append({"execute": {"dest": decision_url, "params": {
         "amd_result": "${detect_result}" if machine_detection_enabled else "human",

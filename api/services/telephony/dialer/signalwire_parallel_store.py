@@ -99,6 +99,25 @@ async def start_screened_single_session(
     return rows
 
 
+async def expire_stale_sessions(*, rep_user_id: str) -> int:
+    """Close this rep's batches that no callback will ever close. Best-effort.
+
+    Never raises: before migration 20270421090500 the RPC does not exist, and an
+    unavailable cleanup must not stop a valid batch (the reservation RPC still
+    enforces one active batch per rep).
+    """
+    try:
+        result = await _rpc(
+            "dialer_signalwire_parallel_expire_stale", {"p_rep_user_id": rep_user_id}
+        )
+    except SignalWireParallelStoreError:
+        logger.warning("Could not expire stale SignalWire parallel sessions", exc_info=True)
+        return 0
+    if isinstance(result, int) and result > 0:
+        logger.warning("Expired %s stale SignalWire parallel session(s) for a rep", result)
+    return result if isinstance(result, int) else 0
+
+
 async def register_provider_call(*, session_id: str, leg_id: str, provider_call_id: str) -> bool:
     changed = await _rpc(
         "dialer_signalwire_parallel_bind_call",

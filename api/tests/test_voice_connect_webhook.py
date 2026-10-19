@@ -431,6 +431,139 @@ def test_voice_connect_parallel_fans_out_only_server_validated_targets(monkeypat
     assert create_call.await_args.kwargs["entry_id"] == targets[0]["entry_id"]
 
 
+def test_voice_connect_parallel_persists_caller_ids_only_after_the_aggregate_row_exists(monkeypatch):
+    """dialer_parallel_assign_caller_id matches the dialer_calls row for the
+    parent call SID; called before that row exists it updates nothing and the
+    whole batch is refused. Model that contract instead of mocking the two
+    calls independently (which hid the ordering bug)."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    targets = [
+        {"leg_id": "11111111-1111-4111-8111-111111111111", "entry_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "phone": "+15550000001", "business": "One"},
+        {"leg_id": "22222222-2222-4222-8222-222222222222", "entry_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "phone": "+15550000002", "business": "Two"},
+    ]
+    rows: list[dict] = []
+    order: list[str] = []
+
+    async def create_row(**kwargs):
+        order.append("create_row")
+        rows.append(kwargs)
+        return True
+
+    async def assign(**kwargs):
+        order.append("assign")
+        return any(row["parent_call_sid"] == kwargs["parent_call_sid"] for row in rows)
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id", return_value=None
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=SimpleNamespace(provider_id="aaaaaaaa-0000-4000-8000-000000000001"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.start_parallel_session",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.parallel_targets",
+        return_value=targets,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.parallel_caller_id_candidates",
+        return_value=["+15551234567"],
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.assign_parallel_caller_id",
+        side_effect=assign,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.finish_parallel_session",
+        return_value=True,
+    ) as finish, patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.register_parallel_leg",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call",
+        side_effect=create_row,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        side_effect=["CA" + "1" * 32, "CA" + "2" * 32],
+    ) as originate:
+        response = client.post(
+            "/voice-connect",
+            data={
+                "To": "+15559999999",
+                "CallSid": _LISTEN_SID,
+                "From": "client:rep-42",
+                "DialMode": "parallel",
+                "ParallelLineCount": "2",
+                "ParallelEntryIds": '["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]',
+            },
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" not in response.text
+    assert "<Conference" in response.text
+    assert order == ["create_row", "assign", "assign"]
+    finish.assert_not_awaited()
+    assert originate.call_count == 2
+    assert {call.kwargs["caller_id"] for call in originate.call_args_list} == {"+15551234567"}
+
+
+def test_voice_connect_parallel_screens_every_destination_against_do_not_call(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    checked: list[str] = []
+
+    async def second_line_blocked(phone):
+        checked.append(phone)
+        return "do_not_call" if phone == "+15550000002" else None
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id", return_value=None
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_phone_block_reason",
+        side_effect=second_line_blocked,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.candidate_phones",
+        return_value={
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa": "+15550000001",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb": "+15550000002",
+        },
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dialer_parallel.start_parallel_session",
+    ) as start_session, patch(
+        "api.services.telephony.providers.twilio.routes.create_dialer_call",
+    ) as create_call, patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+    ) as originate:
+        response = client.post(
+            "/voice-connect",
+            data={
+                "To": "+15550000001",
+                "CallSid": _LISTEN_SID,
+                "From": "client:rep-42",
+                "DialMode": "parallel",
+                "ParallelLineCount": "2",
+                "ParallelEntryIds": '["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa","bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"]',
+            },
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    assert "do not call" in response.text
+    assert sorted(checked) == ["+15550000001", "+15550000002"]
+    start_session.assert_not_awaited()
+    create_call.assert_not_awaited()
+    originate.assert_not_awaited()
+
+
 def test_voice_connect_blocks_suppressed_number_before_creating_or_originating_call(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")

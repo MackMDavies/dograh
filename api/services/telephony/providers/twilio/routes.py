@@ -128,6 +128,19 @@ _PARALLEL_TERMINAL_LEG_STATES = frozenset({
 })
 
 
+def _parallel_refusal_twiml(message: str) -> str:
+    """Hang up a refused parallel batch, telling the rep why in their headset.
+
+    A bare <Hangup/> ended the browser call with no explanation, which the
+    rep could not tell apart from a carrier fault.
+    """
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Say>'
+        + escape(message)
+        + "</Say><Hangup/></Response>"
+    )
+
+
 def _parallel_batch_has_settled(legs: list[dict]) -> bool:
     """Whether every parallel destination has a durable terminal result."""
     return bool(legs) and all(
@@ -933,14 +946,49 @@ async def handle_voice_connect(request: Request):
         candidate_numbers = await dialer_parallel.candidate_phones(parallel_entry_ids)
         if len(candidate_numbers) != parallel_line_count:
             logger.warning("voice-connect could not load every parallel destination for compliance preflight")
-            return HTMLResponse(content=hangup, media_type="application/xml")
-        for candidate_entry_id, candidate_phone in candidate_numbers.items():
-            allowed, reason = await check_dialer_calling_hours(candidate_phone, candidate_entry_id)
+            return HTMLResponse(
+                content=_parallel_refusal_twiml("The selected leads could not be loaded. Refresh the queue and try again."),
+                media_type="application/xml",
+            )
+        # Every destination gets the same server checks as a single dial: the
+        # do-not-call/wrong-number register AND calling hours. The browser only
+        # screened the first lead, so lines 2..N would otherwise reach the
+        # carrier unchecked against a duplicate entry marked Do not call.
+        # Checks run concurrently so a ten-line batch stays inside Twilio's
+        # webhook deadline.
+        candidate_items = list(candidate_numbers.items())
+        block_reasons, hours_results = await asyncio.gather(
+            asyncio.gather(*(
+                get_dialer_phone_block_reason(candidate_phone)
+                for _candidate_entry_id, candidate_phone in candidate_items
+            )),
+            asyncio.gather(*(
+                check_dialer_calling_hours(candidate_phone, candidate_entry_id)
+                for candidate_entry_id, candidate_phone in candidate_items
+            )),
+        )
+        blocked = next((reason for reason in block_reasons if reason), None)
+        if blocked:
+            logger.warning(
+                f"voice-connect blocked parallel batch by server compliance check ({blocked})"
+            )
+            return HTMLResponse(
+                content=_parallel_refusal_twiml(
+                    "One of the selected leads is on the do not call list. Refresh the queue and try again."
+                ),
+                media_type="application/xml",
+            )
+        for allowed, reason in hours_results:
             if not allowed:
                 logger.warning(
                     f"voice-connect blocked parallel batch by calling-hours check ({reason})"
                 )
-                return HTMLResponse(content=hangup, media_type="application/xml")
+                return HTMLResponse(
+                    content=_parallel_refusal_twiml(
+                        "One of the selected leads is outside calling hours. Skip it and try again."
+                    ),
+                    media_type="application/xml",
+                )
     else:
         block_reason = await get_dialer_phone_block_reason(to_number)
         if block_reason:
@@ -994,7 +1042,12 @@ async def handle_voice_connect(request: Request):
                 )
                 if not created:
                     logger.warning(f"voice-connect could not validate parallel session for {parent_call_sid}")
-                    return HTMLResponse(content=hangup, media_type="application/xml")
+                    return HTMLResponse(
+                        content=_parallel_refusal_twiml(
+                            "The parallel batch could not start because one of the leads is no longer available. Refresh the queue and try again."
+                        ),
+                        media_type="application/xml",
+                    )
                 parallel_targets = await dialer_parallel.parallel_targets(
                     parent_call_sid=parent_call_sid,
                     rep_user_id=rep_user_id,
@@ -1014,28 +1067,17 @@ async def handle_voice_connect(request: Request):
                         parent_call_sid=parent_call_sid, status="failed"
                     )
                     return HTMLResponse(content=hangup, media_type="application/xml")
-                for target in parallel_targets:
-                    selected_caller_id = caller_ids_by_entry[target["entry_id"]]
-                    persisted = await dialer_parallel.assign_parallel_caller_id(
-                        parent_call_sid=parent_call_sid,
-                        leg_id=target["leg_id"],
-                        rep_user_id=rep_user_id,
-                        caller_id=selected_caller_id,
-                    )
-                    if not persisted:
-                        logger.error(
-                            f"voice-connect could not persist the caller ID for parallel leg {target['leg_id']}"
-                        )
-                        await dialer_parallel.finish_parallel_session(
-                            parent_call_sid=parent_call_sid, status="failed"
-                        )
-                        return HTMLResponse(content=hangup, media_type="application/xml")
-                    target["caller_id"] = selected_caller_id
                 # Server-resolved entry data, not the custom Voice SDK To value,
                 # controls the aggregate row and all outbound PSTN destinations.
                 to_number = parallel_targets[0]["phone"]
                 entry_id = parallel_targets[0]["entry_id"]
                 caller_id = caller_ids_by_entry[entry_id]
+            # The aggregate history row must exist BEFORE any per-leg caller ID
+            # is persisted: dialer_parallel_assign_caller_id only accepts a
+            # caller ID that equals this row's from_number or is a DID assigned
+            # to the rep, and it locates the row by parent_call_sid. Persisting
+            # first (the original order) matched zero rows, so every Twilio
+            # parallel batch was failed before a single destination was rung.
             call_row_created = await create_dialer_call(
                 parent_call_sid=parent_call_sid,
                 rep_user_id=user.provider_id,
@@ -1058,6 +1100,35 @@ async def handle_voice_connect(request: Request):
                     content='<?xml version="1.0" encoding="UTF-8"?><Response><Say>We could not verify this call. Please try again.</Say><Hangup/></Response>',
                     media_type="application/xml",
                 )
+            if parallel_requested:
+                for target in parallel_targets:
+                    selected_caller_id = caller_ids_by_entry[target["entry_id"]]
+                    persisted = await dialer_parallel.assign_parallel_caller_id(
+                        parent_call_sid=parent_call_sid,
+                        leg_id=target["leg_id"],
+                        rep_user_id=rep_user_id,
+                        caller_id=selected_caller_id,
+                    )
+                    if not persisted:
+                        logger.error(
+                            f"voice-connect could not persist the caller ID for parallel leg {target['leg_id']}"
+                        )
+                        await dialer_parallel.finish_parallel_session(
+                            parent_call_sid=parent_call_sid, status="failed"
+                        )
+                        await update_dialer_call_status(
+                            parent_call_sid=parent_call_sid,
+                            child_call_sid=None,
+                            status="failed",
+                            duration_seconds=0,
+                        )
+                        return HTMLResponse(
+                            content=_parallel_refusal_twiml(
+                                "The parallel batch could not start because a caller ID could not be confirmed. Please try again."
+                            ),
+                            media_type="application/xml",
+                        )
+                    target["caller_id"] = selected_caller_id
             team_voicemail_policy = await get_team_voicemail_policy(
                 user_id=user.provider_id, parent_call_sid=parent_call_sid,
                 entry_id=entry_id,

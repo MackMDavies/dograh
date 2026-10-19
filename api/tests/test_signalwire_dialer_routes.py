@@ -41,6 +41,10 @@ def _request(body, *, query: dict | None = None) -> MagicMock:
 def _authed(body, *, query: dict | None = None) -> MagicMock:
     q = {"k": _SECRET}
     q.update(query or {})
+    # Parallel callback URLs always carry the signed per-leg nonce as call_id
+    # (_parallel_callback_url); mirror the real URL shape.
+    if "session_id" in q and "leg_id" in q and "call_id" not in q:
+        q["call_id"] = f"sw-parallel:{q['session_id']}:{q['leg_id']}"
     return _request(body, query=q)
 
 
@@ -1655,6 +1659,7 @@ async def test_stale_signalwire_answer_status_cannot_resurrect_routed_leg(call_s
         patch(f"{_MODULE}.update_dialer_call_status", new=AsyncMock()) as update_call,
         patch(f"{_MODULE}.close_inbound_call", new=AsyncMock()) as close_inbound,
         patch(f"{_MODULE}.evaluate_overflow_guard", new=AsyncMock()) as evaluate,
+        patch(f"{_MODULE}._finish_signalwire_batch_if_settled", new=AsyncMock(return_value=False)) as finish,
     ):
         response = await handle_sw_parallel_status(_authed(
             {"call": {"call_id": "prospect-call", "call_state": call_state}},
@@ -1662,6 +1667,7 @@ async def test_stale_signalwire_answer_status_cannot_resurrect_routed_leg(call_s
         ))
 
     assert _payload_of(response) == {"ok": True, "ignored": True, "reason": "stale_state"}
+    assert finish.await_count == (1 if should_close else 0)
     if should_close:
         update_call.assert_awaited_once()
         assert update_call.await_args.kwargs["status"] == "completed"
