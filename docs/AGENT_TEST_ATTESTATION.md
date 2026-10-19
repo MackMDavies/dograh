@@ -150,3 +150,16 @@ Redis check verifies ready -> expired heartbeat -> unavailable behaviour.
 The readiness/queue/pipeline verification passed 45 checks, including missing user
 or internal credentials, invalid authenticated organization IDs, redacted pool
 failures, and real Redis heartbeat expiry. Readiness probes never enqueue work.
+
+Private voice admission and report requests now have an eight-second overall
+server deadline, including Redis pool acquisition, scoped preflight and queue or
+report I/O. This is below the bridge's ten-second network deadline. Cooperative
+stalled dependencies are cancelled, and the existing fixed 503 errors disclose
+no lease, credential or internal connection text. A timeout does not prove an
+already enqueued job was cancelled; immutable session identity, one-time claim
+and reserved budgets continue to protect uncertain dispatch outcomes.
+
+All four new cancellation checks failed before the route deadline was added.
+After the fix, 68 route, capacity, task and job checks passed; Ruff check/format
+also passed for the changed files. These local tests use synthetic dependencies,
+do not contact providers and do not activate the production runtime.

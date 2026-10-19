@@ -25,6 +25,9 @@ from api.services.workflow.voice_test_job import (
 
 router = APIRouter(prefix="/workflow")
 UUID_PATTERN = r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+# Includes pool acquisition, scoped preflight and queue/report I/O. Keep the
+# server deadline below the private bridge's ten-second network deadline.
+VOICE_HTTP_DEADLINE_SECONDS = 8
 
 
 class VoiceTestRequest(BaseModel):
@@ -89,7 +92,10 @@ async def create_voice_test_session(
         user.id,
     )
     try:
-        async with httpx.AsyncClient() as http:
+        async with (
+            asyncio.timeout(VOICE_HTTP_DEADLINE_SECONDS),
+            httpx.AsyncClient() as http,
+        ):
             return await enqueue_voice_job(
                 db_client,
                 VoiceControlClient(http, secret),
@@ -130,7 +136,10 @@ async def voice_test_session_status(
         user.id,
     )
     try:
-        async with httpx.AsyncClient() as http:
+        async with (
+            asyncio.timeout(VOICE_HTTP_DEADLINE_SECONDS),
+            httpx.AsyncClient() as http,
+        ):
             return await read_voice_job_status(
                 db_client,
                 VoiceControlClient(http, secret),

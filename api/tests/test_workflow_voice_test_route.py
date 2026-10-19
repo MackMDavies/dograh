@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -233,3 +234,52 @@ def test_voice_capabilities_require_valid_authenticated_scope(
     )
     assert response.status_code == 400
     pool.assert_not_awaited()
+
+
+@pytest.mark.parametrize("operation", ["sessions", "status"])
+@pytest.mark.parametrize("stalled_stage", ["pool", "operation"])
+def test_private_voice_request_deadline_cancels_stalled_dependencies(
+    monkeypatch, operation, stalled_stage
+):
+    client, _, pool, enqueue = setup(monkeypatch)
+    read_status = AsyncMock(return_value={"status": "running"})
+    monkeypatch.setattr(workflow_voice_test, "read_voice_job_status", read_status)
+    monkeypatch.setattr(
+        workflow_voice_test, "VOICE_HTTP_DEADLINE_SECONDS", 0.01, raising=False
+    )
+    cancelled = []
+    continued = []
+
+    async def stalled(*args):
+        try:
+            await asyncio.sleep(0.05)
+        except asyncio.CancelledError:
+            cancelled.append(True)
+            raise
+        continued.append(True)
+        return {"status": "queued", "session_id": SESSION}
+
+    target = (
+        pool
+        if stalled_stage == "pool"
+        else enqueue
+        if operation == "sessions"
+        else read_status
+    )
+    target.side_effect = stalled
+    response = client.post(
+        f"/workflow/185/test-voice/{operation}",
+        json={"session_id": SESSION, "lease_token": LEASE},
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code == 503
+    assert response.json() == {
+        "detail": "voice_queue_unavailable"
+        if operation == "sessions"
+        else "voice_report_unavailable"
+    }
+    assert cancelled == [True] and continued == []
+    assert LEASE not in response.text and SECRET not in response.text
+    if stalled_stage == "pool":
+        enqueue.assert_not_awaited()
+        read_status.assert_not_awaited()
