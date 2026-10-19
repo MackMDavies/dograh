@@ -20,7 +20,9 @@ from pipecat.utils.time import time_now_iso8601
 
 from api.services.workflow.sandbox_repair import workflow_snapshot_hash
 from api.services.workflow.voice_test_capacity import (
+    WORKER_PROTOCOL_KEY,
     claim_voice_capacity,
+    private_voice_capabilities,
     publish_voice_worker_protocol,
     release_voice_capacity,
 )
@@ -206,84 +208,165 @@ class FixtureSpeechRecognition(FrameProcessor):
         self.receiving = False
         self.recognized = 0
 
-    async def process_frame(self,frame,direction):
-        await super().process_frame(frame,direction)
-        if isinstance(frame,InputAudioRawFrame):
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, InputAudioRawFrame):
             if any(frame.audio):
                 self.receiving = True
             elif self.receiving:
                 self.receiving = False
                 self.recognized += 1
-                await self.push_frame(TranscriptionFrame("What are your opening hours?","synthetic-caller",time_now_iso8601()))
-        await self.push_frame(frame,direction)
+                await self.push_frame(
+                    TranscriptionFrame(
+                        "What are your opening hours?",
+                        "synthetic-caller",
+                        time_now_iso8601(),
+                    )
+                )
+        await self.push_frame(frame, direction)
 
 
 @pytest.mark.asyncio
-async def test_durable_worker_drives_native_workflow_and_persists_private_report(private_queue,db_session,async_session,monkeypatch):
+async def test_durable_worker_drives_native_workflow_and_persists_private_report(
+    private_queue, db_session, async_session, monkeypatch
+):
     """Real queue, SQL rows and native pipeline; external speech/control are fixtures."""
-    _,redis = private_queue
-    _,user,workflow = await create_workflow_run_rows(db_session,async_session,
-        workflow_definition=WORKFLOW_DEFINITION,name_prefix="Durable Native Voice",provider_id_suffix="durable-native-voice")
-    definitions = await db_session.get_workflow_versions(workflow.id,limit=None)
+    _, redis = private_queue
+    _, user, workflow = await create_workflow_run_rows(
+        db_session,
+        async_session,
+        workflow_definition=WORKFLOW_DEFINITION,
+        name_prefix="Durable Native Voice",
+        provider_id_suffix="durable-native-voice",
+    )
+    definitions = await db_session.get_workflow_versions(workflow.id, limit=None)
     definition = next(item for item in definitions if item.status == "published")
-    encoded,_ = wav_fixture()
+    encoded, _ = wav_fixture()
     data = metadata()
-    data.update(workflow_id=workflow.id,workflow_version=definition.version_number,
-        runtime_workflow_hash=workflow_snapshot_hash(definition.workflow_json,definition.workflow_configurations,definition.template_context_variables))
-    data["fixture_manifest"][0].update(sha256=hashlib.sha256(encoded).hexdigest(),duration_ms=80)
-    data["script"].update(start_mode="agent_first",opening_timeout_ms=10000)
+    data.update(
+        workflow_id=workflow.id,
+        workflow_version=definition.version_number,
+        runtime_workflow_hash=workflow_snapshot_hash(
+            definition.workflow_json,
+            definition.workflow_configurations,
+            definition.template_context_variables,
+        ),
+    )
+    data["fixture_manifest"][0].update(
+        sha256=hashlib.sha256(encoded).hexdigest(), duration_ms=80
+    )
+    data["script"].update(start_mode="agent_first", opening_timeout_ms=10000)
     data["script"]["steps"][0]["response_timeout_ms"] = 10000
-    session = VoiceSession.parse(data,SESSION,workflow.id)
+    session = VoiceSession.parse(data, SESSION, workflow.id)
     from types import SimpleNamespace
-    control = SimpleNamespace(get=AsyncMock(return_value=session),fixture=AsyncMock(return_value=encoded),
-        claim=AsyncMock(),attach=AsyncMock(),upload=AsyncMock(),finish=AsyncMock())
+
+    control = SimpleNamespace(
+        get=AsyncMock(return_value=session),
+        fixture=AsyncMock(return_value=encoded),
+        claim=AsyncMock(),
+        attach=AsyncMock(),
+        upload=AsyncMock(),
+        finish=AsyncMock(),
+    )
     audio = []
 
-    async def upload(_session,_lease,_nonce,recording):
-        measured = output_measurements(recording,session.duration_seconds)
+    async def upload(_session, _lease, _nonce, recording):
+        measured = output_measurements(recording, session.duration_seconds)
         assert measured["pcm_bytes"] > 0
         audio.append(recording)
         return measured
 
-    async def finish(*_,**kwargs):
+    async def finish(*_, **kwargs):
         assert kwargs["status"] == "completed", kwargs["error_code"]
         runtime_id = control.attach.await_args.args[3]
         saved = await db_session.get_workflow_run_by_id(runtime_id)
         report = saved.annotations["agent_test_voice_result"]
-        control.get.return_value = replace(session,status="completed",runtime_workflow_run_id=runtime_id,
-            actual_duration_ms=report["actual_duration_ms"],audio_sha256=report["audio_sha256"],audio_bytes=report["audio_bytes"])
+        control.get.return_value = replace(
+            session,
+            status="completed",
+            runtime_workflow_run_id=runtime_id,
+            actual_duration_ms=report["actual_duration_ms"],
+            audio_sha256=report["audio_sha256"],
+            audio_bytes=report["audio_bytes"],
+        )
 
     control.upload.side_effect = upload
     control.finish.side_effect = finish
-    monkeypatch.setenv("SYSEVO_MEMORY_SECRET",SECRET)
-    monkeypatch.setattr(agent_test_voice,"db_client",db_session)
-    monkeypatch.setattr(agent_test_voice,"VoiceControlClient",lambda *_:control)
-    context = VoiceJobContext(SESSION,LEASE,workflow.id,workflow.organization_id,user.id)
-    assert await publish_voice_worker_protocol({"redis":redis})
-    await enqueue_voice_job(db_session,control,redis,context)
-    llm = MockLLMService(mock_steps=[MockLLMService.create_text_chunks("We are open Monday to Friday, nine to five.")],chunk_delay=0.001)
-    tts = MockTTSService(mock_audio_duration_ms=160,frame_delay=0)
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", SECRET)
+    monkeypatch.setattr(agent_test_voice, "db_client", db_session)
+    monkeypatch.setattr(agent_test_voice, "VoiceControlClient", lambda *_: control)
+    context = VoiceJobContext(
+        SESSION, LEASE, workflow.id, workflow.organization_id, user.id
+    )
+    assert await publish_voice_worker_protocol({"redis": redis})
+    await enqueue_voice_job(db_session, control, redis, context)
+    llm = MockLLMService(
+        mock_steps=[
+            MockLLMService.create_text_chunks(
+                "We are open Monday to Friday, nine to five."
+            )
+        ],
+        chunk_delay=0.001,
+    )
+    tts = MockTTSService(mock_audio_duration_ms=160, frame_delay=0)
     recognition = FixtureSpeechRecognition()
     captured = []
-    worker = Worker([agent_test_voice.run_agent_test_voice],redis_pool=redis,
-        burst=True,handle_signals=False,poll_delay=0.01,log_results=False)
+    worker = Worker(
+        [agent_test_voice.run_agent_test_voice],
+        redis_pool=redis,
+        burst=True,
+        handle_signals=False,
+        poll_delay=0.01,
+        log_results=False,
+    )
     try:
-        with patch_run_pipeline_externals(captured,llm=llm,tts=tts):
-            monkeypatch.setattr("api.services.pipecat.run_pipeline.create_stt_service",lambda *_args,**_kwargs:recognition)
+        with patch_run_pipeline_externals(captured, llm=llm, tts=tts):
+            monkeypatch.setattr(
+                "api.services.pipecat.run_pipeline.create_stt_service",
+                lambda *_args, **_kwargs: recognition,
+            )
             async with asyncio.timeout(50):
                 await worker.main()
         assert worker.jobs_complete == 1 and worker.jobs_failed == 0
-        info = await Job(f"agent-test-voice:{SESSION}",redis).result_info()
+        info = await Job(f"agent-test-voice:{SESSION}", redis).result_info()
         assert info.result["status"] == "completed", info.result["error_code"]
         assert recognition.recognized == 1 and llm.get_current_step() == 1
         assert len(tts.received_texts) >= 2 and len(audio) == 1
         runtime_id = info.result["runtime_workflow_run_id"]
         native = await db_session.get_workflow_run_by_id(runtime_id)
-        assert native.is_completed and native.annotations["sysevo_test_sandbox"]["voice_session_id"] == SESSION
-        assert await db_session.get_workflow_run(runtime_id,organization_id=workflow.organization_id) is None
+        assert (
+            native.is_completed
+            and native.annotations["sysevo_test_sandbox"]["voice_session_id"] == SESSION
+        )
+        assert (
+            await db_session.get_workflow_run(
+                runtime_id, organization_id=workflow.organization_id
+            )
+            is None
+        )
         assert await db_session.ensure_public_access_token(runtime_id) is None
-        status = await read_voice_job_status(db_session,control,redis,context,SECRET)
+        status = await read_voice_job_status(
+            db_session, control, redis, context, SECRET
+        )
         assert status["report_status"] == "verified" and not status["quality_evaluated"]
-        assert native.annotations["agent_test_voice_result"]["audio_sha256"] == hashlib.sha256(audio[0]).hexdigest()
+        assert (
+            native.annotations["agent_test_voice_result"]["audio_sha256"]
+            == hashlib.sha256(audio[0]).hexdigest()
+        )
     finally:
         await worker.close()
+
+
+@pytest.mark.asyncio
+async def test_private_capabilities_follow_real_worker_heartbeat_expiry(private_queue):
+    _, redis = private_queue
+    assert (await private_voice_capabilities(redis))["worker_ready"] is False
+    assert await publish_voice_worker_protocol({"redis": redis})
+    assert 0 < await redis.ttl(WORKER_PROTOCOL_KEY) <= 90
+    assert (await private_voice_capabilities(redis))["worker_ready"] is True
+    await redis.pexpire(WORKER_PROTOCOL_KEY, 20)
+    for _ in range(50):
+        if await redis.get(WORKER_PROTOCOL_KEY) is None:
+            break
+        await asyncio.sleep(0.02)
+    assert (await private_voice_capabilities(redis))["worker_ready"] is False

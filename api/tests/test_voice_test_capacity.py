@@ -4,7 +4,9 @@ from unittest.mock import AsyncMock
 import pytest
 
 from api.services.workflow.voice_test_capacity import (
+    WORKER_PROTOCOL_KEY,
     claim_voice_capacity,
+    private_voice_capabilities,
     release_voice_capacity,
 )
 from api.services.workflow.voice_test_control import VoiceControlError
@@ -34,3 +36,27 @@ async def test_redis_failure_never_assumes_free_capacity_or_deletes_an_unowned_s
         await claim_voice_capacity(redis)
     redis.eval = AsyncMock(side_effect=RuntimeError("private Redis connection details"))
     assert not await release_voice_capacity(redis, ("agent-test-voice-slot:0", "owner"))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "heartbeat,ready", [(None, False), ("1", True), (b"1", True), ("2", False)]
+)
+async def test_capabilities_require_fresh_exact_worker_protocol(heartbeat, ready):
+    redis = MemoryRedis()
+    redis.values[WORKER_PROTOCOL_KEY] = heartbeat
+    result = await private_voice_capabilities(redis)
+    assert result["worker_ready"] is ready
+    assert result["max_concurrent_jobs"] == 3
+    assert result["max_duration_seconds"] == 120
+    assert result["requires_saved_script"] is True
+    assert result["independent_quality_evaluation"] is False
+
+
+@pytest.mark.asyncio
+async def test_capability_read_failure_is_unavailable_without_private_details():
+    redis = MemoryRedis()
+    redis.get = AsyncMock(side_effect=RuntimeError("private Redis URL"))
+    result = await private_voice_capabilities(redis)
+    assert result["worker_ready"] is False
+    assert "private Redis" not in str(result)

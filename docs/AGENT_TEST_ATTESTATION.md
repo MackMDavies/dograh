@@ -138,3 +138,15 @@ admission/checkpoint orchestration, saved voice scenario/fixture generation,
 main-report ingestion, independent quality evaluation and credential-backed live
 provider verification remain required. Runtime activation still requires a fresh
 source/image reconciliation and the authorized quiet window for the API/worker.
+
+
+The local `/workflow/test-voice/capabilities` probe requires both user and internal
+sandbox authentication. It reports the protocol, fresh worker heartbeat, shared
+concurrency limit, duration envelope and saved-script requirement, with independent
+quality evaluation explicitly false. Redis pool/read failures are bounded and
+redacted; the probe does not enqueue a job or start a provider. A separate real
+Redis check verifies ready -> expired heartbeat -> unavailable behaviour.
+
+The readiness/queue/pipeline verification passed 45 checks, including missing user
+or internal credentials, invalid authenticated organization IDs, redacted pool
+failures, and real Redis heartbeat expiry. Readiness probes never enqueue work.

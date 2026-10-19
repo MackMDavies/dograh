@@ -1,5 +1,6 @@
 """Authenticated entry point for an already reserved private voice session."""
 
+import asyncio
 import os
 from typing import Annotated
 
@@ -32,6 +33,33 @@ class VoiceTestRequest(BaseModel):
     lease_token: str = Field(
         min_length=36, max_length=36, pattern=UUID_PATTERN, repr=False
     )
+
+
+@router.get("/test-voice/capabilities")
+async def voice_test_capabilities(
+    user: Annotated[UserModel, Depends(get_user)],
+    x_sysevo_secret: Annotated[str | None, Header(alias="x-sysevo-secret")] = None,
+):
+    if not sandbox_secret_matches(
+        x_sysevo_secret, os.getenv("SYSEVO_MEMORY_SECRET", "")
+    ):
+        raise HTTPException(
+            status_code=403, detail="Internal sandbox authorization required"
+        )
+    if not positive_int(user.selected_organization_id) or not positive_int(user.id):
+        raise HTTPException(
+            status_code=400, detail="An authenticated organization is required"
+        )
+    from api.services.workflow.voice_test_capacity import private_voice_capabilities
+    from api.tasks.arq import get_arq_redis
+
+    try:
+        async with asyncio.timeout(5):
+            return await private_voice_capabilities(await get_arq_redis())
+    except Exception:  # noqa: BLE001 - never expose Redis pool or connection errors
+        raise HTTPException(
+            status_code=503, detail="voice_worker_unavailable"
+        ) from None
 
 
 @router.post("/{workflow_id}/test-voice/sessions", status_code=202)

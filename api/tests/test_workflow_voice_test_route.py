@@ -171,3 +171,65 @@ def test_status_without_internal_authorization_cannot_read_a_report(monkeypatch)
     assert response.status_code == 403
     status.assert_not_awaited()
     pool.assert_not_awaited()
+
+
+@pytest.mark.parametrize("secret", [None, "wrong"])
+def test_voice_capabilities_require_internal_auth_before_queue_lookup(
+    monkeypatch, secret
+):
+    client, _, pool, _ = setup(monkeypatch)
+    response = client.get(
+        "/workflow/test-voice/capabilities",
+        headers={"x-sysevo-secret": secret} if secret else {},
+    )
+    assert response.status_code == 403
+    pool.assert_not_awaited()
+
+
+def test_voice_capabilities_expose_actual_worker_protocol_without_starting_a_job(
+    monkeypatch,
+):
+    client, _, pool, enqueue = setup(monkeypatch)
+    redis = pool.return_value
+    redis.get.return_value = b"1"
+    response = client.get(
+        "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
+    )
+    assert response.status_code == 200
+    assert response.json()["worker_ready"] is True
+    assert response.json()["independent_quality_evaluation"] is False
+    enqueue.assert_not_awaited()
+    redis.enqueue_job.assert_not_awaited()
+
+
+def test_voice_capability_connection_failure_is_redacted(monkeypatch):
+    client, _, pool, _ = setup(monkeypatch)
+    pool.side_effect = RuntimeError("private queue credentials")
+    response = client.get(
+        "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "voice_worker_unavailable"}
+
+
+def test_voice_capabilities_require_user_authentication(monkeypatch):
+    client, _, pool, _ = setup(monkeypatch)
+    client.app.dependency_overrides.clear()
+    response = client.get(
+        "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
+    )
+    assert response.status_code in {401, 403}
+    pool.assert_not_awaited()
+
+
+@pytest.mark.parametrize("organization_id", [None, 0, True])
+def test_voice_capabilities_require_valid_authenticated_scope(
+    monkeypatch, organization_id
+):
+    client, user, pool, _ = setup(monkeypatch)
+    user.selected_organization_id = organization_id
+    response = client.get(
+        "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
+    )
+    assert response.status_code == 400
+    pool.assert_not_awaited()
