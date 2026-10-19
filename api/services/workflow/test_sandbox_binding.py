@@ -1,4 +1,4 @@
-"""Server-owned configuration attestations for isolated agent-test text turns."""
+"""Server-owned configuration attestations for isolated agent-test execution."""
 
 import hashlib
 import hmac
@@ -150,3 +150,25 @@ def validate_sandbox_execution_binding(
         raise ValueError(
             "The sandbox session no longer matches its attested workflow configuration"
         )
+
+
+def validate_sandbox_pipeline_binding(
+    workflow_run: Any,
+    workflow_id: int,
+    workflow_run_id: int,
+    signing_secret: str,
+) -> bool:
+    """Reject a swapped audio run before resolving any provider configuration."""
+    if not is_sandbox_test_run(workflow_run):
+        return False
+    if (
+        getattr(workflow_run, "id", None) != workflow_run_id
+        or getattr(workflow_run, "workflow_id", None) != workflow_id
+    ):
+        raise ValueError("The sandbox audio run identity does not match the pipeline")
+    if getattr(workflow_run, "mode", None) != "smallwebrtc":
+        raise ValueError("Sandbox PCM audio requires a dedicated WebRTC voice run")
+    validate_sandbox_execution_binding(
+        workflow_run, getattr(workflow_run, "definition", None), signing_secret
+    )
+    return True

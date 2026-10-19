@@ -21,6 +21,7 @@ from api.services.pipecat.tracing_config import get_trace_url
 from api.services.posthog_client import capture_event
 from api.services.pipecat.recovery_speech import pick_recovery_line
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 from api.services.workflow.variable_resolution import (
     fill_if_absent,
     remap_memory_variables,
@@ -54,6 +55,8 @@ async def _capture_call_event(
     Meant to be run via asyncio.create_task() so it never blocks the pipeline."""
     try:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+        if is_sandbox_test_run(workflow_run):
+            return
         properties = {
             "workflow_run_id": workflow_run_id,
             "workflow_id": workflow_run.workflow_id if workflow_run else None,
@@ -294,7 +297,11 @@ def register_event_handlers(
 
         try:
             workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
-            if workflow_run and workflow_run.campaign_id:
+            if (
+                workflow_run
+                and workflow_run.campaign_id
+                and not is_sandbox_test_run(workflow_run)
+            ):
                 await circuit_breaker.record_and_evaluate(
                     campaign_id=workflow_run.campaign_id,
                     is_failure=True,
@@ -394,7 +401,7 @@ def register_event_handlers(
 
         # Store disposition code in workflow for dynamic filtering
         disposition_code = gathered_context.get("mapped_call_disposition")
-        if disposition_code and workflow_run:
+        if disposition_code and workflow_run and not is_sandbox_test_run(workflow_run):
             try:
                 await db_client.add_call_disposition_code(
                     workflow_run.workflow_id, disposition_code

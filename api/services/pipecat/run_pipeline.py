@@ -48,6 +48,7 @@ from api.services.pipecat.recording_audio_cache import (
 )
 from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
+from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
 from api.services.pipecat.service_factory import (
     create_llm_service,
     create_llm_service_from_provider,
@@ -61,11 +62,11 @@ from api.services.pipecat.tracing_config import (
 from api.services.pipecat.transport_setup import create_webrtc_transport
 from api.services.pipecat.voicemail_gating import should_run_voicemail_detection
 from api.services.workflow.voicemail_routing import find_voicemail_node_id
-from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.test_sandbox_binding import validate_sandbox_pipeline_binding
 from api.services.workflow.variable_resolution import (
     build_call_context,
     build_memory_attr_map,
@@ -387,6 +388,22 @@ async def _run_pipeline(
     if workflow_run is None or workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
+    try:
+        is_agent_test_sandbox = validate_sandbox_pipeline_binding(
+            workflow_run,
+            workflow_id,
+            workflow_run_id,
+            os.getenv("SYSEVO_MEMORY_SECRET", ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail="Sandbox audio configuration binding is invalid"
+        ) from exc
+    if isinstance(transport, SandboxAudioTransport) and not is_agent_test_sandbox:
+        raise HTTPException(
+            status_code=409, detail="Private test audio requires an attested sandbox run"
+        )
+
     # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
     # access is validated before the pipeline is invoked.
     workflow = await db_client.get_workflow_by_id(workflow_id)
@@ -611,7 +628,6 @@ async def _run_pipeline(
     )
 
     workflow_graph = WorkflowGraph(ReactFlowDTO.model_validate(run_workflow_json))
-    is_agent_test_sandbox = is_sandbox_test_run(workflow_run)
 
     # Pre-call fetch: fire early so it runs concurrently with remaining setup
     pre_call_fetch_task = None
@@ -739,7 +755,12 @@ async def _run_pipeline(
     # include recording response mode instructions in all node prompts.
     has_recordings = await db_client.has_active_recordings(workflow.organization_id)
 
-    context_compaction_enabled = (workflow.workflow_configurations or {}).get(
+    # Sandbox candidates must use their pinned settings, rather than the
+    # workflow's current published/draft mirror.
+    voice_settings = (
+        run_configs if is_agent_test_sandbox else (workflow.workflow_configurations or {})
+    )
+    context_compaction_enabled = voice_settings.get(
         "context_compaction_enabled", False
     )
     # Context compaction doesn't apply in realtime mode: the speech-to-speech
@@ -751,7 +772,7 @@ async def _run_pipeline(
     # Bridge the silence on transitions whose edge has no authored
     # transition_speech. Opt-in per workflow: it changes what the agent says
     # out loud, so it must never switch on for an agent nobody asked.
-    transition_filler_enabled = (workflow.workflow_configurations or {}).get(
+    transition_filler_enabled = voice_settings.get(
         "transition_filler_enabled", False
     )
     # Realtime services own speech generation end-to-end; a TTSSpeakFrame has
@@ -898,7 +919,7 @@ async def _run_pipeline(
     )
     engine.set_fetch_recording_audio(fetch_audio)
 
-    voicemail_config = (workflow.workflow_configurations or {}).get(
+    voicemail_config = voice_settings.get(
         "voicemail_detection", {}
     )
     # SYSEVO_FIRST_TURN_LATENCY: the classifier sits in front of the main LLM
@@ -1081,15 +1102,16 @@ async def _run_pipeline(
     # Whisper / Take over from the portal (services/supervisor/live_control.py). Best-effort:
     # if Redis is down the call runs exactly as before, just without supervisor controls.
     supervisor = None
-    try:
-        from api.services.supervisor.live_control import SupervisorControl
+    if not is_agent_test_sandbox:
+        try:
+            from api.services.supervisor.live_control import SupervisorControl
 
-        supervisor = SupervisorControl(
-            engine, workflow_run_id, workflow.organization_id if workflow else None
-        )
-        supervisor.start()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"supervisor controls unavailable for run {workflow_run_id}: {e}")
+            supervisor = SupervisorControl(
+                engine, workflow_run_id, workflow.organization_id if workflow else None
+            )
+            supervisor.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"supervisor controls unavailable for run {workflow_run_id}: {e}")
 
     try:
         # Run the pipeline

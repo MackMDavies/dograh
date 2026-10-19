@@ -9,6 +9,7 @@ from api.services.integrations.base import (
     IntegrationRuntimeContext,
 )
 from api.services.workflow.node_data import BaseNodeData
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 
 _PACKAGE_REGISTRY: dict[str, IntegrationPackageSpec] = {}
 
@@ -82,6 +83,10 @@ def all_routers():
 def create_runtime_sessions(
     context: IntegrationRuntimeContext,
 ):
+    # Test evidence must not initialize tenant integration collectors or expose
+    # their private conversation to registered client packages.
+    if is_sandbox_test_run(context.workflow_run):
+        return []
     _ensure_loaded()
     sessions = []
     for package in all_packages():
