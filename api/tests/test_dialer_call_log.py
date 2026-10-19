@@ -668,79 +668,213 @@ async def test_get_dialer_call_child_leg_returns_row(monkeypatch):
     }
 
 
-async def test_get_auto_voicemail_settings_uses_team_policy_and_owned_wav(monkeypatch):
+def _json_response(payload, status_code=200):
+    response = MagicMock()
+    response.status_code = status_code
+    response.raise_for_status = MagicMock()
+    response.json = MagicMock(return_value=payload)
+    return response
+
+
+_REP = "11111111-1111-4111-8111-111111111111"
+_MANAGER = "22222222-2222-4222-8222-222222222222"
+_DROP = "33333333-3333-4333-8333-333333333333"
+
+
+async def test_get_auto_voicemail_settings_uses_team_policy_and_server_resolver(monkeypatch):
     _configure_supabase(monkeypatch)
-    responses = []
-    for payload in (
-        {
+    fake_client = _fake_client(_json_response({}))
+    fake_client.post.side_effect = [
+        _json_response({
             "auto_drop_enabled": True,
             "machine_detection_enabled": True,
             "machine_detection_preset": "balanced",
             "on_machine": "drop_vm",
-        },
-        [{"id": "drop-1", "storage_path": "user-1/message.wav"}],
-        {"signedURL": "/object/sign/voicemail-drops/user-1/message.wav?token=abc"},
-    ):
-        response = MagicMock()
-        response.raise_for_status = MagicMock()
-        response.json = MagicMock(return_value=payload)
-        responses.append(response)
-    fake_client = _fake_client(responses[-1])
-    fake_client.get.return_value = responses[1]
-    fake_client.post.side_effect = [responses[0], responses[2]]
+        }),
+        _json_response({
+            "drop_id": _DROP, "storage_path": f"{_REP}/message.wav", "duration_seconds": 24,
+            "owner_user_id": _REP, "source": "own_default",
+        }),
+        _json_response({"signedURL": f"/object/sign/voicemail-drops/{_REP}/message.wav?token=abc"}),
+    ]
 
     with patch(
         "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
         return_value=fake_client,
-    ):
+    ), patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.verify_voicemail_audio",
+        new=AsyncMock(return_value=True),
+    ) as verify:
         enabled, url, drop_id = await get_auto_voicemail_settings(
-            user_id="user-1", parent_call_sid="CA111", entry_id="entry-1"
+            user_id=_REP, parent_call_sid="CA111", entry_id="entry-1"
         )
 
     assert enabled is True
-    assert drop_id == "drop-1"
-    assert url == "https://example.supabase.co/storage/v1/object/sign/voicemail-drops/user-1/message.wav?token=abc"
-    assert fake_client.get.await_count == 1
-    policy_call = fake_client.post.await_args_list[0]
+    assert drop_id == _DROP
+    assert url == f"https://example.supabase.co/storage/v1/object/sign/voicemail-drops/{_REP}/message.wav?token=abc"
+    verify.assert_awaited_once_with(url)
+    policy_call, resolver_call, sign_call = fake_client.post.await_args_list
     assert policy_call.args[0].endswith("/rest/v1/rpc/dialer_account_voicemail_policy")
     assert policy_call.kwargs["json"] == {
-        "p_rep_user_id": "user-1",
-        "p_entry_id": "entry-1",
-        "p_parent_call_sid": "CA111",
+        "p_rep_user_id": _REP, "p_entry_id": "entry-1", "p_parent_call_sid": "CA111",
     }
-    assert fake_client.get.await_args.kwargs["params"] == {
-        "select": "id,storage_path",
-        "user_id": "eq.user-1",
-        "is_default": "eq.true",
-        "limit": "1",
+    assert resolver_call.args[0].endswith("/rest/v1/rpc/dialer_effective_voicemail_drop")
+    assert resolver_call.kwargs["json"] == {
+        "p_rep_user_id": _REP, "p_entry_id": "entry-1", "p_parent_call_sid": "CA111",
     }
-    assert fake_client.post.await_args.args[0].endswith(
-        "/storage/v1/object/sign/voicemail-drops/user-1/message.wav"
-    )
+    assert sign_call.args[0].endswith(f"/storage/v1/object/sign/voicemail-drops/{_REP}/message.wav")
+    assert sign_call.kwargs["json"] == {"expiresIn": 1800}
+    from api.services.telephony.providers.twilio.dialer_call_log import voicemail_duration
+    assert voicemail_duration(_DROP) == 24.0
 
 
-async def test_get_auto_voicemail_settings_fails_closed_for_other_rep_path(monkeypatch):
+async def test_get_auto_voicemail_settings_plays_the_team_default_for_a_rep_without_one(monkeypatch):
+    """Organisation fallback: the path lives in the MANAGER's folder, owned by them."""
     _configure_supabase(monkeypatch)
-    policy = MagicMock()
-    policy.raise_for_status = MagicMock()
-    policy.json = MagicMock(return_value={"auto_drop_enabled": True})
-    drop = MagicMock()
-    drop.raise_for_status = MagicMock()
-    drop.json = MagicMock(return_value=[{"storage_path": "another-user/message.wav"}])
-    fake_client = _fake_client(drop)
-    fake_client.get.return_value = drop
-    fake_client.post.return_value = policy
+    fake_client = _fake_client(_json_response({}))
+    fake_client.post.side_effect = [
+        _json_response({"auto_drop_enabled": True, "on_machine": "drop_vm"}),
+        _json_response({
+            "drop_id": _DROP, "storage_path": f"{_MANAGER}/team.wav", "duration_seconds": 22,
+            "owner_user_id": _MANAGER, "source": "team_default",
+        }),
+        _json_response({"signedURL": f"/object/sign/voicemail-drops/{_MANAGER}/team.wav?token=t"}),
+    ]
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ), patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.verify_voicemail_audio",
+        new=AsyncMock(return_value=True),
+    ):
+        enabled, url, drop_id = await get_auto_voicemail_settings(user_id=_REP, parent_call_sid="CA111")
+    assert enabled is True and drop_id == _DROP
+    assert url.endswith(f"/voicemail-drops/{_MANAGER}/team.wav?token=t")
 
+
+@pytest.mark.parametrize("row", [
+    # A path outside its owner's folder must never be signed.
+    {"drop_id": _DROP, "storage_path": "another-user/message.wav", "owner_user_id": _REP},
+    {"drop_id": _DROP, "storage_path": f"{_REP}/../x.wav", "owner_user_id": _REP},
+    {"drop_id": "not-a-uuid", "storage_path": f"{_REP}/message.wav", "owner_user_id": _REP},
+    None,
+])
+async def test_get_auto_voicemail_settings_fails_closed_for_unsafe_or_missing_recording(monkeypatch, row):
+    _configure_supabase(monkeypatch)
+    fake_client = _fake_client(_json_response({}))
+    fake_client.post.side_effect = [
+        _json_response({"auto_drop_enabled": True}),
+        _json_response(row),
+    ]
     with patch(
         "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
         return_value=fake_client,
     ):
-        enabled, url, drop_id = await get_auto_voicemail_settings(user_id="user-1", parent_call_sid="CA111")
+        enabled, url, drop_id = await get_auto_voicemail_settings(user_id=_REP, parent_call_sid="CA111")
+    assert (enabled, url, drop_id) == (False, None, None)
+    assert fake_client.post.await_count == 2  # nothing was signed
 
-    assert enabled is False
-    assert url is None
-    assert drop_id is None
+
+async def test_resolver_falls_back_to_own_default_before_the_migration_is_applied(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = _fake_client(_json_response({}))
+    fake_client.post.return_value = _json_response({"code": "PGRST202"}, status_code=404)
+    fake_client.get.return_value = _json_response([
+        {"id": _DROP, "storage_path": f"{_REP}/message.wav", "duration_seconds": 19},
+    ])
+    from api.services.telephony.providers.twilio.dialer_call_log import resolve_effective_voicemail_drop
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        drop = await resolve_effective_voicemail_drop(rep_user_id=_REP)
+    assert drop["id"] == _DROP and drop["source"] == "own_default"
+    assert fake_client.get.await_args.kwargs["params"]["user_id"] == f"eq.{_REP}"
+
+
+async def test_get_auto_voicemail_settings_refuses_a_file_twilio_cannot_play(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = _fake_client(_json_response({}))
+    fake_client.post.side_effect = [
+        _json_response({"auto_drop_enabled": True}),
+        _json_response({"drop_id": _DROP, "storage_path": f"{_REP}/m.wav", "owner_user_id": _REP}),
+        _json_response({"signedURL": f"/object/sign/voicemail-drops/{_REP}/m.wav?token=x"}),
+    ]
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ), patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.verify_voicemail_audio",
+        new=AsyncMock(return_value=False),
+    ):
+        assert await get_auto_voicemail_settings(user_id=_REP) == (False, None, None)
+
+
+class _FakeStream:
+    def __init__(self, status_code, body):
+        self.status_code = status_code
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    async def aiter_bytes(self):
+        yield self._body
+
+
+@pytest.mark.parametrize("status,body,expected", [
+    (206, b"RIFF\x24\x00\x00\x00WAVEfmt ", True),
+    (200, b"ID3\x04\x00\x00\x00\x00\x00\x00\x00\x00", True),
+    (206, b"\x1aE\xdf\xa3webm-container", False),   # a WebM renamed .wav
+    (200, b"<html>error</html>", False),
+    (404, b"", False),
+    (500, b"", None),
+])
+async def test_verify_voicemail_audio_checks_the_real_header(status, body, expected):
+    from api.services.telephony.providers.twilio.dialer_call_log import verify_voicemail_audio
+    client = AsyncMock()
+    client.stream = MagicMock(return_value=_FakeStream(status, body))
+    client.__aenter__ = AsyncMock(return_value=client)
+    client.__aexit__ = AsyncMock(return_value=False)
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=client,
+    ):
+        assert await verify_voicemail_audio("https://example.supabase.co/x.wav?token=t") is expected
+    assert client.stream.call_args.kwargs["headers"] == {"Range": "bytes=0-15"}
+
+
+async def test_record_twilio_amd_decision_posts_measured_duration(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = _fake_client(_json_response(True))
+    from api.services.telephony.providers.twilio.dialer_call_log import record_twilio_amd_decision
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await record_twilio_amd_decision(parent_call_sid="CA1", decision_ms="2410", leg_id="leg") is True
+        assert await record_twilio_amd_decision(parent_call_sid="CA1", decision_ms="n/a") is False
+    call = fake_client.post.await_args_list[0]
+    assert call.args[0].endswith("/rest/v1/rpc/dialer_record_amd_decision")
+    assert call.kwargs["json"] == {
+        "p_parent_call_sid": "CA1", "p_decision_ms": 2410, "p_child_call_sid": None, "p_leg_id": "leg",
+    }
     assert fake_client.post.await_count == 1
+
+
+async def test_voicemail_evidence_read_is_optional(monkeypatch):
+    _configure_supabase(monkeypatch)
+    fake_client = _fake_client(_json_response({}))
+    fake_client.get.side_effect = httpx.HTTPError("column does not exist")
+    from api.services.telephony.providers.twilio.dialer_call_log import get_voicemail_drop_evidence
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_call_log.httpx.AsyncClient",
+        return_value=fake_client,
+    ):
+        assert await get_voicemail_drop_evidence(parent_call_sid="CA1") == {}
 
 
 async def test_get_dialer_call_child_leg_returns_none_for_no_rows(monkeypatch):

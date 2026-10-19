@@ -88,6 +88,8 @@ from api.services.telephony.dialer.inbound_call_log import (
 )
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    is_provider_playable_voicemail,
+    resolve_effective_voicemail_drop,
     update_dialer_call_recording_url,
     update_dialer_call_status,
     update_signalwire_dialer_amd,
@@ -998,35 +1000,30 @@ async def _check_signalwire_parallel_compliance(
         raise RuntimeError(f"Dial blocked by server calling-hours check: {reason}")
 
 
-async def _load_signalwire_parallel_default_drop(rep_user_id: str) -> dict[str, str] | None:
+async def _load_signalwire_parallel_default_drop(
+    rep_user_id: str, entry_id: str | None = None, parent_call_sid: str | None = None,
+) -> dict[str, str] | None:
+    """The recording this call will play, from the same resolver as Twilio.
+
+    Explicit team choice, then the rep's own default, then the account team
+    default for the lead's account. The owner-folder check is enforced in
+    the shared resolver; only provider-playable files (WAV/MP3) qualify.
+    """
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Supabase voicemail credentials are unavailable")
-    async with httpx.AsyncClient(timeout=5.0) as client:
-        response = await client.get(
-            f"{SUPABASE_URL}/rest/v1/dialer_voicemail_drops",
-            params={
-                "select": "id,storage_path",
-                "user_id": f"eq.{rep_user_id}",
-                "is_default": "eq.true",
-                "limit": "1",
-            },
-            headers={
-                "apikey": SUPABASE_SERVICE_ROLE_KEY,
-                "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
-            },
-        )
-        response.raise_for_status()
-        rows = response.json()
-    if not isinstance(rows, list) or not rows:
+    drop = await resolve_effective_voicemail_drop(
+        rep_user_id=rep_user_id, entry_id=entry_id, parent_call_sid=parent_call_sid,
+    )
+    if not drop:
         return None
-    row = rows[0]
-    path = str(row.get("storage_path") or "")
-    drop_id = str(row.get("id") or "")
-    if not re.fullmatch(rf"{re.escape(rep_user_id)}/[^/]+", path):
-        return None
+    path = str(drop.get("storage_path") or "")
+    drop_id = str(drop.get("id") or "")
     try:
         uuid.UUID(drop_id)
     except (ValueError, TypeError, AttributeError):
+        return None
+    if not is_provider_playable_voicemail(path):
+        logger.warning(f"SignalWire cannot play voicemail recording {drop_id} (not WAV/MP3)")
         return None
     return {"id": drop_id, "storage_path": path}
 
@@ -1572,15 +1569,26 @@ async def handle_sw_parallel_decision(request: Request):
                     leg_id=leg_id,
                 ))
 
-            if on_machine == "drop_vm" and policy.get("auto_drop_enabled") is True:
+            # A fax line has no mailbox: never play a recording to it.
+            if on_machine == "drop_vm" and policy.get("auto_drop_enabled") is True and amd_result == "machine":
                 drop = await _load_signalwire_parallel_default_drop(
-                    str(session["rep_user_id"])
+                    str(session["rep_user_id"]),
+                    entry_id=str(leg["entry_id"]),
+                    parent_call_sid=str(session["rep_call_id"]),
                 )
-                if drop and await signalwire_parallel_store.claim_voicemail_drop(
+                # Sign BEFORE claiming: a claim followed by a signing failure
+                # used to leave the leg in voicemail_playing forever, which kept
+                # the whole batch from settling.
+                recording_url = None
+                if drop:
+                    try:
+                        recording_url = await _signed_signalwire_voicemail_url(drop["storage_path"])
+                    except Exception as exc:  # noqa: BLE001 - fall back to recording the voicemail
+                        logger.error(f"Could not sign SignalWire voicemail for leg {leg_id}: {exc}")
+                if drop and recording_url and await signalwire_parallel_store.claim_voicemail_drop(
                     session_id=session_id, leg_id=leg_id,
                     provider_call_id=provider_call_id, drop_id=drop["id"],
                 ):
-                    recording_url = await _signed_signalwire_voicemail_url(drop["storage_path"])
                     backend_endpoint, _ = await get_backend_endpoints()
                     playback_url = _parallel_callback_url(
                         str(backend_endpoint or "").rstrip("/"),
@@ -2575,7 +2583,10 @@ async def websocket_sw_tap(websocket: WebSocket):
         async def on_caption(payload: dict) -> None:
             await publish_text(call_id, payload)
 
-        async with LiveTranscriber(call_id, on_caption) as transcriber:
+        # Mixed mono tap: nobody can be named as the speaker, so speaker stays None.
+        async with LiveTranscriber(
+            call_id, on_caption, speaker=None, source="signalwire_tap"
+        ) as transcriber:
             relayed = await publish_frames(
                 call_id, frames(), sink=transcriber.feed if transcriber.enabled else None
             )

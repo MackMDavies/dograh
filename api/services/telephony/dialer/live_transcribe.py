@@ -38,6 +38,32 @@ _DEEPGRAM_URL = (
 _CONNECT_TIMEOUT_SECONDS = 8.0
 
 
+def caption_payload(
+    deepgram_result: dict, text: str, speaker: str | None, source: str | None
+) -> dict:
+    """One caption in the shape every listener reads (contract C1).
+
+    Old clients read only type/text/is_final/start and ignore the rest, so the extra
+    keys are additive. `start`/`duration` are seconds from the start of this
+    transcription stream, which opens with the call's audio.
+    """
+    def _seconds(value) -> float | None:
+        try:
+            return round(float(value), 3) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "type": "transcript",
+        "text": text,
+        "is_final": bool(deepgram_result.get("is_final")),
+        "start": _seconds(deepgram_result.get("start")),
+        "duration": _seconds(deepgram_result.get("duration")),
+        "speaker": speaker,
+        "source": source,
+    }
+
+
 class LiveTranscriber:
     """Feeds tap audio to Deepgram and hands finished text to a callback.
 
@@ -46,9 +72,21 @@ class LiveTranscriber:
     "transcription is not available".
     """
 
-    def __init__(self, call_id: str, on_text: Callable[[dict], Awaitable[None]]):
+    def __init__(
+        self,
+        call_id: str,
+        on_text: Callable[[dict], Awaitable[None]],
+        *,
+        speaker: str | None = None,
+        source: str | None = None,
+    ):
+        """`speaker` is who this stream carries ("rep"/"prospect"), or None when the
+        audio is a mixed mono stream and nobody can honestly be named. `source` says
+        where the audio came from, so a client can tell attributed from mixed text."""
         self._call_id = call_id
         self._on_text = on_text
+        self._speaker = speaker if speaker in ("rep", "prospect") else None
+        self._source = source
         self._socket: websockets.ClientConnection | None = None
         self._reader: asyncio.Task | None = None
 
@@ -127,14 +165,7 @@ class LiveTranscriber:
                     # Deepgram emits empty results constantly during silence. Publishing
                     # them would clear the caption every time nobody is speaking.
                     continue
-                await self._on_text(
-                    {
-                        "type": "transcript",
-                        "text": text,
-                        "is_final": bool(payload.get("is_final")),
-                        "start": payload.get("start"),
-                    }
-                )
+                await self._on_text(caption_payload(payload, text, self._speaker, self._source))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

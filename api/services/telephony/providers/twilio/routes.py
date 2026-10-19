@@ -27,6 +27,7 @@ from api.db import db_client
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer.parallel_auth import issue_parallel_auth_token
+from api.services.telephony.dialer import twilio_live_transcribe
 from api.services.telephony.dialer.inbound_call_log import (
     bind_inbound_rep_leg,
     close_inbound_call,
@@ -62,6 +63,11 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     get_team_voicemail_policy,
     get_dialer_call_child_leg,
     mark_auto_voicemail_sent,
+    mark_rep_detached_for_voicemail,
+    get_voicemail_drop_evidence,
+    record_twilio_amd_decision,
+    record_voicemail_playback_failure,
+    voicemail_duration,
     update_dialer_call_amd_result,
     request_manual_voicemail_drop,
     claim_manual_voicemail_playback,
@@ -259,31 +265,88 @@ async def get_voice_token(
     )
 
 
+_MACHINE_END_RESULTS = frozenset({"machine_end_beep", "machine_end_silence", "machine_end_other"})
+
+
 def _manual_drop_state(call_row: dict | None) -> str:
     if not call_row:
         return "idle"
     if call_row.get("auto_voicemail_sent") is True:
         return "sent"
+    if call_row.get("voicemail_drop_failed_at"):
+        return "failed"
     if call_row.get("voicemail_drop_started_at"):
         return "playing"
     if not call_row.get("manual_voicemail_requested_at"):
         return "idle"
     amd_result = call_row.get("amd_result")
     if amd_result is None:
-        return "waiting"
-    return "rejected" if amd_result not in {"machine_end_beep", "machine_end_silence", "machine_end_other"} else "waiting"
+        # Joined without any AMD result: detection is off for this account, so
+        # nothing will ever confirm a mailbox. The rep must press again once
+        # they hear the beep (that press plays immediately).
+        return "needs_rep" if call_row.get("lead_joined_at") else "waiting"
+    return "rejected" if amd_result not in _MACHINE_END_RESULTS else "waiting"
+
+
+def _manual_drop_ready(call_row: dict | None) -> bool:
+    """A manual playback may start now: confirmed machine end, or a live call
+    whose account runs no AMD (the rep has heard the mailbox themselves)."""
+    if not call_row or not call_row.get("lead_joined_at"):
+        return False
+    amd_result = call_row.get("amd_result")
+    return amd_result in _MACHINE_END_RESULTS or amd_result is None
+
+
+def _voicemail_complete_url(
+    *, endpoint_root: str, parent_call_sid: str, parallel_leg_id: str = "",
+    drop_id: str | None = None, pause_seconds: int = 0,
+) -> str:
+    """Completion callback carrying the signed playback expectation.
+
+    Twilio signs the full callback URL, so vm_started/vm_expect cannot be
+    forged. The completion handler uses them to refuse a "sent" when Twilio
+    reached the Redirect without playing the whole recording (an unfetchable
+    or unplayable file is skipped by <Play>, which falls straight through).
+    """
+    fields = {"parent_call_sid": parent_call_sid}
+    if parallel_leg_id:
+        fields["parallel_leg_id"] = parallel_leg_id
+    expected = voicemail_duration(drop_id)
+    if expected:
+        fields["vm_started"] = str(int(datetime.now(UTC).timestamp() * 1000))
+        fields["vm_expect"] = str(int((expected + max(0, pause_seconds)) * 1000))
+    return f"{endpoint_root}/dialer-auto-voicemail-complete?" + urlencode(fields)
 
 
 def _voicemail_playback_twiml(
-    *, endpoint_root: str, parent_call_sid: str, playback_url: str, pause_seconds: int = 0
+    *, endpoint_root: str, parent_call_sid: str, playback_url: str, pause_seconds: int = 0,
+    parallel_leg_id: str = "", drop_id: str | None = None,
 ) -> str:
-    complete_url = f"{endpoint_root}/dialer-auto-voicemail-complete?parent_call_sid={parent_call_sid}"
-    pause = f'<Pause length="{max(0, min(10, int(pause_seconds)))}"/>' if pause_seconds else ""
+    pause_seconds = max(0, min(10, int(pause_seconds)))
+    complete_url = _voicemail_complete_url(
+        endpoint_root=endpoint_root, parent_call_sid=parent_call_sid,
+        parallel_leg_id=parallel_leg_id, drop_id=drop_id, pause_seconds=pause_seconds,
+    )
+    pause = f'<Pause length="{pause_seconds}"/>' if pause_seconds else ""
     return (
         '<?xml version="1.0" encoding="UTF-8"?>'
         f"<Response>{pause}<Play>" + escape(playback_url) + "</Play>"
         f"<Redirect method=\"POST\">{escape(complete_url)}</Redirect></Response>"
     )
+
+
+def _playback_finished(*, vm_started: str, vm_expect: str) -> bool:
+    """False only when the callback provably arrived before the recording could end."""
+    try:
+        started_ms = int(vm_started)
+        expect_ms = int(vm_expect)
+    except (TypeError, ValueError):
+        return True
+    if started_ms <= 0 or expect_ms <= 0:
+        return True
+    elapsed_ms = int(datetime.now(UTC).timestamp() * 1000) - started_ms
+    # 15% slack for provider clock/transcoding plus half a second of jitter.
+    return elapsed_ms >= int(expect_ms * 0.85) - 500
 
 
 async def _redirect_twilio_child_to_voicemail(*, child_call_sid: str, twiml: str) -> bool:
@@ -371,7 +434,7 @@ async def control_manual_voicemail_drop(
     if state == "sent" or state == "playing":
         return {"state": state}
 
-    if current and current.get("amd_result") in {"machine_end_beep", "machine_end_silence", "machine_end_other"} and current.get("lead_joined_at"):
+    if _manual_drop_ready(current):
         claimed = await claim_manual_voicemail_playback(
             parent_call_sid=body.parent_call_sid,
             child_call_sid=child_call_sid,
@@ -383,6 +446,7 @@ async def control_manual_voicemail_drop(
                 parent_call_sid=body.parent_call_sid,
                 playback_url=playback_url,
                 pause_seconds=6 if current.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+                drop_id=drop_id,
             )
             if not await _redirect_twilio_child_to_voicemail(child_call_sid=child_call_sid, twiml=twiml):
                 await release_manual_voicemail_playback(
@@ -407,11 +471,20 @@ async def manual_voicemail_drop_status(
     if not call_row or call_row.get("provider") != "twilio" or call_row.get("rep_user_id") != rep_user_id:
         raise HTTPException(status_code=404, detail="This Twilio call was not found for your account.")
     child_call_sid = call_row.get("child_call_sid")
-    return {
-        "state": _manual_drop_state(call_row),
+    evidence = {}
+    if call_row.get("voicemail_drop_started_at") or call_row.get("manual_voicemail_requested_at"):
+        evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
+    state = _manual_drop_state({**call_row, **{
+        key: value for key, value in evidence.items() if key == "voicemail_drop_failed_at"
+    }})
+    result = {
+        "state": state,
         "amd_result": call_row.get("amd_result"),
         "ready": isinstance(child_call_sid, str) and bool(_TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid)),
     }
+    if state == "failed":
+        result["failure"] = evidence.get("voicemail_drop_failure") or "playback_incomplete"
+    return result
 
 
 @router.post("/dialer/telnyx/calls/start", status_code=201)
@@ -681,6 +754,38 @@ async def _verify_twilio_signature(request: Request, form_data: dict) -> bool:
     return validator.validate(str(request.url), form_data, signature)
 
 
+async def _live_transcription_twiml(
+    *, backend_endpoint: str, channel_key: str, leg_call_sid: str
+) -> str:
+    """The rep-leg <Start><Stream> for live captions, or "" -- never raises.
+
+    Optional on every path: a missing key, endpoint or auth token costs the captions
+    and nothing else, so it can never turn into a failed call.
+    """
+    try:
+        if not twilio_live_transcribe.live_transcription_enabled():
+            return ""
+        secret = await _resolve_dialer_auth_token()
+        return twilio_live_transcribe.stream_twiml(
+            backend_endpoint=str(backend_endpoint or ""),
+            channel_key=channel_key,
+            leg_call_sid=leg_call_sid,
+            secret=secret or "",
+        )
+    except Exception as exc:  # noqa: BLE001 - captions must never cost the call
+        logger.warning(f"Live transcription stream omitted: {type(exc).__name__}")
+        return ""
+
+
+@router.websocket("/dialer-twilio-transcribe")
+async def handle_dialer_twilio_transcribe(websocket: WebSocket):
+    """Twilio Media Stream from the rep's leg -> attributed live captions (contract C1)."""
+    async def secret() -> str | None:
+        return await _resolve_dialer_auth_token()
+
+    await twilio_live_transcribe.serve_twilio_transcription(websocket, secret)
+
+
 @router.post("/voice-connect", include_in_schema=False)
 async def handle_voice_connect(request: Request):
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
@@ -755,10 +860,17 @@ async def handle_voice_connect(request: Request):
             events_url=f"{endpoint}/api/v1/telephony/dialer-conference-events",
             recording_url=f"{endpoint}/api/v1/telephony/dialer-recording-callback",
         )
+        # Live captions for the rep's coach, attributed by track. Keyed by the
+        # caller's call SID (the conference's own name), which is what /sw-listen
+        # resolves an inbound_calls row to. "" when not configured.
+        live_stream = await _live_transcription_twiml(
+            backend_endpoint=endpoint, channel_key=parent_call_sid, leg_call_sid=rep_call_sid,
+        )
         twiml = (
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<Response>"
-            "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+            + live_stream
+            + "<Say>This call may be recorded and monitored for quality assurance.</Say>"
             "<Dial><Conference "
             + telemetry_attributes
             + 'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">'
@@ -1140,10 +1252,19 @@ async def handle_voice_connect(request: Request):
     # answerer's "Hello?" behind ~4s of speech.
     # beep="false" everywhere - the old <Dial><Number> bridge had no join
     # tones, and a later task has a manager joining silently to listen.
+    # Live, speaker-attributed captions for the coach: a Media Stream on the
+    # rep's own leg (inbound track = rep, outbound track = the conference mix).
+    # Before <Dial> so the first "Hello?" is captured. "" whenever it is not
+    # configured, which leaves the TwiML exactly as it was.
+    live_stream = await _live_transcription_twiml(
+        backend_endpoint=backend_endpoint, channel_key=parent_call_sid,
+        leg_call_sid=parent_call_sid,
+    )
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Dial>"
+        + live_stream
+        + "<Dial>"
         "<Conference "
         + _conference_telemetry_attributes(
             events_url=conference_events_url, recording_url=recording_callback_url
@@ -1282,6 +1403,8 @@ async def handle_dialer_conference_join(
     # TwiML request. Only a confirmed beep, explicit rep opt-in and a current
     # WAV recording can divert the call into automatic playback.
     answered_by = str(form_data.get("AnsweredBy") or "").strip().lower()
+    # Twilio reports how long its AMD took to decide on the same signed request.
+    amd_decision_ms = form_data.get("MachineDetectionDuration")
     parallel_call_sid = str(form_data.get("CallSid") or "")
     if parallel_leg_id:
         try:
@@ -1297,6 +1420,12 @@ async def handle_dialer_conference_join(
         ):
             logger.warning("Rejected parallel conference join with mismatched call identity")
             return HTMLResponse(content=hangup, media_type="application/xml")
+        if answered_by and amd_decision_ms not in (None, ""):
+            background_tasks.add_task(
+                record_twilio_amd_decision,
+                parent_call_sid=parent_call_sid, decision_ms=amd_decision_ms,
+                child_call_sid=parallel_call_sid, leg_id=parallel_leg_id,
+            )
 
         # Twilio can return `unknown` when AMD times out without confidence.
         # The dialer policy is to prefer a real connect over hiding a person,
@@ -1414,6 +1543,11 @@ async def handle_dialer_conference_join(
                 parent_call_sid=parent_call_sid,
                 answered_by=answered_by,
             )
+            if amd_decision_ms not in (None, ""):
+                background_tasks.add_task(
+                    record_twilio_amd_decision,
+                    parent_call_sid=parent_call_sid, decision_ms=amd_decision_ms,
+                )
 
     if (
         answered_by in {"machine_end_beep", "machine_end_silence", "machine_end_other"}
@@ -1425,15 +1559,24 @@ async def handle_dialer_conference_join(
         rep_user_id = (call_row or {}).get("rep_user_id")
         child_sid = str(form_data.get("CallSid") or "")
         if isinstance(rep_user_id, str) and child_sid:
-            manual_requested = bool((call_row or {}).get("manual_voicemail_requested_at"))
+            # A manual press belongs to the rep's single call. A parallel leg
+            # follows the team's automatic policy only: treating a press on
+            # the aggregate as "manual" made every machine leg fail the claim
+            # (no dialer_calls row for that child) and hang up silently.
+            manual_requested = (
+                not parallel_leg_id
+                and bool((call_row or {}).get("manual_voicemail_requested_at"))
+            )
+            call_entry_id = parallel_entry_id or None
             policy = await get_team_voicemail_policy(
-                user_id=rep_user_id, parent_call_sid=parent_call_sid,
+                user_id=rep_user_id, parent_call_sid=parent_call_sid, entry_id=call_entry_id,
             )
             on_machine = str((policy or {}).get("on_machine") or "drop_vm")
             enabled, playback_url, drop_id = await get_auto_voicemail_settings(
                 user_id=rep_user_id,
                 allow_manual_when_disabled=manual_requested,
                 parent_call_sid=parent_call_sid,
+                entry_id=call_entry_id,
             )
             # Twilio <Play> supports WAV/MP3. Old recordings in browser
             # containers must continue into the conference rather than
@@ -1465,16 +1608,13 @@ async def handle_dialer_conference_join(
                             answered_by=answered_by,
                         )
                     endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
-                    complete_url = (
-                        f"{endpoint_root}/dialer-auto-voicemail-complete"
-                        f"?parent_call_sid={parent_call_sid}"
-                        + (f"&parallel_leg_id={parallel_leg_id}" if parallel_leg_id else "")
-                    )
-                    twiml = (
-                        '<?xml version="1.0" encoding="UTF-8"?>'
-                        + (f'<Response><Pause length="6"/>' if answered_by in {"machine_end_silence", "machine_end_other"} else "<Response>")
-                        + "<Play>" + escape(playback_url) + "</Play>"
-                        + f"<Redirect method=\"POST\">{escape(complete_url)}</Redirect></Response>"
+                    twiml = _voicemail_playback_twiml(
+                        endpoint_root=endpoint_root,
+                        parent_call_sid=parent_call_sid,
+                        playback_url=playback_url,
+                        pause_seconds=6 if answered_by in {"machine_end_silence", "machine_end_other"} else 0,
+                        parallel_leg_id=parallel_leg_id,
+                        drop_id=drop_id,
                     )
                     return HTMLResponse(content=twiml, media_type="application/xml")
             # A detected machine must never silently join the rep when the
@@ -1483,6 +1623,20 @@ async def handle_dialer_conference_join(
             if not manual_requested:
                 if on_machine in {"drop_vm", "hangup"}:
                     return HTMLResponse(content=hangup, media_type="application/xml")
+
+    if (
+        not parallel_leg_id
+        and parent_call_sid
+        and _TWILIO_CALL_SID_PATTERN.fullmatch(parent_call_sid)
+        and parent_call_sid_from_conference_name(conference_name) == parent_call_sid
+    ):
+        # The rep left while a queued manual voicemail kept this destination
+        # ringing. Whoever answers can no longer reach the rep: never drop a
+        # person (or an unplayable machine) into an empty conference.
+        evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
+        if evidence.get("rep_detached_at"):
+            logger.info(f"Rep detached before {parent_call_sid} answered ({answered_by or 'no AMD'}); ending the leg")
+            return HTMLResponse(content=hangup, media_type="application/xml")
 
     known_machine_answers = {
         "machine_start", "machine_end_beep", "machine_end_silence", "machine_end_other", "fax",
@@ -1528,7 +1682,8 @@ async def handle_dialer_conference_join(
 
 @router.post("/dialer-auto-voicemail-complete", include_in_schema=False)
 async def handle_dialer_auto_voicemail_complete(
-    request: Request, parent_call_sid: str = "", parallel_leg_id: str = ""
+    request: Request, parent_call_sid: str = "", parallel_leg_id: str = "",
+    vm_started: str = "", vm_expect: str = "",
 ):
     """Finish the lead leg and the rep's waiting conference after full playback."""
     hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
@@ -1560,13 +1715,23 @@ async def handle_dialer_auto_voicemail_complete(
             logger.warning("Rejected automatic voicemail completion for an unrelated Twilio call")
             return HTMLResponse(content=hangup, media_type="application/xml", status_code=403)
 
-    # This endpoint is reached sequentially after the TwiML <Play> completes.
-    # Record that evidence before ending the rep's leg; neither a beep
-    # detection nor a failed playback reaches this callback.
-    await mark_auto_voicemail_sent(
-        parent_call_sid=parent_call_sid,
-        child_call_sid=str(child_call_sid) if parallel_leg_id and child_call_sid else None,
-    )
+    # This endpoint is reached sequentially after the TwiML <Play> verb. A
+    # recording Twilio could not fetch or decode is skipped and lands here
+    # early, so the signed expectation decides between "sent" and "failed".
+    # Either way the destination is a machine: end it, and the rep's leg.
+    if _playback_finished(vm_started=vm_started, vm_expect=vm_expect):
+        await mark_auto_voicemail_sent(
+            parent_call_sid=parent_call_sid,
+            child_call_sid=str(child_call_sid) if parallel_leg_id and child_call_sid else None,
+        )
+    else:
+        logger.warning(f"Voicemail on {parent_call_sid} reached its completion before the recording could finish")
+        await record_voicemail_playback_failure(
+            parent_call_sid=parent_call_sid,
+            reason="playback_incomplete",
+            child_call_sid=str(child_call_sid) if parallel_leg_id and child_call_sid else None,
+            leg_id=parallel_leg_id or None,
+        )
     if parallel_leg_id:
         session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
         legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
@@ -1655,6 +1820,22 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
             return
 
         if lead_status in _LEAD_LEG_SETTLED_STATUSES:
+            return
+
+        if (
+            not parallel_session
+            and leg.get("manual_voicemail_requested_at")
+            and not leg.get("voicemail_drop_started_at")
+            and leg.get("auto_voicemail_sent") is not True
+            and await mark_rep_detached_for_voicemail(parent_call_sid=parent_call_sid)
+        ):
+            # The rep queued Drop VM while this destination was ringing and then
+            # moved on. Keep the carrier leg alive so its mailbox can still
+            # receive the recording; the join webhook ends it if a person (or
+            # no detectable mailbox) answers instead.
+            logger.info(
+                f"dialer-conference-events: keeping {child_call_sid} ringing for a queued voicemail"
+            )
             return
 
         logger.info(
@@ -1762,6 +1943,7 @@ async def handle_dialer_conference_events(request: Request):
                                 parent_call_sid=parent_call_sid,
                                 playback_url=playback_url,
                                 pause_seconds=6 if call_row.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+                                drop_id=drop_id,
                             )
                             if not await _redirect_twilio_child_to_voicemail(
                                 child_call_sid=child_call_sid,
@@ -2252,3 +2434,9 @@ async def handle_twilio_status_callback(
     await _process_status_update(workflow_run_id, status_update)
 
     return {"status": "success"}
+
+
+# In-call controls (hold, recording, keypad tones, transfer, add call) live in their
+# own module and are mounted here so they share this router's /telephony prefix.
+from api.services.telephony.providers.twilio.dialer_call_controls import router as _call_controls_router  # noqa: E402
+router.include_router(_call_controls_router)

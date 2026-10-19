@@ -3132,3 +3132,89 @@ def test_floor_signed_participant_leave_closes_its_sdk_leg_and_retries_on_outage
         }, headers={"X-Twilio-Signature": "test"})
     assert response.status_code == status
     close.assert_awaited_once_with(_MANAGER_LISTEN_SID)
+
+
+def _post_outbound_voice_connect(call_sid):
+    client = TestClient(_make_test_app())
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.resolve_assigned_caller_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        return_value=None,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        return_value=("https://api.example.com", "wss://api.example.com"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
+        return_value="CA222",
+    ):
+        return client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "CallSid": call_sid},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+
+def test_voice_connect_rep_leg_streams_both_tracks_for_live_captions(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-test")
+    monkeypatch.delenv("SYSEVO_DIALER_LIVE_TRANSCRIBE", raising=False)
+    sid = "CA" + "a" * 32
+    response = _post_outbound_voice_connect(sid)
+    assert response.status_code == 200
+    text = response.text
+    assert "<Start><Stream " in text
+    assert text.index("<Start>") < text.index("<Dial>")
+    assert 'url="wss://api.example.com/api/v1/telephony/dialer-twilio-transcribe"' in text
+    assert 'track="both_tracks"' in text
+    assert f'<Parameter name="channel_key" value="{sid}"/>' in text
+    assert f"call-{sid}</Conference>" in text
+    assert _DISCLOSURE not in text
+
+
+def test_voice_connect_rep_leg_has_no_stream_without_deepgram(monkeypatch):
+    monkeypatch.delenv("DEEPGRAM_API_KEY", raising=False)
+    sid = "CA" + "a" * 32
+    response = _post_outbound_voice_connect(sid)
+    assert response.status_code == 200
+    assert "<Start>" not in response.text
+    assert f"call-{sid}</Conference>" in response.text
+
+
+def test_inbound_rep_join_streams_captions_keyed_by_the_callers_call(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "dg-test")
+    monkeypatch.delenv("SYSEVO_DIALER_LIVE_TRANSCRIBE", raising=False)
+    parent_sid = "CA" + "abcdef0123456789" * 2
+    conference_name = f"call-{parent_sid}"
+    client = TestClient(_make_test_app())
+    rep = SimpleNamespace(provider_id="11111111-1111-1111-1111-111111111111")
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
+        new=AsyncMock(return_value=rep),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.is_claimed_inbound_conference",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.bind_inbound_rep_leg",
+        new=AsyncMock(return_value=True),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
+        new=AsyncMock(return_value=("https://api.example.com", "wss://api.example.com")),
+    ):
+        response = client.post(
+            "/voice-connect",
+            data={"From": "client:rep-123", "To": conference_name, "conference": conference_name,
+                  "CallSid": "CA" + "1" * 32},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+    assert response.status_code == 200
+    text = response.text
+    assert f'<Parameter name="channel_key" value="{parent_sid}"/>' in text
+    assert text.index("<Start>") < text.index("<Dial>")
+    assert _DISCLOSURE in text
