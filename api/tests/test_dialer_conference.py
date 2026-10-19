@@ -102,7 +102,7 @@ async def test_dial_lead_only_enables_message_end_detection_when_requested(monke
     assert result == "CA999"
     params = fake_client.calls.create.call_args.kwargs
     assert params["machine_detection"] == "DetectMessageEnd"
-    assert params["machine_detection_timeout"] == 30
+    assert params["machine_detection_timeout"] == 20  # balanced: a long limit records silence into the mailbox
     assert params["machine_detection_speech_threshold"] == 2400
     assert params["machine_detection_speech_end_threshold"] == 1200
     assert params["machine_detection_silence_timeout"] == 5000

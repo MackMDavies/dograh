@@ -310,6 +310,14 @@ def _manual_drop_ready(call_row: dict | None) -> bool:
     return amd_result in _MACHINE_END_RESULTS or amd_result is None
 
 
+# Every machine_end_* result means Twilio has already judged the greeting over, so the mailbox is
+# recording now. A pause here only records silence, and many carrier mailboxes hang up after a few
+# seconds of it: a 6-second pause on machine_end_other/silence cut real drops short (2026-10-19,
+# CA073838579c…: AMD hit its 30s limit, then 6s of silence, then the mailbox ended 7s into the
+# message). Start the recording immediately.
+_VOICEMAIL_START_PAUSE_SECONDS = 0
+
+
 def _voicemail_complete_url(
     *, endpoint_root: str, parent_call_sid: str, parallel_leg_id: str = "",
     drop_id: str | None = None, pause_seconds: int = 0,
@@ -458,7 +466,7 @@ async def control_manual_voicemail_drop(
                 endpoint_root=endpoint_root,
                 parent_call_sid=body.parent_call_sid,
                 playback_url=playback_url,
-                pause_seconds=6 if current.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+                pause_seconds=_VOICEMAIL_START_PAUSE_SECONDS,
                 drop_id=drop_id,
             )
             if not await _redirect_twilio_child_to_voicemail(child_call_sid=child_call_sid, twiml=twiml):
@@ -1683,7 +1691,7 @@ async def handle_dialer_conference_join(
                         endpoint_root=endpoint_root,
                         parent_call_sid=parent_call_sid,
                         playback_url=playback_url,
-                        pause_seconds=6 if answered_by in {"machine_end_silence", "machine_end_other"} else 0,
+                        pause_seconds=_VOICEMAIL_START_PAUSE_SECONDS,
                         parallel_leg_id=parallel_leg_id,
                         drop_id=drop_id,
                     )
@@ -2013,7 +2021,7 @@ async def handle_dialer_conference_events(request: Request):
                                 endpoint_root=endpoint_root,
                                 parent_call_sid=parent_call_sid,
                                 playback_url=playback_url,
-                                pause_seconds=6 if call_row.get("amd_result") in {"machine_end_silence", "machine_end_other"} else 0,
+                                pause_seconds=_VOICEMAIL_START_PAUSE_SECONDS,
                                 drop_id=drop_id,
                             )
                             if not await _redirect_twilio_child_to_voicemail(

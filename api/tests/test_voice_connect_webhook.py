@@ -1671,7 +1671,9 @@ def test_dialer_conference_join_waits_six_seconds_after_machine_greeting_without
         )
 
     assert response.status_code == 200
-    assert '<Pause length="6"/><Play>https://db.example.com/' in response.text
+    # Playback starts immediately: a pause only records silence into the mailbox.
+    assert '<Pause' not in response.text
+    assert '<Play>https://db.example.com/' in response.text
     assert "dialer-auto-voicemail-complete" in response.text
     assert "<Conference" not in response.text
 

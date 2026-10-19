@@ -87,11 +87,17 @@ async def dial_lead_into_conference(
             # than a single "speed" control. Keep all values within its API
             # bounds; the preset influences classification latency/accuracy,
             # while DetectMessageEnd still waits for a machine greeting.
+            # MachineDetectionTimeout is how long Twilio may hold the line looking
+            # for the end of a greeting. When it runs out on a mailbox (no beep it
+            # recognises) the result is machine_end_other and the mailbox has been
+            # recording silence the whole time, so a long limit loses messages:
+            # 30s on "balanced" did exactly that in production. A limit shorter than
+            # a typical greeting (3s on "fastest") plays over the greeting instead.
             amd_presets = {
-                "fastest": (3, 1000, 500, 2000),
-                "fast": (8, 1800, 900, 3000),
-                "balanced": (30, 2400, 1200, 5000),
-                "accurate": (45, 3200, 2000, 7000),
+                "fastest": (8, 1000, 500, 2000),
+                "fast": (12, 1800, 900, 3000),
+                "balanced": (20, 2400, 1200, 5000),
+                "accurate": (30, 3200, 2000, 7000),
             }
             timeout, speech_threshold, speech_end_threshold, silence_timeout = amd_presets.get(
                 machine_detection_preset, amd_presets["balanced"]
