@@ -38,7 +38,7 @@ import os
 import re
 import time
 import uuid
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qsl, urlencode
 from urllib.parse import quote
 
@@ -46,6 +46,7 @@ import httpx
 from fastapi import APIRouter, Depends, Request, WebSocket
 from starlette.websockets import WebSocketDisconnect
 from loguru import logger
+from pydantic import BaseModel, Field
 from starlette.responses import JSONResponse
 
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
@@ -88,6 +89,7 @@ from api.services.telephony.dialer.inbound_call_log import (
 )
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
+    effective_auto_send,
     is_provider_playable_voicemail,
     resolve_effective_voicemail_drop,
     update_dialer_call_recording_url,
@@ -1112,9 +1114,18 @@ _SETTLED_HISTORY_LEG_STATES = frozenset({
 
 
 async def _finish_signalwire_batch_if_settled(*, session_id: str, session: dict) -> bool:
-    """Close the batch and the rep's waiting leg once every line has settled."""
+    """Close the batch and the rep's waiting leg once no line needs the rep.
+
+    A line playing the rep's voicemail (`voicemail_playing`) needs nothing more
+    from the rep: it finishes by itself and its play callback records the
+    result. It counts as settled, so the rep is released immediately instead of
+    waiting for every message to finish.
+    """
     all_legs = await signalwire_parallel_store.get_session_legs(session_id=session_id)
-    if not all_legs or not all(row.get("status") in _TERMINAL_PARALLEL_LEG_STATES for row in all_legs):
+    if not all_legs or not all(
+        row.get("status") in _TERMINAL_PARALLEL_LEG_STATES or row.get("status") == "voicemail_playing"
+        for row in all_legs
+    ):
         return False
     finished = await signalwire_parallel_store.finish_session(
         session_id=session_id,
@@ -1122,6 +1133,15 @@ async def _finish_signalwire_batch_if_settled(*, session_id: str, session: dict)
     )
     if not finished:
         return False  # Another callback (or the rep leaving) already closed it.
+    rep_call_id = str(session.get("rep_call_id") or "")
+    if (
+        rep_call_id
+        and int(session.get("line_count") or 0) == 1
+        and any(row.get("status") == "voicemail_playing" for row in all_legs)
+    ):
+        # The browser's wrap-up reads this to open straight onto "Voicemail"
+        # and move to the next lead (the leg's play callback writes the outcome).
+        await update_signalwire_dialer_amd(parent_call_sid=rep_call_id, voicemail_started=True)
     # Ending the rep's conference leg closes the active call screen when every
     # prospect leg is done, including an empty batch.
     from api.services.telephony.dialer.signalwire_calling import end_call
@@ -1142,6 +1162,11 @@ async def _abandon_signalwire_batch_after_rep_left(*, session_id: str) -> None:
     """
     session = await signalwire_parallel_store.get_session(session_id=session_id)
     if not session:
+        return
+    if await signalwire_parallel_store.session_rep_released(session_id=session_id):
+        # The rep left on purpose after queuing their voicemail: the leg stays
+        # with the server until its AMD decides (machine -> recording, person
+        # -> hang up). Cancelling it here would lose the message.
         return
     if session.get("status") == "dialing":
         await signalwire_parallel_store.finish_session(session_id=session_id, status="cancelled")
@@ -1227,6 +1252,167 @@ async def get_signalwire_parallel_auth_token(user: UserModel = Depends(require_s
     if not token:
         raise HTTPException(status_code=503, detail="Parallel dialing authorization is not configured.")
     return {"parallel_auth_token": token}
+
+
+# A screened leg the server's AMD has not classified yet (ringing or greeting).
+_PRE_DECISION_LEG_STATES = frozenset({"reserved", "queued", "ringing", "screening"})
+
+
+def _signalwire_drop_state(found: dict) -> dict:
+    """Server truth for the rep's one-line screened call, in the Twilio shape."""
+    session, leg = found["session"], found["leg"]
+    status = str(leg.get("status") or "")
+    machine = leg.get("amd_result") == "machine"
+    if leg.get("voicemail_sent_at") and status in {"voicemail", "completed"}:
+        state = "sent"
+    elif status == "voicemail_playing":
+        state = "playing"
+    elif leg.get("voicemail_started_at") and status == "failed":
+        state = "failed"
+    elif leg.get("manual_voicemail_requested_at") and status in _PRE_DECISION_LEG_STATES | {"machine"}:
+        state = "waiting"
+    elif leg.get("manual_voicemail_requested_at"):
+        # Queued, then a person (or no mailbox) answered: nothing was played.
+        state = "rejected"
+    else:
+        state = "idle"
+    bridged = str(session.get("winner_leg_id") or "") == str(leg.get("id") or "") and status == "connected"
+    result = {
+        "state": state,
+        # machine_end_other: a mailbox the server's AMD bridged to the rep.
+        "amd_result": "machine_end_other" if machine else leg.get("amd_result"),
+        "ready": bool(machine and bridged),
+    }
+    if state == "failed":
+        result["failure"] = "playback_incomplete"
+    return result
+
+
+class SignalWireVoicemailDropRequest(BaseModel):
+    rep_call_id: str = Field(min_length=8, max_length=128)
+    action: Literal["send", "cancel"] = "send"
+
+
+@router.get("/dialer/signalwire/voicemail-drop/{rep_call_id}")
+async def signalwire_voicemail_drop_status(
+    rep_call_id: str, user: UserModel = Depends(require_sales_dialer_role),
+):
+    """Mailbox/playback state of this rep's own screened SignalWire queue call."""
+    from fastapi import HTTPException
+    rep_user_id = str(getattr(user, "provider_id", "") or "")
+    if not rep_user_id or not (8 <= len(rep_call_id) <= 128):
+        raise HTTPException(status_code=404, detail="This SignalWire call was not found for your account.")
+    try:
+        found = await signalwire_parallel_store.get_screened_single_for_rep(
+            rep_call_id=rep_call_id, rep_user_id=rep_user_id,
+        )
+    except signalwire_parallel_store.SignalWireParallelStoreError:
+        raise HTTPException(status_code=503, detail="Could not read this call. Try again.")
+    if not found:
+        # Keypad / direct calls have no server-side mailbox screening.
+        raise HTTPException(status_code=404, detail="This SignalWire call was not found for your account.")
+    return _signalwire_drop_state(found)
+
+
+@router.post("/dialer/signalwire/voicemail-drop")
+async def signalwire_send_voicemail(
+    body: SignalWireVoicemailDropRequest, user: UserModel = Depends(require_sales_dialer_role),
+):
+    """The rep's one tap on "Send my voicemail" for a bridged mailbox.
+
+    The prospect leg is moved out of the rep's conference onto a play-and-hang-up
+    SWML (Calling API `update`), and the rep is released at once. The leg's play
+    callback records sent/failed and the outcome exactly as an automatic drop.
+    """
+    from fastapi import HTTPException
+    from api.services.telephony.dialer.signalwire_calling import SignalWireCallError, update_call_swml
+
+    rep_user_id = str(getattr(user, "provider_id", "") or "")
+    if not rep_user_id:
+        raise HTTPException(status_code=503, detail="Your account is missing its dialer user mapping.")
+    try:
+        found = await signalwire_parallel_store.get_screened_single_for_rep(
+            rep_call_id=body.rep_call_id, rep_user_id=rep_user_id,
+        )
+    except signalwire_parallel_store.SignalWireParallelStoreError:
+        raise HTTPException(status_code=503, detail="Could not read this call. The call was left unchanged.")
+    if not found:
+        raise HTTPException(status_code=404, detail="This SignalWire call was not found for your account.")
+    current = _signalwire_drop_state(found)
+    if body.action == "cancel" or current["state"] in {"playing", "sent", "waiting"}:
+        # Once the rep has handed the line over it belongs to the server.
+        return {"state": current["state"]}
+    session, leg = found["session"], found["leg"]
+    if (
+        str(leg.get("status") or "") in _PRE_DECISION_LEG_STATES
+        and session.get("status") == "dialing"
+    ):
+        # Pressed while it rings or during the greeting: queue it on the leg,
+        # release the rep now, and let the AMD decision play it on a machine
+        # (or hang up on a person) in the background.
+        try:
+            queued = await signalwire_parallel_store.request_manual_voicemail(
+                session_id=str(session["id"]), leg_id=str(leg["id"]), rep_user_id=rep_user_id,
+            )
+        except signalwire_parallel_store.SignalWireParallelStoreError:
+            raise HTTPException(status_code=503, detail="Could not queue the voicemail. The call was left unchanged.")
+        if queued != "waiting":
+            raise HTTPException(status_code=409, detail="This call can no longer take a voicemail.")
+        from api.services.telephony.dialer.signalwire_calling import end_call
+        try:
+            await end_call(call_id=body.rep_call_id, reason="hangup")
+        except SignalWireCallError as exc:  # the request stands; the browser hangs up its own leg too
+            logger.warning(f"Could not end the rep leg {body.rep_call_id} after queuing a voicemail: {exc}")
+        return {"state": "waiting", "released": True}
+    if not current["ready"]:
+        raise HTTPException(status_code=409, detail="The dialer has not confirmed a voicemail on this call, so nothing was sent.")
+
+    session_id, leg_id = str(session["id"]), str(leg["id"])
+    provider_call_id = str(leg.get("provider_call_id") or "")
+    drop = await _load_signalwire_parallel_default_drop(
+        rep_user_id, entry_id=str(leg.get("entry_id") or "") or None, parent_call_sid=body.rep_call_id,
+    )
+    if not drop:
+        raise HTTPException(status_code=409, detail="Record a WAV voicemail before sending one from SignalWire.")
+    try:
+        recording_url = await _signed_signalwire_voicemail_url(drop["storage_path"])
+        backend_endpoint, _ = await get_backend_endpoints()
+        playback_url = _parallel_callback_url(
+            str(backend_endpoint or "").rstrip("/"), "sw-parallel-playback", session_id, leg_id,
+        )
+    except Exception as exc:  # noqa: BLE001 - nothing has changed on the call yet
+        logger.error(f"Could not prepare the SignalWire voicemail for {body.rep_call_id}: {exc}")
+        raise HTTPException(status_code=503, detail="Could not load your recording. Speak your message instead.")
+    if not await signalwire_parallel_store.claim_manual_voicemail(
+        session_id=session_id, leg_id=leg_id, provider_call_id=provider_call_id,
+        drop_id=drop["id"], rep_user_id=rep_user_id,
+    ):
+        refreshed = await signalwire_parallel_store.get_screened_single_for_rep(
+            rep_call_id=body.rep_call_id, rep_user_id=rep_user_id,
+        )
+        state = _signalwire_drop_state(refreshed)["state"] if refreshed else "idle"
+        if state in {"playing", "sent"}:
+            return {"state": state}  # A double tap: the first one is already playing.
+        raise HTTPException(status_code=409, detail="The voicemail could not be safely started.")
+
+    from api.services.telephony.dialer.swml import build_signalwire_parallel_voicemail_swml
+    try:
+        await update_call_swml(call_id=provider_call_id, swml=build_signalwire_parallel_voicemail_swml(
+            recording_url=recording_url, playback_status_url=playback_url,
+        ))
+    except SignalWireCallError as exc:
+        logger.error(f"SignalWire refused to start the voicemail on {provider_call_id}: {exc}")
+        await signalwire_parallel_store.release_manual_voicemail(
+            session_id=session_id, leg_id=leg_id, provider_call_id=provider_call_id,
+        )
+        raise HTTPException(status_code=502, detail="SignalWire could not start the message. Speak your message instead.")
+    await update_signalwire_dialer_amd(parent_call_sid=provider_call_id, voicemail_started=True)
+    # Releases the rep (and closes the session, so their next dial is allowed)
+    # while the prospect leg keeps playing.
+    _spawn_background(_finish_signalwire_batch_if_settled(
+        session_id=session_id, session={**session, "line_count": 1},
+    ))
+    return {"state": "playing", "released": True}
 
 
 @router.post("/sw-parallel-conference", include_in_schema=False)
@@ -1649,6 +1835,12 @@ async def handle_sw_parallel_decision(request: Request):
         amd_result = (_extract(payload, dict(query), ("amd_result", "detect_result")) or "unknown").lower()
         if amd_result not in {"human", "machine", "fax", "unknown", "error"}:
             amd_result = "unknown"
+        # The rep pressed "Send my voicemail" while this line rang (or during
+        # its greeting) and has already moved on.
+        queued_by_rep = (
+            int(session.get("line_count") or 0) == 1
+            and await signalwire_parallel_store.leg_voicemail_requested(session_id=session_id, leg_id=leg_id)
+        )
         raw_ms = _extract(payload, dict(query), ("amd_ms", "detect_ms"))
         try:
             amd_ms = max(0, min(int(raw_ms), 120_000))
@@ -1669,7 +1861,18 @@ async def handle_sw_parallel_decision(request: Request):
             if not policy:
                 return _swml(build_hangup_swml())
             on_machine = str(policy.get("on_machine") or "hangup")
-            if on_machine == "pass_to_rep" and session.get("line_count") == 1:
+            single_line = int(session.get("line_count") or 0) == 1
+            # Single call: the rep's own choice (else the team default).
+            # Parallel line: always, whenever the team action is drop_vm.
+            auto_send = queued_by_rep or effective_auto_send(policy, parallel=not single_line)
+            beep_heard = _truthy(_extract(payload, dict(query), ("beep",)))
+            # Drop VM that does not play automatically on a single call (the
+            # rep chose to be asked) passes the mailbox to the rep, who gets
+            # the one-tap "Send my voicemail" prompt or can speak live.
+            ask_rep = (
+                single_line and on_machine == "drop_vm" and amd_result == "machine" and not auto_send
+            )
+            async def pass_mailbox_to_rep() -> JSONResponse:
                 winner = await signalwire_parallel_store.claim_winner(
                     session_id=session_id, leg_id=leg_id,
                     provider_call_id=provider_call_id, amd_ms=amd_ms,
@@ -1679,16 +1882,25 @@ async def handle_sw_parallel_decision(request: Request):
                     return _swml(build_hangup_swml())
                 # The winning claim transaction already linked the parent to
                 # this exact PSTN leg and its independently selected caller ID.
-                await update_signalwire_dialer_amd(
-                    parent_call_sid=provider_call_id, amd_result="fax" if amd_result == "fax" else "machine_start"
-                )
+                # A Drop VM mailbox carries a machine_end_* result so the rep's
+                # screen offers "Send my voicemail"; pass-to-rep stays as before.
+                if amd_result == "fax":
+                    call_amd = "fax"
+                elif on_machine == "drop_vm":
+                    call_amd = "machine_end_beep" if beep_heard else "machine_end_silence"
+                else:
+                    call_amd = "machine_start"
+                await update_signalwire_dialer_amd(parent_call_sid=provider_call_id, amd_result=call_amd)
                 return _swml(await _signalwire_parallel_join_swml(
                     conference_name=conference_name, session_id=session_id,
                     leg_id=leg_id,
                 ))
 
+            if ((on_machine == "pass_to_rep" and single_line) or ask_rep) and not queued_by_rep:
+                return await pass_mailbox_to_rep()
+
             # A fax line has no mailbox: never play a recording to it.
-            if on_machine == "drop_vm" and policy.get("auto_drop_enabled") is True and amd_result == "machine":
+            if (on_machine == "drop_vm" or queued_by_rep) and auto_send and amd_result == "machine":
                 drop = await _load_signalwire_parallel_default_drop(
                     str(session["rep_user_id"]),
                     entry_id=str(leg["entry_id"]),
@@ -1712,17 +1924,26 @@ async def handle_sw_parallel_decision(request: Request):
                         str(backend_endpoint or "").rstrip("/"),
                         "sw-parallel-playback", session_id, leg_id,
                     )
-                    call_amd = "machine_end_beep" if _truthy(_extract(payload, dict(query), ("beep",))) else "machine_end_silence"
+                    call_amd = "machine_end_beep" if beep_heard else "machine_end_silence"
                     await update_signalwire_dialer_amd(
                         parent_call_sid=provider_call_id,
                         amd_result=call_amd,
                         voicemail_started=True,
                     )
+                    # The leg owns the message now. Release the rep as soon as
+                    # no other line still needs them (a single call: at once).
+                    _spawn_background(_finish_signalwire_batch_if_settled(
+                        session_id=session_id, session=session,
+                    ))
                     from api.services.telephony.dialer.swml import build_signalwire_parallel_voicemail_swml
                     return _swml(build_signalwire_parallel_voicemail_swml(
                         recording_url=recording_url,
                         playback_status_url=playback_url,
                     ))
+                if single_line and not queued_by_rep:
+                    # Automatic send was wanted but nothing playable exists:
+                    # let the rep hear the mailbox and speak instead.
+                    return await pass_mailbox_to_rep()
 
             # No policy, enabled drop, or usable default recording: record the
             # detected voicemail and finish this prospect leg without playback.
@@ -1739,6 +1960,26 @@ async def handle_sw_parallel_decision(request: Request):
                 session_id=session_id, leg_id=leg_id,
                 provider_call_id=provider_call_id, outcome="voicemail",
             )
+            return _swml(build_hangup_swml())
+
+        if queued_by_rep:
+            # A person answered after the rep queued a voicemail and left.
+            # Never bridge them into an empty room and never play a recording
+            # to a person: end the line and leave the lead for the rep.
+            await signalwire_parallel_store.update_leg(
+                session_id=session_id, leg_id=leg_id,
+                provider_call_id=provider_call_id, status="completed",
+                amd_result=amd_result, amd_ms=amd_ms,
+            )
+            await update_signalwire_dialer_amd(
+                parent_call_sid=provider_call_id,
+                amd_result="human" if amd_result == "human" else "unknown",
+            )
+            await update_dialer_call_status(
+                parent_call_sid=provider_call_id, child_call_sid=None, status="completed",
+                duration_seconds=None, rep_user_id=session.get("rep_user_id"), provider="signalwire",
+            )
+            _spawn_background(_finish_signalwire_batch_if_settled(session_id=session_id, session=session))
             return _swml(build_hangup_swml())
 
         await signalwire_parallel_store.update_leg(

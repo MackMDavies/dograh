@@ -7,7 +7,7 @@ from api.services.telephony.dialer.provider import DialerCredentials
 async def test_voice_token_reports_active_provider():
     from api.services.telephony.providers.twilio.routes import get_voice_token
 
-    fake_user = type("U", (), {"id": 42})()
+    fake_user = type("U", (), {"id": 42, "provider_id": "00000000-0000-0000-0000-000000000042"})()
     creds = DialerCredentials(
         token="sw-tok", identity="rep-42", destination="/private/dialer"
     )
@@ -16,10 +16,13 @@ async def test_voice_token_reports_active_provider():
     provider.mint_credentials = AsyncMock(return_value=creds)
 
     with patch(
-        "api.services.telephony.providers.twilio.routes.resolve_active_dialer_provider",
-        return_value="signalwire",
+        "api.services.telephony.providers.twilio.routes.resolve_configured_dialer_provider",
+        new=AsyncMock(return_value="signalwire"),
     ), patch(
-        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        "api.services.telephony.providers.twilio.routes.issue_parallel_auth_token",
+        return_value="parallel-token",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
         new=AsyncMock(return_value=None),
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
@@ -43,10 +46,10 @@ async def test_voice_token_defaults_to_twilio():
     provider.mint_credentials = AsyncMock(return_value=creds)
 
     with patch(
-        "api.services.telephony.providers.twilio.routes.resolve_active_dialer_provider",
-        return_value="twilio",
+        "api.services.telephony.providers.twilio.routes.resolve_configured_dialer_provider",
+        new=AsyncMock(return_value="twilio"),
     ), patch(
-        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
         new=AsyncMock(return_value=None),
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",
@@ -61,7 +64,7 @@ async def test_voice_token_defaults_to_twilio():
 async def test_voice_token_uses_telnyx_for_a_rep_assigned_a_telnyx_number():
     from api.services.telephony.providers.twilio.routes import get_voice_token
 
-    fake_user = type("U", (), {"id": 42})()
+    fake_user = type("U", (), {"id": 42, "provider_id": "00000000-0000-0000-0000-000000000042"})()
     creds = DialerCredentials(
         token="telnyx-jwt", identity="rep-42", destination=""
     )
@@ -71,7 +74,7 @@ async def test_voice_token_uses_telnyx_for_a_rep_assigned_a_telnyx_number():
     provider.mint_credentials = AsyncMock(return_value=creds)
 
     with patch(
-        "api.services.telephony.providers.twilio.routes.resolve_assigned_dialer_number",
+        "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
         new=AsyncMock(return_value={"provider": "telnyx", "phone_number": "+15551234567", "next_rotation_at": boundary}),
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_provider",

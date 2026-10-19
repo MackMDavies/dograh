@@ -354,3 +354,102 @@ async def get_session_legs(*, session_id: str) -> list[dict[str, Any]]:
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise SignalWireParallelStoreError("SignalWire batch line state response was invalid")
     return rows
+
+
+async def claim_manual_voicemail(
+    *, session_id: str, leg_id: str, provider_call_id: str, drop_id: str, rep_user_id: str,
+) -> bool:
+    """One-shot claim for a rep's "Send my voicemail" on a bridged mailbox leg."""
+    result = await _rpc("dialer_signalwire_claim_manual_voicemail", {
+        "p_session_id": session_id, "p_leg_id": leg_id,
+        "p_provider_call_id": provider_call_id, "p_drop_id": drop_id,
+        "p_rep_user_id": rep_user_id,
+    })
+    return result is True
+
+
+async def release_manual_voicemail(*, session_id: str, leg_id: str, provider_call_id: str) -> bool:
+    """Undo a manual claim SignalWire refused to act on (rep can still speak)."""
+    result = await _rpc("dialer_signalwire_release_manual_voicemail", {
+        "p_session_id": session_id, "p_leg_id": leg_id, "p_provider_call_id": provider_call_id,
+    })
+    return result is True
+
+
+async def get_screened_single_for_rep(*, rep_call_id: str, rep_user_id: str) -> dict[str, Any] | None:
+    """The rep's own one-line screened session and its leg, or None.
+
+    Bound to both the browser call id and the authenticated rep, so a rep can
+    never read or act on somebody else's call.
+    """
+    headers = _headers()
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            session_response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/dialer_signalwire_parallel_sessions",
+                params={
+                    "select": "id,rep_user_id,rep_call_id,conference_name,status,winner_leg_id,line_count,rep_released_at",
+                    "rep_call_id": f"eq.{rep_call_id}", "rep_user_id": f"eq.{rep_user_id}",
+                    "line_count": "eq.1", "limit": "1",
+                },
+                headers=headers,
+            )
+            session_response.raise_for_status()
+            sessions = session_response.json()
+            if not isinstance(sessions, list) or len(sessions) != 1 or not isinstance(sessions[0], dict):
+                return None
+            leg_response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/dialer_signalwire_parallel_legs",
+                params={
+                    "select": "id,session_id,entry_id,provider_call_id,status,amd_result,voicemail_started_at,voicemail_sent_at,manual_voicemail_requested_at",
+                    "session_id": f"eq.{sessions[0]['id']}", "limit": "1",
+                },
+                headers=headers,
+            )
+            leg_response.raise_for_status()
+            legs = leg_response.json()
+    except Exception as exc:  # noqa: BLE001 - callers fail closed
+        raise SignalWireParallelStoreError("Could not load the screened SignalWire call") from exc
+    if not isinstance(legs, list) or len(legs) != 1 or not isinstance(legs[0], dict):
+        return None
+    return {"session": sessions[0], "leg": legs[0]}
+
+
+async def request_manual_voicemail(*, session_id: str, leg_id: str, rep_user_id: str) -> str:
+    """Queue the rep's voicemail on a leg AMD has not decided yet and release them.
+
+    Returns 'waiting' (queued, the rep may leave), 'not_ready' (a person is
+    already on the line, or the call is over) or 'not_found'.
+    """
+    result = await _rpc("dialer_signalwire_request_manual_voicemail", {
+        "p_session_id": session_id, "p_leg_id": leg_id, "p_rep_user_id": rep_user_id,
+    })
+    return result if isinstance(result, str) else "not_found"
+
+
+async def _optional_row(table: str, params: dict[str, str]) -> dict[str, Any] | None:
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(f"{SUPABASE_URL}/rest/v1/{table}", params=params, headers=_headers())
+            response.raise_for_status()
+            rows = response.json()
+    except Exception:  # noqa: BLE001 - optional state (pre-migration) reads as absent
+        return None
+    return rows[0] if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else None
+
+
+async def leg_voicemail_requested(*, session_id: str, leg_id: str) -> bool:
+    """Whether the rep queued a voicemail on this leg and left. False when unknown."""
+    row = await _optional_row("dialer_signalwire_parallel_legs", {
+        "select": "manual_voicemail_requested_at", "id": f"eq.{leg_id}",
+        "session_id": f"eq.{session_id}", "limit": "1",
+    })
+    return bool(row and row.get("manual_voicemail_requested_at"))
+
+
+async def session_rep_released(*, session_id: str) -> bool:
+    """Whether the rep already left this session for a background voicemail."""
+    row = await _optional_row("dialer_signalwire_parallel_sessions", {
+        "select": "rep_released_at", "id": f"eq.{session_id}", "limit": "1",
+    })
+    return bool(row and row.get("rep_released_at"))

@@ -142,10 +142,19 @@ def _parallel_refusal_twiml(message: str) -> str:
 
 
 def _parallel_batch_has_settled(legs: list[dict]) -> bool:
-    """Whether every parallel destination has a durable terminal result."""
+    """Whether every parallel destination no longer needs the rep.
+
+    A line already playing the rep's recording finishes by itself and records
+    sent/failed on its own leg, so it counts as settled: the rep is released
+    instead of sitting on hold music for the length of every message. (The
+    browser's automatic next round still waits for those lines to be SENT -
+    see dialer_parallel_batch_summary - so a prospect is never re-dialled
+    while their voicemail is still being left.)
+    """
     return bool(legs) and all(
         leg.get("status") in _PARALLEL_TERMINAL_LEG_STATES
         or (leg.get("status") == "voicemail" and leg.get("auto_voicemail_sent") is True)
+        or (leg.get("status") == "voicemail" and bool(leg.get("voicemail_drop_started_at")))
         for leg in legs
     )
 
@@ -370,6 +379,33 @@ def _playback_finished(*, vm_started: str, vm_expect: str) -> bool:
     return elapsed_ms >= int(expect_ms * 0.85) - 500
 
 
+async def _release_rep_for_voicemail(parent_call_sid: str) -> None:
+    """End the rep's own leg once the prospect's leg owns the voicemail.
+
+    Called only after the one-shot playback claim succeeded (the row now has
+    voicemail_drop_started_at), so the rep is free to move on while the
+    prospect leg - an independent REST-originated call, not a child of the
+    rep's leg - keeps playing. The conference-end that follows is told to keep
+    that leg (_cancel_orphaned_lead_leg), and the signed completion callback
+    still records sent/failed on the same dialer_calls row. Fail-soft: if this
+    fails the completion handler ends the rep's leg as before.
+    """
+    try:
+        if not await cancel_call(call_sid=parent_call_sid):
+            logger.warning(f"Could not release the rep from {parent_call_sid} for a background voicemail")
+    except Exception as exc:  # noqa: BLE001 - background task must not raise
+        logger.error(f"Rep release failed for {parent_call_sid}: {exc}")
+
+
+def _voicemail_playback_in_progress(row: dict | None) -> bool:
+    """The prospect leg is playing the recording and has not finished yet."""
+    return bool(
+        row
+        and row.get("voicemail_drop_started_at")
+        and row.get("auto_voicemail_sent") is not True
+    )
+
+
 async def _redirect_twilio_child_to_voicemail(*, child_call_sid: str, twiml: str) -> bool:
     client = await _twilio_client()
     if not client:
@@ -386,6 +422,7 @@ async def _redirect_twilio_child_to_voicemail(*, child_call_sid: str, twiml: str
 async def control_manual_voicemail_drop(
     body: ManualVoicemailDropRequest,
     request: Request,
+    background_tasks: BackgroundTasks,
     user=Depends(require_sales_dialer_role),
 ):
     """Queue/cancel a server-side Twilio voicemail drop for this rep's own call.
@@ -475,8 +512,24 @@ async def control_manual_voicemail_drop(
                     child_call_sid=child_call_sid,
                 )
                 raise HTTPException(status_code=502, detail="Twilio could not start the message. Try again or speak instead.")
-            return {"state": "playing"}
+            # The prospect leg now plays the message on its own: free the rep.
+            background_tasks.add_task(_release_rep_for_voicemail, body.parent_call_sid)
+            return {"state": "playing", "released": True}
 
+    if state == "waiting" and not (current or {}).get("lead_joined_at"):
+        # Pressed while it rings or during the greeting (Twilio's AMD is still
+        # holding the prospect leg). Hand the line to the server and free the
+        # rep now: the signed AMD answer plays the recording on a machine, and
+        # a person who answers is hung up rather than put in an empty room
+        # (rep_detached_at). Without machine detection nothing would ever
+        # confirm the mailbox, so the rep keeps the call in that case.
+        policy = await get_team_voicemail_policy(
+            user_id=rep_user_id, parent_call_sid=body.parent_call_sid,
+        )
+        detection_on = (policy or {}).get("machine_detection_enabled") is not False
+        if detection_on and await mark_rep_detached_for_voicemail(parent_call_sid=body.parent_call_sid):
+            background_tasks.add_task(_release_rep_for_voicemail, body.parent_call_sid)
+            return {"state": "waiting", "released": True}
     return {"state": state}
 
 
@@ -503,6 +556,10 @@ async def manual_voicemail_drop_status(
         "amd_result": call_row.get("amd_result"),
         "ready": isinstance(child_call_sid, str) and bool(_TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid)),
     }
+    if call_row.get("ended_at"):
+        # Lets a rep who already moved on learn that a queued voicemail's line
+        # ended without one (no answer, or a person who was hung up on).
+        result["ended"] = True
     if state == "failed":
         result["failure"] = evidence.get("voicemail_drop_failure") or "playback_incomplete"
     return result
@@ -1651,17 +1708,22 @@ async def handle_dialer_conference_join(
                 user_id=rep_user_id, parent_call_sid=parent_call_sid, entry_id=call_entry_id,
             )
             on_machine = str((policy or {}).get("on_machine") or "drop_vm")
+            # Single call: the rep's own "Send my voicemail automatically"
+            # choice (else the team default). Parallel line: always, when the
+            # team action is drop_vm. Both resolved server-side for this rep.
             enabled, playback_url, drop_id = await get_auto_voicemail_settings(
                 user_id=rep_user_id,
                 allow_manual_when_disabled=manual_requested,
                 parent_call_sid=parent_call_sid,
                 entry_id=call_entry_id,
+                parallel=bool(parallel_leg_id),
             )
             # Twilio <Play> supports WAV/MP3. Old recordings in browser
             # containers must continue into the conference rather than
             # pretending a silent message was sent.
             is_wav = bool(playback_url and playback_url.split("?", 1)[0].lower().endswith(".wav"))
             should_play = manual_requested or (enabled and on_machine == "drop_vm")
+            endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
             if should_play and playback_url and is_wav:
                 # One database claim covers both paths: when the API request
                 # and this signed answer callback race, exactly one can start
@@ -1686,7 +1748,6 @@ async def handle_dialer_conference_join(
                             status="voicemail",
                             answered_by=answered_by,
                         )
-                    endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
                     twiml = _voicemail_playback_twiml(
                         endpoint_root=endpoint_root,
                         parent_call_sid=parent_call_sid,
@@ -1695,12 +1756,42 @@ async def handle_dialer_conference_join(
                         parallel_leg_id=parallel_leg_id,
                         drop_id=drop_id,
                     )
+                    if not parallel_leg_id:
+                        # The prospect leg now owns the message. Release the
+                        # rep straight away (after this TwiML is returned) so
+                        # they go to wrap-up and the next lead while it plays.
+                        background_tasks.add_task(_release_rep_for_voicemail, parent_call_sid)
                     return HTMLResponse(content=twiml, media_type="application/xml")
-            # A detected machine must never silently join the rep when the
-            # selected policy is Drop VM or Hang up. Passing a machine through
-            # is an explicit manager choice used for training.
+                # Twilio retries a TwiML fetch it did not receive. When the
+                # first attempt already claimed this exact leg, replay the same
+                # playback instead of bridging a mailbox into the conference.
+                replay_row = call_row
+                if parallel_leg_id:
+                    replay_row = next((
+                        leg for leg in await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
+                        if leg.get("leg_id") == parallel_leg_id and leg.get("child_call_sid") == child_sid
+                    ), None)
+                else:
+                    replay_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+                    if (replay_row or {}).get("child_call_sid") != child_sid:
+                        replay_row = None
+                if _voicemail_playback_in_progress(replay_row):
+                    logger.info(f"Replaying the claimed voicemail on {child_sid} for a retried join")
+                    return HTMLResponse(content=_voicemail_playback_twiml(
+                        endpoint_root=endpoint_root,
+                        parent_call_sid=parent_call_sid,
+                        playback_url=playback_url,
+                        pause_seconds=_VOICEMAIL_START_PAUSE_SECONDS,
+                        parallel_leg_id=parallel_leg_id,
+                        drop_id=drop_id,
+                    ), media_type="application/xml")
+            # Hang up is an explicit manager choice, and a parallel machine
+            # line is never bridged. On a single call with Drop VM that did not
+            # play automatically (the rep chose to be asked, or no playable
+            # recording), the mailbox is passed to the rep: they get the
+            # one-tap "Send my voicemail" prompt or can speak live.
             if not manual_requested:
-                if on_machine in {"drop_vm", "hangup"}:
+                if on_machine == "hangup" or (parallel_leg_id and on_machine == "drop_vm"):
                     return HTMLResponse(content=hangup, media_type="application/xml")
 
     if (
@@ -1901,6 +1992,15 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
         if lead_status in _LEAD_LEG_SETTLED_STATUSES:
             return
 
+        if _voicemail_playback_in_progress(leg):
+            # The rep was released on purpose while the prospect leg plays the
+            # recording. Ending that leg here would cut the message off; its
+            # completion callback hangs it up and records sent/failed.
+            logger.info(
+                f"dialer-conference-events: keeping {child_call_sid} for its voicemail playback"
+            )
+            return
+
         if (
             not parallel_session
             and leg.get("manual_voicemail_requested_at")
@@ -2032,6 +2132,8 @@ async def handle_dialer_conference_events(request: Request):
                                     parent_call_sid=parent_call_sid,
                                     child_call_sid=child_call_sid,
                                 )
+                            else:
+                                await _release_rep_for_voicemail(parent_call_sid)
     elif event_type == "conference-end" and parent_call_sid:
         session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
         if not session:

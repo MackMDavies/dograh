@@ -1809,14 +1809,19 @@ def test_manual_voicemail_redirects_only_after_beep_and_lead_join(monkeypatch):
         return_value=twilio,
     ), patch(
         "api.services.telephony.providers.twilio.routes.release_manual_voicemail_playback",
-    ) as release:
+    ) as release, patch(
+        "api.services.telephony.providers.twilio.routes.cancel_call",
+        new=AsyncMock(return_value=True),
+    ) as release_rep:
         response = TestClient(_make_authenticated_test_app()).post(
             "/dialer/manual-voicemail-drop",
             json={"parent_call_sid": parent_sid, "action": "send"},
         )
 
     assert response.status_code == 200
-    assert response.json() == {"state": "playing"}
+    # The prospect leg plays it; the rep is released straight away.
+    assert response.json() == {"state": "playing", "released": True}
+    release_rep.assert_awaited_once_with(call_sid=parent_sid)
     claim.assert_awaited_once_with(parent_call_sid=parent_sid, child_call_sid=child_sid)
     twilio.calls.assert_called_once_with(child_sid)
     twilio.calls.return_value.update.assert_called_once()

@@ -269,7 +269,7 @@ def test_manual_drop_on_a_live_call_without_amd_plays_on_the_reps_press():
         response = _app(authenticated=True).post(
             "/dialer/manual-voicemail-drop", json={"parent_call_sid": _PARENT, "action": "send"},
         )
-    assert response.json() == {"state": "playing"}
+    assert response.json() == {"state": "playing", "released": True}
     twiml = twilio.calls.return_value.update.call_args.kwargs["twiml"]
     assert "<Pause" not in twiml and "<Play>" in twiml
 

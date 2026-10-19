@@ -303,7 +303,7 @@ async def parallel_legs(*, parent_call_sid: str) -> list[dict]:
             response = await client.get(
                 f"{SUPABASE_URL}/rest/v1/dialer_parallel_legs",
                 params={
-                    "select": "leg_id,parent_call_sid,child_call_sid,entry_id,status,answered_by,auto_voicemail_sent,caller_id",
+                    "select": "leg_id,parent_call_sid,child_call_sid,entry_id,status,answered_by,auto_voicemail_sent,voicemail_drop_started_at,caller_id",
                     "parent_call_sid": f"eq.{parent_call_sid}",
                     "order": "started_at.asc",
                 },

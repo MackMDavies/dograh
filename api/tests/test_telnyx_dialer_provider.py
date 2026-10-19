@@ -106,6 +106,13 @@ async def test_telnyx_start_returns_server_selected_rotation_caller_number():
         "api.services.telephony.providers.twilio.routes._get_assigned_dialer_number_or_503",
         new=AsyncMock(return_value={"provider": "telnyx", "direction": "both", "phone_number": "+15551234567"}),
     ), patch(
+        # Compliance lookups go to Supabase; unmocked they fail closed (403).
+        "api.services.telephony.providers.twilio.routes.phone_block_reason",
+        new=AsyncMock(return_value=None),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.check_dialer_calling_hours_with_state",
+        new=AsyncMock(return_value=(True, None, None)),
+    ), patch(
         "api.services.telephony.providers.twilio.routes.create_dialer_call",
         new=AsyncMock(return_value=True),
     ) as create:

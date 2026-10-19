@@ -11,13 +11,14 @@ from typing import Literal, Optional
 from uuid import UUID
 
 import jwt
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from loguru import logger
 from pipecat.utils.run_context import set_current_run_id
 from pydantic import BaseModel, Field
 
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
+from api.services.telephony.dialer import vonage_voicemail
 from api.services.telephony.dialer.compliance import calling_hours_result, phone_block_reason
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
@@ -32,11 +33,12 @@ from api.services.telephony.status_processor import (
     StatusCallbackRequest,
     _process_status_update,
 )
+from api.utils.common import get_backend_endpoints
 
 router = APIRouter()
 
 
-async def _verify_dialer_webhook(request: Request) -> None:
+async def _verify_dialer_webhook(request: Request) -> dict:
     """Accept dialer webhooks only when signed for the configured application."""
     try:
         saved = await db_client.get_platform_vonage_dialer_credentials()
@@ -61,18 +63,49 @@ async def _verify_dialer_webhook(request: Request) -> None:
         raise HTTPException(status_code=401, detail="Invalid Vonage webhook signature.") from exc
     if claims.get("api_key") != api_key:
         raise HTTPException(status_code=401, detail="Vonage webhook is not for this application.")
+    return claims
 
 
-@router.get("/vonage/dialer/answer", include_in_schema=False)
-async def handle_dialer_answer(request: Request):
-    """Return the NCCO for a rep's Vonage Client SDK PSTN call."""
-    await _verify_dialer_webhook(request)
+async def _verified_dialer_body(request: Request) -> dict:
+    """Signed JWT + matching payload_hash; returns the JSON body (or {})."""
+    raw_body = await request.body()
+    claims = await _verify_dialer_webhook(request)
+    if not vonage_voicemail.payload_hash_matches(claims, raw_body):
+        raise HTTPException(status_code=401, detail="Vonage webhook payload does not match its signature.")
+    if not raw_body:
+        return {}
     try:
-        payload = await request.json()
+        body = json.loads(raw_body)
     except (ValueError, json.JSONDecodeError):
-        payload = {}
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=422, detail="Vonage call metadata is invalid.")
+        raise HTTPException(status_code=422, detail="Vonage webhook body is invalid.")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=422, detail="Vonage webhook body is invalid.")
+    return body
+
+
+async def _signed_callback_context(request: Request) -> dict[str, str]:
+    secret = await vonage_voicemail.signature_secret()
+    context = vonage_voicemail.verify_context(secret, dict(request.query_params))
+    if not context or not context.get("call"):
+        raise HTTPException(status_code=403, detail="Vonage callback context is invalid.")
+    return {**context, "_secret": secret}
+
+
+async def _telephony_root() -> str:
+    backend_endpoint, _ = await get_backend_endpoints()
+    return f"{backend_endpoint.rstrip('/')}/api/v1/telephony"
+
+
+@router.api_route("/vonage/dialer/answer", methods=["GET", "POST"], include_in_schema=False)
+async def handle_dialer_answer(request: Request):
+    """Return the NCCO for a rep's Vonage Client SDK PSTN call.
+
+    Vonage's default answer method is GET (fields in the query string); POST
+    sends JSON. Accept both so the Voice application's setting cannot silently
+    break dialing.
+    """
+    body = await _verified_dialer_body(request)
+    payload = {**dict(request.query_params), **body}
     custom_data = payload.get("custom_data")
     if isinstance(custom_data, str):
         try:
@@ -87,11 +120,82 @@ async def handle_dialer_answer(request: Request):
         raise HTTPException(status_code=422, detail="Vonage call destination is invalid.")
     if not re.fullmatch(r"\+?[1-9]\d{7,14}", from_number):
         raise HTTPException(status_code=422, detail="Vonage caller ID is invalid.")
-    return [{
+    connect = {
         "action": "connect",
         "from": from_number.removeprefix("+"),
         "endpoint": [{"type": "phone", "number": to_number.removeprefix("+")}],
-    }]
+    }
+    try:
+        # Voicemail drop: track the prospect's leg (signed context) and, when
+        # the team runs detection, ask Vonage to listen for the greeting's beep.
+        connect.update(await vonage_voicemail.answer_connect_options(
+            endpoint_root=await _telephony_root(),
+            dialer_call_id=custom_data.get("dialer_call_id"),
+            rep_leg_uuid=payload.get("uuid"),
+            to_number=to_number,
+            from_number=from_number,
+        ))
+    except Exception as exc:  # noqa: BLE001 - optional features must never block the call
+        logger.error(f"Vonage voicemail setup skipped: {type(exc).__name__}")
+    return [connect]
+
+
+@router.post("/vonage/dialer/events", include_in_schema=False)
+async def handle_dialer_leg_events(request: Request):
+    """Signed events for the prospect's PSTN leg (status + machine detection)."""
+    body = await _verified_dialer_body(request)
+    context = await _signed_callback_context(request)
+    dialer_call_id = context["call"]
+    child_uuid = str(body.get("uuid") or body.get("call_uuid") or "")
+    status = str(body.get("status") or "").lower()
+    if not child_uuid:
+        return {"status": "ignored"}
+    if status in {"started", "ringing", "answered"}:
+        await vonage_voicemail.bind_child_leg(dialer_call_id=dialer_call_id, child_uuid=child_uuid)
+        return {"status": "ok"}
+    if status in vonage_voicemail.ENDED_STATUSES:
+        return {"status": await vonage_voicemail.on_leg_ended(dialer_call_id=dialer_call_id, child_uuid=child_uuid)}
+    amd_result = vonage_voicemail.classify_amd_event(status, body.get("sub_state"))
+    if not amd_result:
+        return {"status": "ok"}
+    if not await vonage_voicemail.bind_child_leg(dialer_call_id=dialer_call_id, child_uuid=child_uuid):
+        logger.warning(f"Vonage AMD event for an unrelated leg on {dialer_call_id}")
+        return {"status": "ignored"}
+    await vonage_voicemail.record_amd_result(
+        dialer_call_id=dialer_call_id, child_uuid=child_uuid, amd_result=amd_result,
+    )
+    if amd_result not in vonage_voicemail.MACHINE_END_RESULTS:
+        return {"status": "ok"}
+    outcome = await vonage_voicemail.on_machine_end(
+        endpoint_root=await _telephony_root(),
+        secret=context["_secret"],
+        dialer_call_id=dialer_call_id,
+        child_uuid=child_uuid,
+        rep_leg_uuid=context.get("rep"),
+    )
+    return {"status": outcome}
+
+
+@router.post("/vonage/dialer/voicemail-complete", include_in_schema=False)
+async def handle_dialer_voicemail_complete(request: Request):
+    """`notify` after the `stream`: the message reached its end on the PSTN leg."""
+    body = await _verified_dialer_body(request)
+    context = await _signed_callback_context(request)
+    dialer_call_id = context["call"]
+    child_uuid = context.get("leg") or ""
+    reported_uuid = str(body.get("uuid") or body.get("call_uuid") or "")
+    if reported_uuid and reported_uuid != child_uuid:
+        raise HTTPException(status_code=403, detail="Vonage completion is for a different call leg.")
+    fields = {key: value for key, value in context.items() if not key.startswith("_")}
+    if vonage_voicemail.playback_finished(fields):
+        await vonage_voicemail.mark_sent(dialer_call_id=dialer_call_id, child_uuid=child_uuid)
+    else:
+        logger.warning(f"Vonage voicemail on {dialer_call_id} reported before the recording could finish")
+        await vonage_voicemail.mark_failed(
+            dialer_call_id=dialer_call_id, child_uuid=child_uuid, reason="playback_incomplete",
+        )
+    # Empty response: the NCCO has no further actions, so Vonage ends the leg.
+    return Response(status_code=204)
 
 
 class VonageDialerCallStartRequest(BaseModel):
@@ -169,6 +273,44 @@ async def update_vonage_dialer_call_status(
         provider="vonage",
     )
     return None
+
+
+_DROP_REFUSALS = {
+    "not_found": (404, "This Vonage call was not found for your account."),
+    "call_ended": (409, "The call has already ended."),
+    "not_answered": (409, "The call has not been answered yet."),
+    "not_voicemail": (409, "Vonage did not detect a voicemail greeting, so the message was not sent."),
+    "unavailable": (503, "Vonage voicemail drop is not configured."),
+    "no_playable_recording": (409, "Your voicemail recording is not a WAV or MP3 file Vonage can play."),
+    "provider_transfer_failed": (502, "Vonage could not start the message. Speak instead."),
+}
+
+
+@router.post("/dialer/vonage/calls/{call_id}/voicemail-drop")
+async def request_vonage_voicemail_drop(call_id: UUID, user=Depends(require_sales_dialer_role)):
+    """One-tap drop for the rep's live Vonage call."""
+    if not user.provider_id:
+        raise HTTPException(status_code=503, detail="Rep account is missing its Supabase user mapping.")
+    state, refusal = await vonage_voicemail.request_rep_drop(
+        endpoint_root=await _telephony_root(),
+        dialer_call_id=str(call_id),
+        rep_user_id=str(user.provider_id),
+    )
+    if refusal and refusal != "not_claimed":
+        status_code, detail = _DROP_REFUSALS.get(refusal, (409, "The voicemail could not be safely sent."))
+        raise HTTPException(status_code=status_code, detail=detail)
+    return {"state": state}
+
+
+@router.get("/dialer/vonage/calls/{call_id}/voicemail-drop")
+async def vonage_voicemail_drop_status(call_id: UUID, user=Depends(require_sales_dialer_role)):
+    row = await vonage_voicemail.get_call(str(call_id))
+    if not row or str(row.get("rep_user_id") or "") != str(user.provider_id or ""):
+        raise HTTPException(status_code=404, detail="This Vonage call was not found for your account.")
+    result = {"state": vonage_voicemail.drop_state(row), "amd_result": row.get("amd_result")}
+    if result["state"] == "failed":
+        result["failure"] = row.get("voicemail_drop_failure") or "playback_incomplete"
+    return result
 
 
 @router.get("/ncco", include_in_schema=False)

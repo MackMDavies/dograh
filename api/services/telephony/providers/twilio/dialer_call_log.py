@@ -542,20 +542,45 @@ async def sign_voicemail_storage_path(storage_path: str, *, expires_in: int = 18
     return f"{SUPABASE_URL}{storage_path_part}"
 
 
+def effective_auto_send(policy: dict[str, Any] | None, *, parallel: bool = False) -> bool:
+    """Whether this call's machine answer gets the recording without the rep.
+
+    Resolved on the server from ``dialer_account_voicemail_policy`` for the
+    call's own rep_user_id (never from the browser):
+
+    * single call  -> ``single_auto_send``: the rep's own "Send my voicemail
+      automatically" choice when they have made one, else the team default,
+      and only while the team runs machine detection with action drop_vm;
+    * parallel line -> ``parallel_auto_send``: every machine line is dropped
+      whenever the team action is drop_vm, whatever the single-call choice.
+
+    Before migration 20270421110000 the policy has neither key; the old team
+    switch (``auto_drop_enabled``) then decides, exactly as before.
+    """
+    if not isinstance(policy, dict):
+        return False
+    key = "parallel_auto_send" if parallel else "single_auto_send"
+    if key in policy:
+        return policy.get(key) is True
+    return policy.get("auto_drop_enabled") is True
+
+
 async def get_auto_voicemail_settings(
     *,
     user_id: str,
     allow_manual_when_disabled: bool = False,
     parent_call_sid: str | None = None,
     entry_id: str | None = None,
+    parallel: bool = False,
 ) -> tuple[bool, str | None, str | None]:
     """Return team policy and a short-lived URL for the effective recording.
 
     The bucket is private. The URL is minted with the service role only after
     checking the account-owned automatic-drop policy and resolving the
     recording on the server (explicit team choice → rep default → team
-    default). Automatic voicemail is locked by account managers; the old
-    per-rep setting is intentionally not used to make the carrier decision.
+    default). Whether it plays automatically is effective_auto_send(): the
+    rep's own choice (or the team default) for a single call, the team's
+    on-machine action for a parallel line.
     A recording whose bytes are not a playable WAV/MP3 is refused here, so a
     silent "sent" can never be reported for a file the carrier cannot play.
     """
@@ -565,7 +590,7 @@ async def get_auto_voicemail_settings(
         team_policy = await get_team_voicemail_policy(
             user_id=user_id, parent_call_sid=parent_call_sid, entry_id=entry_id
         )
-        enabled = bool(team_policy and team_policy.get("auto_drop_enabled") is True)
+        enabled = effective_auto_send(team_policy, parallel=parallel)
         if not enabled and not allow_manual_when_disabled:
             return False, None, None
         drop = await resolve_effective_voicemail_drop(

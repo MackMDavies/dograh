@@ -104,3 +104,32 @@ async def end_call(*, call_id: str, reason: str = "cancel") -> None:
         ) from exc
     except httpx.HTTPError as exc:
         raise SignalWireCallError("SignalWire call termination request failed") from exc
+
+
+async def update_call_swml(*, call_id: str, swml: dict[str, Any]) -> None:
+    """Hand a live server-originated leg a new inline SWML document.
+
+    Calling API ``update`` command (POST /api/calling/calls,
+    ``{"command": "update", "params": {"id": ..., "swml": {...}}}``). Used to
+    take a bridged mailbox leg out of the rep's conference and play the rep's
+    recording on it, so the rep can leave while it plays.
+    """
+    if not call_id or len(call_id) > 128:
+        raise SignalWireCallError("SignalWire call id is invalid")
+    if not isinstance(swml, dict) or "sections" not in swml:
+        raise SignalWireCallError("SignalWire update requires a SWML document")
+    endpoint, project, token = _calling_api_credentials()
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            response = await client.post(
+                endpoint,
+                json={"command": "update", "params": {"id": call_id, "swml": swml}},
+                auth=(project, token),
+            )
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        raise SignalWireCallError(
+            f"SignalWire could not update call (HTTP {exc.response.status_code})"
+        ) from exc
+    except httpx.HTTPError as exc:
+        raise SignalWireCallError("SignalWire call update request failed") from exc
