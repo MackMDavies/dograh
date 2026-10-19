@@ -359,3 +359,97 @@ def test_maximum_native_output_and_empty_output_have_honest_capture_measurements
         output_measurements(data, 119)
     with pytest.raises(VoiceControlError):
         output_measurements(data[:-2], 120)
+
+
+@pytest.mark.asyncio
+async def test_signed_test_profiles_are_requested_only_for_the_bound_session():
+    from api.tests.test_voice_test_providers import plan_fixture
+
+    _, packets, plan = plan_fixture(signing_secret=SECRET)
+    data = metadata()
+    data["provider_plan"] = plan
+    session = VoiceSession.parse(data, SESSION, 185)
+
+    def handle(request):
+        assert str(request.url) == CONTROL_URL
+        assert json.loads(request.content) == {
+            "operation": "get_providers",
+            "session_id": SESSION,
+            "lease_token": LEASE,
+            "workflow_id": 185,
+        }
+        assert request.headers["x-sysevo-secret"] == SECRET
+        return httpx.Response(
+            200,
+            json={
+                "status": "providers_ready",
+                "session_id": SESSION,
+                "workflow_id": 185,
+                "providers": packets,
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        assert (
+            await VoiceControlClient(http, SECRET).providers(session, LEASE) == packets
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "no_plan",
+        "wrong_session",
+        "wrong_workflow",
+        "duplicate",
+        "missing",
+        "extra_field",
+        "signature",
+        "revision",
+        "unexpected_provider",
+    ],
+)
+async def test_provider_response_must_match_the_exact_saved_plan(bad):
+    from api.tests.test_voice_test_providers import plan_fixture, sign
+
+    _, packets, plan = plan_fixture(signing_secret=SECRET)
+    data = metadata()
+    if bad != "no_plan":
+        data["provider_plan"] = plan
+    session = VoiceSession.parse(data, SESSION, 185)
+    response = {
+        "status": "providers_ready",
+        "session_id": SESSION,
+        "workflow_id": 185,
+        "providers": packets,
+    }
+    if bad == "wrong_session":
+        response["session_id"] = RUN
+    elif bad == "wrong_workflow":
+        response["workflow_id"] = True
+    elif bad == "duplicate":
+        packets[1] = copy.deepcopy(packets[0])
+    elif bad == "missing":
+        packets.pop()
+    elif bad == "extra_field":
+        response["raw_vault_secret"] = "must_not_be_returned"
+    elif bad == "signature":
+        packets[0]["fingerprint"] = "0" * 64
+    elif bad == "revision":
+        packets[0]["revision"] += 1
+        packets[0] = sign(packets[0], SECRET)
+    elif bad == "unexpected_provider":
+        packets[0]["service_type"] = "embeddings"
+        packets[0] = sign(packets[0], SECRET)
+    called = []
+
+    def handle(request):
+        called.append(True)
+        return httpx.Response(200, json=response)
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handle)) as http:
+        with pytest.raises(VoiceControlError):
+            await VoiceControlClient(http, SECRET).providers(session, LEASE)
+    if bad == "no_plan":
+        assert not called

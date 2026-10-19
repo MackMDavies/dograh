@@ -192,7 +192,7 @@ def test_voice_capabilities_expose_actual_worker_protocol_without_starting_a_job
 ):
     client, _, pool, enqueue = setup(monkeypatch)
     redis = pool.return_value
-    redis.get.return_value = b"1"
+    redis.get.return_value = b"2"
     response = client.get(
         "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
     )

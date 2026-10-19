@@ -32,6 +32,7 @@ from api.tests.test_voice_test_control import (
     metadata,
     wav_bytes,
 )
+from api.tests.test_voice_test_providers import plan_fixture
 
 
 class MemoryRedis:
@@ -69,6 +70,8 @@ def setup():
         template_context_variables={},
     )
     data = metadata()
+    _, provider_packets, provider_plan = plan_fixture(signing_secret=SECRET)
+    data["provider_plan"] = provider_plan
     data["runtime_workflow_hash"] = workflow_snapshot_hash(
         definition.workflow_json, {}, {}
     )
@@ -118,12 +121,23 @@ def setup():
         attach=AsyncMock(),
         upload=AsyncMock(),
         finish=AsyncMock(),
+        providers=AsyncMock(return_value=provider_packets),
     )
     started = []
     closed = asyncio.Event()
 
-    async def pipeline(transport, actual_workflow, actual_run):
+    async def pipeline(transport, actual_workflow, actual_run, provider_configuration):
         assert actual_workflow.id == 185 and actual_run.id == 123
+        from api.services.workflow.voice_test_providers import (
+            validate_private_voice_provider_configuration,
+        )
+
+        assert (
+            validate_private_voice_provider_configuration(
+                provider_configuration, actual_run, SECRET
+            ).llm
+            is not None
+        )
         started.append(True)
         observer = transport.voice_observer
         transport.pipeline_task = SimpleNamespace(
@@ -156,7 +170,7 @@ def setup():
 async def test_queue_is_idempotent_and_never_puts_the_lease_in_logged_job_arguments():
     context, db, control, _, _, _, _ = setup()
     redis = MemoryRedis()
-    redis.values[WORKER_PROTOCOL_KEY] = "1"
+    redis.values[WORKER_PROTOCOL_KEY] = "2"
     for _ in range(2):
         assert (await enqueue_voice_job(db, control, redis, context))[
             "status"
@@ -193,7 +207,7 @@ async def test_scope_is_checked_before_reading_control_metadata_or_versions():
 async def test_conflicting_private_queue_context_is_not_replaced_or_enqueued():
     context, db, control, _, _, _, _ = setup()
     redis = MemoryRedis()
-    redis.values[WORKER_PROTOCOL_KEY] = "1"
+    redis.values[WORKER_PROTOCOL_KEY] = "2"
     original = replace(context, organization_id=43).encode()
     redis.values[voice_job_key(SESSION)] = original
     with pytest.raises(VoiceControlError, match="voice_job_context_conflict"):
@@ -209,6 +223,21 @@ async def test_missing_new_worker_protocol_blocks_dispatch_before_context_or_job
     with pytest.raises(VoiceControlError, match="voice_worker_unavailable"):
         await enqueue_voice_job(db, control, redis, context)
     assert redis.values == {} and redis.calls == []
+    redis.enqueue_job.assert_not_awaited()
+    control.claim.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("heartbeat", ["1", b"1", "3", b"3"])
+async def test_an_older_or_unknown_worker_cannot_receive_a_credential_isolated_job(
+    heartbeat,
+):
+    context, db, control, _, _, _, _ = setup()
+    redis = MemoryRedis()
+    redis.values[WORKER_PROTOCOL_KEY] = heartbeat
+    with pytest.raises(VoiceControlError, match="voice_worker_unavailable"):
+        await enqueue_voice_job(db, control, redis, context)
+    assert redis.calls == []
     redis.enqueue_job.assert_not_awaited()
     control.claim.assert_not_awaited()
 
@@ -423,3 +452,54 @@ async def test_native_pipeline_rechecks_scope_before_provider_reads(
     unscoped.assert_not_awaited()
     provider_read.assert_not_awaited()
     provider_start.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "no_plan",
+        "no_profiles",
+        "bad_signature",
+        "wrong_revision",
+        "client_endpoint",
+        "changed_behavior",
+    ],
+)
+async def test_invalid_test_credentials_block_before_claim_runtime_write_or_provider_start(
+    bad,
+):
+    from api.tests.test_voice_test_providers import sign
+
+    context, db, control, _, pipeline, started, _ = setup()
+    session = control.get.return_value
+    if bad == "no_plan":
+        control.get.return_value = replace(session, provider_plan=None)
+    elif bad == "no_profiles":
+        control.providers.return_value = []
+    elif bad == "bad_signature":
+        control.providers.return_value[0]["fingerprint"] = "f" * 64
+    elif bad == "wrong_revision":
+        control.providers.return_value[0]["revision"] += 1
+        control.providers.return_value[0] = sign(
+            control.providers.return_value[0], SECRET
+        )
+    elif bad == "client_endpoint":
+        packet = control.providers.return_value[0]
+        packet["settings"]["base_url"] = "https://client.example.invalid/notify"
+        packet = sign(packet, SECRET)
+        control.providers.return_value[0] = packet
+        session.provider_plan["bindings"][packet["service_type"]]["fingerprint"] = (
+            packet["fingerprint"]
+        )
+    else:
+        session.provider_plan["services"]["llm"]["temperature"] = {
+            "invalid": "not a temperature"
+        }
+    with pytest.raises(VoiceControlError):
+        await execute_voice_job(db, control, context, SECRET, pipeline_runner=pipeline)
+    control.claim.assert_not_awaited()
+    control.attach.assert_not_awaited()
+    control.fixture.assert_not_awaited()
+    db.create_workflow_run.assert_not_awaited()
+    assert not started

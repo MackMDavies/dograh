@@ -13,20 +13,33 @@ from api.services.workflow.test_sandbox_binding import (
     validate_sandbox_pipeline_binding,
 )
 from api.services.workflow.test_sandbox_mode import SANDBOX_ANNOTATION
-from api.services.workflow.voice_test_capacity import WORKER_PROTOCOL_KEY
+from api.services.workflow.voice_test_capacity import (
+    WORKER_PROTOCOL_KEY,
+    WORKER_PROTOCOL_VERSION,
+)
 from api.services.workflow.voice_test_control import (
     VoiceControlError,
     canonical_uuid,
     positive_int,
+)
+from api.services.workflow.voice_test_providers import (
+    build_private_user_configuration,
+    private_voice_source_from_plan,
+    seal_private_voice_provider_configuration,
+    validate_private_voice_provider_plan,
 )
 from api.services.workflow.voice_test_result import (
     validate_rehearsal,
     validate_voice_report,
 )
 
-JOB_NAME = "run_agent_test_voice"
+JOB_NAME = "run_agent_test_voice_v2"
 CONTEXT_TTL_SECONDS = 600
 JOB_EXPIRY_SECONDS = 180
+
+
+class VoiceProviderPreflightError(VoiceControlError):
+    """Credential preparation failed before a paid claim or provider start."""
 
 
 def voice_job_key(session_id):
@@ -119,7 +132,10 @@ async def enqueue_voice_job(db, control, redis, context):
     key = voice_job_key(context.session_id)
     try:
         async with asyncio.timeout(10):
-            if await redis.get(WORKER_PROTOCOL_KEY) not in ("1", b"1"):
+            if await redis.get(WORKER_PROTOCOL_KEY) not in (
+                WORKER_PROTOCOL_VERSION,
+                WORKER_PROTOCOL_VERSION.encode(),
+            ):
                 raise VoiceControlError("voice_worker_unavailable")
             saved = await redis.set(key, encoded, nx=True, ex=CONTEXT_TTL_SECONDS)
             if not saved:
@@ -143,7 +159,7 @@ async def enqueue_voice_job(db, control, redis, context):
     return {"status": "queued", "session_id": session.id}
 
 
-async def _native_pipeline(transport, workflow, run):
+async def _native_pipeline(transport, workflow, run, private_voice_providers=None):
     from api.services.pipecat.audio_config import create_audio_config
     from api.services.pipecat.run_pipeline import _run_pipeline
 
@@ -155,6 +171,7 @@ async def _native_pipeline(transport, workflow, run):
         audio_config=create_audio_config("smallwebrtc"),
         workflow_run=run,
         expected_organization_id=workflow.organization_id,
+        private_voice_providers=private_voice_providers,
     )
 
 
@@ -208,6 +225,19 @@ async def execute_voice_job(
                 "session_id": session.id,
                 "cleanup_verified": True,
             }
+        try:
+            provider_plan = validate_private_voice_provider_plan(session.provider_plan)
+            provider_packets = await control.providers(session, context.lease_token)
+            provider_source = private_voice_source_from_plan(provider_plan)
+            # Validate all QA credentials before the one-time paid claim.
+            build_private_user_configuration(
+                provider_source,
+                provider_packets,
+                signing_secret,
+                provider_plan["bindings"],
+            )
+        except VoiceControlError as exc:
+            raise VoiceProviderPreflightError(exc.code, exc.status_code) from None
         fixtures = {}
         for fixture in session.fixtures:
             fixtures[fixture.file_name] = await control.fixture(
@@ -279,8 +309,17 @@ async def execute_voice_job(
             run = await db.get_workflow_run_by_id(run.id)
             validate_sandbox_pipeline_binding(run, workflow.id, run.id, signing_secret)
             await control.attach(session, context.lease_token, nonce, run.id)
+            provider_configuration = seal_private_voice_provider_configuration(
+                provider_source,
+                provider_packets,
+                signing_secret,
+                provider_plan["bindings"],
+                run,
+            )
             pipeline = asyncio.create_task(
-                (pipeline_runner or _native_pipeline)(transport, workflow, run)
+                (pipeline_runner or _native_pipeline)(
+                    transport, workflow, run, provider_configuration
+                )
             )
             driver = asyncio.create_task(
                 run_voice_script(session, fixtures, transport, observer)

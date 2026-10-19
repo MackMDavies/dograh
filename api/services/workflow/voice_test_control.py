@@ -170,6 +170,7 @@ class VoiceSession:
     audio_sha256: str | None = None
     audio_bytes: int | None = None
     error_code: str | None = None
+    provider_plan: dict | None = None
 
     @classmethod
     def parse(cls, value, session_id, workflow_id):
@@ -261,6 +262,13 @@ class VoiceSession:
                 if value.get("script") is not None
                 else None
             )
+            provider_plan = value.get("provider_plan")
+            if provider_plan is not None:
+                from api.services.workflow.voice_test_providers import (
+                    validate_private_voice_provider_plan,
+                )
+
+                provider_plan = validate_private_voice_provider_plan(provider_plan)
             return cls(
                 value["id"],
                 value["run_id"],
@@ -279,6 +287,7 @@ class VoiceSession:
                 audio_hash,
                 audio_size,
                 error_code,
+                provider_plan,
             )
         except (KeyError, TypeError, ValueError):
             raise VoiceControlError("voice_control_protocol_invalid") from None
@@ -357,8 +366,8 @@ class VoiceControlClient:
         except (httpx.HTTPError, TimeoutError):
             raise VoiceControlError("voice_control_unavailable") from None
 
-    async def _json(self, body, expected_status=None):
-        encoded, _ = await self._exchange(body)
+    async def _json(self, body, expected_status=None, maximum=65536):
+        encoded, _ = await self._exchange(body, maximum)
         try:
             value = json.loads(encoded)
             if not isinstance(value, dict) or (
@@ -384,7 +393,7 @@ class VoiceControlClient:
 
     async def get(self, session_id, lease_token, workflow_id):
         value = await self._json(
-            self._identity("get", session_id, lease_token, workflow_id)
+            self._identity("get", session_id, lease_token, workflow_id), maximum=131072
         )
         return VoiceSession.parse(value.get("session"), session_id, workflow_id)
 
@@ -400,6 +409,56 @@ class VoiceControlClient:
             },
             "claimed",
         )
+
+    async def providers(self, session, lease_token):
+        """Read only the profiles pinned in this active session's immutable plan."""
+        from api.services.workflow.voice_test_providers import (
+            TestProviderConnection,
+            validate_private_voice_provider_plan,
+        )
+
+        plan = validate_private_voice_provider_plan(session.provider_plan)
+        body = self._identity(
+            "get_providers", session.id, lease_token, session.workflow_id
+        )
+        encoded, _ = await self._exchange(body, maximum=196608)
+        try:
+            value = json.loads(encoded)
+            if (
+                not isinstance(value, dict)
+                or set(value) != {"status", "session_id", "workflow_id", "providers"}
+                or value["status"] != "providers_ready"
+                or value["session_id"] != session.id
+                or type(value["workflow_id"]) is not int
+                or value["workflow_id"] != session.workflow_id
+                or not isinstance(value["providers"], list)
+                or len(value["providers"]) != len(plan["bindings"])
+            ):
+                raise VoiceControlError("voice_test_provider_response_invalid")
+            seen = set()
+            for packet in value["providers"]:
+                connection = TestProviderConnection.parse(packet, self._secret)
+                expected = plan["bindings"].get(connection.service_type)
+                if (
+                    connection.service_type in seen
+                    or expected
+                    != {
+                        "id": connection.id,
+                        "revision": connection.revision,
+                        "fingerprint": connection.fingerprint,
+                    }
+                    or plan["services"][connection.service_type]["provider"]
+                    != connection.provider
+                ):
+                    raise VoiceControlError("voice_test_provider_binding_invalid")
+                seen.add(connection.service_type)
+            if seen != set(plan["bindings"]):
+                raise VoiceControlError("voice_test_provider_binding_invalid")
+            return value["providers"]
+        except VoiceControlError:
+            raise
+        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError):
+            raise VoiceControlError("voice_test_provider_response_invalid") from None
 
     async def attach(self, session, lease_token, claim_token, runtime_id):
         canonical_uuid(claim_token)

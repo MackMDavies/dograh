@@ -16,6 +16,7 @@ from api.services.workflow.voice_test_control import (
 )
 from api.services.workflow.voice_test_job import (
     VoiceJobContext,
+    VoiceProviderPreflightError,
     execute_voice_job,
     voice_job_key,
 )
@@ -41,6 +42,11 @@ async def run_agent_test_voice(ctx, session_id):
     except asyncio.CancelledError:
         release_allowed = False
         raise
+    except VoiceProviderPreflightError as exc:
+        # This narrow error is raised only before claim/provider startup.
+        # Missing credentials must not quarantine all three slots for six minutes.
+        release_allowed = True
+        return {"status": "blocked", "code": exc.code}
     except VoiceControlError as exc:
         return {"status": "blocked", "code": exc.code}
     except Exception:  # noqa: BLE001 - prevent ARQ from logging raw SDK errors or capabilities

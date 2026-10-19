@@ -357,6 +357,18 @@ async def run_pipeline_smallwebrtc(
     )
 
 
+async def _resolve_pipeline_embeddings(user_config, organization_id, is_private_voice):
+    if is_private_voice:
+        from api.services.workflow.voice_test_providers import (
+            private_voice_embedding_configuration,
+        )
+
+        return private_voice_embedding_configuration(user_config)
+    return await resolve_embeddings_config(
+        organization_id=organization_id, user_config=user_config
+    )
+
+
 async def _run_pipeline(
     transport,
     workflow_id: int,
@@ -369,6 +381,7 @@ async def _run_pipeline(
     resolved_user_config=None,
     is_telephony: bool = False,
     expected_organization_id: int | None = None,
+    private_voice_providers=None,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration
@@ -381,6 +394,8 @@ async def _run_pipeline(
         workflow_run: Pre-fetched workflow run row. Fetched here if None.
         resolved_user_config: User configuration with model_overrides already
             applied. Fetched and resolved here if None.
+        private_voice_providers: In-memory QA credential envelope bound to this
+            exact private run. Required for private voice; forbidden for live calls.
     """
     if workflow_run is None:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
@@ -420,6 +435,41 @@ async def _run_pipeline(
         workflow = await db_client.get_workflow_by_id(workflow_id)
         if not workflow:
             raise HTTPException(status_code=404, detail="Workflow not found")
+
+    private_user_config = None
+    if is_agent_test_sandbox:
+        from api.services.workflow.test_sandbox_mode import SANDBOX_ANNOTATION
+        from api.services.workflow.voice_test_control import VoiceControlError
+        from api.services.workflow.voice_test_providers import (
+            validate_private_voice_provider_configuration,
+        )
+
+        marker = workflow_run.annotations.get(SANDBOX_ANNOTATION, {})
+        if (
+            resolved_user_config is not None
+            or expected_organization_id is None
+            or workflow.organization_id != expected_organization_id
+            or marker.get("organization_id") != expected_organization_id
+            or is_telephony
+        ):
+            raise HTTPException(
+                status_code=409, detail="Private voice provider scope is invalid"
+            )
+        try:
+            private_user_config = validate_private_voice_provider_configuration(
+                private_voice_providers,
+                workflow_run,
+                os.getenv("SYSEVO_MEMORY_SECRET", ""),
+            )
+        except VoiceControlError:
+            raise HTTPException(
+                status_code=409,
+                detail="Private voice test credentials are missing or invalid",
+            ) from None
+    elif private_voice_providers is not None:
+        raise HTTPException(
+            status_code=409, detail="Test credentials require a private voice run"
+        )
 
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
@@ -498,7 +548,11 @@ async def _run_pipeline(
 
     # Resolve model overrides from the version onto global user config (skip
     # when the caller already resolved it).
-    if resolved_user_config is None:
+    if is_agent_test_sandbox:
+        # Only the sealed, run-bound QA configuration may reach provider SDKs.
+        # Never resolve owner, org, global or environment credentials here.
+        user_config = private_user_config
+    elif resolved_user_config is None:
         from api.services.configuration.resolve import resolve_effective_config
         from api.services.configuration.org_provider_resolver import (
             enrich_config_from_org_connections,
@@ -533,7 +587,7 @@ async def _run_pipeline(
                 user_config.tts = user_config.tts.model_copy(update={"speed": speed})
 
     # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
-    if user_config.tts is not None:
+    if user_config.tts is not None and not is_agent_test_sandbox:
         tts_override = run_configs.get("model_overrides", {}).get("tts", {})
         voice_uuid = tts_override.get("voice_uuid")
         if voice_uuid:
@@ -757,9 +811,8 @@ async def _run_pipeline(
 
     node_transition_callback = send_node_transition
 
-    embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
-        organization_id=workflow.organization_id,
-        user_config=user_config,
+    embeddings_api_key, embeddings_model, embeddings_base_url = await _resolve_pipeline_embeddings(
+        user_config, workflow.organization_id, is_agent_test_sandbox
     )
 
     # Check if the workflow has any active recordings so the engine can

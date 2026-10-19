@@ -48,6 +48,7 @@ from api.tasks.campaign_tasks import (
 )
 from api.tasks.agent_test_voice import run_agent_test_voice
 from api.services.workflow.voice_test_capacity import publish_voice_worker_protocol
+from api.services.workflow.voice_test_job import JOB_NAME as AGENT_TEST_VOICE_JOB_NAME
 from api.tasks.knowledge_base_processing import process_knowledge_base_document
 from api.tasks.run_integrations import run_integrations_post_workflow_run
 from api.tasks.s3_upload import (
@@ -65,7 +66,13 @@ from api.services.api_usage_counter import flush_api_request_usage
 
 class WorkerSettings:
     functions = [
-        func(run_agent_test_voice, timeout=270, max_tries=3, keep_result=600),
+        func(
+            run_agent_test_voice,
+            name=AGENT_TEST_VOICE_JOB_NAME,
+            timeout=270,
+            max_tries=3,
+            keep_result=600,
+        ),
         run_integrations_post_workflow_run,
         upload_voicemail_audio_to_s3,
         process_workflow_completion,
