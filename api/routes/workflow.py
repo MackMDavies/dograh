@@ -1534,7 +1534,7 @@ async def internal_run_transcript(
     if not expected or x_sysevo_secret != expected:
         raise HTTPException(status_code=403, detail="Forbidden")
 
-    run = await db_client.get_workflow_run(run_id, organization_id=None)
+    run = await db_client.get_workflow_run(run_id, organization_id=None, include_sandbox=True)
     if not run:
         raise HTTPException(status_code=404, detail="Workflow run not found")
 

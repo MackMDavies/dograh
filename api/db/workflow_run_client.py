@@ -16,6 +16,7 @@ from api.db.models import (
     WorkflowModel,
     WorkflowRunModel,
 )
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.enums import CallType, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.services.workflow.variable_resolution import sanitize_context_variables
@@ -42,6 +43,7 @@ class WorkflowRunClient(BaseDBClient):
         api_key_id: int | None = None,
         definition_id: int | None = None,
         idempotency_key: str | None = None,
+        annotations: dict | None = None,
     ) -> WorkflowRunModel:
         async with self.async_session() as session:
             workflow_query = select(WorkflowModel).options(joinedload(WorkflowModel.user)).where(
@@ -169,6 +171,7 @@ class WorkflowRunClient(BaseDBClient):
                 storage_backend=current_backend.value,
                 call_type=call_type.value,
                 api_key_id=api_key_id,
+                annotations=annotations or {},
             )
             session.add(new_run)
             try:
@@ -309,7 +312,11 @@ class WorkflowRunClient(BaseDBClient):
             return formatted_runs, total_count
 
     async def get_workflow_run(
-        self, run_id: int, user_id: int = None, organization_id: int = None
+        self,
+        run_id: int,
+        user_id: int = None,
+        organization_id: int = None,
+        include_sandbox: bool = False,
     ) -> WorkflowRunModel | None:
         async with self.async_session() as session:
             query = (
@@ -333,6 +340,8 @@ class WorkflowRunClient(BaseDBClient):
             else:
                 query = query.where(WorkflowRunModel.id == run_id)
 
+            if not include_sandbox:
+                query = query.where(customer_visible_workflow_run())
             result = await session.execute(query)
             return result.scalars().first()
 
@@ -486,7 +495,10 @@ class WorkflowRunClient(BaseDBClient):
             base_query = (
                 select(WorkflowRunModel)
                 .join(WorkflowModel, WorkflowRunModel.workflow_id == WorkflowModel.id)
-                .where(WorkflowRunModel.workflow_id == workflow_id)
+                .where(
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    customer_visible_workflow_run(),
+                )
             )
 
             if organization_id:
@@ -656,7 +668,10 @@ class WorkflowRunClient(BaseDBClient):
         """
         async with self.async_session() as session:
             result = await session.execute(
-                select(WorkflowRunModel).where(WorkflowRunModel.id == workflow_run_id)
+                select(WorkflowRunModel).where(
+                    WorkflowRunModel.id == workflow_run_id,
+                    customer_visible_workflow_run(),
+                )
             )
             run = result.scalars().first()
             if not run:
@@ -693,7 +708,8 @@ class WorkflowRunClient(BaseDBClient):
         async with self.async_session() as session:
             result = await session.execute(
                 select(WorkflowRunModel).where(
-                    WorkflowRunModel.public_access_token == token
+                    WorkflowRunModel.public_access_token == token,
+                    customer_visible_workflow_run(),
                 )
             )
             return result.scalars().first()

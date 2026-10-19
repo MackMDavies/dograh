@@ -5,6 +5,7 @@ from sqlalchemy import String, and_, func, select
 
 from api.db.base_client import BaseDBClient
 from api.db.models import WorkflowModel, WorkflowRunModel
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 
 
 class ReportsClient(BaseDBClient):
@@ -108,6 +109,7 @@ class ReportsClient(BaseDBClient):
                 .where(
                     and_(
                         WorkflowModel.organization_id == organization_id,
+                        customer_visible_workflow_run(),
                         WorkflowRunModel.created_at >= start_utc,
                         WorkflowRunModel.created_at <= end_utc,
                     )

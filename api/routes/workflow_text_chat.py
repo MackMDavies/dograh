@@ -238,6 +238,11 @@ async def create_text_chat_session(
             raise HTTPException(status_code=409, detail=str(exc)) from exc
     await _ensure_text_chat_quota(user, workflow_id)
 
+    annotations = build_run_annotations(
+        {"tester": {"source": "workflow_editor", "modality": "text"}},
+        request.annotations,
+        sandbox_authorized=sandbox_authorized,
+    )
     session_name = request.name or f"WR-TEXT-{uuid4().hex[:6].upper()}"
     try:
         workflow_run = await db_client.create_workflow_run(
@@ -257,6 +262,7 @@ async def create_text_chat_session(
             if request.candidate_draft_version_number is not None
             else "published",
             organization_id=organization_id,
+            annotations=annotations,
         )
     except ValueError as e:
         status_code = 409 if "no longer available" in str(e) else 404
@@ -264,16 +270,6 @@ async def create_text_chat_session(
 
     set_current_run_id(workflow_run.id)
 
-    annotations = build_run_annotations(
-        {
-            "tester": {
-                "source": "workflow_editor",
-                "modality": "text",
-            }
-        },
-        request.annotations,
-        sandbox_authorized=sandbox_authorized,
-    )
     if bound_definition is not None:
         annotations[SANDBOX_ANNOTATION]["workflow_binding"] = (
             make_sandbox_workflow_binding(

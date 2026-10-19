@@ -1020,6 +1020,11 @@ async def _run_pipeline(
 
     # Create pipeline task with audio configuration
     task = create_pipeline_task(pipeline, workflow_run_id, audio_config)
+    if (
+        isinstance(transport, SandboxAudioTransport)
+        and transport.voice_observer is not None
+    ):
+        task.add_observer(transport.voice_observer)
 
     for runtime_session in integration_runtime_sessions:
         runtime_session.attach(task)

@@ -60,3 +60,42 @@ customer endpoint, or production database was used by these database tests.
 The production capability probe did not yet advertise
 `exact_candidate_hash_pinning`. The running API image and the dirty host checkout
 were different deployment sources; this patch alone is not a production rollout.
+
+## Private voice rehearsal source (19 October 2026)
+
+`VoiceControlClient` talks only to the fixed internal Supabase voice controller.
+It bounds response sizes, refuses redirects, checks fixture hashes and WAV
+durations, and independently compares stored output hash/size/PCM measurements.
+Claims are never automatically retried. Provider bodies and credentials are not
+included in its fixed error codes. Missing saved scripts remain missing.
+
+`run_voice_script` plays the exact saved fixture order after native pipeline
+readiness. It supports an agent opening, caller-first flows, response waits and
+deliberate interruptions. It rejects changed fixtures, missed interruption
+windows, early pipeline closure, missing speech and excess duration. The private
+output writer records first audio synchronously, avoiding asynchronous observer
+queue delays. Per-input timing refers to native speech segments; overlapping
+speech can produce a negative interval and must not count as a low-latency pass.
+The result explicitly says `quality_evaluated: false`.
+
+Private execution annotations now persist with initial workflow-run creation,
+before a model or action can start. Customer history, daily reports, CSV exports,
+usage/model breakdowns and public access tokens exclude private test runs. An
+authenticated internal transcript reader retains explicit access. Standard S3
+links reject private runs even for superusers; private audio belongs in the
+dedicated access-controlled test bucket. Background completion and sandbox
+processing can still read the private run.
+
+Verification used the local test database, synthetic provider boundaries and the
+actual paced PCM pipeline. The broader sandbox regression passed 143 checks; a
+final privacy/rehearsal run passed 20 checks after two additional closure/timeout
+cases were added. Disabling customer visibility filtering made both privacy DB
+tests fail, and restoring it returned them to passing. No real provider, client
+destination or production database was used. This source is not a runtime
+activation: authenticated durable voice dispatch, one-time job orchestration,
+result ingestion and live speech/provider evaluation remain to be wired and
+verified before advertising automated voice execution.
+
+The final media/client/rehearsal run passed 91 checks, including six invalid
+duration cases and an opening with speaking events but no actual PCM. The latter
+must time out before any caller fixture plays.

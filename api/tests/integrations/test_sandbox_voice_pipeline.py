@@ -9,6 +9,7 @@ import pytest
 from api.services.pipecat.audio_config import create_audio_config
 from api.services.pipecat.run_pipeline import _run_pipeline
 from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
 from api.services.workflow.test_sandbox_binding import make_sandbox_workflow_binding
 from api.tests.integrations._run_pipeline_helpers import (
     create_workflow_run_rows,
@@ -60,6 +61,8 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
     )
     captured = []
     transport = SandboxAudioTransport(duration_limit=30)
+    observer = VoiceTurnObserver(transport.output())
+    transport.set_voice_observer(observer)
     with patch_run_pipeline_externals(captured):
         running = asyncio.create_task(
             _run_pipeline(
@@ -80,6 +83,7 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
                 running.result()
             assert captured, "Private voice pipeline never created its task"
             await asyncio.wait_for(captured[0]._pipeline_start_event.wait(), timeout=5)
+            await asyncio.wait_for(observer.ready.wait(), timeout=5)
             caller_audio = io.BytesIO()
             with wave.open(caller_audio, "wb") as fixture:
                 fixture.setnchannels(1)
