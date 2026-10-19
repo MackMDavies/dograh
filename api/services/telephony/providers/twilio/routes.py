@@ -46,8 +46,10 @@ from api.services.telephony.dialer.provider import (
     resolve_configured_dialer_provider,
 )
 from api.services.telephony.factory import get_telephony_provider_for_run
-from api.services.telephony.providers.twilio.dialer_call_listeners import (
-    create_dialer_call_listener,
+from api.services.telephony.providers.twilio.floor_monitor import (
+    claim_floor_monitor,
+    change_floor_monitor_mode,
+    close_floor_monitor_for_provider,
 )
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
@@ -1798,6 +1800,13 @@ async def handle_dialer_conference_events(request: Request):
                 )
         await _cancel_orphaned_lead_leg(parent_call_sid)
 
+    if event_type in {"participant-leave", "leave"}:
+        participant_sid = str(form_data.get("CallSid") or form_data.get("ParticipantCallSid") or "")
+        if _TWILIO_CALL_SID_PATTERN.fullmatch(participant_sid):
+            closed = await close_floor_monitor_for_provider(participant_sid)
+            if closed is None:
+                raise HTTPException(status_code=503, detail="Could not persist monitoring participant leave")
+
     return {"status": "success"}
 
 
@@ -1853,13 +1862,9 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
             logger.error("listen-in missing ListenParentCallSid")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
-        # Constrain the SID to Twilio's own grammar before it becomes a
-        # conference name. There is no FK on dialer_call_listeners.
-        # parent_call_sid and no lookup here (a fail-closed existence check in
-        # front of live audio is a worse trade - see the design notes), so
-        # this shape guard is what stops an authenticated manager naming an
-        # arbitrary conference, and it demotes the XML escaping below from
-        # sole defense to belt-and-braces. Free: a regex, no I/O.
+        # Reject malformed SIDs before lookup. The session claim below also
+        # requires an active, account-authorized call and supplies its actual
+        # conference and rep leg, including for inbound calls.
         if not _TWILIO_CALL_SID_PATTERN.match(parent_call_sid):
             logger.warning("listen-in rejected malformed ListenParentCallSid")
             return HTMLResponse(content=hangup, media_type="application/xml")
@@ -1897,11 +1902,15 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
             logger.warning(f"listen-in: {user.provider_id} is not a manager/admin")
             return HTMLResponse(content=hangup, media_type="application/xml")
 
-        await create_dialer_call_listener(
+        monitor = await claim_floor_monitor(
             parent_call_sid=parent_call_sid,
             manager_user_id=user.provider_id,
+            manager_call_sid=str(form_data.get("CallSid") or ""),
             mode=mode,
+            session_id=str(form_data["MonitorSessionId"]) if "MonitorSessionId" in form_data else None,
         )
+        if not monitor:
+            return HTMLResponse(content=hangup, media_type="application/xml")
     except Exception as exc:  # noqa: BLE001 - deliberate: must never raise into a webhook handler
         logger.error(f"listen-in failed: {exc}")
         return HTMLResponse(content=hangup, media_type="application/xml")
@@ -1909,7 +1918,7 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
     # escape() is belt-and-braces now that the SID shape is validated above,
     # and stays for exactly that reason - it must not be the only thing
     # standing between a caller-supplied string and the TwiML document.
-    conference_name = conference_name_for(parent_call_sid)
+    conference_name = monitor["conference_name"]
     conference_attrs = {
         "muted": "true" if mode == "listen" else "false",
         "startConferenceOnEnter": "false",
@@ -1917,10 +1926,9 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
         "beep": "false",
     }
     if mode == "whisper":
-        # The rep leg is the Conference SID used by this dialer's call model.
-        # Twilio rejects coaching when the target is not connected, which is
-        # fail-closed and preferable to accidentally opening a barge.
-        conference_attrs["coach"] = parent_call_sid
+        # Inbound parent SIDs name the prospect. The server target reader supplies
+        # the actual rep SDK leg so Whisper never coaches the prospect instead.
+        conference_attrs["coach"] = monitor["coach_call_sid"]
     attrs = " ".join(f'{key}={quoteattr(value)}' for key, value in conference_attrs.items())
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
@@ -1930,6 +1938,30 @@ async def _serve_listen_in_twiml(form_data: dict) -> HTMLResponse:
         "</Dial></Response>"
     )
     return HTMLResponse(content=twiml, media_type="application/xml")
+
+
+class FloorMonitorModeRequest(BaseModel):
+    session_id: UUID
+    mode: Literal["listen", "whisper", "barge"]
+
+
+@router.post("/dialer/floor-monitor/mode")
+async def control_floor_monitor_mode(
+    body: FloorMonitorModeRequest, user=Depends(require_sales_dialer_role)
+):
+    manager_id = getattr(user, "provider_id", None)
+    if not isinstance(manager_id, str) or not manager_id:
+        raise HTTPException(status_code=503, detail="Your dialer user mapping is unavailable.")
+    result = await change_floor_monitor_mode(
+        session_id=str(body.session_id), manager_user_id=manager_id, mode=body.mode
+    )
+    if result == "changed":
+        return {"session_id": str(body.session_id), "mode": body.mode}
+    if result == "busy":
+        raise HTTPException(status_code=409, detail="A mode change is already in progress for this monitor.")
+    if result == "unavailable":
+        raise HTTPException(status_code=404, detail="This active monitoring session was not found.")
+    raise HTTPException(status_code=503, detail="The monitoring mode could not be confirmed. Reconnect and try again.")
 
 
 @router.post("/dialer-listen-connect", include_in_schema=False)

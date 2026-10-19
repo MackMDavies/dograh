@@ -19,6 +19,17 @@ _DISCLOSURE = "<Say>This call may be recorded and monitored for quality assuranc
 # short "CA111" placeholder the other tests use is deliberately rejected
 # there - see test_dialer_listen_connect_rejects_malformed_parent_call_sid.
 _LISTEN_SID = "CA" + "abcdef0123456789" * 2
+_MANAGER_LISTEN_SID = "CA" + "2" * 32
+
+
+@pytest.fixture(autouse=True)
+def _isolated_floor_leave_boundary(monkeypatch):
+    # Ordinary rep/prospect events have no Floor session. Dedicated tests below
+    # override this transport boundary to exercise manager closure and retry.
+    monkeypatch.setattr(
+        "api.services.telephony.providers.twilio.routes.close_floor_monitor_for_provider",
+        AsyncMock(return_value=False),
+    )
 
 
 @pytest.mark.parametrize("status", [
@@ -47,6 +58,30 @@ def _make_authenticated_test_app():
         provider_id="11111111-1111-1111-1111-111111111111"
     )
     return app
+
+
+@pytest.mark.parametrize('result,status', [('changed', 200), ('busy', 409), ('unavailable', 404), ('failed', 503)])
+def test_floor_mode_change_binds_authenticated_actor(result, status):
+    session_id = '20000000-0000-0000-0000-000000000001'
+    with patch('api.services.telephony.providers.twilio.routes.change_floor_monitor_mode', new_callable=AsyncMock, return_value=result) as change:
+        response = TestClient(_make_authenticated_test_app()).post('/dialer/floor-monitor/mode', json={
+            'session_id': session_id, 'mode': 'whisper', 'manager_user_id': 'untrusted-body-actor',
+        })
+    assert response.status_code == status
+    change.assert_awaited_once_with(session_id=session_id, manager_user_id='11111111-1111-1111-1111-111111111111', mode='whisper')
+    if status == 200:
+        assert response.json() == {'session_id': session_id, 'mode': 'whisper'}
+
+
+@pytest.mark.parametrize('body', [
+    {'session_id': 'bad', 'mode': 'listen'},
+    {'session_id': '20000000-0000-0000-0000-000000000001', 'mode': 'unknown'},
+])
+def test_floor_mode_change_validates_request_before_provider(body):
+    with patch('api.services.telephony.providers.twilio.routes.change_floor_monitor_mode', new_callable=AsyncMock) as change:
+        response = TestClient(_make_authenticated_test_app()).post('/dialer/floor-monitor/mode', json=body)
+    assert response.status_code == 422
+    change.assert_not_awaited()
 
 
 @pytest.fixture(autouse=True)
@@ -2594,11 +2629,12 @@ def test_dialer_listen_connect_allows_manager(monkeypatch):
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2619,6 +2655,8 @@ def test_dialer_listen_connect_allows_manager(monkeypatch):
     mock_create_listener.assert_awaited_once_with(
         parent_call_sid=_LISTEN_SID,
         manager_user_id="00000000-0000-0000-0000-000000000001",
+        manager_call_sid=_MANAGER_LISTEN_SID,
+        session_id=None,
         mode="listen",
     )
     # Well-formedness is asserted, not eyeballed: parse the document rather
@@ -2651,7 +2689,8 @@ def test_dialer_listen_connect_uses_requested_supervisor_mode(
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
@@ -2659,6 +2698,7 @@ def test_dialer_listen_connect_uses_requested_supervisor_mode(
                 "From": "client:rep-7",
                 "ListenParentCallSid": _LISTEN_SID,
                 "MonitorMode": mode,
+                "CallSid": _MANAGER_LISTEN_SID,
             },
             headers={"X-Twilio-Signature": "fake-signature"},
         )
@@ -2671,6 +2711,8 @@ def test_dialer_listen_connect_uses_requested_supervisor_mode(
     mock_create_listener.assert_awaited_once_with(
         parent_call_sid=_LISTEN_SID,
         manager_user_id="00000000-0000-0000-0000-000000000001",
+        manager_call_sid=_MANAGER_LISTEN_SID,
+        session_id=None,
         mode=mode,
     )
 
@@ -2690,11 +2732,12 @@ def test_dialer_listen_connect_rejects_non_manager(monkeypatch):
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=False,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2713,11 +2756,12 @@ def test_dialer_listen_connect_hangs_up_on_invalid_signature(monkeypatch):
         "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
         return_value=False,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "bad-signature"},
         )
 
@@ -2735,7 +2779,8 @@ def test_dialer_listen_connect_hangs_up_when_parent_call_sid_missing(monkeypatch
         "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
@@ -2757,7 +2802,8 @@ def test_dialer_listen_connect_hangs_up_for_unrecognized_identity(monkeypatch):
         "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
@@ -2785,11 +2831,12 @@ def test_dialer_listen_connect_hangs_up_when_user_has_no_provider_id(monkeypatch
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2818,7 +2865,8 @@ def test_dialer_listen_connect_rejects_malformed_parent_call_sid(monkeypatch):
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
@@ -2847,11 +2895,12 @@ def test_dialer_listen_connect_survives_a_raising_user_lookup(monkeypatch):
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
         side_effect=RuntimeError("database is on fire"),
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/dialer-listen-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2915,7 +2964,8 @@ def test_voice_connect_delegates_to_listen_in_for_manager(monkeypatch):
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=True,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener, patch(
         "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
     ) as mock_dial, patch(
@@ -2923,7 +2973,7 @@ def test_voice_connect_delegates_to_listen_in_for_manager(monkeypatch):
     ) as mock_create_call:
         response = client.post(
             "/voice-connect",
-            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID},
+            data={"From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2936,6 +2986,8 @@ def test_voice_connect_delegates_to_listen_in_for_manager(monkeypatch):
     mock_create_listener.assert_awaited_once_with(
         parent_call_sid=_LISTEN_SID,
         manager_user_id="00000000-0000-0000-0000-000000000001",
+        manager_call_sid=_MANAGER_LISTEN_SID,
+        session_id=None,
         mode="listen",
     )
     # Listening must never place an outbound call or log a dial.
@@ -2961,7 +3013,8 @@ def test_voice_connect_delegation_still_rejects_a_non_manager(monkeypatch):
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
         return_value=False,
     ), patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener, patch(
         "api.services.telephony.providers.twilio.routes.dial_lead_into_conference",
     ) as mock_dial:
@@ -3014,7 +3067,8 @@ def test_voice_connect_rep_dial_is_untouched_without_listen_param(monkeypatch):
     ), patch(
         "api.services.telephony.providers.twilio.routes.is_manager_or_admin",
     ) as mock_is_manager, patch(
-        "api.services.telephony.providers.twilio.routes.create_dialer_call_listener",
+        "api.services.telephony.providers.twilio.routes.claim_floor_monitor",
+        return_value={"allowed": True, "conference_name": f"call-{_LISTEN_SID}", "coach_call_sid": _LISTEN_SID},
     ) as mock_create_listener:
         response = client.post(
             "/voice-connect",
@@ -3031,3 +3085,50 @@ def test_voice_connect_rep_dial_is_untouched_without_listen_param(monkeypatch):
     # Not so much as a role lookup on the dial path.
     mock_is_manager.assert_not_awaited()
     mock_create_listener.assert_not_awaited()
+
+
+def test_floor_whisper_uses_server_inbound_conference_and_rep_leg(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    rep_sid = "CA" + "3" * 32
+    request_id = "20000000-0000-0000-0000-000000000001"
+    with patch("api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True), \
+         patch("api.services.telephony.providers.twilio.routes.db_client.get_user_by_id", return_value=MagicMock(provider_id="10000000-0000-0000-0000-000000000011")), \
+         patch("api.services.telephony.providers.twilio.routes.is_manager_or_admin", return_value=True), \
+         patch("api.services.telephony.providers.twilio.routes.claim_floor_monitor", return_value={"allowed": True, "conference_name": "inbound-real-conference", "coach_call_sid": rep_sid}) as claim:
+        response = TestClient(_make_test_app()).post("/voice-connect", data={
+            "From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID,
+            "CallSid": _MANAGER_LISTEN_SID, "MonitorMode": "whisper", "MonitorSessionId": request_id,
+        }, headers={"X-Twilio-Signature": "test"})
+    assert response.status_code == 200
+    assert f'coach="{rep_sid}"' in response.text
+    assert f'coach="{_LISTEN_SID}"' not in response.text
+    assert "inbound-real-conference</Conference>" in response.text
+    assert claim.await_args.kwargs["session_id"] == request_id
+    assert claim.await_args.kwargs["manager_call_sid"] == _MANAGER_LISTEN_SID
+
+
+def test_floor_denied_or_unavailable_state_never_returns_conference_twiml(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    with patch("api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True), \
+         patch("api.services.telephony.providers.twilio.routes.db_client.get_user_by_id", return_value=MagicMock(provider_id="10000000-0000-0000-0000-000000000011")), \
+         patch("api.services.telephony.providers.twilio.routes.is_manager_or_admin", return_value=True), \
+         patch("api.services.telephony.providers.twilio.routes.claim_floor_monitor", return_value=None):
+        response = TestClient(_make_test_app()).post("/voice-connect", data={
+            "From": "client:rep-7", "ListenParentCallSid": _LISTEN_SID, "CallSid": _MANAGER_LISTEN_SID,
+        }, headers={"X-Twilio-Signature": "test"})
+    assert response.status_code == 200
+    assert "<Hangup/>" in response.text
+    assert "<Conference" not in response.text
+
+
+@pytest.mark.parametrize(("closed", "status"), [(True, 200), (False, 200), (None, 503)])
+def test_floor_signed_participant_leave_closes_its_sdk_leg_and_retries_on_outage(monkeypatch, closed, status):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    with patch("api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True), \
+         patch("api.services.telephony.providers.twilio.routes.close_floor_monitor_for_provider", return_value=closed) as close:
+        response = TestClient(_make_test_app()).post("/dialer-conference-events", data={
+            "StatusCallbackEvent": "participant-leave", "CallSid": _MANAGER_LISTEN_SID,
+            "FriendlyName": "inbound-real-conference",
+        }, headers={"X-Twilio-Signature": "test"})
+    assert response.status_code == status
+    close.assert_awaited_once_with(_MANAGER_LISTEN_SID)
