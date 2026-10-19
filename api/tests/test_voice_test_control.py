@@ -118,6 +118,12 @@ async def test_bound_metadata_and_nonsecret_repr():
         {"scenario_id": "../../client"},
         {"fixture_manifest": []},
         {"runtime_workflow_run_id": 0},
+        {"actual_duration_ms": True},
+        {"actual_duration_ms": -1},
+        {"audio_sha256": "not-a-hash"},
+        {"audio_bytes": True},
+        {"audio_bytes": 1},
+        {"error_code": "private provider body"},
     ],
 )
 def test_rejects_invalid_job_metadata(mutation):

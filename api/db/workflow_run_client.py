@@ -2,7 +2,7 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import JSON, Text, cast, func, literal, text, update
+from sqlalchemy import JSON, Text, cast, func, literal, or_, text, update
 from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload, selectinload
@@ -23,6 +23,42 @@ from api.services.workflow.variable_resolution import sanitize_context_variables
 
 
 class WorkflowRunClient(BaseDBClient):
+    async def save_agent_test_voice_result(
+        self, run_id, workflow_id, organization_id, session_id, result
+    ):
+        """Atomically add immutable private evidence without replacing annotations."""
+        async with self.async_session() as session:
+            annotations = cast(WorkflowRunModel.annotations, JSONB)
+            saved = annotations.op("->")("agent_test_voice_result")
+            written = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.id == run_id,
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    WorkflowRunModel.workflow_id.in_(
+                        select(WorkflowModel.id).where(
+                            WorkflowModel.organization_id == organization_id
+                        )
+                    ),
+                    annotations.contains({
+                        "sysevo_test_sandbox": {
+                            "enabled": True,
+                            "voice_session_id": session_id,
+                            "organization_id": organization_id,
+                        }
+                    }),
+                    or_(saved.is_(None), saved == literal(result, JSONB)),
+                )
+                .values(annotations=cast(func.jsonb_set(
+                    annotations, array(["agent_test_voice_result"], type_=Text),
+                    literal(result, JSONB), True,
+                ), JSON))
+                .returning(WorkflowRunModel.id)
+            )
+            exists = written.scalar_one_or_none() is not None
+            await session.commit()
+            return exists
+
     async def create_workflow_run(
         self,
         name: str,

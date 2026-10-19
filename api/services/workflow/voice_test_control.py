@@ -166,6 +166,10 @@ class VoiceSession:
     fixtures: tuple[VoiceFixture, ...]
     script: VoiceScript | None
     runtime_workflow_run_id: int | None
+    actual_duration_ms: int | None = None
+    audio_sha256: str | None = None
+    audio_bytes: int | None = None
+    error_code: str | None = None
 
     @classmethod
     def parse(cls, value, session_id, workflow_id):
@@ -230,6 +234,28 @@ class VoiceSession:
             runtime_id = value.get("runtime_workflow_run_id")
             if runtime_id is not None and not positive_int(runtime_id):
                 raise ValueError
+            actual_duration = value.get("actual_duration_ms")
+            audio_hash = value.get("audio_sha256")
+            audio_size = value.get("audio_bytes")
+            error_code = value.get("error_code")
+            if actual_duration is not None and (
+                type(actual_duration) is not int
+                or not 0 <= actual_duration <= 2147483647
+            ):
+                raise ValueError
+            if audio_hash is not None and (
+                not isinstance(audio_hash, str) or not HASH.fullmatch(audio_hash)
+            ):
+                raise ValueError
+            if audio_size is not None and (
+                type(audio_size) is not int or not 44 <= audio_size <= MAX_OUTPUT_BYTES
+            ):
+                raise ValueError
+            if error_code is not None and (
+                not isinstance(error_code, str)
+                or not re.fullmatch(r"[a-z0-9_]{1,64}", error_code)
+            ):
+                raise ValueError
             script = (
                 VoiceScript.parse(value["script"], fixtures, seconds)
                 if value.get("script") is not None
@@ -249,6 +275,10 @@ class VoiceSession:
                 tuple(fixtures),
                 script,
                 runtime_id,
+                actual_duration,
+                audio_hash,
+                audio_size,
+                error_code,
             )
         except (KeyError, TypeError, ValueError):
             raise VoiceControlError("voice_control_protocol_invalid") from None

@@ -30,6 +30,7 @@ from api.routes.workflow_embed import router as workflow_embed_router
 from api.routes.workflow_recording import router as workflow_recording_router
 from api.routes.voice_library import router as voice_library_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
+from api.routes.workflow_voice_test import router as workflow_voice_test_router
 from api.routes.ai_providers import router as ai_providers_router
 from api.routes.memory_tools import router as memory_tools_router
 from api.routes.admin_telephony import router as admin_telephony_router
@@ -47,6 +48,7 @@ router.include_router(superuser_router)
 router.include_router(supervisor_router)
 router.include_router(workflow_router)
 router.include_router(workflow_text_chat_router)
+router.include_router(workflow_voice_test_router)
 router.include_router(user_router)
 router.include_router(campaign_router)
 router.include_router(credentials_router)

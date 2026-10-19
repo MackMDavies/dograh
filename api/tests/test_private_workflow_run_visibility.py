@@ -132,3 +132,56 @@ async def test_even_superusers_cannot_get_standard_public_storage_links_for_priv
             7, SimpleNamespace(is_superuser=True)
         )
     assert error.value.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_voice_result_write_is_private_scoped_immutable_and_preserves_other_annotations(
+    db_session, workflow_with_v1, org_and_user
+):
+    org, user = org_and_user
+    workflow, _ = workflow_with_v1
+    session_id = str(uuid4())
+    run = await db_session.create_workflow_run(
+        name="Private voice evidence fixture",
+        workflow_id=workflow.id,
+        mode="smallwebrtc",
+        user_id=user.id,
+        organization_id=org.id,
+        annotations={
+            SANDBOX_ANNOTATION: {
+                "enabled": True,
+                "voice_session_id": session_id,
+                "organization_id": workflow.organization_id,
+            },
+            "preserve": "existing",
+        },
+    )
+    report = {"version": 1, "session_id": session_id, "quality_evaluated": False}
+    assert await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id, session_id, report
+    )
+    assert await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id, session_id, report
+    )
+    assert not await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id, session_id, {**report, "version": 2}
+    )
+    assert not await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id + 10000, session_id, report
+    )
+    assert not await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id, str(uuid4()), report
+    )
+    readback = await db_session.get_workflow_run_by_id(run.id)
+    assert readback.annotations["preserve"] == "existing"
+    assert readback.annotations["agent_test_voice_result"] == report
+    changed = {**readback.annotations}
+    changed[SANDBOX_ANNOTATION] = {
+        **changed[SANDBOX_ANNOTATION],
+        "organization_id": org.id + 10000,
+    }
+    await db_session.update_workflow_run(run.id, annotations=changed)
+    assert not await db_session.save_agent_test_voice_result(
+        run.id, workflow.id, org.id, session_id, report
+    )
+    assert await db_session.get_workflow_run(run.id, organization_id=org.id) is None

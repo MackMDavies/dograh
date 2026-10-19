@@ -251,6 +251,7 @@ class SandboxAudioTransport(BaseTransport):
         self.duration_limit = duration_limit
         self.failure: str | None = None
         self.voice_observer = None
+        self.pipeline_task = None
         self.capture = AudioCapture(duration_limit)
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")

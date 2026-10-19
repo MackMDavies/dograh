@@ -368,6 +368,7 @@ async def _run_pipeline(
     workflow_run=None,
     resolved_user_config=None,
     is_telephony: bool = False,
+    expected_organization_id: int | None = None,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration
@@ -404,11 +405,21 @@ async def _run_pipeline(
             status_code=409, detail="Private test audio requires an attested sandbox run"
         )
 
-    # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
-    # access is validated before the pipeline is invoked.
-    workflow = await db_client.get_workflow_by_id(workflow_id)
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Workflow not found")
+    # A queued private voice job may outlive its admission request. Recheck the
+    # original organization and provider owner before reading configuration.
+    if expected_organization_id is not None:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=expected_organization_id
+        )
+        if workflow is None or workflow.user_id != user_id:
+            raise HTTPException(
+                status_code=409, detail="Private voice workflow scope changed"
+            )
+    else:
+        # Existing live-call entry points validate access before invoking us.
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
 
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
@@ -1024,6 +1035,7 @@ async def _run_pipeline(
         isinstance(transport, SandboxAudioTransport)
         and transport.voice_observer is not None
     ):
+        transport.pipeline_task = task
         task.add_observer(transport.voice_observer)
 
     for runtime_session in integration_runtime_sessions:
