@@ -437,7 +437,9 @@ async def test_ringback_twiml_is_none_when_the_rep_is_not_free():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("expired", [True, False])
 async def test_unanswered_ringback_lets_the_person_go_only_if_the_rep_never_took_it(expired):
+    # The Phase 1b chain is unavailable here: the Phase 1 behaviour is the fallback.
     with patch(f"{_RINGBACK}.expire_unanswered_inbound_call", new=AsyncMock(return_value=expired)), \
+         patch(f"{_RINGBACK}.dialer_extra_answer.continue_after_ringback", new=AsyncMock(return_value=None)), \
          patch(f"{_RINGBACK}.cancel_call", new=AsyncMock(return_value=True)) as cancel, \
          patch(f"{_RINGBACK}.record_voicemail_playback_failure", new=AsyncMock(return_value=True)) as failed, \
          patch(f"{_RINGBACK}.call_stages.record_call_stage", new=AsyncMock(return_value=True)) as record:
@@ -488,6 +490,7 @@ async def test_signalwire_person_after_the_hand_off_rings_the_original_rep_back(
          patch(f"{_SW}.call_stages.offer_voicemail_ringback", new=AsyncMock(
              return_value={"inbound_call_id": "ic-1", "rep_user_id": _REP})) as offer, \
          patch(f"{_SW}.notify_inbound_call") as notify, \
+         patch("api.services.telephony.dialer.extra_answer.clip_url", new=AsyncMock(return_value=None)) as clip, \
          patch(f"{_SW}._spawn_background", new=lambda coro: spawned.append(coro)):
         response = await handle_sw_parallel_decision(_sw_request("human"))
     for coro in spawned:
@@ -496,8 +499,14 @@ async def test_signalwire_person_after_the_hand_off_rings_the_original_rep_back(
     room = offer.await_args.kwargs["conference_name"]
     assert offer.await_args.kwargs["parent_call_sid"] == "browser-call"
     assert offer.await_args.kwargs["prospect_call_id"] == "prospect-call"
-    assert document == build_signalwire_ringback_wait_swml(conference_name=room)
-    assert "play" not in json.dumps(document["sections"]["main"][1:])   # no recording, ever
+    # Phase 1b: the rep's hello clip (here none recorded → neutral words) while their
+    # softphone auto-joins; never hold music, never the voicemail recording.
+    assert document == {"sections": {"main": [
+        {"play": {"url": "say:This call may be recorded and monitored for quality assurance."}},
+        {"play": {"url": "say:Hi, one moment."}},
+        {"join_conference": {"name": room, "start_on_enter": False, "end_on_exit": True}},
+    ]}}
+    assert clip.await_args.args == (_REP, "hello")
     winner.assert_not_awaited()
     notify.assert_called_once_with("ic-1")
     assert history.await_args.kwargs["status"] == "in-progress"

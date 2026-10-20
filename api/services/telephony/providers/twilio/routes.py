@@ -27,7 +27,7 @@ from api.db import db_client
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer.parallel_auth import issue_parallel_auth_token
-from api.services.telephony.dialer import call_sorter, call_stages, sorter_gate, twilio_live_transcribe
+from api.services.telephony.dialer import call_sorter, call_stages, extra_answer, sorter_gate, twilio_live_transcribe
 from api.services.telephony.dialer.inbound_call_log import (
     bind_inbound_rep_leg,
     close_inbound_call,
@@ -88,6 +88,7 @@ from api.services.telephony.providers.twilio.dialer_conference import (
 )
 from api.services.telephony.providers.twilio import dialer_parallel
 from api.services.telephony.providers.twilio import dialer_agent_handoff
+from api.services.telephony.providers.twilio import dialer_extra_answer
 from api.services.telephony.providers.twilio import dialer_hold
 from api.services.telephony.providers.twilio.dialer_twiml import conference_telemetry_attributes as _conference_telemetry_attributes
 from api.services.telephony.providers.twilio import dialer_overflow_recovery
@@ -980,6 +981,11 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
             return HTMLResponse(content=hangup, media_type="application/xml")
         # A ring-back after a voicemail hand-off: the rep is back with the person.
         background_tasks.add_task(call_stages.record_ringback_joined, inbound_conference)
+        # An extra answer: a teammate took it, or the agent's transfer-back target is
+        # in the room and the agent can hand over now.
+        background_tasks.add_task(
+            dialer_extra_answer.on_rep_joined, conference_name=inbound_conference, rep_user_id=rep_user_id,
+        )
         try:
             backend_endpoint, _ = await get_backend_endpoints()
         except Exception as exc:  # noqa: BLE001 - keep the call but omit optional telemetry
@@ -1030,6 +1036,15 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
         except (TypeError, ValueError, json.JSONDecodeError):
             logger.warning("voice-connect rejected malformed parallel dial request")
             return HTMLResponse(content=hangup, media_type="application/xml")
+        # Adaptive line count (Phase 1b): a list that answers a lot dials fewer lines,
+        # so fewer people answer at once with nobody free to take them.
+        capped_entry_ids = extra_answer.trim_to_line_cap(
+            parallel_entry_ids, await extra_answer.parallel_line_cap(parallel_entry_ids),
+        )
+        if len(capped_entry_ids) != parallel_line_count:
+            logger.info(f"voice-connect trimmed a parallel batch to {len(capped_entry_ids)} lines (line cap)")
+            parallel_entry_ids = capped_entry_ids
+            parallel_line_count = len(capped_entry_ids)
     if double_dial_authorization_id and (parallel_requested or not entry_id):
         logger.warning("voice-connect rejected double-dial authorization without one queue entry")
         return HTMLResponse(content=hangup, media_type="application/xml")
@@ -1563,6 +1578,23 @@ async def handle_parallel_hold_next(request: Request,parent_call_sid: str,leg_id
     return HTMLResponse(content=twiml or dialer_hold.HANGUP,media_type="application/xml")
 
 
+@router.post("/dialer-extra-answer-wait", include_in_schema=False)
+async def handle_extra_answer_wait(request: Request):
+    """Conference waitUrl for an extra answer / ring-back: the original rep's hello clip
+    (else a neutral "Hi, one moment.") while the softphone joins. Never hold music."""
+    form = dict(await request.form())
+    if not await _verify_twilio_signature(request, form):
+        raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    # The person's own call: named in the (signed) waitUrl, else the request's CallSid.
+    call_sid = str(request.query_params.get("call") or form.get("CallSid") or "")
+    if not _TWILIO_CALL_SID_PATTERN.fullmatch(call_sid):
+        return HTMLResponse(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Pause length="20"/></Response>',
+            media_type="application/xml",
+        )
+    return HTMLResponse(content=await dialer_extra_answer.hello_wait_twiml(call_sid), media_type="application/xml")
+
+
 @router.post("/dialer-conference-join", include_in_schema=False)
 async def handle_dialer_conference_join(
     request: Request,
@@ -1652,65 +1684,17 @@ async def handle_dialer_conference_join(
                 leg_id=parallel_leg_id,
             )
             if not won:
-                overflow_conference = conference_name_for(parallel_call_sid)
-                overflow = await dialer_parallel.route_parallel_to_teammate(
-                    parent_call_sid=parent_call_sid,
-                    child_call_sid=parallel_call_sid,
-                    conference_name=overflow_conference,
-                    entry_id=parallel_entry_id,
-                    leg_id=parallel_leg_id,
+                # Dialer Phase 1b: a second person answered while the rep is already
+                # talking. Hold is gone: the extra-answer chain connects a free
+                # teammate, the voice agent, or plays the rep's apology. The person
+                # never hears music, silence or "please hold".
+                endpoint_root = str(request.url).split("?", 1)[0].rsplit("/", 1)[0]
+                twiml = await dialer_extra_answer.first_answer_twiml(
+                    parent_call_sid=parent_call_sid, child_call_sid=parallel_call_sid,
+                    leg_id=parallel_leg_id, account_sid=str(form_data.get("AccountSid") or ""),
+                    root=endpoint_root,
                 )
-                if not overflow:
-                    # The prospect already answered: adopt this exact call into
-                    # the account's agent runtime; never call their phone again.
-                    await dialer_parallel.update_parallel_leg(
-                        child_call_sid=parallel_call_sid,leg_id=parallel_leg_id,
-                        status="answered",answered_by="human",
-                    )
-                    try:
-                        held = await dialer_hold.hold_twiml(
-                            parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,leg_id=parallel_leg_id,
-                            account_sid=str(form_data.get("AccountSid") or ""),begin=True,
-                        )
-                        if held:
-                            return HTMLResponse(content=held,media_type="application/xml")
-                        prepared = await dialer_agent_handoff.prepare_agent_handoff(
-                            parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,
-                            leg_id=parallel_leg_id,account_sid=str(form_data.get("AccountSid") or ""),
-                            allow_fallback=True,
-                        )
-                        if prepared:
-                            return HTMLResponse(content=prepared.twiml,media_type="application/xml")
-                    except dialer_agent_handoff.AgentHandoffUnavailable as exc:
-                        if exc.retryable:
-                            raise HTTPException(status_code=503,detail="Could not persist the parallel handoff")
-                        logger.warning(f"Parallel agent handoff unavailable: {exc}")
-                    # Fail closed if account policy, availability or persistence
-                    # prevents a real handoff; never leave the prospect alone.
-                    await dialer_parallel.update_parallel_leg(
-                        child_call_sid=parallel_call_sid,
-                        leg_id=parallel_leg_id,
-                        status="cancelled",
-                        answered_by=parallel_answered_by,
-                    )
-                    return HTMLResponse(content=hangup, media_type="application/xml")
-                conference_name = overflow_conference
-                try:
-                    scheduled = await dialer_overflow_recovery.schedule_overflow(
-                        parent_call_sid=parent_call_sid,child_call_sid=parallel_call_sid,
-                        leg_id=parallel_leg_id,account_sid=str(form_data.get("AccountSid") or ""),
-                    )
-                except dialer_agent_handoff.AgentHandoffUnavailable:
-                    scheduled = False
-                if not scheduled:
-                    raise HTTPException(status_code=503,detail="Could not persist the teammate fallback deadline")
-                notify_inbound_call(str(overflow["inbound_call_id"]))
-                background_tasks.add_task(
-                    _expire_parallel_overflow_offer,
-                    child_call_sid=parallel_call_sid,
-                    parent_call_sid=parent_call_sid,leg_id=parallel_leg_id,
-                    account_sid=str(form_data.get("AccountSid") or ""),
-                )
+                return HTMLResponse(content=twiml, media_type="application/xml")
             else:
                 # The claim RPC has already linked entry, destination, caller ID
                 # and status atomically. No delayed PATCH may revive this parent.
@@ -2588,6 +2572,8 @@ async def handle_dialer_call_status(
                 raise HTTPException(status_code=503, detail="Could not settle agent handoff history")
             await close_inbound_call(provider_call_id=child_call_sid)
             await evaluate_overflow_guard(provider_call_id=child_call_sid, provider="twilio")
+            # An extra answer's person hung up: settle where the chain took them.
+            await extra_answer.mark("twilio", child_call_sid, "ended")
         legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
         session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
         if (
@@ -2651,8 +2637,10 @@ async def _record_single_call_status_stage(
         if not row or (child_call_sid and row.get("child_call_sid") != child_call_sid):
             return
         if row.get("manual_voicemail_requested_at") and child_call_sid:
-            # A ring-back offer for this person ends with their call.
+            # A ring-back offer for this person ends with their call, and so does the
+            # extra-answer chain that may have followed it.
             await close_inbound_call(provider_call_id=child_call_sid)
+            await extra_answer.mark("twilio", child_call_sid, "ended")
         started = row.get("voicemail_drop_started_at")
         if call_status == "completed" and started and row.get("auto_voicemail_sent") is not True:
             try:

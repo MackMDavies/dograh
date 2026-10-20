@@ -63,9 +63,8 @@ from api.services.telephony.dialer.swml import (
     build_signalwire_parallel_rep_swml,
     build_signalwire_parallel_voicemail_swml,
     build_say_and_hangup_swml,
-    build_signalwire_ringback_wait_swml,
 )
-from api.services.telephony.dialer import call_sorter, call_stages, signalwire_parallel_store, sorter_gate
+from api.services.telephony.dialer import call_sorter, call_stages, extra_answer, signalwire_parallel_store, sorter_gate
 from api.services.telephony.dialer import signalwire_call_sorter
 from api.services.telephony.dialer.compliance import (
     calling_hours_allowed,
@@ -154,14 +153,25 @@ async def _expire_signalwire_ringback(*, rep_call_id: str, provider_call_id: str
     await asyncio.sleep(call_stages.RINGBACK_OFFER_SECONDS)
     if not await expire_unanswered_inbound_call(provider_call_id=provider_call_id, provider="signalwire"):
         return
+    # Phase 1b: the chain carries on (teammate in the same room → agent → apology).
+    from api.services.telephony.dialer import signalwire_extra_answer
+    state = None
     try:
-        from api.services.telephony.dialer.signalwire_calling import end_call
-        await end_call(call_id=provider_call_id, reason="hangup")
+        state = await signalwire_extra_answer.continue_after_ringback(
+            rep_call_id=rep_call_id, provider_call_id=provider_call_id,
+        )
     except Exception as exc:  # noqa: BLE001 - a background timer must not raise
-        logger.error(f"Could not end unanswered SignalWire ring-back {provider_call_id}: {exc}")
-    await call_stages.record_call_stage(
-        rep_call_id, "person", {"after_vm_request": True, "ringback": "missed"},
-    )
+        logger.error(f"SignalWire ring-back chain failed for {provider_call_id}: {type(exc).__name__}")
+    if state is None:
+        try:
+            from api.services.telephony.dialer.signalwire_calling import end_call
+            await end_call(call_id=provider_call_id, reason="hangup")
+        except Exception as exc:  # noqa: BLE001 - a background timer must not raise
+            logger.error(f"Could not end unanswered SignalWire ring-back {provider_call_id}: {exc}")
+    if state is None or state.get("action") in {"apology", "hangup"}:
+        await call_stages.record_call_stage(
+            rep_call_id, "person", {"after_vm_request": True, "ringback": "missed"},
+        )
 
 
 async def _expire_signalwire_overflow_offer(provider_call_id: str) -> None:
@@ -720,6 +730,9 @@ async def _start_signalwire_session(
             entry_ids = [str(uuid.UUID(str(value))) for value in entry_ids]
             if len(entry_ids) != line_count or len(set(entry_ids)) != line_count:
                 raise ValueError("entry count does not match selected lines")
+            # Adaptive line count (Phase 1b): a list that answers a lot dials fewer lines.
+            entry_ids = extra_answer.trim_to_line_cap(entry_ids, await extra_answer.parallel_line_cap(entry_ids))
+            line_count = len(entry_ids)
         if not browser_call_id or len(browser_call_id) > 128:
             raise ValueError("missing browser call id")
     except (ValueError, TypeError, json.JSONDecodeError) as exc:
@@ -1742,6 +1755,8 @@ async def handle_sw_parallel_status(request: Request):
             # but it must still release the teammate's reservation.
             await close_inbound_call(provider_call_id=provider_call_id)
             await evaluate_overflow_guard(provider_call_id=provider_call_id, provider="signalwire")
+            # An extra answer's person hung up: settle where the chain took them.
+            await extra_answer.mark("signalwire", provider_call_id, "ended")
 
         leg_updated = await signalwire_parallel_store.update_leg(
             session_id=session_id, leg_id=leg_id,
@@ -2153,7 +2168,11 @@ async def handle_sw_parallel_decision(request: Request):
                     rep_call_id=rep_call_id, provider_call_id=provider_call_id,
                 ))
                 _spawn_background(_finish_signalwire_batch_if_settled(session_id=session_id, session=session))
-                return _swml(build_signalwire_ringback_wait_swml(conference_name=ringback_room))
+                from api.services.telephony.dialer import signalwire_extra_answer
+                return _swml(await signalwire_extra_answer.teammate_swml(
+                    rep_user_id=str(session.get("rep_user_id") or "") or None,
+                    conference_name=ringback_room, status_callback_url=None, disclose=True,
+                ))
             _spawn_background(_record_stages(
                 rep_call_id or provider_call_id,
                 ("person", {"after_vm_request": True, "ringback": "unavailable", "answered_by": amd_result}),
@@ -2185,42 +2204,19 @@ async def handle_sw_parallel_decision(request: Request):
             amd_result=amd_result,
         )
         if not winner:
-            # A second human cannot join the rep's winner room: that would put
-            # both prospects on the same call. Reserve a teammate and a new
-            # conference transactionally, then notify them off the webhook path.
-            overflow = await signalwire_parallel_store.route_to_teammate(
-                session_id=session_id,
-                leg_id=leg_id,
-                provider_call_id=provider_call_id,
+            # A second human cannot join the rep's winner room: that would put both
+            # prospects on the same call. Dialer Phase 1b: the extra-answer chain
+            # connects a free teammate, the voice agent, or plays the rep's apology.
+            # Nobody is parked and nobody hears hold music.
+            from api.services.telephony.dialer import signalwire_extra_answer
+            await update_dialer_call_status(
+                parent_call_sid=provider_call_id, child_call_sid=None, status="in-progress",
+                duration_seconds=None, rep_user_id=session.get("rep_user_id"), provider="signalwire",
             )
-            if overflow:
-                notify_inbound_call(str(overflow["inbound_call_id"]))
-                _spawn_background(_expire_signalwire_overflow_offer(provider_call_id))
-                await update_dialer_call_status(
-                    parent_call_sid=provider_call_id,
-                    child_call_sid=None,
-                    status="in-progress",
-                    duration_seconds=None,
-                    rep_user_id=session.get("rep_user_id"),
-                    provider="signalwire",
-                )
-                return _swml(build_signalwire_parallel_overflow_swml(
-                    conference_name=str(overflow["conference_name"]),
-                    status_callback_url=await _signalwire_overflow_callback_url(str(overflow["conference_name"])),
-                ))
-
-            # No teammate was reachable or the configured route is unsupported.
-            # Do not leave a second live person listening to silence.
-            await signalwire_parallel_store.update_leg(
-                session_id=session_id, leg_id=leg_id,
-                provider_call_id=provider_call_id, status="completed",
-                amd_result=amd_result, amd_ms=amd_ms,
-            )
-            await signalwire_parallel_store.record_outcome(
-                session_id=session_id, leg_id=leg_id,
-                provider_call_id=provider_call_id, outcome="overflow_unrouted",
-            )
-            return _swml(build_hangup_swml())
+            return _swml(await signalwire_extra_answer.first_answer_swml(
+                session_id=session_id, leg_id=leg_id, provider_call_id=provider_call_id,
+                rep_call_id=str(session.get("rep_call_id") or ""),
+            ))
         if int(session.get("line_count") or 0) == 1:
             _spawn_background(_record_stages(
                 _stage_key(session, provider_call_id), ("person", {"answered_by": amd_result}),
@@ -2288,6 +2284,10 @@ async def handle_sw_dialer_connect(request: Request):
                 return _swml(build_hangup_swml())
             if conference_name.startswith("sysevo-ringback-"):
                 _spawn_background(call_stages.record_ringback_joined(conference_name))
+            # An extra answer: the auto-connected teammate took it.
+            _spawn_background(extra_answer.record_rep_joined(
+                provider="signalwire", conference_name=conference_name, rep_user_id=rep_user_id,
+            ))
             logger.info(
                 f"sw-dialer-connect joining conference {conference_name!r} for {identity!r}"
             )

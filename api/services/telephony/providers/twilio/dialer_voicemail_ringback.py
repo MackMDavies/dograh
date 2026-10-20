@@ -7,12 +7,15 @@ targeting only them, pushed to their softphone). The person waits in a private
 conference named after their own call (``call-<prospect SID>``), which the rep's
 browser joins through voice-connect's claimed-conference branch, exactly like a Hold
 offer. If the rep is busy or offline, or does not take it within the offer window,
-today's behaviour applies: the line ends and the call is recorded as
-``person_answered`` ("picked up after you moved on — call them back").
+the extra-answer chain carries on from its teammate step (Phase 1b; see
+dialer_extra_answer). Only when the chain cannot run at all does the old behaviour
+apply: the line ends and the call is recorded as ``person_answered``.
+
+Phase 1b: the offer is auto-connected (the rep is idle, that is checked in SQL) and the
+person hears the rep's hello clip while the softphone joins, never hold music.
 """
 
 import asyncio
-from xml.sax.saxutils import escape
 
 from loguru import logger
 
@@ -28,7 +31,7 @@ from api.services.telephony.providers.twilio.dialer_conference import (
     cancel_call,
     conference_name_for,
 )
-from api.services.telephony.providers.twilio.dialer_twiml import conference_telemetry_attributes
+from api.services.telephony.providers.twilio import dialer_extra_answer
 
 
 async def offer_ringback_twiml(
@@ -43,17 +46,10 @@ async def offer_ringback_twiml(
     if not offer:
         return None
     notify_inbound_call(str(offer["inbound_call_id"]))
-    attrs = conference_telemetry_attributes(
-        events_url=f"{endpoint_root}/dialer-conference-events",
-        recording_url=f"{endpoint_root}/dialer-recording-callback",
-    )
-    # The person waits (Twilio's hold music) until the rep's leg starts the room.
-    return (
-        '<?xml version="1.0" encoding="UTF-8"?><Response>'
-        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
-        "<Dial><Conference " + attrs
-        + 'startConferenceOnEnter="false" endConferenceOnExit="true" beep="false">'
-        + escape(conference_name) + "</Conference></Dial></Response>"
+    # The person hears the rep's hello clip (waitUrl), never hold music, until the
+    # rep's softphone joins and starts the room.
+    return dialer_extra_answer.conference_twiml(
+        prospect_call_sid=prospect_call_sid, root=endpoint_root, disclose=True,
     )
 
 
@@ -66,10 +62,18 @@ async def expire_ringback(
     try:
         if not await expire_unanswered_inbound_call(provider_call_id=prospect_call_sid, provider="twilio"):
             return  # the rep took it (or the person already hung up and it was closed)
-        await cancel_call(call_sid=prospect_call_sid)
-        await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="person_answered")
-        await call_stages.record_call_stage(
-            parent_call_sid, "person", {"after_vm_request": True, "ringback": "missed"},
+        # Phase 1b: the chain carries on (teammate → agent → apology). The person is
+        # still in call-<SID>, so a teammate offer needs no change to their call.
+        state = await dialer_extra_answer.continue_after_ringback(
+            parent_call_sid=parent_call_sid, prospect_call_sid=prospect_call_sid,
         )
+        if state is None:
+            await cancel_call(call_sid=prospect_call_sid)
+        if state is None or state.get("action") in {"apology", "hangup"}:
+            # Nobody could take them: the rep's status says "call them back".
+            await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="person_answered")
+            await call_stages.record_call_stage(
+                parent_call_sid, "person", {"after_vm_request": True, "ringback": "missed"},
+            )
     except Exception as exc:  # noqa: BLE001 - background timer must not raise
         logger.error(f"Twilio ring-back expiry failed for {parent_call_sid}: {exc}")

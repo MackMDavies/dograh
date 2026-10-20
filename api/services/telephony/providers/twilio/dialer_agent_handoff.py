@@ -83,6 +83,10 @@ async def record_handoff_event(
         "p_child_call_sid": call_id, "p_event": event, "p_event_at": event_at,
         "p_workflow_run_id": workflow_run_id, "p_duration_seconds": duration_seconds,
     }) is True
+    if recorded and event == "started" and (run.initial_context or {}).get("dialer_extra_answer_id"):
+        # The agent is talking: its 90 s transfer-back window opens now.
+        from api.services.telephony.dialer import extra_answer
+        await extra_answer.mark("twilio", call_id, "agent_started")
     if recorded and event == "ended":
         run = await db_client.get_workflow_run_by_call_id(call_id)
         context = (run.initial_context or {}) if run else {}
@@ -150,6 +154,41 @@ async def prepare_agent_handoff(
         return None
     if plan.get("call_id") != child_call_sid or str(plan.get("request_id")) != leg_id:
         raise AgentHandoffUnavailable("Agent handoff identity does not match the reserved line")
+    return await _materialize_handoff(
+        plan=plan, child_call_sid=child_call_sid, parent_call_sid=parent_call_sid,
+        account_sid=account_sid,
+    )
+
+
+async def prepare_extra_answer_agent(
+    *, prospect_call_sid: str, account_sid: str, disclose: bool = True,
+) -> PreparedAgentHandoff | None:
+    """Adopt an extra answer (Phase 1b chain, step 'agent') into the outbound agent.
+
+    The reservation is the account-scoped dialer_extra_answers row; its id is the
+    agent request id, so a retried webhook reuses the stored run. ``disclose`` is off
+    when the person already heard the recording notice in this call.
+    """
+    if not account_sid:
+        raise AgentHandoffUnavailable("The provider account is missing")
+    from api.services.telephony.dialer import extra_answer
+
+    plan = await extra_answer.prepare_agent_plan(prospect_call_sid)
+    if not isinstance(plan, dict):
+        return None
+    if plan.get("call_id") != prospect_call_sid or str(plan.get("request_id")) != str(plan.get("extra_answer_id")):
+        raise AgentHandoffUnavailable("Agent handoff identity does not match the extra answer")
+    return await _materialize_handoff(
+        plan=plan, child_call_sid=prospect_call_sid, parent_call_sid=str(plan.get("parent_call_sid") or ""),
+        account_sid=account_sid, disclose=disclose,
+        extra_context={"dialer_extra_answer_id": str(plan["extra_answer_id"])},
+    )
+
+
+async def _materialize_handoff(
+    *, plan: dict, child_call_sid: str, parent_call_sid: str, account_sid: str,
+    disclose: bool = True, extra_context: dict | None = None,
+) -> PreparedAgentHandoff:
     # This UUID comes from the approved server-side catalogue, never from the
     # browser or provider query string. Derive the execution organization here.
     workflow = await db_client.get_workflow_by_uuid_unscoped(plan["workflow_uuid"])
@@ -190,6 +229,7 @@ async def prepare_agent_handoff(
                     "dialer_account_id": plan["account_id"], "dialer_entry_id": plan["entry_id"],
                     "dialer_rep_user_id": plan["rep_user_id"], "dialer_parent_call_sid": parent_call_sid,
                     "dialer_concurrency_slot": slot,
+                    **(extra_context or {}),
                 },
                 gathered_context={"call_id": child_call_sid, "provider": "twilio"},
             )
@@ -214,9 +254,10 @@ async def prepare_agent_handoff(
     stream_url = f"{str(websocket_endpoint).rstrip('/')}/api/v1/telephony/dialer-agent-media/{run.id}"
     status_url = f"{str(backend_endpoint).rstrip('/')}/api/v1/telephony/dialer-agent-stream-status?workflow_run_id={run.id}"
     token = media_token(auth_token=provider.auth_token, run_id=run.id, call_id=child_call_sid)
+    notice = '<Say>This call may be recorded and monitored for quality assurance.</Say>' if disclose else ''
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?><Response>'
-        '<Say>This call may be recorded and monitored for quality assurance.</Say>'
+        + notice +
         f'<Connect><Stream url={quoteattr(stream_url)} statusCallback={quoteattr(status_url)}>'
         f'<Parameter name="handoffToken" value={quoteattr(token)}/>'
         '</Stream></Connect><Hangup/></Response>'

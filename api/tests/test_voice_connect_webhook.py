@@ -94,6 +94,8 @@ def allow_unblocked_test_phones(monkeypatch):
     monkeypatch.setattr("api.services.telephony.providers.twilio.routes.dialer_hold.independent_children", AsyncMock(return_value=set()))
     monkeypatch.setattr("api.services.telephony.providers.twilio.routes.dialer_hold.record_ended", AsyncMock())
     monkeypatch.setattr("api.services.telephony.providers.twilio.routes.dialer_overflow_recovery.schedule_overflow", AsyncMock(return_value=True))
+    monkeypatch.setattr("api.services.telephony.providers.twilio.routes.extra_answer.parallel_line_cap", AsyncMock(return_value=None))
+    monkeypatch.setattr("api.services.telephony.providers.twilio.routes.extra_answer.mark", AsyncMock(return_value=None))
     with patch(
         "api.services.telephony.providers.twilio.routes.get_dialer_phone_block_reason",
         return_value=None,
@@ -803,143 +805,148 @@ def test_parallel_join_bridges_only_atomic_human_winner(monkeypatch, amd_answer)
     cancel.assert_awaited_once_with(call_sid=loser_sid)
 
 
-@pytest.mark.parametrize("amd_answer", ["human", "unknown"])
-def test_parallel_join_routes_another_human_to_reserved_teammate(monkeypatch, amd_answer):
-    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    client = TestClient(_make_test_app())
-    with patch(
-        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.dialer_parallel.claim_parallel_winner",
-        return_value=False,
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.dialer_parallel.route_parallel_to_teammate",
-        new_callable=AsyncMock,
-        return_value={"inbound_call_id": "inbound-1", "rep_user_id": "rep-2"},
-    ) as route_to_teammate, patch(
-        "api.services.telephony.providers.twilio.routes.notify_inbound_call"
-    ) as notify, patch(
-        "api.services.telephony.providers.twilio.routes._expire_parallel_overflow_offer",
-        new_callable=AsyncMock,
-    ) as expire_offer:
-        response = client.post(
-            "/dialer-conference-join",
-            params={
-                "conference_name": f"call-{_LISTEN_SID}",
-                "parent_call_sid": _LISTEN_SID,
-                "parallel_leg_id": "11111111-1111-4111-8111-111111111111",
-                "parallel_entry_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            },
-            data={"CallSid": "CA" + "2" * 32, "AnsweredBy": amd_answer},
-            headers={"X-Twilio-Signature": "fake-signature"},
-        )
+_XA = "api.services.telephony.dialer.extra_answer"
+_TXA = "api.services.telephony.providers.twilio.dialer_extra_answer"
+_EXTRA_CHILD = "CA" + "2" * 32
+_EXTRA_LEG = "11111111-1111-4111-8111-111111111111"
+_EXTRA_REP = "44444444-4444-4444-8444-444444444444"
 
+
+def _post_second_human(amd_answer="human", account=""):
+    return TestClient(_make_test_app()).post(
+        "/dialer-conference-join",
+        params={
+            "conference_name": f"call-{_LISTEN_SID}",
+            "parent_call_sid": _LISTEN_SID,
+            "parallel_leg_id": _EXTRA_LEG,
+            "parallel_entry_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+        },
+        data={"CallSid": _EXTRA_CHILD, "AnsweredBy": amd_answer, "AccountSid": account},
+        headers={"X-Twilio-Signature": "fake-signature"},
+    )
+
+
+def _chain_patches(*, advance, begin=None, clip=None):
+    path = "api.services.telephony.providers.twilio.routes"
+    return (
+        patch(f"{path}.RequestValidator.validate", return_value=True),
+        patch(f"{path}.dialer_parallel.claim_parallel_winner", new=AsyncMock(return_value=False)),
+        patch(f"{path}.dialer_parallel.route_parallel_to_teammate", new=AsyncMock()),
+        patch(f"{path}.dialer_hold.hold_twiml", new=AsyncMock()),
+        patch(f"{_XA}.begin", new=AsyncMock(return_value=begin if begin is not None else {
+            "status": "active", "step": "start", "rep_user_id": _EXTRA_REP})),
+        patch(f"{_XA}.advance", new=AsyncMock(side_effect=advance)),
+        patch(f"{_XA}.clip_url", new=AsyncMock(return_value=clip)),
+    )
+
+
+@pytest.mark.parametrize("amd_answer", ["human", "unknown"])
+def test_second_human_auto_connects_a_teammate_and_is_never_held(monkeypatch, amd_answer):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    advance = [{"action": "teammate", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP,
+                "inbound_call_id": "inbound-1", "conference_name": f"call-{_EXTRA_CHILD}"}]
+    p = _chain_patches(advance=advance)
+    with p[0], p[1], p[2] as old_route, p[3] as hold, p[4] as begin, p[5] as adv, p[6], \
+            patch(f"{_TXA}.notify_inbound_call") as notify, patch(f"{_TXA}._spawn") as spawn:
+        response = _post_second_human(amd_answer)
+    for call in spawn.call_args_list:
+        call.args[0].close()
     assert response.status_code == 200
     assert "<Hangup/>" not in response.text
     assert _DISCLOSURE in response.text
-    assert "call-CA" + "2" * 32 in response.text
-    route_to_teammate.assert_awaited_once_with(
-        parent_call_sid=_LISTEN_SID,
-        child_call_sid="CA" + "2" * 32,
-        conference_name="call-CA" + "2" * 32,
-        entry_id="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        leg_id="11111111-1111-4111-8111-111111111111",
-    )
+    doc = xml.dom.minidom.parseString(response.text)
+    conference = doc.getElementsByTagName("Conference")[0]
+    assert conference.firstChild.data == f"call-{_EXTRA_CHILD}"
+    assert conference.getAttribute("startConferenceOnEnter") == "false"
+    # Never Twilio's hold music: the wait plays the rep's hello clip.
+    assert conference.getAttribute("waitUrl").endswith(f"/dialer-extra-answer-wait?call={_EXTRA_CHILD}")
+    assert begin.await_args.kwargs["source"] == "parallel"
+    assert begin.await_args.kwargs["leg_id"] == _EXTRA_LEG
+    assert adv.await_args.kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD}
     notify.assert_called_once_with("inbound-1")
-    expire_offer.assert_awaited_once_with(
-        child_call_sid="CA" + "2" * 32,parent_call_sid=_LISTEN_SID,
-        leg_id="11111111-1111-4111-8111-111111111111",account_sid="",
-    )
+    assert spawn.call_count == 1   # the 8 s offer expiry
+    old_route.assert_not_awaited()
+    hold.assert_not_awaited()
 
 
-def test_parallel_join_fails_closed_when_no_teammate_can_be_reserved(monkeypatch):
+def test_second_human_with_nobody_free_hears_the_reps_apology(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    client = TestClient(_make_test_app())
-    child_sid = "CA" + "2" * 32
-    with patch(
-        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.dialer_parallel.claim_parallel_winner",
-        new_callable=AsyncMock,
-        return_value=False,
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.dialer_parallel.route_parallel_to_teammate",
-        new_callable=AsyncMock,
-        return_value=None,
-    ), patch(
-        "api.services.telephony.providers.twilio.routes.dialer_parallel.update_parallel_leg",
-        new_callable=AsyncMock,
-    ) as mark_unrouted:
-        response = client.post(
-            "/dialer-conference-join",
-            params={
-                "conference_name": f"call-{_LISTEN_SID}",
-                "parent_call_sid": _LISTEN_SID,
-                "parallel_leg_id": "11111111-1111-4111-8111-111111111111",
-                "parallel_entry_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            },
-            data={"CallSid": child_sid, "AnsweredBy": "human"},
-            headers={"X-Twilio-Signature": "fake-signature"},
-        )
-
+    advance = [{"action": "apology", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP}]
+    p = _chain_patches(advance=advance, clip="https://storage.example.com/sorry.wav")
+    with p[0], p[1], p[2], p[3] as hold, p[4], p[5], p[6] as clip:
+        response = _post_second_human()
     assert response.status_code == 200
-    assert "<Hangup/>" in response.text
-    assert _DISCLOSURE not in response.text
-    assert mark_unrouted.await_count == 2
-    mark_unrouted.assert_any_await(
-        child_call_sid=child_sid,
-        leg_id="11111111-1111-4111-8111-111111111111",
-        status="cancelled",
-        answered_by="human",
-    )
+    assert "<Play>https://storage.example.com/sorry.wav</Play><Hangup/>" in response.text
+    assert clip.await_args.args == (_EXTRA_REP, "apology")
+    hold.assert_not_awaited()
 
 
-def test_second_human_uses_existing_agent_media_without_redial(monkeypatch):
+def test_second_human_apology_falls_back_to_neutral_speech(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
-    path = "api.services.telephony.providers.twilio.routes"
-    child = "CA" + "2" * 32
+    p = _chain_patches(advance=[{"action": "apology", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP}])
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6]:
+        response = _post_second_human()
+    assert "<Say>Sorry, I've just been pulled onto another call." in response.text
+    assert response.text.endswith("<Hangup/></Response>")
+
+
+def test_second_human_with_apology_switched_off_is_ended_without_hold(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    p = _chain_patches(advance=[{"action": "hangup", "prospect_call_id": _EXTRA_CHILD}])
+    with p[0], p[1], p[2], p[3] as hold, p[4], p[5], p[6]:
+        response = _post_second_human()
+    assert response.text == '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    hold.assert_not_awaited()
+
+
+def test_second_human_goes_to_the_voice_agent_on_the_same_call(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     account = "AC" + "3" * 32
-    prepared = SimpleNamespace(twiml='<Response><Connect><Stream url="wss://example.invalid/media"/></Connect></Response>')
-    with (
-        patch(f"{path}.RequestValidator.validate",return_value=True),
-        patch(f"{path}.dialer_parallel.claim_parallel_winner",new=AsyncMock(return_value=False)),
-        patch(f"{path}.dialer_parallel.route_parallel_to_teammate",new=AsyncMock(return_value=None)),
-        patch(f"{path}.dialer_parallel.update_parallel_leg",new=AsyncMock()) as update,
-        patch(f"{path}.dialer_agent_handoff.prepare_agent_handoff",new=AsyncMock(return_value=prepared)) as adopt,
-    ):
-        result = TestClient(_make_test_app()).post("/dialer-conference-join",params={
-            "conference_name":f"call-{_LISTEN_SID}","parent_call_sid":_LISTEN_SID,
-            "parallel_leg_id":"11111111-1111-4111-8111-111111111111",
-            "parallel_entry_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        },data={"CallSid":child,"AccountSid":account,"AnsweredBy":"human"},
-            headers={"X-Twilio-Signature":"fake-signature"})
-    assert result.status_code == 200
-    assert result.text == prepared.twiml
-    assert adopt.await_args.kwargs["child_call_sid"] == child
-    assert adopt.await_args.kwargs["account_sid"] == account
-    assert update.await_args.kwargs["status"] == "answered"
+    prepared = SimpleNamespace(twiml='<Response><Connect><Stream url="wss://example.invalid/media"/></Connect></Response>',
+                               already_streaming=False)
+    p = _chain_patches(advance=[{"action": "agent", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP}])
+    with p[0], p[1], p[2], p[3], p[4], p[5], p[6], patch(
+        f"{_TXA}.dialer_agent_handoff.prepare_extra_answer_agent", new=AsyncMock(return_value=prepared),
+    ) as adopt:
+        response = _post_second_human(account=account)
+    assert response.text == prepared.twiml
+    assert adopt.await_args.kwargs == {"prospect_call_sid": _EXTRA_CHILD, "account_sid": account, "disclose": True}
 
 
-def test_teammate_offer_requires_a_durable_fallback_deadline(monkeypatch):
-    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN","test-auth-token")
-    path = "api.services.telephony.providers.twilio.routes"
-    with (
-        patch(f"{path}.RequestValidator.validate",return_value=True),
-        patch(f"{path}.dialer_parallel.claim_parallel_winner",new=AsyncMock(return_value=False)),
-        patch(f"{path}.dialer_parallel.route_parallel_to_teammate",new=AsyncMock(return_value={"inbound_call_id":"offer"})),
-        patch(f"{path}.dialer_overflow_recovery.schedule_overflow",new=AsyncMock(return_value=False)),
-        patch(f"{path}.notify_inbound_call") as notify,
-        patch(f"{path}._expire_parallel_overflow_offer",new=AsyncMock()) as timer,
+def test_second_human_skips_an_unavailable_agent_to_the_next_step(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    from api.services.telephony.providers.twilio.dialer_agent_handoff import AgentHandoffUnavailable
+    advance = [
+        {"action": "agent", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP},
+        {"action": "apology", "prospect_call_id": _EXTRA_CHILD, "rep_user_id": _EXTRA_REP},
+    ]
+    p = _chain_patches(advance=advance)
+    with p[0], p[1], p[2], p[3], p[4], p[5] as adv, p[6], patch(
+        f"{_TXA}.dialer_agent_handoff.prepare_extra_answer_agent",
+        new=AsyncMock(side_effect=AgentHandoffUnavailable("no quota")),
     ):
-        result = TestClient(_make_test_app()).post("/dialer-conference-join",params={
-            "conference_name":f"call-{_LISTEN_SID}","parent_call_sid":_LISTEN_SID,
-            "parallel_leg_id":"11111111-1111-4111-8111-111111111111",
-            "parallel_entry_id":"aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-        },data={"CallSid":"CA"+"2"*32,"AccountSid":"AC"+"3"*32,"AnsweredBy":"human"},
-            headers={"X-Twilio-Signature":"fake-signature"})
-    assert result.status_code == 503
-    notify.assert_not_called()
-    timer.assert_not_awaited()
+        response = _post_second_human(account="AC" + "3" * 32)
+    assert adv.await_args_list[1].kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD, "after": "agent"}
+    assert "Sorry, I've just been pulled onto another call." in response.text
+
+
+def test_second_human_is_apologised_to_when_the_chain_is_unavailable(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    p = _chain_patches(advance=[], begin={})
+    with p[0], p[1], p[2], p[3] as hold, p[4], p[5] as adv, p[6]:
+        response = _post_second_human()
+    assert "Sorry, I've just been pulled onto another call." in response.text
+    adv.assert_not_awaited()
+    hold.assert_not_awaited()
+
+
+def test_retried_second_human_webhook_repeats_the_reserved_step(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    p = _chain_patches(advance=[], begin={"status": "active", "step": "teammate", "rep_user_id": _EXTRA_REP})
+    with p[0], p[1], p[2], p[3], p[4], p[5] as adv, p[6]:
+        response = _post_second_human()
+    adv.assert_not_awaited()   # never reserves a second teammate
+    assert f"call-{_EXTRA_CHILD}</Conference>" in response.text
 
 
 def test_agent_stream_callback_uses_iso_provider_timestamp(monkeypatch):

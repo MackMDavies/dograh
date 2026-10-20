@@ -26,6 +26,9 @@ STAGES = frozenset({
     "ringing", "vm_button_shown", "vm_requested", "machine", "beep", "vm_playing",
     "vm_left", "vm_live_recording", "vm_left_live", "person", "mailbox_full",
     "no_answer", "screener", "ivr", "rep_ringback", "rep_rejoined",
+    # Phase 1b: the extra-answer chain (written in SQL by dialer_extra_answer_*).
+    "extra_answer", "teammate_connected", "agent_bridging", "agent_transferred",
+    "callback_booked", "apology_played",
 })
 
 # What the listening stream / call sorter may report (see report_listening_stage).
@@ -38,8 +41,9 @@ MAILBOX_FULL_MAX_PLAYBACK_MS = 3000
 RECORDING_REQUIRED_CODE = "voicemail_recording_required"
 RECORDING_REQUIRED_MESSAGE = "Record your voicemail to start calling."
 
-# A rep has this long to accept the ring-back before the person is let go.
-RINGBACK_OFFER_SECONDS = 20
+# The original rep's softphone auto-answers the ring-back (Phase 1b); after this long
+# without a join the extra-answer chain moves on to a teammate.
+RINGBACK_OFFER_SECONDS = 10
 
 
 def _headers() -> dict[str, str]:
@@ -118,6 +122,14 @@ async def latest_call_stage(call_key: str | None) -> dict[str, Any] | None:
     }
 
 
+# The person is with (or being connected to) someone: the original rep on a ring-back,
+# or the Phase 1b chain's teammate / voice agent. Never "picked up after you moved on".
+_LOOKED_AFTER_STAGES = frozenset({
+    "rep_ringback", "rep_rejoined", "extra_answer", "teammate_connected",
+    "agent_bridging", "agent_transferred",
+})
+
+
 def with_stage(payload: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
     """Add `stage` / `stage_at` to a voicemail status payload.
 
@@ -127,7 +139,7 @@ def with_stage(payload: dict[str, Any], latest: dict[str, Any] | None) -> dict[s
     """
     payload["stage"] = (latest or {}).get("stage")
     payload["stage_at"] = (latest or {}).get("stage_at")
-    if payload["stage"] in {"rep_ringback", "rep_rejoined"} and payload.get("state") in {
+    if payload["stage"] in _LOOKED_AFTER_STAGES and payload.get("state") in {
         "rejected", "waiting", "idle",
     }:
         payload["state"] = "ringback"

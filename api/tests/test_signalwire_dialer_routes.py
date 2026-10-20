@@ -1457,32 +1457,39 @@ def test_signalwire_parallel_overflow_gets_a_private_waiting_room():
     }
 
 
-async def test_signalwire_second_human_routes_to_reserved_teammate():
-    """The callback returns an isolated conference only after durable routing succeeds."""
+async def test_signalwire_second_human_auto_connects_a_teammate_via_the_chain():
+    """Phase 1b: a second person is never parked. The chain reserves the longest-idle
+    teammate (auto-connect), and the person hears the rep's hello before the room."""
     from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_decision
 
     session_id = "00000000-0000-0000-0000-000000000001"
     leg_id = "00000000-0000-0000-0000-000000000002"
-    routed = {
-        "inbound_call_id": "00000000-0000-0000-0000-000000000003",
-        "rep_user_id": "00000000-0000-0000-0000-000000000004",
-        "caller_name": "Example Co",
-        "conference_name": f"sysevo-overflow-{leg_id}",
-    }
+    rep = "00000000-0000-0000-0000-000000000004"
+    xa = "api.services.telephony.dialer.extra_answer"
+    sx = "api.services.telephony.dialer.signalwire_extra_answer"
 
     def _close_coro(coro):
         coro.close()
 
+    async def _advance(**kwargs):
+        return {"action": "teammate", "prospect_call_id": "prospect-call", "rep_user_id": rep,
+                "inbound_call_id": "00000000-0000-0000-0000-000000000003",
+                "conference_name": kwargs["conference_name"]}
+
     with (
         patch(f"{_MODULE}._secret_ok", return_value=True),
         patch(f"{_MODULE}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value={
-            "session": {"id": session_id, "rep_user_id": routed["rep_user_id"], "rep_call_id": "rep-call", "conference_name": f"sysevo-par-{session_id}", "status": "connected"},
+            "session": {"id": session_id, "rep_user_id": rep, "rep_call_id": "rep-call", "conference_name": f"sysevo-par-{session_id}", "status": "connected"},
             "leg": {"id": leg_id, "entry_id": "entry", "provider_call_id": "prospect-call", "status": "human"},
         })),
         patch(f"{_MODULE}.signalwire_parallel_store.update_leg", new=AsyncMock(return_value=True)),
         patch(f"{_MODULE}.signalwire_parallel_store.claim_winner", new=AsyncMock(return_value=False)),
-        patch(f"{_MODULE}.signalwire_parallel_store.route_to_teammate", new=AsyncMock(return_value=routed)) as route,
-        patch(f"{_MODULE}.notify_inbound_call") as notify,
+        patch(f"{_MODULE}.signalwire_parallel_store.route_to_teammate", new=AsyncMock()) as old_route,
+        patch(f"{xa}.begin", new=AsyncMock(return_value={"status": "active", "step": "start", "rep_user_id": rep})) as begin,
+        patch(f"{xa}.advance", new=AsyncMock(side_effect=_advance)) as advance,
+        patch(f"{xa}.clip_url", new=AsyncMock(return_value="https://storage.example.com/hello.wav")),
+        patch(f"{sx}.notify_inbound_call") as notify,
+        patch(f"{sx}._spawn", side_effect=_close_coro) as spawned,
         patch(f"{_MODULE}.get_backend_endpoints", new=AsyncMock(return_value=("https://api.example.com", "wss://api.example.com"))),
         patch(f"{_MODULE}._spawn_background", side_effect=_close_coro),
         patch(f"{_MODULE}.update_dialer_call_status", new=AsyncMock()) as update_call,
@@ -1492,13 +1499,21 @@ async def test_signalwire_second_human_routes_to_reserved_teammate():
             query={"session_id": session_id, "leg_id": leg_id},
         ))
 
-    route.assert_awaited_once()
-    notify.assert_called_once_with(routed["inbound_call_id"])
-    update_call.assert_awaited_once()
+    old_route.assert_not_awaited()
+    assert begin.await_args.kwargs == {
+        "provider": "signalwire", "prospect_call_id": "prospect-call", "source": "parallel",
+        "parent_call_sid": "rep-call", "leg_id": leg_id, "session_id": session_id,
+    }
+    room = advance.await_args.kwargs["conference_name"]
+    assert room.startswith("sysevo-overflow-")
+    notify.assert_called_once_with("00000000-0000-0000-0000-000000000003")
+    spawned.assert_called_once()   # the 8 s offer expiry
     assert update_call.await_args.kwargs["status"] == "in-progress"
-    join = _payload_of(response)["sections"]["main"][0]["join_conference"]
-    assert join["name"] == routed["conference_name"]
-    assert join["name"] != f"sysevo-par-{session_id}"
+    steps = _payload_of(response)["sections"]["main"]
+    assert steps[0] == {"play": {"url": "https://storage.example.com/hello.wav"}}
+    join = steps[1]["join_conference"]
+    assert join["name"] == room and join["name"] != f"sysevo-par-{session_id}"
+    assert join["start_on_enter"] is False
     assert "sw-overflow-conference" in join["status_callback"]
     assert join["status_callback_event"] == "join leave"
 
