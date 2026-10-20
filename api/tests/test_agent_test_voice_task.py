@@ -93,5 +93,134 @@ async def test_unexpected_worker_errors_have_no_private_detail_in_job_result(
 
 def test_worker_registration_includes_the_voice_task():
     from api.tasks.arq import WorkerSettings
-    voice = next(item for item in WorkerSettings.functions if getattr(item,"coroutine",None) is agent_test_voice.run_agent_test_voice)
-    assert voice.max_tries == 3 and voice.timeout_s == 270 and voice.keep_result_s == 600
+
+    voice = next(
+        item
+        for item in WorkerSettings.functions
+        if getattr(item, "coroutine", None) is agent_test_voice.run_agent_test_voice
+    )
+    assert (
+        voice.max_tries == 3 and voice.timeout_s == 270 and voice.keep_result_s == 600
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "failure,expected_code",
+    [
+        ("workflow", "voice_workflow_not_found"),
+        ("session", "voice_session_expired"),
+        ("source", "voice_source_changed"),
+        ("fixture", "voice_fixture_invalid"),
+        ("provider", "voice_test_provider_plan_invalid"),
+        ("unexpected", "voice_preflight_unavailable"),
+        ("timeout", "voice_preflight_timeout"),
+        ("signer", "voice_control_not_configured"),
+    ],
+)
+async def test_real_preclaim_failures_release_capacity_without_paid_work(
+    monkeypatch, failure, expected_code
+):
+    from dataclasses import replace
+
+    from api.services.workflow import voice_test_job
+    from api.services.workflow.voice_test_control import VoiceControlError
+    from api.tests.test_voice_test_job import setup as job_setup
+
+    context, db, control, _, _, _, _ = job_setup()
+    redis = MemoryRedis()
+    redis.values[voice_job_key(SESSION)] = context.encode()
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "" if failure == "signer" else SECRET)
+    monkeypatch.setattr(agent_test_voice, "db_client", db)
+    monkeypatch.setattr(agent_test_voice, "VoiceControlClient", lambda *_: control)
+    if failure == "workflow":
+        db.get_workflow.return_value = None
+    elif failure == "session":
+        control.get.side_effect = VoiceControlError("voice_session_expired")
+    elif failure == "source":
+        db.get_workflow_versions.return_value[0].workflow_json = {
+            "nodes": [{"id": "changed"}]
+        }
+    elif failure == "fixture":
+        control.fixture.side_effect = VoiceControlError("voice_fixture_invalid")
+    elif failure == "provider":
+        control.get.return_value = replace(control.get.return_value, provider_plan=None)
+    elif failure == "unexpected":
+        control.fixture.side_effect = RuntimeError(f"private {SECRET} {LEASE}")
+    elif failure == "timeout":
+        monkeypatch.setattr(voice_test_job, "PREFLIGHT_TIMEOUT_SECONDS", 0.01)
+
+        async def stalled(*_):
+            await asyncio.Event().wait()
+
+        control.fixture.side_effect = stalled
+
+    result = await agent_test_voice.run_agent_test_voice({"redis": redis}, SESSION)
+    assert result == {"status": "blocked", "code": expected_code}
+    assert redis.values == {voice_job_key(SESSION): context.encode()}
+    control.claim.assert_not_awaited()
+    control.attach.assert_not_awaited()
+    db.create_workflow_run.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["preflight", "claim", "after_claim"])
+async def test_real_cancellation_only_releases_capacity_before_claim(
+    monkeypatch, phase
+):
+    from api.tests.test_voice_test_job import setup as job_setup
+
+    context, db, control, _, _, _, _ = job_setup()
+    redis = MemoryRedis()
+    redis.values[voice_job_key(SESSION)] = context.encode()
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", SECRET)
+    monkeypatch.setattr(agent_test_voice, "db_client", db)
+    monkeypatch.setattr(agent_test_voice, "VoiceControlClient", lambda *_: control)
+    entered = asyncio.Event()
+
+    async def stalled(*_, **__):
+        entered.set()
+        await asyncio.Event().wait()
+
+    boundary = {
+        "preflight": control.fixture,
+        "claim": control.claim,
+        "after_claim": db.create_workflow_run,
+    }[phase]
+    boundary.side_effect = stalled
+    task = asyncio.create_task(
+        agent_test_voice.run_agent_test_voice({"redis": redis}, SESSION)
+    )
+    async with asyncio.timeout(5):
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    slots = [key for key in redis.values if key.startswith("agent-test-voice-slot:")]
+    assert len(slots) == (0 if phase == "preflight" else 1)
+    if phase == "preflight":
+        control.claim.assert_not_awaited()
+    else:
+        control.claim.assert_awaited_once()
+    control.attach.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_real_uncertain_claim_keeps_capacity_without_starting_runtime(
+    monkeypatch,
+):
+    from api.services.workflow.voice_test_control import VoiceControlError
+    from api.tests.test_voice_test_job import setup as job_setup
+
+    context, db, control, _, _, _, _ = job_setup()
+    redis = MemoryRedis()
+    redis.values[voice_job_key(SESSION)] = context.encode()
+    monkeypatch.setenv("SYSEVO_MEMORY_SECRET", SECRET)
+    monkeypatch.setattr(agent_test_voice, "db_client", db)
+    monkeypatch.setattr(agent_test_voice, "VoiceControlClient", lambda *_: control)
+    control.claim.side_effect = VoiceControlError("voice_control_unavailable")
+    result = await agent_test_voice.run_agent_test_voice({"redis": redis}, SESSION)
+    assert result == {"status": "blocked", "code": "voice_control_unavailable"}
+    assert sum(key.startswith("agent-test-voice-slot:") for key in redis.values) == 1
+    control.claim.assert_awaited_once()
+    db.create_workflow_run.assert_not_awaited()

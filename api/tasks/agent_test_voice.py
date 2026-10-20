@@ -16,7 +16,8 @@ from api.services.workflow.voice_test_control import (
 )
 from api.services.workflow.voice_test_job import (
     VoiceJobContext,
-    VoiceProviderPreflightError,
+    VoicePreflightCancelled,
+    VoicePreflightError,
     execute_voice_job,
     voice_job_key,
 )
@@ -39,12 +40,15 @@ async def run_agent_test_voice(ctx, session_id):
             result = await execute_voice_job(db_client, control, context, secret)
             release_allowed = result.get("cleanup_verified") is True
             return result
+    except VoicePreflightCancelled:
+        release_allowed = True
+        raise
     except asyncio.CancelledError:
         release_allowed = False
         raise
-    except VoiceProviderPreflightError as exc:
-        # This narrow error is raised only before claim/provider startup.
-        # Missing credentials must not quarantine all three slots for six minutes.
+    except VoicePreflightError as exc:
+        # Only this preclaim boundary proves no paid execution could have begun.
+        # Expired sessions or invalid fixtures must not quarantine worker slots.
         release_allowed = True
         return {"status": "blocked", "code": exc.code}
     except VoiceControlError as exc:

@@ -36,10 +36,19 @@ from api.services.workflow.voice_test_result import (
 JOB_NAME = "run_agent_test_voice_v2"
 CONTEXT_TTL_SECONDS = 600
 JOB_EXPIRY_SECONDS = 180
+PREFLIGHT_TIMEOUT_SECONDS = 60
 
 
-class VoiceProviderPreflightError(VoiceControlError):
+class VoicePreflightError(VoiceControlError):
+    """Preparation failed before any paid claim or provider start."""
+
+
+class VoiceProviderPreflightError(VoicePreflightError):
     """Credential preparation failed before a paid claim or provider start."""
+
+
+class VoicePreflightCancelled(asyncio.CancelledError):
+    """Cancellation occurred before a claim could have been submitted."""
 
 
 def voice_job_key(session_id):
@@ -215,34 +224,47 @@ async def execute_voice_job(
     )
 
     if not signing_secret:
-        raise VoiceControlError("voice_control_not_configured")
-    async with asyncio.timeout(60):
-        workflow, session, _ = await prepare_voice_job(db, control, context)
-        if session.status != "reserved":
-            # ARQ retries after a crash cannot claim a second paid execution.
-            return {
-                "status": session.status,
-                "session_id": session.id,
-                "cleanup_verified": True,
-            }
-        try:
-            provider_plan = validate_private_voice_provider_plan(session.provider_plan)
-            provider_packets = await control.providers(session, context.lease_token)
-            provider_source = private_voice_source_from_plan(provider_plan)
-            # Validate all QA credentials before the one-time paid claim.
-            build_private_user_configuration(
-                provider_source,
-                provider_packets,
-                signing_secret,
-                provider_plan["bindings"],
-            )
-        except VoiceControlError as exc:
-            raise VoiceProviderPreflightError(exc.code, exc.status_code) from None
-        fixtures = {}
-        for fixture in session.fixtures:
-            fixtures[fixture.file_name] = await control.fixture(
-                session, context.lease_token, fixture
-            )
+        raise VoicePreflightError("voice_control_not_configured")
+    try:
+        async with asyncio.timeout(PREFLIGHT_TIMEOUT_SECONDS):
+            workflow, session, _ = await prepare_voice_job(db, control, context)
+            if session.status != "reserved":
+                # ARQ retries after a crash cannot claim a second paid execution.
+                return {
+                    "status": session.status,
+                    "session_id": session.id,
+                    "cleanup_verified": True,
+                }
+            try:
+                provider_plan = validate_private_voice_provider_plan(
+                    session.provider_plan
+                )
+                provider_packets = await control.providers(session, context.lease_token)
+                provider_source = private_voice_source_from_plan(provider_plan)
+                # Validate all QA credentials before the one-time paid claim.
+                build_private_user_configuration(
+                    provider_source,
+                    provider_packets,
+                    signing_secret,
+                    provider_plan["bindings"],
+                )
+            except VoiceControlError as exc:
+                raise VoiceProviderPreflightError(exc.code, exc.status_code) from None
+            fixtures = {}
+            for fixture in session.fixtures:
+                fixtures[fixture.file_name] = await control.fixture(
+                    session, context.lease_token, fixture
+                )
+    except asyncio.CancelledError:
+        raise VoicePreflightCancelled from None
+    except TimeoutError:
+        raise VoicePreflightError("voice_preflight_timeout", 504) from None
+    except VoicePreflightError:
+        raise
+    except VoiceControlError as exc:
+        raise VoicePreflightError(exc.code, exc.status_code) from None
+    except Exception:  # noqa: BLE001 - preclaim storage/configuration errors must be redacted
+        raise VoicePreflightError("voice_preflight_unavailable", 503) from None
     nonce = str(uuid4())
     loop = asyncio.get_running_loop()
     started_at = loop.time()
