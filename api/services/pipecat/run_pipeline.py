@@ -212,31 +212,19 @@ async def run_pipeline_telephony(
     # Resolve effective user config here so the transport can tune its
     # bot-stopped-speaking fallback based on is_realtime; pass the resolved
     # values into _run_pipeline so it doesn't fetch them again.
-    from api.services.configuration.resolve import resolve_effective_config
+    from api.services.configuration.pipeline import resolve_pipeline_configuration
 
-    user_config = await db_client.get_user_configurations(user_id)
     run_configs = (
         (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
-    )
-    from api.services.configuration.org_provider_resolver import (
-        enrich_config_from_org_connections,
-        enrich_overrides_with_org_api_keys,
-        resolve_org_provider_config,
     )
     effective_org_id = workflow.organization_id if workflow else None
     if not effective_org_id:
         _user = await db_client.get_user_by_id(user_id)
         if _user:
             effective_org_id = _user.selected_organization_id
-    if effective_org_id:
-        user_config = await resolve_org_provider_config(effective_org_id, user_config)
-        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
-    raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and effective_org_id:
-        raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, effective_org_id
-        )
-    user_config = resolve_effective_config(user_config, raw_overrides)
+    user_config = await resolve_pipeline_configuration(
+        db_client, user_id, effective_org_id, run_configs.get("model_overrides")
+    )
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     spec = telephony_registry.get(provider_name)
@@ -307,34 +295,22 @@ async def run_pipeline_smallwebrtc(
     # Resolve workflow_run + effective user_config here so the transport can
     # tune its bot-stopped-speaking fallback based on is_realtime. _run_pipeline
     # reuses these via kwargs so we don't fetch twice.
-    from api.services.configuration.resolve import resolve_effective_config
+    from api.services.configuration.pipeline import resolve_pipeline_configuration
 
     workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
-    user_config = await db_client.get_user_configurations(user_id)
     run_configs = (
         (workflow_run.definition.workflow_configurations or {})
         if (workflow_run and workflow_run.definition)
         else {}
-    )
-    from api.services.configuration.org_provider_resolver import (
-        enrich_config_from_org_connections,
-        enrich_overrides_with_org_api_keys,
-        resolve_org_provider_config,
     )
     effective_org_id = workflow.organization_id if workflow else None
     if not effective_org_id:
         _user = await db_client.get_user_by_id(user_id)
         if _user:
             effective_org_id = _user.selected_organization_id
-    if effective_org_id:
-        user_config = await resolve_org_provider_config(effective_org_id, user_config)
-        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
-    raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and effective_org_id:
-        raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, effective_org_id
-        )
-    user_config = resolve_effective_config(user_config, raw_overrides)
+    user_config = await resolve_pipeline_configuration(
+        db_client, user_id, effective_org_id, run_configs.get("model_overrides")
+    )
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     transport = await create_webrtc_transport(
@@ -553,22 +529,12 @@ async def _run_pipeline(
         # Never resolve owner, org, global or environment credentials here.
         user_config = private_user_config
     elif resolved_user_config is None:
-        from api.services.configuration.resolve import resolve_effective_config
-        from api.services.configuration.org_provider_resolver import (
-            enrich_config_from_org_connections,
-            enrich_overrides_with_org_api_keys,
-            resolve_org_provider_config,
-        )
+        from api.services.configuration.pipeline import resolve_pipeline_configuration
 
-        user_config = await db_client.get_user_configurations(user_id)
         org_id = workflow.organization_id if workflow else None
-        if org_id:
-            user_config = await resolve_org_provider_config(org_id, user_config)
-            user_config = await enrich_config_from_org_connections(org_id, user_config)
-        raw_overrides = run_configs.get("model_overrides")
-        if raw_overrides and org_id:
-            raw_overrides = await enrich_overrides_with_org_api_keys(raw_overrides, org_id)
-        user_config = resolve_effective_config(user_config, raw_overrides)
+        user_config = await resolve_pipeline_configuration(
+            db_client, user_id, org_id, run_configs.get("model_overrides")
+        )
     else:
         user_config = resolved_user_config
 
@@ -588,31 +554,15 @@ async def _run_pipeline(
 
     # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
     if user_config.tts is not None and not is_agent_test_sandbox:
-        tts_override = run_configs.get("model_overrides", {}).get("tts", {})
-        voice_uuid = tts_override.get("voice_uuid")
-        if voice_uuid:
-            from api.services.configuration.org_provider_resolver import resolve_voice_for_tts
-            # Use effective org: workflow org → user's selected org (same fallback as provider resolution)
-            _voice_org_id = workflow.organization_id if workflow else None
-            if not _voice_org_id:
-                _user = await db_client.get_user_by_id(user_id)
-                if _user:
-                    _voice_org_id = _user.selected_organization_id
-            resolved_voice = await resolve_voice_for_tts(voice_uuid, _voice_org_id)
-            logger.info(
-                f"[run {workflow_run_id}] Voice resolution: uuid={voice_uuid} "
-                f"org_id={_voice_org_id} → resolved={resolved_voice!r}"
-            )
-            if resolved_voice:
-                user_config = user_config.model_copy(deep=True)
-                user_config.tts = user_config.tts.model_copy(
-                    update={"voice": resolved_voice}
-                )
-            else:
-                logger.warning(
-                    f"[run {workflow_run_id}] Voice UUID {voice_uuid!r} not found — "
-                    f"using default voice: {user_config.tts.voice!r}"
-                )
+        from api.services.configuration.pipeline import resolve_pipeline_voice
+
+        user_config = await resolve_pipeline_voice(
+            db_client,
+            user_config,
+            run_configs.get("model_overrides"),
+            workflow.organization_id if workflow else None,
+            user_id,
+        )
 
     # Detect realtime mode (speech-to-speech services like OpenAI Realtime, Gemini Live)
     is_realtime = user_config.is_realtime and user_config.realtime is not None
