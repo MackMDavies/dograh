@@ -277,30 +277,6 @@ async def capture_voice_provider_intent(
                     embedding.base_url or model.model_fields["base_url"].default
                 )
             source.embeddings = model.model_construct(**fields)
-        required = ["llm", "realtime"] if source.is_realtime else ["llm", "stt", "tts"]
-        if source.embeddings is not None:
-            required.append("embeddings")
-        services, schemas, routes = {}, {}, {}
-        for name in required:
-            section = getattr(source, name)
-            if section is None:
-                raise VoiceControlError("voice_provider_configuration_incomplete")
-            services[name] = provider_behavior_intent(name, section)
-            schemas[name] = provider_schema_fingerprint(
-                name, services[name]["provider"]
-            )
-            routes[name] = _signature(
-                signing_secret,
-                {
-                    "scope": INTENT_SCOPE,
-                    "service_type": name,
-                    "routing": {
-                        key: getattr(section, key)
-                        for key in ROUTING_FIELDS
-                        if key in type(section).model_fields
-                    },
-                },
-            )
         # Reject a workflow edited, moved or reassigned while its configuration was read.
         current = await db.get_workflow(workflow_id, organization_id=organization_id)
         if (
@@ -317,6 +293,54 @@ async def capture_voice_provider_intent(
         raise VoiceControlError(
             "voice_provider_configuration_changed_or_invalid"
         ) from None
+    return attest_voice_provider_intent(
+        source,
+        workflow_id=workflow_id,
+        organization_id=organization_id,
+        owner_user_id=owner_user_id,
+        workflow_version=workflow_version,
+        version_kind=version_kind,
+        runtime_workflow_hash=runtime_workflow_hash,
+        embedding_source=embedding.source,
+        signing_secret=signing_secret,
+    )
+
+
+def attest_voice_provider_intent(
+    source,
+    *,
+    workflow_id,
+    organization_id,
+    owner_user_id,
+    workflow_version,
+    version_kind,
+    runtime_workflow_hash,
+    embedding_source,
+    signing_secret,
+):
+    """Pure exporter shared by capture and protocol fixtures; never resolves credentials."""
+    required = ["llm", "realtime"] if source.is_realtime else ["llm", "stt", "tts"]
+    if source.embeddings is not None:
+        required.append("embeddings")
+    services, schemas, routes = {}, {}, {}
+    for name in required:
+        section = getattr(source, name)
+        if section is None:
+            raise VoiceControlError("voice_provider_configuration_incomplete")
+        services[name] = provider_behavior_intent(name, section)
+        schemas[name] = provider_schema_fingerprint(name, services[name]["provider"])
+        routes[name] = _signature(
+            signing_secret,
+            {
+                "scope": INTENT_SCOPE,
+                "service_type": name,
+                "routing": {
+                    key: getattr(section, key)
+                    for key in ROUTING_FIELDS
+                    if key in type(section).model_fields
+                },
+            },
+        )
     body = {
         "version": 1,
         "scope": INTENT_SCOPE,
@@ -332,8 +356,8 @@ async def capture_voice_provider_intent(
         "schemas": schemas,
         "routing_fingerprints": routes,
         "embedding_resolution": {
-            "configured": bool(embedding.api_key),
-            "source": embedding.source,
+            "configured": source.embeddings is not None,
+            "source": embedding_source,
         },
         "production_credentials_verified": False,
         "production_routing_verified": False,
@@ -349,3 +373,52 @@ async def capture_voice_provider_intent(
         {**body, **attestation, "signature": _signature(signing_secret, attestation)},
         signing_secret,
     )
+
+
+def validate_voice_session_provider_plan(session, signing_secret, workflow=None):
+    from api.services.workflow.voice_test_providers import (
+        validate_private_voice_provider_plan,
+    )
+
+    plan = validate_private_voice_provider_plan(session.provider_plan)
+    # These schemas are present in configuration/pricing, but their native
+    # speech factory has no executable adapter. Reject before credentials/claim.
+    if plan["services"].get("tts", {}).get("provider") in {"playht", "neets"}:
+        raise VoiceControlError("voice_provider_runtime_unsupported")
+    intent = validate_voice_provider_intent(session.provider_intent, signing_secret)
+    if (
+        intent["workflow_id"] != session.workflow_id
+        or intent["workflow_version"] != session.workflow_version
+        or intent["version_kind"] != session.version_kind
+        or intent["runtime_workflow_hash"] != session.runtime_workflow_hash
+        or intent["configuration_hash"] != session.provider_intent_hash
+        or hashlib.sha256(_canonical(plan["bindings"])).hexdigest()
+        != session.provider_binding_hash
+        or plan["services"] != intent["services"]
+        or plan["is_realtime"] != intent["is_realtime"]
+        or plan["timezone"] != intent["timezone"]
+        or workflow is not None
+        and (
+            intent["workflow_id"] != workflow.id
+            or intent["organization_id"] != workflow.organization_id
+            or intent["owner_user_id"] != workflow.user_id
+        )
+    ):
+        raise VoiceControlError("voice_provider_intent_binding_invalid")
+    return plan
+
+
+async def validate_current_voice_provider_source(db, workflow, session, signing_secret):
+    plan = validate_voice_session_provider_plan(session, signing_secret, workflow)
+    current = await capture_voice_provider_intent(
+        db,
+        workflow_id=workflow.id,
+        organization_id=workflow.organization_id,
+        workflow_version=session.workflow_version,
+        version_kind=session.version_kind,
+        runtime_workflow_hash=session.runtime_workflow_hash,
+        signing_secret=signing_secret,
+    )
+    if current["configuration_hash"] != session.provider_intent_hash:
+        raise VoiceControlError("voice_provider_configuration_changed")
+    return plan

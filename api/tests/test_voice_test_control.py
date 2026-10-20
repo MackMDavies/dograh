@@ -78,6 +78,58 @@ def metadata():
     }
 
 
+def bound_metadata(runtime_hash=None, tts_provider=None):
+    from api.services.workflow.voice_test_intent import attest_voice_provider_intent
+    from api.services.workflow.voice_test_providers import _canonical
+    from api.tests.test_voice_test_providers import fixture, plan_fixture
+
+    source, packets, plan = plan_fixture(signing_secret=SECRET)
+    if tts_provider is not None:
+        from api.services.workflow.voice_test_providers import provider_behavior_intent
+        from api.tests.test_voice_test_providers import sign
+
+        source.tts, packet = fixture("tts", tts_provider)
+        packet = sign(packet, SECRET)
+        packets = [item for item in packets if item["service_type"] != "tts"] + [packet]
+        plan["services"]["tts"] = provider_behavior_intent("tts", source.tts)
+    # Complete unused sections avoid any organization/global lookup in the
+    # in-memory job fixture. The actual capture service still runs in tests.
+    source.realtime = fixture("realtime", "openai_realtime")[0]
+    data = metadata()
+    if runtime_hash is not None:
+        data["runtime_workflow_hash"] = runtime_hash
+    intent = attest_voice_provider_intent(
+        source,
+        workflow_id=185,
+        organization_id=42,
+        owner_user_id=7,
+        workflow_version=3,
+        version_kind="published",
+        runtime_workflow_hash=data["runtime_workflow_hash"],
+        embedding_source="unconfigured",
+        signing_secret=SECRET,
+    )
+    data.update(
+        provider_plan=plan,
+        provider_intent=intent,
+        provider_intent_hash=intent["configuration_hash"],
+        provider_binding_hash=hashlib.sha256(_canonical(plan["bindings"])).hexdigest(),
+    )
+    return data, source, packets
+
+
+@pytest.mark.parametrize("provider", ["playht", "neets"])
+def test_unsupported_native_adapters_cannot_authorize_paid_execution(provider):
+    from api.services.workflow.voice_test_intent import (
+        validate_voice_session_provider_plan,
+    )
+
+    data, _, _ = bound_metadata(tts_provider=provider)
+    session = VoiceSession.parse(data, SESSION, 185)
+    with pytest.raises(VoiceControlError, match="voice_provider_runtime_unsupported"):
+        validate_voice_session_provider_plan(session, SECRET)
+
+
 @pytest.mark.asyncio
 async def test_bound_metadata_and_nonsecret_repr():
     def handle(request):
@@ -286,7 +338,7 @@ async def test_fixture_readback_rejects_changed_bytes_or_headers(bad):
 
 @pytest.mark.asyncio
 async def test_claim_attach_and_settlement_do_not_retry_or_invent_success():
-    session = VoiceSession.parse(metadata(), SESSION, 185)
+    session = VoiceSession.parse(bound_metadata()[0], SESSION, 185)
     requests = []
 
     def handle(request):
@@ -313,6 +365,9 @@ async def test_claim_attach_and_settlement_do_not_retry_or_invent_success():
         )
     assert len(requests) == 3
     assert requests[0]["runtime_workflow_hash"] == session.runtime_workflow_hash
+    assert requests[0]["protocol_version"] == 2
+    assert requests[0]["provider_intent_hash"] == session.provider_intent_hash
+    assert requests[0]["provider_binding_hash"] == session.provider_binding_hash
     assert requests[1]["runtime_workflow_run_id"] == 123
     assert requests[2]["actual_duration_ms"] is None and not requests[2]["retain_audio"]
 

@@ -22,11 +22,13 @@ from api.services.workflow.voice_test_control import (
     canonical_uuid,
     positive_int,
 )
+from api.services.workflow.voice_test_intent import (
+    validate_current_voice_provider_source,
+)
 from api.services.workflow.voice_test_providers import (
     build_private_user_configuration,
     private_voice_source_from_plan,
     seal_private_voice_provider_configuration,
-    validate_private_voice_provider_plan,
 )
 from api.services.workflow.voice_test_result import (
     validate_rehearsal,
@@ -137,6 +139,8 @@ async def enqueue_voice_job(db, control, redis, context):
     _, session, _ = await prepare_voice_job(db, control, context)
     if session.status != "reserved":
         return {"status": session.status, "session_id": session.id}
+    if session.provider_intent is None or session.provider_plan is None:
+        raise VoiceControlError("voice_provider_plan_unavailable")
     encoded = context.encode()
     key = voice_job_key(context.session_id)
     try:
@@ -236,8 +240,8 @@ async def execute_voice_job(
                     "cleanup_verified": True,
                 }
             try:
-                provider_plan = validate_private_voice_provider_plan(
-                    session.provider_plan
+                provider_plan = await validate_current_voice_provider_source(
+                    db, workflow, session, signing_secret
                 )
                 provider_packets = await control.providers(session, context.lease_token)
                 provider_source = private_voice_source_from_plan(provider_plan)
