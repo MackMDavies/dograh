@@ -1763,7 +1763,7 @@ def test_manual_voicemail_status_exposes_called_leg_readiness():
         )
 
     assert response.status_code == 200
-    assert response.json() == {"state": "idle", "amd_result": None, "ready": True}
+    assert response.json() == {"state": "idle", "amd_result": None, "ready": True, "stage": None, "stage_at": None}
 
     row["child_call_sid"] = None
     with patch(

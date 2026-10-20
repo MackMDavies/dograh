@@ -447,3 +447,27 @@ def build_signalwire_parallel_voicemail_swml(
         {"play": {"url": recording_url, "status_url": playback_status_url}},
         {"hangup": {}},
     ]}}
+
+
+def build_say_and_hangup_swml(message: str) -> dict:
+    """Tell the rep why their call was refused, then hang up (e.g. the recording lock)."""
+    return {"sections": {"main": [
+        {"play": {"url": "say:" + message}},
+        {"hangup": {}},
+    ]}}
+
+
+def build_signalwire_ringback_wait_swml(*, conference_name: str) -> dict:
+    """Park a person who answered after a voicemail hand-off for their original rep.
+
+    The rep's accepted offer joins this room (build_conference_join_swml) and starts
+    it; the room ends when the person leaves. Never plays the rep's recording.
+    """
+    if not conference_name.startswith("sysevo-ringback-"):
+        raise ValueError("invalid SignalWire ring-back conference name")
+    return {"sections": {"main": [
+        {"play": {"url": "say:This call may be recorded and monitored for quality assurance."}},
+        {"join_conference": {
+            "name": conference_name, "start_on_enter": False, "end_on_exit": True,
+        }},
+    ]}}

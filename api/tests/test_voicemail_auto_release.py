@@ -309,6 +309,17 @@ def _sw_env(monkeypatch):
     yield
 
 
+def _without_stage_writes(spawned: list) -> list:
+    """Background stage-evidence writes are not call control; drop them from counts."""
+    kept = []
+    for coro in spawned:
+        if getattr(coro, "__name__", "") == "_record_stages":
+            coro.close()
+        else:
+            kept.append(coro)
+    return kept
+
+
 _SESSION = "00000000-0000-0000-0000-000000000021"
 _SW_LEG = "00000000-0000-0000-0000-000000000022"
 
@@ -358,8 +369,9 @@ async def test_signalwire_auto_send_plays_and_schedules_the_reps_release(_sw_env
     assert body["sections"]["main"][0]["play"]["url"] == "https://db.example.com/m.wav"
     m["claim"].assert_awaited_once()
     m["winner"].assert_not_awaited()          # never bridged to the rep
-    assert len(spawned) == 1                  # the release runs straight after
-    spawned[0].close()
+    calls = _without_stage_writes(spawned)
+    assert len(calls) == 1                    # the release runs straight after
+    calls[0].close()
 
 
 @pytest.mark.asyncio
@@ -375,7 +387,7 @@ async def test_signalwire_auto_send_off_bridges_the_mailbox_with_a_machine_resul
     m["winner"].assert_awaited_once()
     m["claim"].assert_not_awaited()
     assert m["amd"].await_args.kwargs["amd_result"] == "machine_end_beep"
-    assert spawned == []
+    assert _without_stage_writes(spawned) == []
 
 
 @pytest.mark.asyncio
@@ -476,7 +488,7 @@ def test_signalwire_status_reports_a_bridged_mailbox_as_ready():
     with patch(f"{_SW}.signalwire_parallel_store.get_screened_single_for_rep",
                new=AsyncMock(return_value=_bridged_mailbox())) as lookup:
         body = _sw_app().get("/dialer/signalwire/voicemail-drop/browser-call").json()
-    assert body == {"state": "idle", "amd_result": "machine_end_other", "ready": True}
+    assert body == {"state": "idle", "amd_result": "machine_end_other", "ready": True, "stage": None, "stage_at": None}
     lookup.assert_awaited_once_with(rep_call_id="browser-call", rep_user_id=_REP)
 
 
@@ -501,8 +513,9 @@ def test_signalwire_one_tap_send_plays_on_the_prospect_leg_and_releases_the_rep(
                                    drop_id=_DROP, rep_user_id=_REP)
     assert update.await_args.kwargs["call_id"] == "prospect-call"
     assert update.await_args.kwargs["swml"]["sections"]["main"][0]["play"]["url"] == "https://db.example.com/m.wav"
-    assert len(spawned) == 1  # releases the rep and closes the session
-    spawned[0].close()
+    calls = _without_stage_writes(spawned)
+    assert len(calls) == 1  # releases the rep and closes the session
+    calls[0].close()
 
 
 def test_signalwire_one_tap_send_gives_the_line_back_when_signalwire_refuses():
