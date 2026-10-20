@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from pydantic import TypeAdapter
+
 from api.schemas.user_configuration import UserConfiguration
 from api.services.configuration.masking import contains_masked_key
 from api.services.configuration.registry import REGISTRY, ServiceType
@@ -114,6 +116,52 @@ def _canonical(value):
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def validate_provider_behavior_intent(service_type, value):
+    """Validate complete behavior without needing or retaining production keys."""
+    try:
+        if not isinstance(value, dict) or not isinstance(value.get("provider"), str):
+            raise _invalid("voice_test_provider_behavior_invalid")
+        model = _provider_class(service_type, value["provider"])
+        names = BEHAVIOR_FIELDS & set(model.model_fields)
+        if set(value) != {"provider"} | names:
+            raise _invalid("voice_test_provider_behavior_invalid")
+        result = {"provider": value["provider"]}
+        for name in names:
+            adapter = TypeAdapter(model.model_fields[name].rebuild_annotation())
+            item = adapter.validate_python(value[name], strict=True)
+            if isinstance(item, str) and (
+                not item or len(item) > 4096 or re.search(r"[\x00-\x1f\x7f]", item)
+                or "://" in item and not (
+                    name == "voice" and value["provider"] == "playht"
+                    and item.startswith("s3://voice-cloning-zero-shot/")
+                )
+            ):
+                raise _invalid("voice_test_provider_behavior_invalid")
+            result[name] = adapter.dump_python(item, mode="json")
+        if len(_canonical(result)) > 16384:
+            raise _invalid("voice_test_provider_behavior_invalid")
+        return result
+    except VoiceControlError:
+        raise
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+        raise _invalid("voice_test_provider_behavior_invalid") from None
+
+
+def provider_behavior_intent(service_type, source):
+    """Export only fields which may be copied into a private QA configuration."""
+    provider = getattr(source, "provider", None)
+    provider = getattr(provider, "value", provider)
+    if not isinstance(provider, str):
+        raise _invalid("voice_test_provider_behavior_invalid")
+    model = _provider_class(service_type, provider)
+    if type(source) is not model or getattr(source, "model_extra", None):
+        raise _invalid("voice_test_provider_behavior_invalid")
+    return validate_provider_behavior_intent(service_type, {
+        "provider": provider,
+        **{name: getattr(source, name) for name in BEHAVIOR_FIELDS & set(model.model_fields)},
+    })
 
 
 def _key(value):
@@ -455,6 +503,7 @@ def validate_private_voice_provider_plan(value):
                 BEHAVIOR_FIELDS & set(model.model_fields)
             ):
                 raise _invalid("voice_test_provider_plan_invalid")
+            validate_provider_behavior_intent(name, intent)
             binding = value["bindings"][name]
             if (
                 not isinstance(binding, dict)

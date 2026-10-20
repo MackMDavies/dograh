@@ -2,7 +2,7 @@
 
 import asyncio
 import os
-from typing import Annotated
+from typing import Annotated, Literal
 
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Path
@@ -17,6 +17,7 @@ from api.services.workflow.voice_test_control import (
     VoiceControlError,
     positive_int,
 )
+from api.services.workflow.voice_test_intent import capture_voice_provider_intent
 from api.services.workflow.voice_test_job import (
     VoiceJobContext,
     enqueue_voice_job,
@@ -36,6 +37,39 @@ class VoiceTestRequest(BaseModel):
     lease_token: str = Field(
         min_length=36, max_length=36, pattern=UUID_PATTERN, repr=False
     )
+
+
+class VoiceProviderIntentRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    workflow_version: int = Field(gt=0, le=2**53 - 1)
+    version_kind: Literal["draft", "published"]
+    runtime_workflow_hash: str = Field(min_length=64, max_length=64, pattern=r"^[0-9a-f]{64}$")
+
+
+@router.post("/{workflow_id}/test-voice/provider-intent")
+async def voice_provider_intent(
+    workflow_id: Annotated[int, Path(gt=0)],
+    request: VoiceProviderIntentRequest,
+    user: Annotated[UserModel, Depends(get_user)],
+    x_sysevo_secret: Annotated[str | None, Header(alias="x-sysevo-secret")] = None,
+):
+    secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, secret):
+        raise HTTPException(status_code=403, detail="Internal sandbox authorization required")
+    if not positive_int(user.selected_organization_id) or not positive_int(user.id):
+        raise HTTPException(status_code=400, detail="An authenticated organization is required")
+    try:
+        async with asyncio.timeout(VOICE_HTTP_DEADLINE_SECONDS):
+            return await capture_voice_provider_intent(
+                db_client, workflow_id=workflow_id,
+                organization_id=user.selected_organization_id,
+                workflow_version=request.workflow_version, version_kind=request.version_kind,
+                runtime_workflow_hash=request.runtime_workflow_hash, signing_secret=secret,
+            )
+    except VoiceControlError as exc:
+        raise HTTPException(status_code=exc.status_code or 409, detail=exc.code) from None
+    except Exception:  # noqa: BLE001 - never expose configuration or database errors
+        raise HTTPException(status_code=503, detail="voice_provider_intent_unavailable") from None
 
 
 @router.get("/test-voice/capabilities")

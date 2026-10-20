@@ -102,10 +102,10 @@ async def resolve_org_provider_config(
                 config_dict["voice"] = default_model.model_id
 
             setattr(effective, section_key, config_cls(**config_dict))
-        except Exception as exc:
+        except Exception:  # noqa: BLE001 - retain fallback without logging validation input
             logger.warning(
                 f"resolve_org_provider_config: failed to build config for "
-                f"{section_key}/{conn.provider}: {exc}"
+                f"{section_key}; validation input redacted"
             )
 
     return effective

@@ -23,7 +23,26 @@ async def resolve_pipeline_configuration(db, user_id, organization_id, model_ove
     return resolve_effective_config(config, overrides)
 
 
-async def resolve_pipeline_voice(db, config, model_overrides, organization_id, user_id):
+def apply_pipeline_call_configuration(config, workflow_configurations, call_context):
+    """Apply the existing Syra per-call rate before resolving the selected voice."""
+    if config.tts is None:
+        return config
+    from api.services.syra_voice import is_syra_voice_config, syra_speech_speed
+
+    if not is_syra_voice_config(workflow_configurations):
+        return config
+    speed = syra_speech_speed(call_context.get("syra_speech_speed"))
+    provider = getattr(config.tts.provider, "value", config.tts.provider)
+    if speed is None or provider != "elevenlabs":
+        return config
+    effective = config.model_copy(deep=True)
+    effective.tts = effective.tts.model_copy(update={"speed": speed})
+    return effective
+
+
+async def resolve_pipeline_voice(
+    db, config, model_overrides, organization_id, user_id, *, strict_scope=False
+):
     """Resolve the voice UUID with the existing live-call fallback rules."""
     if config.tts is None:
         return config
@@ -36,7 +55,26 @@ async def resolve_pipeline_voice(db, config, model_overrides, organization_id, u
         user = await db.get_user_by_id(user_id)
         if user:
             organization_id = user.selected_organization_id
-    voice = await resolve_voice_for_tts(voice_uuid, organization_id)
+    if strict_scope:
+        row = await db.get_voice_for_private_planning(voice_uuid, organization_id)
+        if row is None or not (
+            row.organization_id == organization_id
+            or row.is_public is True
+            and row.status == "ready"
+        ):
+            raise ValueError("voice_reference_unavailable")
+        if row.status != "ready":
+            raise ValueError("voice_reference_not_ready")
+        provider = getattr(config.tts.provider, "value", config.tts.provider)
+        if (
+            "elevenlabs" if row.provider == "dograh_clone" else row.provider
+        ) != provider:
+            raise ValueError("voice_provider_mismatch")
+        voice = row.provider_voice_id
+        if not isinstance(voice, str) or not voice.strip():
+            raise ValueError("voice_reference_unavailable")
+    else:
+        voice = await resolve_voice_for_tts(voice_uuid, organization_id)
     if not voice:
         return config
     effective = config.model_copy(deep=True)

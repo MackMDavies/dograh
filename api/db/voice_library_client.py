@@ -81,6 +81,25 @@ class VoiceLibraryClient(BaseDBClient):
             )
             return result.scalars().first()
 
+    async def get_voice_for_private_planning(
+        self, voice_uuid: str, organization_id: int
+    ) -> VoiceLibraryModel | None:
+        """Resolve an org voice or an explicitly public, ready library voice."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(VoiceLibraryModel).where(
+                    VoiceLibraryModel.uuid == voice_uuid,
+                    or_(
+                        VoiceLibraryModel.organization_id == organization_id,
+                        and_(
+                            VoiceLibraryModel.is_public == True,
+                            VoiceLibraryModel.status == "ready",
+                        ),
+                    ),
+                )
+            )
+            return result.scalars().first()
+
     async def get_voice_by_provider_id(
         self, provider_voice_id: str, organization_id: int
     ) -> Optional[VoiceLibraryModel]:

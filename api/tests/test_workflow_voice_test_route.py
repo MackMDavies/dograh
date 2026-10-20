@@ -27,6 +27,131 @@ def setup(monkeypatch):
     return TestClient(app), user, pool, enqueue
 
 
+def intent_request():
+    return {
+        "workflow_version": 3,
+        "version_kind": "published",
+        "runtime_workflow_hash": "a" * 64,
+    }
+
+
+@pytest.mark.parametrize("secret", [None, "wrong"])
+def test_provider_intent_requires_internal_authentication_before_configuration_reads(
+    monkeypatch, secret
+):
+    client, _, _, _ = setup(monkeypatch)
+    capture = AsyncMock()
+    monkeypatch.setattr(workflow_voice_test, "capture_voice_provider_intent", capture)
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json=intent_request(),
+        headers={"x-sysevo-secret": secret} if secret else {},
+    )
+    assert response.status_code == 403
+    capture.assert_not_awaited()
+
+
+def test_provider_intent_requires_user_authentication_and_uses_server_scope(
+    monkeypatch,
+):
+    client, _, pool, enqueue = setup(monkeypatch)
+    capture = AsyncMock(return_value={"configuration_hash": "b" * 64})
+    monkeypatch.setattr(workflow_voice_test, "capture_voice_provider_intent", capture)
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json=intent_request(),
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code == 200 and response.json() == {
+        "configuration_hash": "b" * 64
+    }
+    assert capture.await_args.kwargs == {
+        **intent_request(),
+        "workflow_id": 185,
+        "organization_id": 42,
+        "signing_secret": SECRET,
+    }
+    pool.assert_not_awaited()
+    enqueue.assert_not_awaited()
+    capture.reset_mock()
+    client.app.dependency_overrides.clear()
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json=intent_request(),
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code in {401, 403}
+    capture.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"organization_id": 99},
+        {"owner_user_id": 7},
+        {"url": "https://client.invalid"},
+        {"workflow_version": True},
+        {"workflow_version": 0},
+        {"workflow_version": "3"},
+        {"runtime_workflow_hash": "bad"},
+        {"version_kind": "active"},
+    ],
+)
+def test_provider_intent_rejects_untrusted_scope_or_unpinned_requests(
+    monkeypatch, extra
+):
+    client, _, _, _ = setup(monkeypatch)
+    capture = AsyncMock()
+    monkeypatch.setattr(workflow_voice_test, "capture_voice_provider_intent", capture)
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json={**intent_request(), **extra},
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code == 422
+    capture.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "error,expected",
+    [
+        (RuntimeError("private-provider-key"), 503),
+        (VoiceControlError("voice_workflow_not_found", 404), 404),
+    ],
+)
+def test_provider_intent_http_errors_are_redacted(monkeypatch, error, expected):
+    client, _, _, _ = setup(monkeypatch)
+    monkeypatch.setattr(
+        workflow_voice_test,
+        "capture_voice_provider_intent",
+        AsyncMock(side_effect=error),
+    )
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json=intent_request(),
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code == expected
+    assert "private-provider-key" not in response.text
+
+
+def test_provider_intent_deadline_is_bounded_and_redacted(monkeypatch):
+    client, _, _, _ = setup(monkeypatch)
+
+    async def blocked(*args, **kwargs):
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(workflow_voice_test, "capture_voice_provider_intent", blocked)
+    monkeypatch.setattr(workflow_voice_test, "VOICE_HTTP_DEADLINE_SECONDS", 0.001)
+    response = client.post(
+        "/workflow/185/test-voice/provider-intent",
+        json=intent_request(),
+        headers={"x-sysevo-secret": SECRET},
+    )
+    assert response.status_code == 503
+    assert response.json() == {"detail": "voice_provider_intent_unavailable"}
+
+
 @pytest.mark.parametrize("secret", [None, "wrong"])
 def test_voice_dispatch_requires_internal_secret_before_queue_access(
     monkeypatch, secret

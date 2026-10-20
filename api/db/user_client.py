@@ -82,11 +82,11 @@ class UserClient(BaseDBClient):
                         "last_validated_at": configuration_obj.last_validated_at,
                     }
                 )
-            except ValidationError as e:
+            except ValidationError:
                 # If configuration contains an unsupported provider,
                 # return a default configuration without failing
                 logger.warning(
-                    f"Failed to validate user configuration for user {user_id}: {e}. "
+                    f"Failed to validate user configuration for user {user_id}. "
                     "Returning default configuration."
                 )
                 return UserConfiguration()
