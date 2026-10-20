@@ -1,4 +1,5 @@
 class FunctionNames:
+    RUN_AGENT_TEST_VOICE = "run_agent_test_voice"
     RUN_INTEGRATIONS_POST_WORKFLOW_RUN = "run_integrations_post_workflow_run"
     PROCESS_WORKFLOW_COMPLETION = "process_workflow_completion"
     UPLOAD_VOICEMAIL_AUDIO_TO_S3 = "upload_voicemail_audio_to_s3"

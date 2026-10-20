@@ -6,15 +6,23 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
+from api.schemas.user_configuration import UserConfiguration
 from api.services.pipecat.audio_config import create_audio_config
 from api.services.pipecat.run_pipeline import _run_pipeline
 from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
 from api.services.workflow.test_sandbox_binding import make_sandbox_workflow_binding
+from api.services.workflow.voice_test_providers import (
+    seal_private_voice_provider_configuration,
+)
 from api.tests.integrations._run_pipeline_helpers import (
+    USER_CONFIGURATION,
     create_workflow_run_rows,
     patch_run_pipeline_externals,
 )
 from api.tests.integrations.test_run_pipeline import WORKFLOW_DEFINITION
+from api.tests.test_voice_test_providers import bindings, sign
+from api.tests.test_voice_test_providers import fixture as provider_fixture
 
 
 @pytest.mark.asyncio
@@ -36,6 +44,9 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
     monkeypatch.setenv("SYSEVO_MEMORY_SECRET", secret)
     marker = {
         "enabled": True,
+        "source": "agent_testing_engine",
+        "voice_session_id": "55555555-5555-4555-8555-555555555555",
+        "organization_id": workflow.organization_id,
         "agent_test_run_id": "11111111-1111-4111-8111-111111111111",
         "scenario_id": "private_audio",
     }
@@ -52,6 +63,14 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
         annotations={"sysevo_test_sandbox": marker},
         gathered_context={"mapped_call_disposition": "private-test-only"},
     )
+    run = await db_session.get_workflow_run_by_id(run.id)
+    packets = [
+        sign(provider_fixture(name, USER_CONFIGURATION[name]["provider"])[1], secret)
+        for name in ["llm", "stt", "tts"]
+    ]
+    envelope = seal_private_voice_provider_configuration(
+        UserConfiguration(**USER_CONFIGURATION), packets, secret, bindings(packets), run
+    )
     metadata_write = AsyncMock()
     monkeypatch.setattr(db_session, "add_call_disposition_code", metadata_write)
     supervisor = Mock()
@@ -60,6 +79,8 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
     )
     captured = []
     transport = SandboxAudioTransport(duration_limit=30)
+    observer = VoiceTurnObserver(transport.output())
+    transport.set_voice_observer(observer)
     with patch_run_pipeline_externals(captured):
         running = asyncio.create_task(
             _run_pipeline(
@@ -69,6 +90,8 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
                 user.id,
                 audio_config=create_audio_config("smallwebrtc"),
                 user_provider_id=user.provider_id,
+                expected_organization_id=workflow.organization_id,
+                private_voice_providers=envelope,
             )
         )
         try:
@@ -80,6 +103,7 @@ async def test_attested_audio_pipeline_finishes_without_tenant_metadata_or_super
                 running.result()
             assert captured, "Private voice pipeline never created its task"
             await asyncio.wait_for(captured[0]._pipeline_start_event.wait(), timeout=5)
+            await asyncio.wait_for(observer.ready.wait(), timeout=5)
             caller_audio = io.BytesIO()
             with wave.open(caller_audio, "wb") as fixture:
                 fixture.setnchannels(1)

@@ -9,6 +9,7 @@ from sqlalchemy.future import select
 from api.db.base_client import BaseDBClient
 from api.db.filters import apply_workflow_run_filters, get_workflow_run_order_clause
 from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.schemas.workflow import WorkflowRunResponseSchema
 
 
@@ -896,6 +897,7 @@ class CampaignClient(BaseDBClient):
         async with self.async_session() as session:
             conditions = [
                 WorkflowRunModel.is_completed.is_(True),
+                customer_visible_workflow_run(),
                 WorkflowRunModel.cost_info["call_duration_seconds"]
                 .as_string()
                 .isnot(None),

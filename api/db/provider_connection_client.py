@@ -372,9 +372,13 @@ async def _fetch_live_models(provider: str, service_type: str, api_key: Optional
 class ProviderConnectionClient(BaseDBClient):
 
     async def get_default_embedding_model_connection(
-        self, organization_id: int
-    ) -> Optional[tuple]:
-        """Return (api_key, model_id, base_url) for the org's default embedding model, or None."""
+        self, organization_id: int, *, include_metadata: bool = False
+    ) -> Optional[tuple | dict]:
+        """Resolve the default connection; private planning also needs its provenance.
+
+        The legacy tuple API is unchanged. The metadata path verifies the
+        connection's organization before reading any credentials.
+        """
         async with self.async_session() as session:
             model_result = await session.execute(
                 select(OrgAvailableModelModel).where(
@@ -393,7 +397,17 @@ class ProviderConnectionClient(BaseDBClient):
                 )
             )
             conn = conn_result.scalar_one_or_none()
+            if include_metadata and conn and conn.organization_id != organization_id:
+                raise ValueError("embedding_connection_scope_changed")
             if conn and conn.api_key:
+                if include_metadata:
+                    return {
+                        "api_key": conn.api_key,
+                        "model": model.model_id,
+                        "base_url": (conn.extra_config or {}).get("base_url"),
+                        "provider": conn.provider,
+                        "source": "org_default",
+                    }
                 return (
                     conn.api_key,
                     model.model_id,

@@ -210,13 +210,21 @@ class _CapturedOutput(BaseOutputTransport):
         super().__init__(params)
         self.owner = owner
 
+    async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+        if self.owner.voice_observer is not None:
+            self.owner.voice_observer.observe_output(frame, direction)
+        await super().push_frame(frame, direction)
+
     async def start(self, frame: StartFrame):
         await super().start(frame)
         await self.set_transport_ready(frame)
 
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         try:
-            self.owner.capture.append(frame, asyncio.get_running_loop().time())
+            at = asyncio.get_running_loop().time()
+            self.owner.capture.append(frame, at)
+            if self.owner.voice_observer is not None:
+                self.owner.voice_observer.record_audio(at, len(frame.audio))
         except ValueError as exc:
             self.owner.failure = str(exc)
             return False
@@ -242,6 +250,8 @@ class SandboxAudioTransport(BaseTransport):
         super().__init__()
         self.duration_limit = duration_limit
         self.failure: str | None = None
+        self.voice_observer = None
+        self.pipeline_task = None
         self.capture = AudioCapture(duration_limit)
         self._register_event_handler("on_client_connected")
         self._register_event_handler("on_client_disconnected")
@@ -261,6 +271,17 @@ class SandboxAudioTransport(BaseTransport):
 
     def output(self):
         return self._output
+
+    def set_voice_observer(self, observer):
+        if (
+            self.voice_observer is not None
+            or self._input.started.is_set()
+            or observer.output is not self._output
+        ):
+            raise ValueError(
+                "A private voice observer must bind once before the pipeline starts"
+            )
+        self.voice_observer = observer
 
     async def play_wav(self, encoded: bytes) -> None:
         await self._input.play(AudioFixture.from_wav(encoded))

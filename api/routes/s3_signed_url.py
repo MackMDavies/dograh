@@ -11,6 +11,7 @@ from api.db import db_client
 from api.enums import StorageBackend
 from api.services.auth.depends import get_user
 from api.services.storage import get_storage_for_backend, storage_fs
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
 
 
 class S3SignedUrlResponse(TypedDict):
@@ -135,6 +136,8 @@ async def _authorize_and_get_workflow_run(
         # Superusers: Use get_workflow_run_by_id (no user/org constraint needed)
         workflow_run = await db_client.get_workflow_run_by_id(run_id)
 
+    if workflow_run and is_sandbox_test_run(workflow_run):
+        raise HTTPException(status_code=404, detail="Workflow run not found")
     return workflow_run
 
 
