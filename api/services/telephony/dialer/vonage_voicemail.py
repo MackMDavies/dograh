@@ -233,7 +233,7 @@ async def get_call(dialer_call_id: str) -> dict | None:
                         "parent_call_sid,child_call_sid,rep_user_id,entry_id,provider,from_number,"
                         "to_number,status,ended_at,amd_result,manual_voicemail_requested_at,"
                         "voicemail_drop_started_at,auto_voicemail_sent,voicemail_drop_id,"
-                        "voicemail_drop_failed_at,voicemail_drop_failure"
+                        "voicemail_drop_failed_at,voicemail_drop_failure,created_at"
                     ),
                     "parent_call_sid": f"eq.{dialer_call_id}",
                     "provider": f"eq.{PROVIDER}",

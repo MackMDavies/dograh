@@ -37,6 +37,7 @@ def _row(**overrides):
         "manual_voicemail_requested_at": None, "voicemail_drop_started_at": None,
         "auto_voicemail_sent": False, "voicemail_drop_id": None,
         "voicemail_drop_failed_at": None, "voicemail_drop_failure": None,
+        "created_at": datetime.now(UTC).isoformat(),
     }
     row.update(overrides)
     return row
@@ -179,11 +180,35 @@ def test_answer_post_json_is_also_accepted(client):
     assert connect["eventUrl"]
 
 
-def test_answer_for_a_mismatched_history_row_keeps_the_plain_connect(client):
+def _refused(response):
+    assert response.status_code == 200
+    ncco = response.json()
+    return len(ncco) == 1 and ncco[0]["action"] == "talk" and "connect" not in {a["action"] for a in ncco}
+
+
+def test_answer_for_a_mismatched_history_row_is_not_dialled(client):
     with patch(f"{_VM}.get_call", new=AsyncMock(return_value=_row(child_call_sid=None, to_number="+14155559999"))):
         response = client.get("/api/v1/telephony/vonage/dialer/answer", params=_answer_payload())
-    assert response.status_code == 200
-    assert set(response.json()[0]) == {"action", "from", "endpoint"}
+    assert _refused(response)
+
+
+def test_answer_cannot_choose_a_different_caller_id(client):
+    with patch(f"{_VM}.get_call", new=AsyncMock(return_value=_row(child_call_sid=None))):
+        response = client.get("/api/v1/telephony/vonage/dialer/answer", params=_answer_payload(**{"from": "+14155550199"}))
+    assert _refused(response)
+
+
+def test_answer_without_a_started_call_is_not_dialled(client):
+    with patch(f"{_VM}.get_call", new=AsyncMock(return_value=None)):
+        response = client.get("/api/v1/telephony/vonage/dialer/answer", params=_answer_payload())
+    assert _refused(response)
+
+
+def test_answer_for_a_stale_call_is_not_dialled(client):
+    old = (datetime.now(UTC) - timedelta(minutes=30)).isoformat()
+    with patch(f"{_VM}.get_call", new=AsyncMock(return_value=_row(child_call_sid=None, created_at=old))):
+        response = client.get("/api/v1/telephony/vonage/dialer/answer", params=_answer_payload())
+    assert _refused(response)
 
 
 # ─────────────────────────────── leg events ───────────────────────────────

@@ -1806,6 +1806,13 @@ async def handle_dialer_conference_join(
         evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
         if evidence.get("rep_detached_at"):
             logger.info(f"Rep detached before {parent_call_sid} answered ({answered_by or 'no AMD'}); ending the leg")
+            if not answered_by.startswith("machine") and answered_by != "fax":
+                # A person picked up after the rep handed the line over and moved on.
+                # Record it so the rep's background status says "call them back"
+                # rather than "no mailbox", and the call row shows what happened.
+                await record_voicemail_playback_failure(
+                    parent_call_sid=parent_call_sid, reason="person_answered",
+                )
             return HTMLResponse(content=hangup, media_type="application/xml")
 
     known_machine_answers = {

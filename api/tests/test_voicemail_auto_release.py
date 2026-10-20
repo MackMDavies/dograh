@@ -589,9 +589,22 @@ def test_twilio_queued_press_then_a_person_is_never_bridged_into_an_empty_room()
     with patch(f"{_PATH}.update_dialer_call_child_sid", new=AsyncMock()), \
          patch(f"{_PATH}.update_dialer_call_amd_result", new=AsyncMock(return_value=True)), \
          patch(f"{_PATH}.record_twilio_amd_decision", new=AsyncMock()), \
-         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={"rep_detached_at": "x"})):
+         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={"rep_detached_at": "x"})), \
+         patch(f"{_PATH}.record_voicemail_playback_failure", new=AsyncMock(return_value=True)) as failed:
         response = _join("human")
     assert "<Hangup/>" in response.text and "<Play>" not in response.text and "<Conference" not in response.text
+    # The rep's background status must say "call them back", not "no mailbox".
+    failed.assert_awaited_once_with(parent_call_sid=_PARENT, reason="person_answered")
+
+
+def test_twilio_queued_press_then_unplayable_machine_is_not_reported_as_a_person():
+    with patch(f"{_PATH}.update_dialer_call_child_sid", new=AsyncMock()), \
+         patch(f"{_PATH}.update_dialer_call_amd_result", new=AsyncMock(return_value=True)), \
+         patch(f"{_PATH}.record_twilio_amd_decision", new=AsyncMock()), \
+         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={"rep_detached_at": "x"})), \
+         patch(f"{_PATH}.record_voicemail_playback_failure", new=AsyncMock(return_value=True)) as failed:
+        _join("fax")
+    failed.assert_not_awaited()
 
 
 def test_twilio_press_on_a_detected_mailbox_plays_now_and_releases_the_rep():
@@ -711,3 +724,16 @@ async def test_signalwire_rep_leaving_after_queuing_does_not_cancel_the_line():
         await signalwire_routes._abandon_signalwire_batch_after_rep_left(session_id=_SESSION)
     finish.assert_not_awaited()
     cancel.assert_not_awaited()
+
+
+def test_signalwire_status_says_a_person_answered_after_the_rep_left():
+    from api.services.telephony.dialer.signalwire_routes import _signalwire_drop_state
+    found = {
+        "session": {"winner_leg_id": None},
+        "leg": {"id": "leg-1", "status": "completed", "amd_result": "human",
+                "manual_voicemail_requested_at": "2026-10-20T00:00:00Z"},
+    }
+    state = _signalwire_drop_state(found)
+    assert state["state"] == "rejected" and state["failure"] == "person_answered"
+    no_answer = {**found, "leg": {**found["leg"], "amd_result": None}}
+    assert "failure" not in _signalwire_drop_state(no_answer)

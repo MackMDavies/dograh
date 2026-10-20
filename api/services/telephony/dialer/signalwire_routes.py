@@ -1285,6 +1285,9 @@ def _signalwire_drop_state(found: dict) -> dict:
     }
     if state == "failed":
         result["failure"] = "playback_incomplete"
+    elif state == "rejected" and leg.get("amd_result") in {"human", "unknown"}:
+        # A person picked up after the rep handed the line over and moved on.
+        result["failure"] = "person_answered"
     return result
 
 

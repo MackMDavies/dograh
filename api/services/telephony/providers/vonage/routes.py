@@ -7,6 +7,7 @@ provider registry — see ProviderSpec.router.
 import json
 import os
 import re
+from datetime import UTC, datetime, timedelta
 from typing import Literal, Optional
 from uuid import UUID
 
@@ -96,6 +97,16 @@ async def _telephony_root() -> str:
     return f"{backend_endpoint.rstrip('/')}/api/v1/telephony"
 
 
+def _parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=UTC)
+
+
 @router.api_route("/vonage/dialer/answer", methods=["GET", "POST"], include_in_schema=False)
 async def handle_dialer_answer(request: Request):
     """Return the NCCO for a rep's Vonage Client SDK PSTN call.
@@ -120,6 +131,23 @@ async def handle_dialer_answer(request: Request):
         raise HTTPException(status_code=422, detail="Vonage call destination is invalid.")
     if not re.fullmatch(r"\+?[1-9]\d{7,14}", from_number):
         raise HTTPException(status_code=422, detail="Vonage caller ID is invalid.")
+    # Only dial a call the dialer started: /dialer/vonage/calls/start checked the rep's
+    # assigned Vonage number, the do-not-call lists and calling hours, and recorded the
+    # caller ID it allowed. The browser's custom data can't choose another caller ID
+    # or skip those checks.
+    row = await vonage_voicemail.get_call(str(custom_data.get("dialer_call_id") or ""))
+    started = _parse_time((row or {}).get("created_at"))
+    if (
+        not row
+        or row.get("ended_at")
+        or row.get("child_call_sid")
+        or vonage_voicemail.normalize_e164(row.get("to_number")) != vonage_voicemail.normalize_e164(to_number)
+        or vonage_voicemail.normalize_e164(row.get("from_number")) != vonage_voicemail.normalize_e164(from_number)
+        or started is None
+        or datetime.now(UTC) - started > timedelta(minutes=10)
+    ):
+        logger.warning("Refused a Vonage dialer answer that does not match a call the dialer started")
+        return [{"action": "talk", "text": "This call could not be verified. Please dial again from the Sysevo dialer."}]
     connect = {
         "action": "connect",
         "from": from_number.removeprefix("+"),
