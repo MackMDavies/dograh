@@ -74,6 +74,7 @@ async def test_resolve_org_does_not_overwrite_existing_section():
 
     with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
         mock_db.list_connections = AsyncMock(return_value=[])
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
         mock_db.list_available_models = AsyncMock(return_value=[])
 
         result = await resolve_org_provider_config(42, base)
@@ -98,6 +99,7 @@ async def test_resolve_org_fills_stt_section():
 
     with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
         mock_db.list_connections = AsyncMock(side_effect=_list_connections)
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
         mock_db.list_available_models = AsyncMock(return_value=[stt_model])
 
         result = await resolve_org_provider_config(42, base)
@@ -119,10 +121,42 @@ async def test_enrich_fills_missing_api_key_from_org_connection():
 
     with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
         mock_db.get_connection_by_provider = AsyncMock(return_value=conn)
+        mock_db.list_connections = AsyncMock(return_value=[])
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
 
         result = await enrich_overrides_with_org_api_keys(overrides, 42)
 
     assert result["llm"]["api_key"] == "sk-org-llm"
+
+
+@pytest.mark.asyncio
+async def test_enrich_realtime_reuses_elevenlabs_tts_connection_key():
+    """Realtime can use the account key from an existing ElevenLabs TTS connection."""
+    from api.services.configuration.org_provider_resolver import enrich_overrides_with_org_api_keys
+
+    overrides = {
+        "realtime": {
+            "provider": "elevenlabs_realtime",
+            "model": "eleven_realtime_v1_max",
+        }
+    }
+    tts_conn = _make_conn("elevenlabs", "tts", "el-org-key")
+
+    async def _get_connection(_org_id, service_type, provider):
+        if (service_type, provider) == ("tts", "elevenlabs"):
+            return tts_conn
+        return None
+
+    with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
+        mock_db.get_connection_by_provider = AsyncMock(side_effect=_get_connection)
+        mock_db.list_connections = AsyncMock(return_value=[tts_conn])
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
+
+        result = await enrich_overrides_with_org_api_keys(overrides, 42)
+
+    assert result["realtime"]["api_key"] == "el-org-key"
+    assert result["realtime"]["provider"] == "elevenlabs_realtime"
+    assert result["realtime"]["model"] == "eleven_realtime_v1_max"
 
 
 @pytest.mark.asyncio
@@ -133,11 +167,13 @@ async def test_enrich_does_not_overwrite_existing_api_key():
     overrides = {"llm": {"provider": "openai", "model": "gpt-4.1", "api_key": "sk-already-set"}}
 
     with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
-        mock_db.get_connection_by_provider = AsyncMock()
+        mock_db.get_connection_by_provider = AsyncMock(return_value=None)
+        mock_db.list_connections = AsyncMock(return_value=[])
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
 
         result = await enrich_overrides_with_org_api_keys(overrides, 42)
 
-    mock_db.get_connection_by_provider.assert_not_called()
+    mock_db.get_connection_by_provider.assert_awaited_once_with(42, "llm", "openai")
     assert result["llm"]["api_key"] == "sk-already-set"
 
 
@@ -165,6 +201,7 @@ async def test_resolve_voice_returns_none_when_not_found():
 
     with patch("api.services.configuration.org_provider_resolver.db_client") as mock_db:
         mock_db.get_voice_by_uuid = AsyncMock(return_value=None)
+        mock_db.get_voice_by_uuid_any_org = AsyncMock(return_value=None)
 
         result = await resolve_voice_for_tts("nonexistent", 42)
 

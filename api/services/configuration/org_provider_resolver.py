@@ -222,28 +222,46 @@ async def enrich_overrides_with_org_api_keys(
         if has_real_credentials:
             continue
 
-        conn = await db_client.get_connection_by_provider(
-            organization_id, service_type_str, provider
-        )
-        if conn is None or not conn.api_key:
-            # Fallback 1: search all service types for the same provider within the org.
-            # Many providers (xAI, OpenAI, etc.) use one API key across all services,
-            # so if the TTS connection lacks a key but the LLM connection has one, use it.
+        # ElevenLabs uses one account API key for TTS and Realtime. Older
+        # workspaces may have only an `elevenlabs` TTS connection, so reuse that
+        # credential without changing the selected Realtime provider or model.
+        connection_candidates = [(service_type_str, provider)]
+        if service_type_str == "realtime" and provider == "elevenlabs_realtime":
+            connection_candidates.append(("tts", "elevenlabs"))
+
+        conn = None
+        for candidate_service, candidate_provider in connection_candidates:
+            candidate = await db_client.get_connection_by_provider(
+                organization_id, candidate_service, candidate_provider
+            )
+            if candidate and candidate.api_key:
+                conn = candidate
+                break
+
+        if conn is None:
             all_conns = await db_client.list_connections(organization_id)
             conn = next(
-                (c for c in all_conns if c.provider == provider and c.api_key),
-                conn,
+                (
+                    c for candidate_provider in (p for _, p in connection_candidates)
+                    for c in all_conns
+                    if c.provider == candidate_provider and c.api_key
+                ),
+                None,
             )
 
-        if conn is None or not conn.api_key:
+        if conn is None:
             # Fallback 2: platform-level — the org has no connection for this provider
             # at all, so search across every org (e.g. admin org holds the keys).
             # Use conn as the default so we keep the original connection's extra_config
             # (e.g. Google service-account JSON stored in extra_config["credentials"]).
             all_org_conns = await db_client.list_all_connections_superuser()
             conn = next(
-                (c for c in all_org_conns if c.provider == provider and c.api_key),
-                conn,
+                (
+                    c for candidate_provider in (p for _, p in connection_candidates)
+                    for c in all_org_conns
+                    if c.provider == candidate_provider and c.api_key
+                ),
+                None,
             )
 
         if conn is None:
