@@ -63,6 +63,7 @@ class ServiceProviders(str, Enum):
     MINIMAX = "minimax"
     GOOGLE_VERTEX = "google_vertex"
     OPENAI_REALTIME = "openai_realtime"
+    ELEVENLABS_REALTIME = "elevenlabs_realtime"
     GROK_REALTIME = "grok_realtime"
     ULTRAVOX_REALTIME = "ultravox_realtime"
     GOOGLE_REALTIME = "google_realtime"
@@ -104,6 +105,7 @@ class BaseServiceConfiguration(BaseModel):
         ServiceProviders.MINIMAX,
         ServiceProviders.GOOGLE_VERTEX,
         ServiceProviders.OPENAI_REALTIME,
+        ServiceProviders.ELEVENLABS_REALTIME,
         ServiceProviders.GROK_REALTIME,
         ServiceProviders.ULTRAVOX_REALTIME,
         ServiceProviders.GOOGLE_REALTIME,
@@ -252,6 +254,11 @@ DOGRAH_PROVIDER_MODEL_CONFIG = provider_model_config("Dograh")
 AWS_BEDROCK_PROVIDER_MODEL_CONFIG = provider_model_config("AWS Bedrock")
 GOOGLE_VERTEX_PROVIDER_MODEL_CONFIG = provider_model_config("Google Vertex")
 OPENAI_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("OpenAI Realtime")
+ELEVENLABS_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config(
+    "ElevenLabs Realtime",
+    description="ElevenLabs low-latency speech-to-speech models.",
+    provider_docs_url="https://elevenlabs.io/docs/eleven-agents/customization/realtime-models",
+)
 GROK_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("Grok Realtime")
 ULTRAVOX_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("Ultravox Realtime")
 GOOGLE_REALTIME_PROVIDER_MODEL_CONFIG = provider_model_config("Google Realtime")
@@ -765,6 +772,11 @@ OPENAI_REALTIME_VOICES = [
     "verse",
 ]
 
+ELEVENLABS_REALTIME_MODELS = [
+    "eleven_realtime_v1_mini",
+    "eleven_realtime_v1_max",
+]
+
 
 @register_service(ServiceType.REALTIME)
 class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
@@ -787,6 +799,27 @@ class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
             "examples": OPENAI_REALTIME_VOICES,
             "allow_custom_input": True,
         },
+    )
+
+
+@register_service(ServiceType.REALTIME)
+class ElevenLabsRealtimeConfiguration(BaseLLMConfiguration):
+    model_config = ELEVENLABS_REALTIME_PROVIDER_MODEL_CONFIG
+    provider: Literal[ServiceProviders.ELEVENLABS_REALTIME] = (
+        ServiceProviders.ELEVENLABS_REALTIME
+    )
+    model: str = Field(
+        default="eleven_realtime_v1_mini",
+        description="ElevenLabs Realtime speech-to-speech model.",
+        json_schema_extra={
+            "examples": ELEVENLABS_REALTIME_MODELS,
+            "allow_custom_input": True,
+        },
+    )
+    voice: str = Field(
+        default="brian",
+        description="ElevenLabs voice name or voice ID.",
+        json_schema_extra={"allow_custom_input": True},
     )
 
 
@@ -923,6 +956,7 @@ class GoogleVertexRealtimeLLMConfiguration(BaseLLMConfiguration):
 
 REALTIME_PROVIDERS = {
     ServiceProviders.OPENAI_REALTIME.value,
+    ServiceProviders.ELEVENLABS_REALTIME.value,
     ServiceProviders.GROK_REALTIME.value,
     ServiceProviders.ULTRAVOX_REALTIME.value,
     ServiceProviders.GOOGLE_REALTIME.value,
@@ -956,6 +990,7 @@ LLMConfig = Annotated[
 RealtimeConfig = Annotated[
     Union[
         OpenAIRealtimeLLMConfiguration,
+        ElevenLabsRealtimeConfiguration,
         GrokRealtimeLLMConfiguration,
         UltravoxRealtimeLLMConfiguration,
         GoogleRealtimeLLMConfiguration,

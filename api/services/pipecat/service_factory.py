@@ -1168,6 +1168,33 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
                 ),
             ),
         )
+    elif provider == ServiceProviders.ELEVENLABS_REALTIME.value:
+        from api.services.pipecat.realtime.elevenlabs_realtime import (
+            DograhElevenLabsRealtimeLLMService,
+        )
+        from pipecat.services.openai.realtime.events import (
+            AudioConfiguration,
+            AudioInput,
+            AudioOutput,
+            InputAudioTranscription,
+            SessionProperties,
+        )
+
+        return DograhElevenLabsRealtimeLLMService(
+            api_key=api_key,
+            base_url="wss://api.elevenlabs.io/v1/convai/realtime",
+            settings=DograhElevenLabsRealtimeLLMService.Settings(
+                model=model,
+                session_properties=SessionProperties(
+                    audio=AudioConfiguration(
+                        input=AudioInput(
+                            transcription=InputAudioTranscription(),
+                        ),
+                        output=AudioOutput(voice=voice or "brian"),
+                    ),
+                ),
+            ),
+        )
     elif provider == ServiceProviders.GROK_REALTIME.value:
         from api.services.pipecat.realtime.grok_realtime import (
             DograhGrokRealtimeLLMService,
