@@ -69,6 +69,8 @@ from api.services.telephony.dialer import signalwire_call_sorter
 from api.services.telephony.dialer.compliance import (
     calling_hours_allowed,
     calling_hours_result,
+    dial_block_message,
+    rep_overrides_hours,
     phone_block_reason,
 )
 from api.services.telephony.dialer.live_transcribe import LiveTranscriber
@@ -2461,11 +2463,17 @@ async def handle_sw_dialer_connect(request: Request):
             block_reason = await phone_block_reason(lead_number)
             if block_reason:
                 logger.warning(f"SignalWire outbound call blocked by server suppression check ({block_reason})")
-                return _swml(build_hangup_swml())
+                return _swml(build_say_and_hangup_swml(dial_block_message(block_reason)))
             allowed, reason, phone_us_state = await calling_hours_result(lead_number, entry_id)
+            if not allowed and rep_overrides_hours(reason, _extract(payload, query, ("HoursOverride", "hours_override"))):
+                logger.warning(
+                    f"SignalWire: rep chose Call anyway past the calling-hours check ({reason}) "
+                    f"for {call_id} by {rep_user_id}"
+                )
+                allowed = True
             if not allowed:
                 logger.warning(f"SignalWire outbound call blocked by calling-hours check ({reason})")
-                return _swml(build_hangup_swml())
+                return _swml(build_say_and_hangup_swml(dial_block_message(reason)))
             if not await create_dialer_call(
                 parent_call_sid=call_id,
                 rep_user_id=rep_user_id,

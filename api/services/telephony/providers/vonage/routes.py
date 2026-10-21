@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer import call_stages, vonage_voicemail
-from api.services.telephony.dialer.compliance import calling_hours_result, phone_block_reason
+from api.services.telephony.dialer.compliance import calling_hours_result, phone_block_reason, rep_overrides_hours
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
@@ -230,6 +230,8 @@ class VonageDialerCallStartRequest(BaseModel):
     call_id: UUID
     to_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
     entry_id: UUID | None = None
+    # The rep confirmed "Call anyway" on the calling-hours warning.
+    hours_override: bool = False
 
 
 class VonageDialerCallStatusRequest(BaseModel):
@@ -264,6 +266,9 @@ async def start_vonage_dialer_call(
     allowed, reason, phone_us_state = await calling_hours_result(
         body.to_number, str(body.entry_id) if body.entry_id else None
     )
+    if not allowed and rep_overrides_hours(reason, body.hours_override):
+        logger.warning(f"Vonage: rep chose Call anyway past the calling-hours check ({reason}) by {user.provider_id}")
+        allowed = True
     if not allowed:
         raise HTTPException(status_code=403, detail=f"Call blocked by calling-hours check ({reason}).")
     if await call_stages.voicemail_recording_required(str(user.provider_id)):

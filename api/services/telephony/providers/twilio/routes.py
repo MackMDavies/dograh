@@ -38,7 +38,9 @@ from api.services.telephony.dialer.inbound_call_log import (
     record_overflow_join,
 )
 from api.services.telephony.dialer.compliance import (
+    dial_block_message,
     phone_block_reason,
+    rep_overrides_hours,
 )
 from api.services.telephony.dialer.provider import (
     UnknownDialerProvider,
@@ -143,6 +145,13 @@ def _parallel_refusal_twiml(message: str) -> str:
         + escape(message)
         + "</Say><Hangup/></Response>"
     )
+
+
+
+def _dial_block_twiml(reason: str | None) -> str:
+    """Tell the rep why a single dial was refused, then hang up (a bare <Hangup/> made the
+    browser phone show "ConnectionError 31005", which reads like a carrier fault)."""
+    return _parallel_refusal_twiml(dial_block_message(reason))
 
 
 def _parallel_batch_has_settled(legs: list[dict]) -> bool:
@@ -1171,7 +1180,12 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
         logger.error(
             "voice-connect missing To number, a resolvable default caller id, or CallSid"
         )
-        return HTMLResponse(content=hangup, media_type="application/xml")
+        return HTMLResponse(
+            content=_parallel_refusal_twiml(
+                "No caller ID number is set up for this line, so the call was not placed. Ask your admin to assign one."
+            ),
+            media_type="application/xml",
+        )
 
     if parallel_requested:
         candidate_numbers = await dialer_parallel.candidate_phones(parallel_entry_ids)
@@ -1226,15 +1240,21 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
             logger.warning(
                 f"voice-connect blocked outbound dial by server compliance check ({block_reason})"
             )
-            return HTMLResponse(content=hangup, media_type="application/xml")
+            return HTMLResponse(content=_dial_block_twiml(block_reason), media_type="application/xml")
         allowed, reason, phone_us_state = await check_dialer_calling_hours_with_state(
             to_number, entry_id
         )
+        if not allowed and rep_overrides_hours(reason, form_data.get("HoursOverride")):
+            logger.warning(
+                f"voice-connect: rep chose Call anyway past the calling-hours check ({reason}) "
+                f"for {parent_call_sid} by {raw_from}"
+            )
+            allowed = True
         if not allowed:
             logger.warning(
                 f"voice-connect blocked outbound dial by calling-hours check ({reason})"
             )
-            return HTMLResponse(content=hangup, media_type="application/xml")
+            return HTMLResponse(content=_dial_block_twiml(reason), media_type="application/xml")
 
     rep_id = _parse_rep_id_from_identity(raw_from)
     team_voicemail_policy: dict[str, Any] | None = None

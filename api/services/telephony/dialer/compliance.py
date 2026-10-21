@@ -67,3 +67,30 @@ async def calling_hours_allowed(phone: str, entry_id: str | None = None) -> tupl
     """Compatibility wrapper for callers that need only allow/block."""
     allowed, reason, _state = await calling_hours_result(phone, entry_id)
     return allowed, reason
+
+
+# The rep saw the calling-hours warning and chose "Call anyway". Only the time-of-day
+# reasons can be overridden; the do-not-call register and lead/account mismatches never.
+HOURS_OVERRIDE_REASONS = frozenset({"outside_calling_hours", "public_holiday", "timezone_unavailable"})
+
+
+def rep_overrides_hours(reason: str | None, override_flag: object) -> bool:
+    """True when a refused dial may go ahead because the rep confirmed it."""
+    confirmed = str(override_flag or "").strip().lower() in {"1", "true", "yes"}
+    return confirmed and str(reason or "") in HOURS_OVERRIDE_REASONS
+
+
+# What the rep hears when the server refuses a single dial.
+_DIAL_BLOCK_MESSAGES = {
+    "do_not_call": "This number is on the do not call list. The call was not placed.",
+    "outside_calling_hours": "This lead is outside calling hours right now. The call was not placed.",
+    "public_holiday": "It is a public holiday where this lead is. The call was not placed.",
+    "timezone_unavailable": "This lead's time zone could not be confirmed, so the call was not placed.",
+    "compliance_unavailable": "The calling hours check is unavailable right now. Please try again in a minute.",
+}
+
+
+def dial_block_message(reason: str | None) -> str:
+    return _DIAL_BLOCK_MESSAGES.get(
+        str(reason or ""), "This call could not be placed. Please check the lead and try again."
+    )

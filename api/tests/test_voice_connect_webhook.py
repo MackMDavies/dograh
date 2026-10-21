@@ -630,9 +630,60 @@ def test_voice_connect_blocks_outside_calling_hours_before_creating_or_originati
 
     assert response.status_code == 200
     assert "<Hangup/>" in response.text
+    # The rep hears why instead of the browser phone's bare "ConnectionError 31005".
+    assert "outside calling hours" in response.text
     hours_check.assert_awaited_once_with("+15559876543", "entry-123")
     create_call.assert_not_awaited()
     originate.assert_not_awaited()
+
+
+def test_voice_connect_call_anyway_overrides_calling_hours_but_not_do_not_call(monkeypatch):
+    """The rep confirmed "Call anyway": time-of-day reasons give way, the DNC register never."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    monkeypatch.setenv("SYSEVO_TWILIO_DEFAULT_CALLER_ID", "+15551234567")
+    client = TestClient(_make_test_app())
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.check_dialer_calling_hours_with_state",
+        return_value=(False, "outside_calling_hours", "CA"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_phone_block_reason", return_value=None,
+    ):
+        refused = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "CallSid": _LISTEN_SID, "EntryId": "entry-123", "HoursOverride": "1"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+    # Past the calling-hours gate: the next refusal is the unresolved identity, not the hours.
+    assert "outside calling hours" not in refused.text
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate", return_value=True
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.get_dialer_phone_block_reason", return_value="do_not_call",
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.check_dialer_calling_hours_with_state",
+    ) as hours_check:
+        dnc = client.post(
+            "/voice-connect",
+            data={"To": "+15559876543", "CallSid": _LISTEN_SID, "EntryId": "entry-123", "HoursOverride": "1"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+    assert "do not call list" in dnc.text and "<Hangup/>" in dnc.text
+    hours_check.assert_not_awaited()
+
+
+def test_rep_overrides_hours_only_for_time_of_day_reasons():
+    from api.services.telephony.dialer.compliance import rep_overrides_hours
+
+    assert rep_overrides_hours("outside_calling_hours", "1")
+    assert rep_overrides_hours("public_holiday", "true")
+    assert rep_overrides_hours("timezone_unavailable", True)
+    assert not rep_overrides_hours("outside_calling_hours", "")
+    assert not rep_overrides_hours("do_not_call", "1")
+    assert not rep_overrides_hours("lead_phone_mismatch", "1")
+    assert not rep_overrides_hours("compliance_unavailable", "1")
 
 
 def test_voice_connect_blocks_parallel_batch_if_any_number_is_outside_hours(monkeypatch):

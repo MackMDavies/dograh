@@ -545,7 +545,10 @@ async def test_signalwire_outbound_blocks_suppressed_number_before_call_record(c
         _authed({"params": {"lead": "+15559876543", "identity": "client:rep-9", "call_id": "blocked"}})
     )
 
-    assert _payload_of(response) == {"sections": {"main": [{"hangup": {}}]}}
+    assert _payload_of(response) == {"sections": {"main": [
+        {"play": {"url": "say:This number is on the do not call list. The call was not placed."}},
+        {"hangup": {}},
+    ]}}
     connect_deps["create"].assert_not_awaited()
 
 
@@ -558,7 +561,33 @@ async def test_signalwire_outbound_blocks_outside_calling_hours_before_call_reco
         _authed({"params": {"lead": "+15559876543", "identity": "client:rep-9", "call_id": "blocked-hours"}})
     )
 
-    assert _is_hangup(_payload_of(response))
+    assert _payload_of(response) == {"sections": {"main": [
+        {"play": {"url": "say:This lead is outside calling hours right now. The call was not placed."}},
+        {"hangup": {}},
+    ]}}
+    connect_deps["create"].assert_not_awaited()
+
+
+async def test_signalwire_call_anyway_dials_past_calling_hours(connect_deps, monkeypatch):
+    monkeypatch.setattr(
+        _MODULE + ".calling_hours_result",
+        AsyncMock(return_value=(False, "outside_calling_hours", "CA")),
+    )
+    await handle_sw_dialer_connect(_authed({"params": {
+        "lead": "+15559876543", "identity": "client:rep-9", "call_id": "override-hours",
+        "HoursOverride": "1",
+    }}))
+
+    connect_deps["create"].assert_awaited_once()
+
+
+async def test_signalwire_call_anyway_never_overrides_do_not_call(connect_deps, monkeypatch):
+    monkeypatch.setattr(_MODULE + ".phone_block_reason", AsyncMock(return_value="do_not_call"))
+    await handle_sw_dialer_connect(_authed({"params": {
+        "lead": "+15559876543", "identity": "client:rep-9", "call_id": "override-dnc",
+        "HoursOverride": "1",
+    }}))
+
     connect_deps["create"].assert_not_awaited()
 
 
