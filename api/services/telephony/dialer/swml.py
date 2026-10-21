@@ -39,6 +39,7 @@ def build_dialer_swml(
     call_state_webhook: str = "",
     connect_status_webhook: str = "",
     tap_websocket: str = "",
+    ring_timeout_seconds: int = 60,
 ) -> dict:
     """Record the call, then bridge the rep to the lead.
 
@@ -78,7 +79,7 @@ def build_dialer_swml(
         # RING timeout only. It bounds how long we wait for an answer and has no
         # bearing on how long the conversation may run -- worth stating, because it
         # was the first thing suspected when reps reported being cut off mid-call.
-        "timeout": 60,
+        "timeout": max(5, min(120, int(ring_timeout_seconds or 60))),
         # How long the CONVERSATION may run, stated rather than inherited.
         #
         # A rep on a good call can be on it for half an hour, and the requirement is

@@ -488,7 +488,7 @@ def test_signalwire_status_reports_a_bridged_mailbox_as_ready():
     with patch(f"{_SW}.signalwire_parallel_store.get_screened_single_for_rep",
                new=AsyncMock(return_value=_bridged_mailbox())) as lookup:
         body = _sw_app().get("/dialer/signalwire/voicemail-drop/browser-call").json()
-    assert body == {"state": "idle", "amd_result": "machine_end_other", "ready": True, "stage": None, "stage_at": None}
+    assert body == {"state": "idle", "amd_result": "machine_end_other", "ready": True, "stage": None, "stage_at": None, "stage_detail": {}}
     lookup.assert_awaited_once_with(rep_call_id="browser-call", rep_user_id=_REP)
 
 

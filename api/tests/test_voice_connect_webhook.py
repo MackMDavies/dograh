@@ -46,6 +46,21 @@ def test_parallel_batch_waits_for_voicemail_playback_and_live_lines():
     assert _parallel_batch_has_settled([{"status": "voicemail", "auto_voicemail_sent": True}]) is True
 
 
+# A resolvable dialer rep: voice-connect refuses an outbound dial whose identity does
+# not resolve to a dialer user (it would skip the recording lock and call history).
+_DIALER_REP = SimpleNamespace(id=7, provider_id="10000000-0000-0000-0000-000000000007")
+
+
+@pytest.fixture(autouse=True)
+def _dialer_rep_defaults():
+    """Defaults for a resolved rep; tests that care patch these themselves."""
+    path = "api.services.telephony.providers.twilio.routes"
+    with patch(f"{path}.call_stages.voicemail_recording_required", new=AsyncMock(return_value=False)), \
+         patch(f"{path}.create_dialer_call", new=AsyncMock(return_value=True)), \
+         patch(f"{path}.get_team_voicemail_policy", new=AsyncMock(return_value=None)):
+        yield
+
+
 def _make_test_app() -> FastAPI:
     app = FastAPI()
     app.include_router(router)
@@ -183,7 +198,7 @@ def test_voice_connect_returns_conference_twiml_for_valid_signature(monkeypatch)
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -193,7 +208,7 @@ def test_voice_connect_returns_conference_twiml_for_valid_signature(monkeypatch)
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -862,7 +877,8 @@ def test_second_human_auto_connects_a_teammate_and_is_never_held(monkeypatch, am
     assert conference.getAttribute("waitUrl").endswith(f"/dialer-extra-answer-wait?call={_EXTRA_CHILD}")
     assert begin.await_args.kwargs["source"] == "parallel"
     assert begin.await_args.kwargs["leg_id"] == _EXTRA_LEG
-    assert adv.await_args.kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD}
+    # The person hears the recording notice first: the offer runs ~3 s after it.
+    assert adv.await_args.kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD, "offer_seconds": 7}
     notify.assert_called_once_with("inbound-1")
     assert spawn.call_count == 1   # the 8 s offer expiry
     old_route.assert_not_awaited()
@@ -895,7 +911,11 @@ def test_second_human_with_apology_switched_off_is_ended_without_hold(monkeypatc
     p = _chain_patches(advance=[{"action": "hangup", "prospect_call_id": _EXTRA_CHILD}])
     with p[0], p[1], p[2], p[3] as hold, p[4], p[5], p[6]:
         response = _post_second_human()
-    assert response.text == '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    # Apology off still ends politely: a spoken goodbye, never a bare hang-up.
+    assert response.text == (
+        '<?xml version="1.0" encoding="UTF-8"?><Response>'
+        "<Say>Sorry we missed you, we'll call you back shortly. Bye for now.</Say><Hangup/></Response>"
+    )
     hold.assert_not_awaited()
 
 
@@ -1042,7 +1062,7 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
         return_value="+15559998888",
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -1051,7 +1071,7 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
     ) as mock_dial:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1073,6 +1093,7 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
         ),
         machine_detection=True,
         machine_detection_preset="balanced",
+        ringing_timeout_seconds=30,
     )
 
 
@@ -1127,7 +1148,7 @@ def test_voice_connect_falls_back_to_default_when_no_assignment(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -1136,7 +1157,7 @@ def test_voice_connect_falls_back_to_default_when_no_assignment(monkeypatch):
     ) as mock_dial:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1161,7 +1182,7 @@ def test_voice_connect_hangs_up_when_lead_dial_fails(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -1171,7 +1192,7 @@ def test_voice_connect_hangs_up_when_lead_dial_fails(monkeypatch):
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1283,7 +1304,7 @@ def test_voice_connect_still_dials_when_get_backend_endpoints_raises(monkeypatch
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         side_effect=Exception("backend unreachable"),
@@ -1293,7 +1314,7 @@ def test_voice_connect_still_dials_when_get_backend_endpoints_raises(monkeypatch
     ):
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -1770,7 +1791,7 @@ def test_manual_voicemail_status_exposes_called_leg_readiness():
         )
 
     assert response.status_code == 200
-    assert response.json() == {"state": "idle", "amd_result": None, "ready": True, "stage": None, "stage_at": None}
+    assert response.json() == {"state": "idle", "amd_result": None, "ready": True, "stage": None, "stage_at": None, "stage_detail": {}}
 
     row["child_call_sid"] = None
     with patch(
@@ -2507,7 +2528,7 @@ def test_voice_connect_marks_dialer_call_failed_when_lead_dial_fails(monkeypatch
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -2519,7 +2540,7 @@ def test_voice_connect_marks_dialer_call_failed_when_lead_dial_fails(monkeypatch
     ) as mock_update:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2547,7 +2568,7 @@ def test_voice_connect_does_not_mark_failed_on_success(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -2559,7 +2580,7 @@ def test_voice_connect_does_not_mark_failed_on_success(monkeypatch):
     ) as mock_update:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -2585,7 +2606,7 @@ def test_voice_connect_persists_child_call_sid_immediately(monkeypatch):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -2597,7 +2618,7 @@ def test_voice_connect_persists_child_call_sid_immediately(monkeypatch):
     ) as mock_child_sid:
         response = client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": "CA111"},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": "CA111"},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 
@@ -3291,7 +3312,7 @@ def _post_outbound_voice_connect(call_sid):
         return_value=None,
     ), patch(
         "api.services.telephony.providers.twilio.routes.db_client.get_user_by_id",
-        return_value=None,
+        return_value=_DIALER_REP,
     ), patch(
         "api.services.telephony.providers.twilio.routes.get_backend_endpoints",
         return_value=("https://api.example.com", "wss://api.example.com"),
@@ -3301,7 +3322,7 @@ def _post_outbound_voice_connect(call_sid):
     ):
         return client.post(
             "/voice-connect",
-            data={"To": "+15559876543", "CallSid": call_sid},
+            data={"From": "client:rep-7", "To": "+15559876543", "CallSid": call_sid},
             headers={"X-Twilio-Signature": "fake-signature"},
         )
 

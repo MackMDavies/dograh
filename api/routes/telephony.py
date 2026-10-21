@@ -1212,6 +1212,10 @@ def _mount_signalwire_dialer_router() -> None:
     )
 
     router.include_router(signalwire_dialer_router)
+    # Dialer Phases 2 + 3: take over / hand to rep / end a call the agent is handling.
+    from api.services.telephony.dialer.handling_routes import router as handling_router
+
+    router.include_router(handling_router)
 
 
 _mount_signalwire_dialer_router()

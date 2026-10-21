@@ -613,6 +613,29 @@ class PipecatEngine:
 
         self.llm.register_function("press_keys", press_keys_func)
 
+    def _dialer_callback_enabled(self) -> bool:
+        """Dialer extra-answer agent runs may book the agreed callback time."""
+        context = self._call_context_vars or {}
+        return bool(context.get("dialer_extra_answer_id") and context.get("dialer_original_call_id"))
+
+    async def _register_dialer_callback_function(self) -> None:
+        """book_callback: store the callback time agreed with the person (Phase 1b gap)."""
+        from api.services.telephony.dialer import agent_callback
+
+        async def book_callback_func(function_call_params: FunctionCallParams) -> None:
+            try:
+                result = await agent_callback.handle_tool_call(
+                    dict(function_call_params.arguments or {}), dict(self._call_context_vars or {}),
+                )
+                if result.get("status") == "booked":
+                    self._gathered_context["dialer_callback_due_at"] = result.get("due_at")
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"book_callback failed: {e}")
+                result = {"status": "error", "reason": "the callback could not be saved"}
+            await function_call_params.result_callback(result)
+
+        self.llm.register_function(agent_callback.TOOL_NAME, book_callback_func)
+
     async def _perform_variable_extraction_if_needed(
         self, node: Optional[Node], run_in_background: bool = True
     ) -> None:
@@ -858,6 +881,9 @@ class PipecatEngine:
         # SYSEVO_DTMF: available on every node — an IVR or call-control gate can
         # appear at any point, not just when the call is answered.
         await self._register_dtmf_function()
+        dialer_callback = self._dialer_callback_enabled()
+        if dialer_callback:
+            await self._register_dialer_callback_function()
 
         # Compose prompt and functions via the context composer module
         system_prompt = compose_system_prompt_for_node(
@@ -871,6 +897,10 @@ class PipecatEngine:
             node=node,
             custom_tool_manager=self._custom_tool_manager,
             kb_document_uuids=kb_doc_uuids,
+            dialer_callback_tz=(
+                str((self._call_context_vars or {}).get("phone_timezone") or "UTC")
+                if dialer_callback else None
+            ),
         )
         await self._update_llm_context(system_prompt, functions)
 

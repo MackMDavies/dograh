@@ -27,7 +27,7 @@ from api.db import db_client
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer.parallel_auth import issue_parallel_auth_token
-from api.services.telephony.dialer import call_sorter, call_stages, extra_answer, sorter_gate, twilio_live_transcribe
+from api.services.telephony.dialer import call_handling, call_sorter, call_stages, extra_answer, sorter_gate, twilio_live_transcribe
 from api.services.telephony.dialer.inbound_call_log import (
     bind_inbound_rep_leg,
     close_inbound_call,
@@ -67,6 +67,7 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     get_voicemail_drop_evidence,
     record_twilio_amd_decision,
     record_voicemail_playback_failure,
+    settle_interrupted_playback,
     voicemail_duration,
     update_dialer_call_amd_result,
     request_manual_voicemail_drop,
@@ -293,6 +294,24 @@ async def get_voice_token(
 _MACHINE_END_RESULTS = frozenset({"machine_end_beep", "machine_end_silence", "machine_end_other"})
 
 
+def _amd_machine_stages(answered_by: str, *, mode: str | None) -> list[tuple[str, dict]]:
+    """Stages for a mailbox handed to the rep, from Twilio's AMD answer.
+
+    'machine' is the AMD decision itself. 'beep' only when there is one to report:
+    machine_end_beep (Twilio heard the tone) or machine_end_silence (the greeting
+    ended in silence, so the mailbox is recording). machine_end_other is AMD running
+    out of time with no tone heard: the rep sees 'machine' only (the call sorter may
+    still report a real beep later).
+    """
+    detail = {"answered_by": answered_by, "mode": mode}
+    stages: list[tuple[str, dict]] = [("machine", {**detail, "source": "amd"})]
+    if answered_by == "machine_end_beep":
+        stages.append(("beep", {**detail, "source": "tone"}))
+    elif answered_by == "machine_end_silence":
+        stages.append(("beep", {**detail, "source": "end_of_greeting"}))
+    return stages
+
+
 def _manual_drop_state(call_row: dict | None) -> str:
     if not call_row:
         return "idle"
@@ -426,6 +445,82 @@ async def _redirect_twilio_child_to_voicemail(*, child_call_sid: str, twiml: str
         return False
 
 
+# Machine detection off + the rep pressed "Send voicemail" and left: how long the
+# sorter is given to hear the greeting end (the line is held silently meanwhile).
+_GREETING_WAIT_SECONDS = 30
+
+
+def _greeting_wait_twiml() -> str:
+    """Hold a mailbox silently while its greeting plays; the recording is redirected in
+    as soon as the greeting ends. Bounded: an unconfirmed mailbox is hung up, never left."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f'<Response><Pause length="{_GREETING_WAIT_SECONDS + 5}"/><Hangup/></Response>'
+    )
+
+
+async def _play_queued_voicemail_after_greeting(
+    *, parent_call_sid: str, child_call_sid: str, endpoint_root: str,
+    wait_seconds: float = _GREETING_WAIT_SECONDS,
+) -> str:
+    """AMD off: play the rep's queued recording when the sorter hears the greeting end.
+
+    Returns what happened ('played' | 'mailbox_full' | 'no_recording' | 'not_claimed' |
+    'redirect_failed'). Background task, never raises.
+    """
+    try:
+        state = await call_sorter.wait_for_sorter_stage(
+            parent_call_sid, stages=("beep", "mailbox_full"), timeout=wait_seconds,
+        )
+        stage = (state or {}).get("stage")
+        if stage == "mailbox_full":
+            await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="mailbox_full")
+            await cancel_call(call_sid=child_call_sid)
+            return "mailbox_full"
+        call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        rep_user_id = (call_row or {}).get("rep_user_id")
+        if not isinstance(rep_user_id, str):
+            await cancel_call(call_sid=child_call_sid)
+            return "no_recording"
+        _, playback_url, drop_id = await get_auto_voicemail_settings(
+            user_id=rep_user_id, allow_manual_when_disabled=True, parent_call_sid=parent_call_sid,
+        )
+        if not playback_url or not playback_url.split("?", 1)[0].lower().endswith(".wav"):
+            await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="no_recording")
+            await cancel_call(call_sid=child_call_sid)
+            return "no_recording"
+        # The sorter stands in for AMD: record its verdict so the one-shot claim applies.
+        await update_dialer_call_child_sid(parent_call_sid=parent_call_sid, child_call_sid=child_call_sid)
+        await update_dialer_call_amd_result(
+            parent_call_sid=parent_call_sid,
+            answered_by="machine_end_beep" if stage == "beep" else "machine_end_other",
+        )
+        if not await claim_manual_voicemail_playback(
+            parent_call_sid=parent_call_sid, child_call_sid=child_call_sid, manual=True,
+        ):
+            return "not_claimed"
+        if drop_id:
+            await attach_voicemail_drop_to_call(
+                parent_call_sid=parent_call_sid, child_call_sid=child_call_sid, drop_id=drop_id,
+            )
+        twiml = _voicemail_playback_twiml(
+            endpoint_root=endpoint_root, parent_call_sid=parent_call_sid,
+            playback_url=playback_url, pause_seconds=_VOICEMAIL_START_PAUSE_SECONDS,
+            drop_id=drop_id, leg_call_sid=child_call_sid,
+        )
+        if not await _redirect_twilio_child_to_voicemail(child_call_sid=child_call_sid, twiml=twiml):
+            await release_manual_voicemail_playback(
+                parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+            )
+            await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="playback_not_started")
+            return "redirect_failed"
+        await call_stages.record_call_stage(parent_call_sid, "vm_playing", {"source": "manual", "drop_id": drop_id})
+        return "played"
+    except Exception as exc:  # noqa: BLE001 - background task
+        logger.error(f"Queued voicemail after greeting failed for {parent_call_sid}: {type(exc).__name__}")
+        return "error"
+
+
 @router.post("/dialer/manual-voicemail-drop")
 async def control_manual_voicemail_drop(
     body: ManualVoicemailDropRequest,
@@ -541,7 +636,11 @@ async def control_manual_voicemail_drop(
             user_id=rep_user_id, parent_call_sid=body.parent_call_sid,
         )
         detection_on = (policy or {}).get("machine_detection_enabled") is not False
-        if detection_on and await mark_rep_detached_for_voicemail(parent_call_sid=body.parent_call_sid):
+        # With machine detection off the call sorter is what hears the greeting end
+        # (the answer webhook then holds the line and plays on the beep). With neither,
+        # nothing could confirm a mailbox and the rep keeps the call.
+        server_can_hold = detection_on or call_sorter.call_sorter_enabled()
+        if server_can_hold and await mark_rep_detached_for_voicemail(parent_call_sid=body.parent_call_sid):
             background_tasks.add_task(_release_rep_for_voicemail, body.parent_call_sid)
             return {"state": "waiting", "released": True}
     return {"state": state}
@@ -1276,6 +1375,15 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
     if parallel_requested and (rep_user_id is None or not parallel_targets):
         logger.warning(f"voice-connect rejected parallel request from an unresolved rep identity")
         return HTMLResponse(content=hangup, media_type="application/xml")
+    if rep_user_id is None:
+        # An outbound dial whose identity does not resolve to a dialer user skips the
+        # recording lock, the call-history row and the per-rep compliance checks. It is
+        # refused rather than placed. (Inbound answers returned above.)
+        logger.warning(f"voice-connect refused {parent_call_sid}: the caller identity is not a dialer user")
+        return HTMLResponse(
+            content=_parallel_refusal_twiml("This call could not be verified. Sign in to the dialer again and retry."),
+            media_type="application/xml",
+        )
 
     # Reuse the same publicly-reachable backend URL resolution every other
     # telephony provider webhook in this codebase uses (env var, falling
@@ -1440,6 +1548,8 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
             # silence (with a six-second grace period for the latter).
             machine_detection=(team_voicemail_policy or {}).get("machine_detection_enabled") is not False,
             machine_detection_preset=str((team_voicemail_policy or {}).get("machine_detection_preset") or "balanced"),
+            # One team setting for how long a single call rings (default 30 s).
+            ringing_timeout_seconds=call_stages.no_answer_seconds(team_voicemail_policy),
         )
         if not child_call_sid:
             logger.error(f"voice-connect failed to dial lead into conference for {parent_call_sid}")
@@ -1608,6 +1718,7 @@ async def handle_dialer_conference_join(
     parent_call_sid: str = "",
     parallel_leg_id: str = "",
     parallel_entry_id: str = "",
+    handled: str = "",
 ):
     """Default end_on_exit="true" is deliberately the fail-SAFE default, even
     though voice-connect (its only caller) always passes it explicitly. If
@@ -1634,10 +1745,27 @@ async def handle_dialer_conference_join(
     # Twilio reports how long its AMD took to decide on the same signed request.
     amd_decision_ms = form_data.get("MachineDetectionDuration")
     parallel_call_sid = str(form_data.get("CallSid") or "")
+    # Dialer Phases 2 + 3: the handling agent hands the leg back through this same
+    # signed URL with handled=person|timeout (a person / the fail-safe: to the rep) or
+    # handled=machine (a mailbox: Phase 1 voicemail rules). Only our server builds it.
+    handled = handled if handled in {"person", "machine", "timeout"} else ""
+    if handled:
+        answered_by = "machine_end_beep" if handled == "machine" else "human"
+    elif call_sorter.call_sorter_enabled():
+        handling_ref = parallel_call_sid if parallel_leg_id else parent_call_sid
+        if _TWILIO_CALL_SID_PATTERN.fullmatch(handling_ref or "") and await call_handling.is_live(handling_ref):
+            # The agent is working this line (screener / menu): it must not join the
+            # rep's room behind the agent's back. Wait; the agent hands it on.
+            fallback = str(request.url) + ("&" if "?" in str(request.url) else "?") + "handled=timeout"
+            return HTMLResponse(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Pause length="90"/>'
+                        f'<Redirect method="POST">{escape(fallback)}</Redirect></Response>',
+                media_type="application/xml",
+            )
     # F5 (only with SYSEVO_DIALER_CALL_SORTER): what the call sorter heard decides
     # an unsure AMD, and can veto a machine before anything plays.
     sorter_mailbox_full = False
-    if answered_by in _MACHINE_END_RESULTS | {"unknown"} and call_sorter.call_sorter_enabled():
+    if not handled and answered_by in _MACHINE_END_RESULTS | {"unknown"} and call_sorter.call_sorter_enabled():
         sorter_ref = parallel_call_sid if parallel_leg_id else parent_call_sid
         decision = await sorter_gate.consult_sorter(
             sorter_ref if _TWILIO_CALL_SID_PATTERN.fullmatch(sorter_ref or "") else None,
@@ -1885,11 +2013,13 @@ async def handle_dialer_conference_join(
                     return HTMLResponse(content=hangup, media_type="application/xml")
                 if not parallel_leg_id:
                     # The mailbox goes to the rep, who is still on the line (mode
-                    # "self", or "ask" before a choice). DetectMessageEnd only
-                    # answers after the greeting, so the mailbox is recording now.
-                    detail = {"answered_by": answered_by, "mode": (policy or {}).get("voicemail_mode")}
-                    background_tasks.add_task(call_stages.record_call_stage, parent_call_sid, "machine", detail)
-                    background_tasks.add_task(call_stages.record_call_stage, parent_call_sid, "beep", detail)
+                    # "self", or "ask" before a choice). 'machine' is recorded at the
+                    # AMD decision; 'beep' only for a real tone or a greeting that
+                    # ended (machine_end_other is AMD giving up, not a beep).
+                    for stage, detail in _amd_machine_stages(
+                        answered_by, mode=(policy or {}).get("voicemail_mode"),
+                    ):
+                        background_tasks.add_task(call_stages.record_call_stage, parent_call_sid, stage, detail)
 
     if (
         not parallel_leg_id
@@ -1903,6 +2033,33 @@ async def handle_dialer_conference_join(
         evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
         if evidence.get("rep_detached_at"):
             lead_sid = str(form_data.get("CallSid") or "")
+            if (
+                not answered_by
+                and call_sorter.call_sorter_enabled()
+                and _TWILIO_CALL_SID_PATTERN.fullmatch(lead_sid)
+            ):
+                # Machine detection is off for this account, so Twilio says nothing about
+                # who answered. The call sorter decides: a mailbox is held (silently, the
+                # rep has gone) and the recording plays when the greeting ends.
+                decision = await sorter_gate.consult_sorter(parent_call_sid, amd="unsure")
+                if decision.kind == "machine":
+                    if decision.mailbox_full:
+                        await record_voicemail_playback_failure(
+                            parent_call_sid=parent_call_sid, reason="mailbox_full",
+                        )
+                        background_tasks.add_task(
+                            call_stages.record_call_stage, parent_call_sid, "mailbox_full", {"source": "sorter"},
+                        )
+                        return HTMLResponse(content=hangup, media_type="application/xml")
+                    background_tasks.add_task(
+                        call_stages.record_call_stage, parent_call_sid, "machine", {"source": "sorter"},
+                    )
+                    background_tasks.add_task(
+                        _play_queued_voicemail_after_greeting,
+                        parent_call_sid=parent_call_sid, child_call_sid=lead_sid,
+                        endpoint_root=str(request.url).split("?", 1)[0].rsplit("/", 1)[0],
+                    )
+                    return HTMLResponse(content=_greeting_wait_twiml(), media_type="application/xml")
             if (
                 not answered_by.startswith("machine") and answered_by != "fax"
                 and _TWILIO_CALL_SID_PATTERN.fullmatch(lead_sid)
@@ -1922,6 +2079,17 @@ async def handle_dialer_conference_join(
                         parent_call_sid=parent_call_sid, prospect_call_sid=lead_sid,
                     )
                     return HTMLResponse(content=ringback, media_type="application/xml")
+                # The rep is busy, offline or still wrapping up: start the extra-answer
+                # chain straight away (teammate → agent → apology / goodbye) instead of
+                # hanging up on the person.
+                chain_twiml = await dialer_extra_answer.ringback_unavailable_twiml(
+                    parent_call_sid=parent_call_sid, prospect_call_sid=lead_sid,
+                    account_sid=str(form_data.get("AccountSid") or ""), root=endpoint_root,
+                )
+                if chain_twiml:
+                    # The chain recorded 'extra_answer' on this call already.
+                    logger.info(f"Ring-back not possible for {parent_call_sid}: the extra-answer chain took the call")
+                    return HTMLResponse(content=chain_twiml, media_type="application/xml")
             logger.info(f"Rep detached before {parent_call_sid} answered ({answered_by or 'no AMD'}); ending the leg")
             if not answered_by.startswith("machine") and answered_by != "fax":
                 # The rep is busy (or offline): today's behaviour. Record it so the
@@ -2216,6 +2384,10 @@ async def handle_dialer_conference_events(request: Request):
                 )
                 if recorded is None:
                     raise HTTPException(status_code=503, detail="Could not persist conference timing")
+                # An extra answer's person reached the rep's room: the agent's handover landed.
+                await dialer_extra_answer.on_prospect_joined(
+                    conference_name=str(form_data.get("FriendlyName") or ""), call_sid=child_call_sid,
+                )
         call_row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
         if (
             call_row
@@ -2574,6 +2746,13 @@ async def handle_dialer_call_status(
             await evaluate_overflow_guard(provider_call_id=child_call_sid, provider="twilio")
             # An extra answer's person hung up: settle where the chain took them.
             await extra_answer.mark("twilio", child_call_sid, "ended")
+            if mapped_status == "completed":
+                # A machine line whose playback the carrier ended early: mailbox full or
+                # cut short, never "voicemail left" (no-op when nothing was playing).
+                await settle_interrupted_playback(
+                    parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+                    leg_id=parallel_leg_id,
+                )
         legs = await dialer_parallel.parallel_legs(parent_call_sid=parent_call_sid)
         session = await dialer_parallel.parallel_session(parent_call_sid=parent_call_sid)
         if (
@@ -2643,14 +2822,12 @@ async def _record_single_call_status_stage(
             await extra_answer.mark("twilio", child_call_sid, "ended")
         started = row.get("voicemail_drop_started_at")
         if call_status == "completed" and started and row.get("auto_voicemail_sent") is not True:
-            try:
-                started_at = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
-            except ValueError:
-                return
-            elapsed_ms = int((datetime.now(UTC) - started_at).total_seconds() * 1000)
-            if 0 <= elapsed_ms < call_stages.MAILBOX_FULL_MAX_PLAYBACK_MS:
-                await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="mailbox_full")
-                await call_stages.record_call_stage(parent_call_sid, "mailbox_full", {"elapsed_ms": elapsed_ms})
+            # The carrier ended the call while the recording was still playing (the
+            # Redirect after <Play> never ran). Measured against the recording's length:
+            # mailbox full, cut short, or left. Always a final outcome.
+            await settle_interrupted_playback(
+                parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+            )
     except Exception as exc:  # noqa: BLE001 - status webhook must not fail on evidence
         logger.info(f"Could not record status stage for {parent_call_sid}: {type(exc).__name__}")
 

@@ -78,6 +78,7 @@ TOKEN_TTL_SECONDS = 300
 _TOKEN_DOMAIN = "dialer-call-sorter.v1"
 
 StageRecorder = Callable[[str, str, dict], Awaitable[None]]
+HandlingStarter = Callable[..., Awaitable[object | None]]
 LlmFallback = Callable[[str], Awaitable[SorterVerdict | None]]
 
 
@@ -233,6 +234,14 @@ async def wait_for_sorter_stage(
                 await client.aclose()
 
 
+async def _start_handling(**kwargs):
+    """Default starter: call_handling.maybe_start_session (flag + account settings)."""
+    if not kwargs.get("leg_id"):
+        return None
+    from api.services.telephony.dialer.call_handling import maybe_start_session
+    return await maybe_start_session(**kwargs)
+
+
 # ── websocket credential (provider-neutral) ──────────────────────────────────────
 
 def _signature(secret: str, call_ref: str, leg_id: str, expires_at: int) -> str:
@@ -300,8 +309,17 @@ class CallSorter:
         llm_fallback: LlmFallback | None = None,
         provider: str = "",
         max_listen_seconds: float = MAX_LISTEN_SECONDS,
+        leg_id: str = "",
+        handling_starter: HandlingStarter | None = None,
     ):
         self.call_ref = call_ref
+        # Phases 2 + 3: the provider leg this audio comes from, and the agent's session
+        # once it takes a screener / menu off the rep (see call_handling.py).
+        self.leg_id = leg_id
+        self._handling_starter = handling_starter or _start_handling
+        self.handling = None
+        self._handling_control: asyncio.Task | None = None
+        self._handling_stop: asyncio.Event | None = None
         self._emit = emit
         self._publish_state = publish_state
         self._llm = llm_fallback if (llm_fallback is not None and llm_fallback_enabled()) else None
@@ -347,6 +365,9 @@ class CallSorter:
         if self._first_text_at is None:
             self._first_text_at = self.audio.seconds
         await self._evaluate()
+        if self.handling is not None:
+            with suppress(Exception):
+                await self.handling.on_text(text, is_final=bool(payload.get("is_final")), now=self.audio.seconds)
 
     async def on_audio(self, frame: bytes) -> None:
         """One frame of prospect mu-law audio."""
@@ -362,6 +383,11 @@ class CallSorter:
             })
             return
         now = self.audio.seconds
+        if self.handling is not None:
+            with suppress(Exception):
+                await self.handling.on_tick(now, silence=self.audio.silence_seconds)
+            if not self.handling.active:
+                self._end_handling()
         if now >= self._max_listen:
             self._finish("listen_cap")
             return
@@ -430,6 +456,7 @@ class CallSorter:
         if self._publish_state is not None:
             with suppress(Exception):
                 await self._publish_state(self.call_ref, stage, detail)
+        await self._drive_handling(stage, detail)
         # The words lag the audio by a few hundred ms, so "...at the tone." can be
         # transcribed after the tone itself has already gone by. A tone heard since
         # the far end started talking is that beep.
@@ -446,6 +473,55 @@ class CallSorter:
                 "at_seconds": beep.at_seconds,
                 "heard_before_verdict": True,
             })
+
+    async def _drive_handling(self, stage: str, detail: dict) -> None:
+        """Phases 2 + 3: start the agent on a screener / menu, or tell it what was heard."""
+        try:
+            if self.handling is not None:
+                await self.handling.on_stage(stage, detail, now=self.audio.seconds)
+                if not self.handling.active:
+                    self._end_handling()
+                return
+            if stage not in {"screener", "ivr"} or self.done:
+                return
+            session = await self._handling_starter(
+                call_key=self.call_ref, leg_id=self.leg_id, stage=stage, detail=detail,
+                now=self.audio.seconds,
+            )
+            if session is None:
+                return
+            self.handling = session
+            # The agent may hold the line for a while: keep listening past the usual cap.
+            settings = getattr(session, "settings", {}) or {}
+            budget = max(float(settings.get("agent_max_hold_seconds") or 60),
+                         float(settings.get("ivr_max_seconds") or 60))
+            self._max_listen = max(self._max_listen, self.audio.seconds + budget + 75.0)
+            self._start_handling_control(session)
+        except Exception as exc:  # noqa: BLE001 - the agent is optional; the call is not
+            logger.warning(f"call handling for {self.call_ref} failed: {type(exc).__name__}: {exc}")
+
+    def _start_handling_control(self, session) -> None:
+        try:
+            from api.services.telephony.dialer.call_handling import serve_commands
+        except Exception:  # noqa: BLE001
+            return
+        self._handling_stop = asyncio.Event()
+        with suppress(RuntimeError):
+            self._handling_control = asyncio.create_task(serve_commands(session, self._handling_stop))
+
+    def _end_handling(self) -> None:
+        if self._handling_stop is not None:
+            self._handling_stop.set()
+
+    async def close_handling(self) -> None:
+        """The stream ended: a session still holding the line hands it on."""
+        if self.handling is not None and self.handling.active:
+            with suppress(Exception):
+                await self.handling.on_stream_end(now=self.audio.seconds)
+        self._end_handling()
+        if self._handling_control is not None:
+            with suppress(BaseException):
+                await asyncio.wait_for(self._handling_control, timeout=3.0)
 
     def _finish(self, reason: str) -> None:
         if not self.done:
@@ -512,6 +588,8 @@ async def run_call_sorter(
         logger.info(f"call sorter stream for {sorter.call_ref} ended: {type(exc).__name__}: {exc}")
     finally:
         sorter._finish(sorter.stop_reason or "stream_ended")
+        with suppress(Exception):
+            await sorter.close_handling()
     logger.info(
         f"call sorter closed for {sorter.call_ref}: stages={sorter.stages} "
         f"reason={sorter.stop_reason} audio={sorter.audio.seconds:.1f}s"

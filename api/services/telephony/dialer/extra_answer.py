@@ -32,10 +32,17 @@ from loguru import logger
 from api.constants import SUPABASE_ANON_KEY, SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 
 STEPS = ("ringback", "teammate", "agent", "callback", "apology")
-ACTIONS = frozenset({"teammate", "agent", "apology", "hangup", "none"})
+ACTIONS = frozenset({"teammate", "agent", "apology", "goodbye", "hangup", "none"})
 
-# A teammate's softphone answers by itself; a join this slow means it did not.
-OFFER_SECONDS = 8
+# A teammate's softphone answers by itself; a join this slow means it did not. Counted
+# from after the recording notice when the person hears one first.
+OFFER_SECONDS = 3
+# How long the spoken recording notice takes before the wait audio starts.
+DISCLOSURE_SECONDS = 4
+# All teammate offers together stay within about this long; then the chain moves on.
+TEAMMATE_TOTAL_SECONDS = 6
+# The agent's handover has to land (the person joins the rep's room) within this long.
+TRANSFER_LAND_SECONDS = 10
 # The agent hands the person back to whoever frees up first within this window.
 AGENT_TRANSFER_WINDOW_SECONDS = 90
 
@@ -44,6 +51,10 @@ NEUTRAL_HELLO = "Hi, one moment."
 NEUTRAL_APOLOGY = (
     "Sorry, I've just been pulled onto another call. I'll ring you straight back. Bye for now."
 )
+# The polite end when a manager switched the apology step off. Never a bare hang-up.
+NEUTRAL_GOODBYE = "Sorry we missed you, we'll call you back shortly. Bye for now."
+# Repeated (with short pauses, never more than about 2 s of quiet) while a softphone joins.
+CONNECTING_LINE = "Just connecting you now."
 RECORDING_DISCLOSURE = "This call may be recorded and monitored for quality assurance."
 
 _CLIP_KINDS = frozenset({"hello", "apology"})
@@ -82,6 +93,11 @@ async def _rpc_dict(name: str, payload: dict[str, Any]) -> dict[str, Any] | None
     return result if isinstance(result, dict) else None
 
 
+def offer_seconds(*, disclose: bool) -> int:
+    """How long an offer may ring: about 3 s, counted from after the recording notice."""
+    return OFFER_SECONDS + (DISCLOSURE_SECONDS if disclose else 0)
+
+
 def first_name(name: Any) -> str:
     text = str(name or "").strip()
     return text.split()[0] if text else ""
@@ -103,7 +119,7 @@ async def begin(
 
 async def advance(
     *, provider: str, prospect_call_id: str, after: str | None = None,
-    conference_name: str | None = None,
+    conference_name: str | None = None, offer_seconds: int = OFFER_SECONDS,
 ) -> dict[str, Any] | None:
     """Reserve the next possible step. ``after`` is the step that just failed or ran out.
 
@@ -115,6 +131,7 @@ async def advance(
     state = await _rpc_dict("dialer_extra_answer_advance", {
         "p_provider": provider, "p_prospect_call_id": prospect_call_id,
         "p_after": after, "p_conference_name": conference_name,
+        "p_offer_seconds": int(offer_seconds),
     })
     if state is None or state.get("action") not in ACTIONS:
         return None
@@ -124,11 +141,21 @@ async def advance(
 async def mark(
     provider: str, prospect_call_id: str, event: str, detail: dict[str, Any] | None = None,
 ) -> dict[str, Any] | None:
-    if event not in {"rep_joined", "agent_started", "agent_transferred", "callback_requested", "ended"}:
+    if event not in {
+        "rep_joined", "agent_started", "agent_transferred", "callback_requested", "ended",
+        "transfer_recovery",
+    }:
         return None
     return await _rpc_dict("dialer_extra_answer_mark", {
         "p_provider": provider, "p_prospect_call_id": prospect_call_id,
         "p_event": event, "p_detail": detail or {},
+    })
+
+
+async def prospect_joined(*, provider: str, prospect_call_id: str) -> dict[str, Any] | None:
+    """The person reached the rep's room after the agent's handover: the transfer landed."""
+    return await _rpc_dict("dialer_extra_answer_prospect_joined", {
+        "p_provider": provider, "p_prospect_call_id": prospect_call_id,
     })
 
 
@@ -195,6 +222,9 @@ async def clip_url(user_id: str | None, kind: str) -> str | None:
     path = clip.get("storage_path")
     owner = str(clip.get("owner_user_id") or "")
     if not isinstance(path, str) or not re.fullmatch(rf"{re.escape(owner)}/[^/]+", path) or owner != user_id:
+        return None
+    if not path.lower().endswith(".wav"):
+        # Phone playback needs WAV, exactly like the voicemail resolver.
         return None
     from api.services.telephony.providers.twilio.dialer_call_log import sign_voicemail_storage_path
     try:
@@ -279,7 +309,8 @@ def callback_whisper(rep_name: str | None) -> str:
     return (
         "Nobody on the team is free to take this call yet. Do not promise a transfer. "
         f"Agree a convenient time today or tomorrow for {who} to call them back, repeat the "
-        "time back to confirm it, then close politely."
+        "time back to confirm it, and once they confirm it call book_callback with the agreed "
+        "time. Then close politely."
     )
 
 
@@ -337,3 +368,117 @@ def trim_to_line_cap(entry_ids: list[str], cap: int | None) -> list[str]:
         return entry_ids
     allowed = [count for count in PARALLEL_LINE_COUNTS if count <= cap]
     return entry_ids[: allowed[-1]] if allowed else entry_ids[:2]
+
+
+# ── the agent's summary for the rep's card ─────────────────────────────────────────────
+
+_TIME_RE = re.compile(
+    r"\b(?:(?:today|tomorrow|tonight|monday|tuesday|wednesday|thursday|friday|saturday|sunday)"
+    r"(?:\s+(?:morning|afternoon|evening))?(?:\s+at\s+\d{1,2}(?::\d{2})?\s*(?:am|pm)?)?"
+    r"|\d{1,2}(?::\d{2})?\s*(?:am|pm)|\d{1,2}:\d{2}|(?:in\s+)?(?:an?|\d+)\s+(?:hour|minute)s?)\b",
+    re.I,
+)
+_NAME_RE = re.compile(r"\b(?i:my name is|this is|i'?m|it'?s)\s+([A-Z][a-z'-]{1,20})\b")
+_COMPANY_RE = re.compile(
+    r"\b(?i:i'?m|we'?re|i work|calling)\s+(?i:with|at|from|for)\s+([A-Z][\w&'-]*(?:\s+[A-Z][\w&'-]*){0,3})")
+_INTEREST_RE = re.compile(
+    r"\b(interested|sounds good|tell me more|send (?:me )?(?:some )?(?:info|information|details)|"
+    r"how much|what does it cost|pricing|yes please|that would be great)\b", re.I)
+_OBJECTION_RE = re.compile(
+    r"\b(not interested|too expensive|no budget|already (?:have|use|got)|busy right now|"
+    r"bad time|call (?:me )?(?:back )?later|don'?t need|remove me|stop calling)\b", re.I)
+_NOT_NAMES = {"Sorry", "Just", "Not", "Calling", "Busy", "Here", "Fine", "Good", "Great", "Ok", "Okay", "Yes", "No"}
+
+
+def _turns(messages: Any) -> list[tuple[str, str]]:
+    turns: list[tuple[str, str]] = []
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(str(part.get("text") or "") for part in content if isinstance(part, dict))
+        text = " ".join(str(content or "").split())
+        if text and not text.startswith("[Private instruction"):
+            turns.append((str(message["role"]), text))
+    return turns
+
+
+def summarize_conversation(messages: Any, *, limit: int = 900) -> str:
+    """Key facts from the agent's conversation for the rep's card, deterministic.
+
+    Name, company, interest, objections, an agreed time and their last question. Falls
+    back to their last two lines when nothing stands out. Never the agent's own patter.
+    """
+    turns = _turns(messages)
+    theirs = [text for role, text in turns if role == "user"]
+    if not theirs:
+        return ""
+    said = " ".join(theirs)
+    facts: list[str] = []
+    name = next((m.group(1) for m in _NAME_RE.finditer(said) if m.group(1) not in _NOT_NAMES), None)
+    if name:
+        facts.append(f"Name: {name}")
+    company = _COMPANY_RE.search(said)
+    if company:
+        facts.append(f"Company: {company.group(1)}")
+    interest = sorted({m.group(1).lower() for m in _INTEREST_RE.finditer(said)})
+    if interest:
+        facts.append("Interest: " + ", ".join(interest[:3]))
+    objections = sorted({m.group(1).lower() for m in _OBJECTION_RE.finditer(said)})
+    if objections:
+        facts.append("Objections: " + ", ".join(objections[:3]))
+    times = [m.group(0) for text in theirs for m in _TIME_RE.finditer(text)]
+    if times:
+        facts.append(f"Time mentioned: {times[-1]}")
+    question = next((text for text in reversed(theirs) if "?" in text), None)
+    if question:
+        facts.append(f"Last question: {question[-200:]}")
+    if not facts:
+        facts.append("They said: " + " / ".join(theirs[-2:])[-400:])
+    return "\n".join(facts)[:limit]
+
+
+def _summary_llm_enabled() -> bool:
+    import os
+    return (os.environ.get("SYSEVO_DIALER_SUMMARY_LLM") or "").strip().lower() in {"1", "on", "true", "yes"} and bool(
+        (os.environ.get("OPENAI_API_KEY") or "").strip())
+
+
+async def agent_summary(messages: Any, *, budget_seconds: float = 3.0) -> str:
+    """A short summary for the rep: an LLM when switched on (3 s budget), else key facts."""
+    facts = summarize_conversation(messages)
+    if not facts or not _summary_llm_enabled():
+        return facts
+    import asyncio
+    import os
+    transcript = "\n".join(
+        ("Them: " if role == "user" else "Agent: ") + text for role, text in _turns(messages)[-16:]
+    )[-4000:]
+
+    async def ask() -> str:
+        async with httpx.AsyncClient(timeout=budget_seconds) as client:
+            response = await client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY'].strip()}"},
+                json={
+                    "model": os.environ.get("SYSEVO_DIALER_SUMMARY_MODEL") or "gpt-4o-mini",
+                    "max_tokens": 160, "temperature": 0,
+                    "messages": [
+                        {"role": "system", "content": (
+                            "Summarise this sales call for the rep taking it over, in at most 4 short "
+                            "lines: who they are, what they want or object to, any agreed time, and "
+                            "their last open question. Facts only, from the transcript.")},
+                        {"role": "user", "content": transcript},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            return str(response.json()["choices"][0]["message"]["content"] or "").strip()
+
+    try:
+        text = await asyncio.wait_for(ask(), timeout=budget_seconds)
+    except Exception as exc:  # noqa: BLE001 - the key facts are always there
+        logger.info(f"Agent summary LLM unavailable: {type(exc).__name__}")
+        return facts
+    return text[:900] if text else facts

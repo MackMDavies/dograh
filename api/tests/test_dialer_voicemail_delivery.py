@@ -292,7 +292,7 @@ def test_manual_status_reports_needs_rep_and_failed_states():
          })):
         body = _app(authenticated=True).get(f"/dialer/manual-voicemail-drop/{_PARENT}").json()
     assert body == {"state": "failed", "amd_result": "machine_end_beep", "ready": True, "failure": "playback_incomplete",
-                    "stage": None, "stage_at": None}
+                    "stage": None, "stage_at": None, "stage_detail": {}}
 
 
 # ── SignalWire: same resolver, no fax playback, sign before claim ────────────

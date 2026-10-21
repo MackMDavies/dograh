@@ -83,17 +83,17 @@ async def test_record_call_stage_never_raises():
 
 def test_with_stage_adds_stage_fields_and_reports_a_ringback():
     plain = call_stages.with_stage({"state": "waiting"}, {"stage": "machine", "stage_at": "t1"})
-    assert plain == {"state": "waiting", "stage": "machine", "stage_at": "t1"}
+    assert plain == {"state": "waiting", "stage": "machine", "stage_at": "t1", "stage_detail": {}}
     ringing_back = call_stages.with_stage(
         {"state": "rejected", "failure": "person_answered"}, {"stage": "rep_ringback", "stage_at": "t2"},
     )
-    assert ringing_back == {"state": "ringback", "stage": "rep_ringback", "stage_at": "t2"}
+    assert ringing_back == {"state": "ringback", "stage": "rep_ringback", "stage_at": "t2", "stage_detail": {}}
     # A missed ring-back records 'person' after it: today's toast applies again.
     missed = call_stages.with_stage(
         {"state": "failed", "failure": "person_answered"}, {"stage": "person", "stage_at": "t3"},
     )
     assert missed["state"] == "failed" and missed["failure"] == "person_answered"
-    assert call_stages.with_stage({"state": "idle"}, None) == {"state": "idle", "stage": None, "stage_at": None}
+    assert call_stages.with_stage({"state": "idle"}, None) == {"state": "idle", "stage": None, "stage_at": None, "stage_detail": {}}
 
 
 @pytest.mark.asyncio
@@ -119,7 +119,7 @@ def test_twilio_status_poll_carries_the_latest_stage():
         body = _app(authenticated=True).get(f"/dialer/manual-voicemail-drop/{_PARENT}").json()
     latest.assert_awaited_once_with(_PARENT)
     assert body == {"state": "ringback", "amd_result": "human", "ready": True,
-                    "stage": "rep_ringback", "stage_at": "2026-10-20T00:00:05Z"}
+                    "stage": "rep_ringback", "stage_at": "2026-10-20T00:00:05Z", "stage_detail": {}}
 
 
 def test_signalwire_status_poll_carries_the_latest_stage():
@@ -312,7 +312,9 @@ def test_twilio_mailbox_passed_to_the_rep_records_machine_then_beep():
     assert "<Conference" in response.text and "<Play>" not in response.text
     stages = [c.args[1] for c in record.await_args_list]
     assert stages == ["machine", "beep"]
-    assert record.await_args_list[1].args[2] == {"answered_by": "machine_end_beep", "mode": "self"}
+    # 'machine' is the AMD decision; 'beep' is the tone Twilio heard.
+    assert record.await_args_list[0].args[2] == {"answered_by": "machine_end_beep", "mode": "self", "source": "amd"}
+    assert record.await_args_list[1].args[2] == {"answered_by": "machine_end_beep", "mode": "self", "source": "tone"}
 
 
 def test_twilio_auto_playback_records_machine_then_vm_playing():
@@ -348,8 +350,10 @@ def test_twilio_full_playback_records_vm_left():
     record.assert_awaited_once_with(_PARENT, "vm_left", {})
 
 
-def _status(call_status: str, row: dict | None):
+def _status(call_status: str, row: dict | None, settle=None):
+    settle = settle or AsyncMock(return_value=None)
     with patch(f"{_PATH}.update_dialer_call_status", new=AsyncMock()), \
+         patch(f"{_PATH}.settle_interrupted_playback", new=settle), \
          patch(f"{_PATH}.get_dialer_call_child_leg", new=AsyncMock(return_value=row)), \
          patch(f"{_PATH}.record_voicemail_playback_failure", new=AsyncMock(return_value=True)) as failed, \
          patch(f"{_PATH}.close_inbound_call", new=AsyncMock()) as close, \
@@ -361,20 +365,25 @@ def _status(call_status: str, row: dict | None):
     return failed, close, record
 
 
-def test_twilio_mailbox_that_hangs_up_on_the_message_is_mailbox_full_not_left():
+def test_twilio_playback_the_carrier_ends_is_settled_by_its_length():
+    """Mailbox full vs cut short vs left is measured in SQL against the recording's own
+    length (dialer_settle_interrupted_playback); the route always asks for a settlement."""
     from datetime import UTC, datetime, timedelta
     row = {"child_call_sid": _CHILD, "voicemail_drop_started_at": (datetime.now(UTC) - timedelta(seconds=1)).isoformat(),
            "auto_voicemail_sent": False, "manual_voicemail_requested_at": None}
-    failed, _close, record = _status("completed", row)
-    failed.assert_awaited_once_with(parent_call_sid=_PARENT, reason="mailbox_full")
-    assert record.await_args.args[:2] == (_PARENT, "mailbox_full")
+    settle = AsyncMock(return_value="mailbox_full")
+    failed, _close, _record = _status("completed", row, settle)
+    settle.assert_awaited_once_with(parent_call_sid=_PARENT, child_call_sid=_CHILD)
+    failed.assert_not_awaited()  # the RPC writes the failure itself
 
 
-def test_twilio_long_playback_that_ends_is_not_mailbox_full():
+def test_twilio_sent_playback_is_never_settled_again():
     from datetime import UTC, datetime, timedelta
     row = {"child_call_sid": _CHILD, "voicemail_drop_started_at": (datetime.now(UTC) - timedelta(seconds=20)).isoformat(),
-           "auto_voicemail_sent": False}
-    failed, _close, record = _status("completed", row)
+           "auto_voicemail_sent": True}
+    settle = AsyncMock(return_value=None)
+    failed, _close, record = _status("completed", row, settle)
+    settle.assert_not_awaited()
     failed.assert_not_awaited()
     record.assert_not_awaited()
 
@@ -636,3 +645,11 @@ async def test_sorter_seam_routes_verdicts_through_the_listening_hook():
         await call_stage_events.record_call_stage(_PARENT, "beep", {})
     hook.assert_awaited_once_with(call_key=_PARENT, stage="ivr", detail={"phrase": "press 1"})
     record.assert_awaited_once_with(_PARENT, "beep", {"source": "listening"})
+
+
+def test_with_stage_passes_the_stage_detail_through():
+    body = call_stages.with_stage(
+        {"state": "idle"},
+        {"stage": "agent_ivr", "stage_at": "t4", "detail": {"pressed": ["2", "5"]}},
+    )
+    assert body["stage_detail"] == {"pressed": ["2", "5"]}

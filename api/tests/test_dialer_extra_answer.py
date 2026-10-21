@@ -59,6 +59,7 @@ async def test_advance_passes_the_failed_step_and_rejects_unknown_actions():
         assert (await extra_answer.advance(provider="twilio", prospect_call_id=_SID, after="ringback"))["action"] == "teammate"
     assert rpc.await_args.args == ("dialer_extra_answer_advance", {
         "p_provider": "twilio", "p_prospect_call_id": _SID, "p_after": "ringback", "p_conference_name": None,
+        "p_offer_seconds": 3,
     })
     with patch(f"{_XA}._rpc_dict", new=AsyncMock(return_value={"action": "hold"})):
         assert await extra_answer.advance(provider="twilio", prospect_call_id=_SID) is None
@@ -173,7 +174,7 @@ async def test_live_call_moves_from_an_expired_teammate_offer_to_the_agent():
          patch(f"{_TXA}.dialer_agent_handoff.prepare_extra_answer_agent", new=AsyncMock(return_value=prepared)) as adopt, \
          patch(f"{_TXA}._update_live_call", new=AsyncMock(return_value=True)) as update:
         await dialer_extra_answer.continue_after(_SID, after="teammate")
-    adv.assert_awaited_once_with(provider="twilio", prospect_call_id=_SID, after="teammate")
+    adv.assert_awaited_once_with(provider="twilio", prospect_call_id=_SID, after="teammate", offer_seconds=3)
     # The person already heard the recording notice when they answered.
     adopt.assert_awaited_once_with(prospect_call_sid=_SID, account_sid=_ACCOUNT, disclose=False)
     update.assert_awaited_once_with(_SID, prepared.twiml, _ACCOUNT)
@@ -233,7 +234,8 @@ async def test_agent_failure_falls_through_in_chain_order():
             root="https://x", account_sid=_ACCOUNT, disclose=True,
         )
     advance.assert_awaited_once_with(provider="twilio", prospect_call_id=_SID, after="agent")
-    assert twiml == dialer_extra_answer.HANGUP
+    # Never a bare hang-up: the person hears a goodbye.
+    assert twiml == dialer_extra_answer.goodbye_twiml()
 
 
 @pytest.mark.asyncio
@@ -300,7 +302,8 @@ async def test_ringback_offer_waits_with_the_hello_clip_not_music():
         twiml = await dialer_voicemail_ringback.offer_ringback_twiml(
             parent_call_sid=_PARENT, prospect_call_sid=_SID, endpoint_root="https://api.example.com/t")
     assert f'waitUrl="https://api.example.com/t/dialer-extra-answer-wait?call={_SID}"' in twiml
-    assert call_stages.RINGBACK_OFFER_SECONDS == 10
+    # About 3 s after the ~4 s recording notice the person hears first.
+    assert call_stages.RINGBACK_OFFER_SECONDS == 7
 
 
 # ── Twilio: the agent's transfer-back window ────────────────────────────────
@@ -354,19 +357,22 @@ async def test_handover_not_claimable_does_nothing():
 @pytest.mark.asyncio
 async def test_window_over_asks_the_agent_to_book_the_callback():
     state = {"prospect_call_id": _SID, "workflow_run_id": "501", "callback_in_chain": True, "rep_name": "Max Tan"}
-    with patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
+    with patch(f"{_TXA}.request_summary", new=AsyncMock(return_value=0)), \
+         patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
          patch.object(live_control, "publish_command", new=AsyncMock(return_value=1)) as publish, \
          patch(f"{_XA}.mark", new=AsyncMock()) as mark:
         await dialer_extra_answer.drive_agent(state)
     command = publish.await_args.args[1]
     assert command["type"] == "whisper" and "Max" in command["text"] and "call them back" in command["text"]
+    assert "book_callback" in command["text"]
     mark.assert_awaited_once_with("twilio", _SID, "callback_requested")
 
 
 @pytest.mark.asyncio
 async def test_window_over_without_the_callback_step_only_stops_trying():
     state = {"prospect_call_id": _SID, "workflow_run_id": "501", "callback_in_chain": False}
-    with patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
+    with patch(f"{_TXA}.request_summary", new=AsyncMock(return_value=0)), \
+         patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
          patch.object(live_control, "publish_command", new=AsyncMock()) as publish, \
          patch(f"{_XA}.mark", new=AsyncMock()) as mark:
         await dialer_extra_answer.drive_agent(state)
@@ -377,7 +383,8 @@ async def test_window_over_without_the_callback_step_only_stops_trying():
 @pytest.mark.asyncio
 async def test_window_over_is_not_repeated_once_requested():
     state = {"prospect_call_id": _SID, "callback_requested_at": "t", "callback_in_chain": True, "workflow_run_id": "1"}
-    with patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
+    with patch(f"{_TXA}.request_summary", new=AsyncMock(return_value=0)), \
+         patch(f"{_XA}.reserve_transfer", new=AsyncMock(return_value={"status": "deadline"})), \
          patch.object(live_control, "publish_command", new=AsyncMock()) as publish, \
          patch(f"{_XA}.mark", new=AsyncMock()) as mark:
         await dialer_extra_answer.drive_agent(state)
@@ -441,8 +448,10 @@ async def test_agent_hands_over_into_its_own_calls_room():
     spoken = engine.task.queue_frame.await_args.args[0]
     assert "Max is free now" in spoken.text
     engine.end_call_with_reason.assert_awaited_once_with("transfer_call", abort_immediately=False)
-    summary.assert_awaited_once_with(_SID, "Them: send me pricing")
-    mark.assert_awaited_once_with("twilio", _SID, "agent_transferred", {"user_id": _REP})
+    # A real summary (key facts), written before the handover.
+    summary.assert_awaited_once_with(_SID, "Interest: pricing")
+    # The transfer is only recorded when the person reaches the rep's room.
+    mark.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -580,7 +589,7 @@ async def test_signalwire_retried_decision_never_reserves_a_second_step():
         doc = await signalwire_extra_answer.first_answer_swml(
             session_id="s", leg_id="l", provider_call_id="sw-1", rep_call_id="r")
     advance.assert_not_awaited()
-    assert doc == {"sections": {"main": [{"hangup": {}}]}}
+    assert doc == signalwire_extra_answer.goodbye_swml()
 
 
 # ── The reconciliation worker ───────────────────────────────────────────────

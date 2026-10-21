@@ -846,6 +846,33 @@ async def record_voicemail_playback_failure(
         return False
 
 
+INTERRUPTED_PLAYBACK_OUTCOMES = frozenset({"vm_left", "mailbox_full", "cut_short"})
+
+
+async def settle_interrupted_playback(
+    *, parent_call_sid: str, child_call_sid: str | None = None, leg_id: str | None = None,
+) -> str | None:
+    """The carrier ended a call while the recording was playing: give it a final outcome.
+
+    dialer_settle_interrupted_playback measures how much played against the recording's
+    own length: 'vm_left' (it reached the end), 'mailbox_full' (ended as it began) or
+    'cut_short'. It writes the failure/sent flag, the stage and the lead's disposition.
+    None when nothing was playing or it was already settled. Never raises.
+    """
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not parent_call_sid:
+        return None
+    try:
+        result = await _service_rpc("dialer_settle_interrupted_playback", {
+            "p_parent_call_sid": parent_call_sid,
+            "p_child_call_sid": child_call_sid,
+            "p_leg_id": leg_id or None,
+        })
+    except Exception as exc:  # noqa: BLE001 - evidence write must not break the webhook
+        logger.error(f"Could not settle an interrupted playback for {parent_call_sid}: {exc}")
+        return None
+    return result if result in INTERRUPTED_PLAYBACK_OUTCOMES else None
+
+
 async def mark_rep_detached_for_voicemail(*, parent_call_sid: str) -> bool:
     """True when a queued manual voicemail should keep the ringing leg alive."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY or not parent_call_sid:

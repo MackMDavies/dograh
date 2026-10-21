@@ -37,6 +37,7 @@ async def originate_call(
     swml_url: str,
     status_url: str,
     status_events: tuple[str, ...] = ("created", "ringing", "answered", "ended"),
+    ring_timeout_seconds: int | None = None,
 ) -> dict[str, Any]:
     """Create one PSTN leg and return SignalWire's call object.
 
@@ -63,6 +64,9 @@ async def originate_call(
             "status_events": list(status_events),
         },
     }
+    if ring_timeout_seconds is not None:
+        # Calling API dial `timeout`: ring time in seconds (1..600).
+        payload["params"]["timeout"] = max(5, min(120, int(ring_timeout_seconds)))
     try:
         async with httpx.AsyncClient(timeout=8.0) as client:
             response = await client.post(endpoint, json=payload, auth=(project, token))

@@ -219,6 +219,9 @@ async def serve_twilio_sorter(
         return None
 
     sorter = sorter_factory(call_ref, provider="twilio")
+    # Phases 2 + 3: the verified prospect leg the handling agent may work.
+    with suppress(Exception):
+        sorter.leg_id = leg_call_sid
 
     async def frames():
         while True:

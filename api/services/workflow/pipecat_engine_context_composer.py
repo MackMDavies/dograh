@@ -138,6 +138,7 @@ async def compose_functions_for_node(
     node: "Node",
     custom_tool_manager: Optional["CustomToolManager"],
     kb_document_uuids: Optional[list[str]] = None,
+    dialer_callback_tz: Optional[str] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -191,6 +192,21 @@ async def compose_functions_for_node(
             required=["digits"],
         )
     )
+
+    # Dialer extra answers: the agent books the callback time it agreed.
+    if dialer_callback_tz is not None:
+        from datetime import UTC, datetime
+
+        from api.services.telephony.dialer import agent_callback
+
+        functions.append(
+            get_function_schema(
+                agent_callback.TOOL_NAME,
+                agent_callback.tool_description(datetime.now(UTC), dialer_callback_tz),
+                properties=agent_callback.tool_schema_properties(),
+                required=["when"],
+            )
+        )
 
     # Custom tools
     if node.tool_uuids and custom_tool_manager:

@@ -72,6 +72,15 @@ DIALER_TRANSFER = "dialer_transfer"
 DIALER_TRANSFER_TOOL_ID = "dialer-extra-answer"
 
 
+# Internal (server-published): store the agent's summary for the rep's card before the
+# transfer-back offer is written. Only acted on by a dialer extra-answer run.
+DIALER_SUMMARY = "dialer_summary"
+
+
+def dialer_summary_command() -> dict[str, Any]:
+    return {"type": DIALER_SUMMARY}
+
+
 def dialer_transfer_command(*, conference_name: str, to_name: str, to_user_id: str) -> dict[str, Any]:
     return {
         "type": DIALER_TRANSFER, "conference_name": conference_name,
@@ -230,6 +239,12 @@ class SupervisorControl:
                 await client.aclose()
 
     async def _handle(self, command: dict[str, Any]) -> None:
+        if isinstance(command, dict) and command.get("type") == DIALER_SUMMARY:
+            try:
+                await self.dialer_summary()
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"dialer summary failed for run {self._run_id}: {exc}")
+            return
         if isinstance(command, dict) and command.get("type") == DIALER_TRANSFER:
             try:
                 await self.dialer_transfer(command)
@@ -261,6 +276,35 @@ class SupervisorControl:
         )
         logger.info(f"supervisor whisper delivered to run {self._run_id}")
 
+    def _messages(self) -> Any:
+        engine = self._engine
+        if getattr(engine, "context", None) is not None:
+            with suppress(Exception):
+                return engine.context.get_messages()
+        return []
+
+    async def _dialer_call_id(self) -> str | None:
+        from api.db import db_client
+
+        run = await db_client.get_workflow_run_by_id(self._run_id)
+        context = (run.initial_context or {}) if run else {}
+        call_id = str(((run.gathered_context or {}) if run else {}).get("call_id") or "")
+        if not run or not context.get("dialer_extra_answer_id") or not call_id \
+                or context.get("dialer_original_call_id") != call_id:
+            return None
+        return call_id
+
+    async def dialer_summary(self) -> None:
+        """Store a short summary of this extra-answer call (key facts, or an LLM's)."""
+        from api.services.telephony.dialer import extra_answer
+
+        call_id = await self._dialer_call_id()
+        if not call_id:
+            return
+        summary = await extra_answer.agent_summary(self._messages())
+        if summary:
+            await extra_answer.set_summary(call_id, summary)
+
     async def dialer_transfer(self, command: dict[str, Any]) -> None:
         """Hand this agent call to the rep who joined call-<call SID> (extra answer)."""
         from pipecat.frames.frames import TTSSpeakFrame
@@ -286,29 +330,34 @@ class SupervisorControl:
             return
         self._takeover_running = True
         engine = self._engine
-        messages: Any = []
-        if getattr(engine, "context", None) is not None:
-            with suppress(Exception):
-                messages = engine.context.get_messages()
-        await extra_answer.set_summary(call_id, conversation_summary(messages))
-        manager = await get_call_transfer_manager()
-        await manager.store_transfer_context(TransferContext(
-            transfer_id=str(uuid.uuid4()), call_sid=None, target_number="",
-            tool_uuid=DIALER_TRANSFER_TOOL_ID, original_call_sid=call_id,
-            conference_name=conference_name, initiated_at=time.time(),
-            workflow_run_id=self._run_id,
-        ))
-        task = engine.task
-        if task:
-            await task.queue_frame(TTSSpeakFrame(
-                extra_answer.transfer_line(str(command.get("to_name") or "")), append_to_context=False,
+        try:
+            summary = await extra_answer.agent_summary(self._messages())
+            if summary:
+                await extra_answer.set_summary(call_id, summary)
+            manager = await get_call_transfer_manager()
+            await manager.store_transfer_context(TransferContext(
+                transfer_id=str(uuid.uuid4()), call_sid=None, target_number="",
+                tool_uuid=DIALER_TRANSFER_TOOL_ID, original_call_sid=call_id,
+                conference_name=conference_name, initiated_at=time.time(),
+                workflow_run_id=self._run_id,
             ))
-        # The serializer's transfer strategy moves the caller into the conference once
-        # the line above has been spoken; the rep is already in it.
-        await engine.end_call_with_reason(EndTaskReason.TRANSFER_CALL.value, abort_immediately=False)
-        await extra_answer.mark("twilio", call_id, "agent_transferred",
-                                {"user_id": str(command.get("to_user_id") or "")})
-        logger.info(f"dialer extra answer handed over from run {self._run_id}")
+            task = engine.task
+            if task:
+                await task.queue_frame(TTSSpeakFrame(
+                    extra_answer.transfer_line(str(command.get("to_name") or "")), append_to_context=False,
+                ))
+            # The serializer's transfer strategy moves the caller into the conference once
+            # the line above has been spoken; the rep is already in it. The transfer is only
+            # recorded when the person's leg joins that room (dialer_extra_answer
+            # .on_prospect_joined); if it never does, the worker recovers it.
+            await engine.end_call_with_reason(EndTaskReason.TRANSFER_CALL.value, abort_immediately=False)
+        except Exception:
+            # Nothing was handed over: let the worker try again rather than leave the rep
+            # waiting in the room.
+            self._takeover_running = False
+            await extra_answer.release_transfer(call_id)
+            raise
+        logger.info(f"dialer extra answer handover started from run {self._run_id}")
 
     async def take_over(self, destination: str) -> None:
         if self._takeover_running:

@@ -42,8 +42,9 @@ RECORDING_REQUIRED_CODE = "voicemail_recording_required"
 RECORDING_REQUIRED_MESSAGE = "Record your voicemail to start calling."
 
 # The original rep's softphone auto-answers the ring-back (Phase 1b); after this long
-# without a join the extra-answer chain moves on to a teammate.
-RINGBACK_OFFER_SECONDS = 10
+# without a join the extra-answer chain moves on to a teammate. About 3 s, counted from
+# after the recording notice the person hears first (~4 s).
+RINGBACK_OFFER_SECONDS = 7
 
 
 def _headers() -> dict[str, str]:
@@ -131,7 +132,7 @@ _LOOKED_AFTER_STAGES = frozenset({
 
 
 def with_stage(payload: dict[str, Any], latest: dict[str, Any] | None) -> dict[str, Any]:
-    """Add `stage` / `stage_at` to a voicemail status payload.
+    """Add `stage` / `stage_at` / `stage_detail` to a voicemail status payload.
 
     While the original rep is being rung back (or has rejoined) the drop state reads
     `ringback`, so the browser does not report "picked up after you moved on" for a
@@ -139,6 +140,7 @@ def with_stage(payload: dict[str, Any], latest: dict[str, Any] | None) -> dict[s
     """
     payload["stage"] = (latest or {}).get("stage")
     payload["stage_at"] = (latest or {}).get("stage_at")
+    payload["stage_detail"] = (latest or {}).get("detail") or {}
     if payload["stage"] in _LOOKED_AFTER_STAGES and payload.get("state") in {
         "rejected", "waiting", "idle",
     }:
@@ -184,6 +186,19 @@ async def voicemail_recording_required(rep_user_id: str | None) -> bool:
         logger.warning(f"Could not read voicemail readiness for {rep_user_id}: {type(exc).__name__}")
         return False
     return isinstance(result, dict) and result.get("lock") is True
+
+
+DEFAULT_NO_ANSWER_SECONDS = 30
+
+
+def no_answer_seconds(policy: dict[str, Any] | None) -> int:
+    """How long a single call rings before it is no answer: the team setting (15..60),
+    else 30 s. Read from dialer_account_voicemail_policy's no_answer_seconds."""
+    try:
+        value = int((policy or {}).get("no_answer_seconds") or DEFAULT_NO_ANSWER_SECONDS)
+    except (TypeError, ValueError):
+        value = DEFAULT_NO_ANSWER_SECONDS
+    return max(15, min(60, value))
 
 
 def recording_required_detail() -> dict[str, str]:
