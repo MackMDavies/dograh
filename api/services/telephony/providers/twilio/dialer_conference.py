@@ -93,10 +93,13 @@ async def dial_lead_into_conference(
             # recording silence the whole time, so a long limit loses messages:
             # 30s on "balanced" did exactly that in production. A limit shorter than
             # a typical greeting (3s on "fastest") plays over the greeting instead.
+            # 2026-10-21: 28 of 31 mailboxes in 30 days ran to the limit (beeps that
+            # were detected came at 12-20s) and ~1 in 5 hung up on the silence before
+            # the message ended, so "balanced" waits 16s, not 20s (owner decision).
             amd_presets = {
                 "fastest": (8, 1000, 500, 2000),
                 "fast": (12, 1800, 900, 3000),
-                "balanced": (20, 2400, 1200, 5000),
+                "balanced": (16, 2400, 1200, 5000),
                 "accurate": (30, 3200, 2000, 7000),
             }
             timeout, speech_threshold, speech_end_threshold, silence_timeout = amd_presets.get(
