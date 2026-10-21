@@ -159,6 +159,7 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
         "openrouter": ["openai/text-embedding-3-large", "openai/text-embedding-3-small"],
     },
     "realtime": {
+        "elevenlabs_realtime": ["eleven_realtime_v1_mini", "eleven_realtime_v1_max"],
         "openai_realtime": ["gpt-4o-realtime-preview", "gpt-4o-mini-realtime-preview"],
         "google_realtime": ["gemini-2.0-flash-live-001", "gemini-2.0-flash-exp"],
         "google_vertex_realtime": ["gemini-2.0-flash-exp"],

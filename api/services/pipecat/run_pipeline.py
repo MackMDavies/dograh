@@ -126,8 +126,11 @@ def _create_realtime_user_turn_config(provider: str):
             SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         )
 
-    if provider == ServiceProviders.OPENAI_REALTIME.value:
-        # OpenAI Realtime already emits speaking-state frames and interruption
+    if provider in {
+        ServiceProviders.OPENAI_REALTIME.value,
+        ServiceProviders.ELEVENLABS_REALTIME.value,
+    }:
+        # OpenAI-compatible realtime providers emit speaking-state frames and interruption
         # events from the provider, so the aggregator should follow those
         # external signals rather than run its own local VAD.
         return (
