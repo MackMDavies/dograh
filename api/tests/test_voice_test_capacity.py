@@ -42,7 +42,7 @@ async def test_redis_failure_never_assumes_free_capacity_or_deletes_an_unowned_s
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "heartbeat,ready",
-    [(None, False), ("2", True), (b"2", True), ("1", False), (b"1", False)],
+    [(None, False), ("3", True), (b"3", True), ("2", False), (b"2", False)],
 )
 async def test_capabilities_require_fresh_exact_worker_protocol(heartbeat, ready):
     redis = MemoryRedis()
@@ -54,7 +54,8 @@ async def test_capabilities_require_fresh_exact_worker_protocol(heartbeat, ready
     assert result["requires_saved_script"] is True
     assert result["requires_provider_plan"] is True
     assert result["isolated_provider_credentials"] is True
-    assert result["protocol_version"] == 2
+    assert result["protocol_version"] == 3
+    assert result["requires_provider_intent"] is True
     assert result["independent_quality_evaluation"] is False
 
 
@@ -71,7 +72,7 @@ async def test_capability_read_failure_is_unavailable_without_private_details():
 async def test_worker_publishes_only_the_expiring_isolation_protocol():
     redis = MemoryRedis()
     assert await publish_voice_worker_protocol({"redis": redis})
-    assert redis.values == {WORKER_PROTOCOL_KEY: "2"}
+    assert redis.values == {WORKER_PROTOCOL_KEY: "3"}
     assert redis.calls == [(WORKER_PROTOCOL_KEY, False, 90)]
 
 

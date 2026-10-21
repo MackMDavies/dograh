@@ -5,6 +5,7 @@ speech providers. Only the native job service may consume a successful claim.
 """
 
 import base64
+import copy
 import hashlib
 import io
 import json
@@ -171,6 +172,9 @@ class VoiceSession:
     audio_bytes: int | None = None
     error_code: str | None = None
     provider_plan: dict | None = None
+    provider_intent: dict | None = None
+    provider_intent_hash: str | None = None
+    provider_binding_hash: str | None = None
 
     @classmethod
     def parse(cls, value, session_id, workflow_id):
@@ -269,6 +273,21 @@ class VoiceSession:
                 )
 
                 provider_plan = validate_private_voice_provider_plan(provider_plan)
+            intent = value.get("provider_intent")
+            intent_hash = value.get("provider_intent_hash")
+            binding_hash = value.get("provider_binding_hash")
+            if any(item is not None for item in (intent, intent_hash, binding_hash)):
+                if (
+                    not isinstance(intent, dict)
+                    or provider_plan is None
+                    or len(json.dumps(intent, ensure_ascii=False).encode()) > 65536
+                ):
+                    raise ValueError
+                if any(
+                    not isinstance(item, str) or not HASH.fullmatch(item)
+                    for item in (intent_hash, binding_hash)
+                ):
+                    raise ValueError
             return cls(
                 value["id"],
                 value["run_id"],
@@ -288,6 +307,9 @@ class VoiceSession:
                 audio_size,
                 error_code,
                 provider_plan,
+                copy.deepcopy(intent),
+                intent_hash,
+                binding_hash,
             )
         except (KeyError, TypeError, ValueError):
             raise VoiceControlError("voice_control_protocol_invalid") from None
@@ -393,11 +415,16 @@ class VoiceControlClient:
 
     async def get(self, session_id, lease_token, workflow_id):
         value = await self._json(
-            self._identity("get", session_id, lease_token, workflow_id), maximum=131072
+            self._identity("get", session_id, lease_token, workflow_id), maximum=196608
         )
         return VoiceSession.parse(value.get("session"), session_id, workflow_id)
 
     async def claim(self, session, lease_token, claim_token):
+        from api.services.workflow.voice_test_intent import (
+            validate_voice_session_provider_plan,
+        )
+
+        validate_voice_session_provider_plan(session, self._secret)
         canonical_uuid(claim_token)
         body = self._identity("claim", session.id, lease_token, session.workflow_id)
         await self._json(
@@ -406,6 +433,9 @@ class VoiceControlClient:
                 "claim_token": claim_token,
                 "workflow_version": session.workflow_version,
                 "runtime_workflow_hash": session.runtime_workflow_hash,
+                "protocol_version": 2,
+                "provider_intent_hash": session.provider_intent_hash,
+                "provider_binding_hash": session.provider_binding_hash,
             },
             "claimed",
         )

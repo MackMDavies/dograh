@@ -317,12 +317,14 @@ def test_voice_capabilities_expose_actual_worker_protocol_without_starting_a_job
 ):
     client, _, pool, enqueue = setup(monkeypatch)
     redis = pool.return_value
-    redis.get.return_value = b"2"
+    redis.get.return_value = b"3"
     response = client.get(
         "/workflow/test-voice/capabilities", headers={"x-sysevo-secret": SECRET}
     )
     assert response.status_code == 200
     assert response.json()["worker_ready"] is True
+    assert response.json()["protocol_version"] == 3
+    assert response.json()["requires_provider_intent"] is True
     assert response.json()["independent_quality_evaluation"] is False
     enqueue.assert_not_awaited()
     redis.enqueue_job.assert_not_awaited()

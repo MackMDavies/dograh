@@ -15,7 +15,10 @@ from pipecat.processors.frame_processor import FrameDirection
 
 from api.services.workflow.sandbox_repair import workflow_snapshot_hash
 from api.services.workflow.test_sandbox_mode import SANDBOX_ANNOTATION
-from api.services.workflow.voice_test_capacity import WORKER_PROTOCOL_KEY
+from api.services.workflow.voice_test_capacity import (
+    WORKER_PROTOCOL_KEY,
+    WORKER_PROTOCOL_VERSION,
+)
 from api.services.workflow.voice_test_control import VoiceControlError, VoiceSession
 from api.services.workflow.voice_test_job import (
     JOB_NAME,
@@ -29,10 +32,9 @@ from api.tests.test_voice_test_control import (
     LEASE,
     SECRET,
     SESSION,
-    metadata,
+    bound_metadata,
     wav_bytes,
 )
-from api.tests.test_voice_test_providers import plan_fixture
 
 
 class MemoryRedis:
@@ -60,7 +62,9 @@ class MemoryRedis:
 
 def setup():
     context = VoiceJobContext(SESSION, LEASE, 185, 42, 9)
-    workflow = SimpleNamespace(id=185, organization_id=42, user_id=7)
+    workflow = SimpleNamespace(
+        id=185, organization_id=42, user_id=7, template_context_variables={}
+    )
     definition = SimpleNamespace(
         workflow_id=185,
         version_number=3,
@@ -69,11 +73,8 @@ def setup():
         workflow_configurations={},
         template_context_variables={},
     )
-    data = metadata()
-    _, provider_packets, provider_plan = plan_fixture(signing_secret=SECRET)
-    data["provider_plan"] = provider_plan
-    data["runtime_workflow_hash"] = workflow_snapshot_hash(
-        definition.workflow_json, {}, {}
+    data, source, provider_packets = bound_metadata(
+        workflow_snapshot_hash(definition.workflow_json, {}, {})
     )
     data["script"].update(start_mode="caller_first", opening_timeout_ms=500)
     data["script"]["steps"][0]["response_timeout_ms"] = 500
@@ -113,6 +114,10 @@ def setup():
         get_workflow_run_by_id=AsyncMock(return_value=run),
         update_workflow_run=AsyncMock(side_effect=update),
         save_agent_test_voice_result=AsyncMock(side_effect=save_result),
+        get_user_configurations=AsyncMock(return_value=source),
+        get_default_embedding_model_connection=AsyncMock(return_value=None),
+        list_connections=AsyncMock(return_value=[]),
+        list_all_connections_superuser=AsyncMock(return_value=[]),
     )
     control = SimpleNamespace(
         get=AsyncMock(return_value=session),
@@ -170,7 +175,7 @@ def setup():
 async def test_queue_is_idempotent_and_never_puts_the_lease_in_logged_job_arguments():
     context, db, control, _, _, _, _ = setup()
     redis = MemoryRedis()
-    redis.values[WORKER_PROTOCOL_KEY] = "2"
+    redis.values[WORKER_PROTOCOL_KEY] = WORKER_PROTOCOL_VERSION
     for _ in range(2):
         assert (await enqueue_voice_job(db, control, redis, context))[
             "status"
@@ -207,7 +212,7 @@ async def test_scope_is_checked_before_reading_control_metadata_or_versions():
 async def test_conflicting_private_queue_context_is_not_replaced_or_enqueued():
     context, db, control, _, _, _, _ = setup()
     redis = MemoryRedis()
-    redis.values[WORKER_PROTOCOL_KEY] = "2"
+    redis.values[WORKER_PROTOCOL_KEY] = WORKER_PROTOCOL_VERSION
     original = replace(context, organization_id=43).encode()
     redis.values[voice_job_key(SESSION)] = original
     with pytest.raises(VoiceControlError, match="voice_job_context_conflict"):
@@ -228,7 +233,7 @@ async def test_missing_new_worker_protocol_blocks_dispatch_before_context_or_job
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("heartbeat", ["1", b"1", "3", b"3"])
+@pytest.mark.parametrize("heartbeat", ["1", b"1", "2", b"2", "4", b"4"])
 async def test_an_older_or_unknown_worker_cannot_receive_a_credential_isolated_job(
     heartbeat,
 ):
@@ -503,3 +508,64 @@ async def test_invalid_test_credentials_block_before_claim_runtime_write_or_prov
     control.fixture.assert_not_awaited()
     db.create_workflow_run.assert_not_awaited()
     assert not started
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "change",
+    [
+        "model",
+        "route",
+        "owner",
+        "missing_intent",
+        "intent_hash",
+        "binding_hash",
+        "plan_behavior",
+    ],
+)
+async def test_current_source_and_frozen_plan_must_match_before_credentials_or_paid_claim(
+    change,
+):
+    context, db, control, _, pipeline, started, _ = setup()
+    session = control.get.return_value
+    if change in {"model", "route"}:
+        source = db.get_user_configurations.return_value
+        source.llm = source.llm.model_copy(
+            update={
+                "model" if change == "model" else "base_url": "changed-model"
+                if change == "model"
+                else "https://private-customer.invalid/model"
+            }
+        )
+    elif change == "owner":
+        db.get_workflow.return_value.user_id = 8
+    elif change == "missing_intent":
+        control.get.return_value = replace(session, provider_intent=None)
+    elif change == "intent_hash":
+        control.get.return_value = replace(session, provider_intent_hash="0" * 64)
+    elif change == "binding_hash":
+        control.get.return_value = replace(session, provider_binding_hash="0" * 64)
+    else:
+        session.provider_plan["services"]["llm"]["model"] = "substituted-model"
+    with pytest.raises(VoiceControlError) as error:
+        await execute_voice_job(db, control, context, SECRET, pipeline_runner=pipeline)
+    assert "private-customer" not in str(error.value)
+    control.providers.assert_not_awaited()
+    control.fixture.assert_not_awaited()
+    control.claim.assert_not_awaited()
+    db.create_workflow_run.assert_not_awaited()
+    assert not started
+
+
+@pytest.mark.asyncio
+async def test_frozen_qa_execution_does_not_depend_on_the_owners_production_key():
+    context, db, control, _, pipeline, _, _ = setup()
+    source = db.get_user_configurations.return_value
+    source.llm = source.llm.model_copy(
+        update={"api_key": "SYNTHETIC_PRODUCTION_VALUE_NEVER_FOR_SDK"}
+    )
+    result = await execute_voice_job(
+        db, control, context, SECRET, pipeline_runner=pipeline
+    )
+    assert result["status"] == "completed"
+    control.claim.assert_awaited_once()
