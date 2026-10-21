@@ -346,12 +346,14 @@ def _manual_drop_state(call_row: dict | None) -> str:
 
 
 def _manual_drop_ready(call_row: dict | None) -> bool:
-    """A manual playback may start now: confirmed machine end, or a live call
-    whose account runs no AMD (the rep has heard the mailbox themselves)."""
-    if not call_row or not call_row.get("lead_joined_at"):
-        return False
-    amd_result = call_row.get("amd_result")
-    return amd_result in _MACHINE_END_RESULTS or amd_result is None
+    """A manual playback may start now: the rep is on the line and pressed it.
+
+    Once the rep can hear the far end, their press IS the verdict, whatever Twilio's
+    machine detection guessed. A greeting that opens like a person ("Hi, you've reached
+    John...") comes back `human` or `unknown`, and refusing then was the 'Leave voicemail
+    does nothing' reps reported (2026-10-21: 14 of one rep's answered calls were
+    human/unknown). Before the rep joins, the request still waits for a machine verdict."""
+    return bool(call_row and call_row.get("lead_joined_at"))
 
 
 # Every machine_end_* result means Twilio has already judged the greeting over, so the mailbox is

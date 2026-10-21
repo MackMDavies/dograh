@@ -274,6 +274,29 @@ def test_manual_drop_on_a_live_call_without_amd_plays_on_the_reps_press():
     assert "<Pause" not in twiml and "<Play>" in twiml
 
 
+def test_rep_press_on_a_live_line_plays_even_when_detection_said_human():
+    """The rep hears a mailbox that Twilio's detection read as a person: their press wins."""
+    for verdict in ("human", "unknown"):
+        row = {
+            "rep_user_id": _REP, "provider": "twilio", "child_call_sid": _CHILD, "amd_result": verdict,
+            "manual_voicemail_requested_at": "2026-10-19T00:00:00Z", "voicemail_drop_started_at": None,
+            "auto_voicemail_sent": False, "voicemail_drop_failed_at": None,
+            "ended_at": None, "lead_joined_at": "2026-10-19T00:00:00Z",
+        }
+        twilio = MagicMock()
+        with patch(f"{_PATH}.get_dialer_call_child_leg", new=AsyncMock(return_value=row)), \
+             patch(f"{_PATH}.get_auto_voicemail_settings", new=AsyncMock(return_value=(False, _URL, _DROP))), \
+             patch(f"{_PATH}.attach_voicemail_drop_to_call", new=AsyncMock(return_value=True)), \
+             patch(f"{_PATH}.request_manual_voicemail_drop", new=AsyncMock(return_value={"accepted": True, "state": "ready"})), \
+             patch(f"{_PATH}.claim_manual_voicemail_playback", new=AsyncMock(return_value=True)), \
+             patch(f"{_PATH}._twilio_client", new=AsyncMock(return_value=twilio)):
+            response = _app(authenticated=True).post(
+                "/dialer/manual-voicemail-drop", json={"parent_call_sid": _PARENT, "action": "send"},
+            )
+        assert response.json() == {"state": "playing", "released": True}, verdict
+        assert "<Play>" in twilio.calls.return_value.update.call_args.kwargs["twiml"]
+
+
 def test_manual_status_reports_needs_rep_and_failed_states():
     row = {
         "rep_user_id": _REP, "provider": "twilio", "child_call_sid": _CHILD, "amd_result": None,
