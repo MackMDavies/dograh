@@ -893,14 +893,17 @@ class PipecatEngine:
             has_recordings=self._has_recordings,
             call_context_vars=self._call_context_vars,
         )
+        # Only dialer extra-answer runs pass the callback tool's timezone; every other
+        # call composes its tools exactly as before.
+        dialer_kwargs = (
+            {"dialer_callback_tz": str((self._call_context_vars or {}).get("phone_timezone") or "UTC")}
+            if dialer_callback else {}
+        )
         functions = await compose_functions_for_node(
             node=node,
             custom_tool_manager=self._custom_tool_manager,
             kb_document_uuids=kb_doc_uuids,
-            dialer_callback_tz=(
-                str((self._call_context_vars or {}).get("phone_timezone") or "UTC")
-                if dialer_callback else None
-            ),
+            **dialer_kwargs,
         )
         await self._update_llm_context(system_prompt, functions)
 
