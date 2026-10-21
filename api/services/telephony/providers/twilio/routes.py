@@ -38,9 +38,11 @@ from api.services.telephony.dialer.inbound_call_log import (
     record_overflow_join,
 )
 from api.services.telephony.dialer.compliance import (
+    BATCH_TOO_SMALL_MESSAGE,
     dial_block_message,
     phone_block_reason,
     rep_overrides_hours,
+    snap_parallel_lines,
 )
 from api.services.telephony.dialer.provider import (
     UnknownDialerProvider,
@@ -227,6 +229,8 @@ class TelnyxDialerCallStartRequest(BaseModel):
     call_id: UUID
     to_number: str = Field(pattern=r"^\+[1-9]\d{7,14}$")
     entry_id: UUID | None = None
+    # The rep confirmed the two-step calling-hours warning.
+    hours_override: bool = False
 
 
 class TelnyxDialerCallStatusRequest(BaseModel):
@@ -709,8 +713,11 @@ async def start_telnyx_dialer_call(
     allowed, reason, phone_us_state = await check_dialer_calling_hours_with_state(
         body.to_number, str(body.entry_id) if body.entry_id else None
     )
+    if not allowed and rep_overrides_hours(reason, body.hours_override):
+        logger.warning(f"Telnyx: rep confirmed the calling-hours warning ({reason}) by {user.provider_id}")
+        allowed = True
     if not allowed:
-        raise HTTPException(status_code=403, detail=f"Call blocked by calling-hours check ({reason}).")
+        raise HTTPException(status_code=403, detail=dial_block_message(reason))
     if await call_stages.voicemail_recording_required(str(user.provider_id)):
         raise HTTPException(status_code=409, detail=call_stages.recording_required_detail())
     created = await create_dialer_call(
@@ -1196,11 +1203,9 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
                 media_type="application/xml",
             )
         # Every destination gets the same server checks as a single dial: the
-        # do-not-call/wrong-number register AND calling hours. The browser only
-        # screened the first lead, so lines 2..N would otherwise reach the
-        # carrier unchecked against a duplicate entry marked Do not call.
-        # Checks run concurrently so a ten-line batch stays inside Twilio's
-        # webhook deadline.
+        # do-not-call register and calling hours. A lead that fails either is dropped
+        # and the rest dial (never the whole batch refused); the batch snaps down to a
+        # supported size. Checks run concurrently to stay inside Twilio's deadline.
         candidate_items = list(candidate_numbers.items())
         block_reasons, hours_results = await asyncio.gather(
             asyncio.gather(*(
@@ -1212,28 +1217,29 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
                 for candidate_entry_id, candidate_phone in candidate_items
             )),
         )
-        blocked = next((reason for reason in block_reasons if reason), None)
-        if blocked:
+        keep_ids: list[str] = []
+        skipped: dict[str, str] = {}
+        for (candidate_entry_id, _phone), blocked, (hours_ok, hours_reason) in zip(
+            candidate_items, block_reasons, hours_results
+        ):
+            if blocked or not hours_ok:
+                skipped[candidate_entry_id] = str(blocked or hours_reason or "compliance_unavailable")
+            else:
+                keep_ids.append(candidate_entry_id)
+        if skipped:
+            lines = snap_parallel_lines(len(keep_ids))
             logger.warning(
-                f"voice-connect blocked parallel batch by server compliance check ({blocked})"
+                f"voice-connect skipped {len(skipped)} parallel lead(s) "
+                f"({sorted(set(skipped.values()))}); dialing {lines} of {parallel_line_count}"
             )
-            return HTMLResponse(
-                content=_parallel_refusal_twiml(
-                    "One of the selected leads is on the do not call list. Refresh the queue and try again."
-                ),
-                media_type="application/xml",
-            )
-        for allowed, reason in hours_results:
-            if not allowed:
-                logger.warning(
-                    f"voice-connect blocked parallel batch by calling-hours check ({reason})"
-                )
+            if lines < 2:
                 return HTMLResponse(
-                    content=_parallel_refusal_twiml(
-                        "One of the selected leads is outside calling hours. Skip it and try again."
-                    ),
+                    content=_parallel_refusal_twiml(BATCH_TOO_SMALL_MESSAGE),
                     media_type="application/xml",
                 )
+            kept = set(keep_ids)
+            parallel_entry_ids = [entry for entry in parallel_entry_ids if entry in kept][:lines]
+            parallel_line_count = lines
     else:
         block_reason = await get_dialer_phone_block_reason(to_number)
         if block_reason:

@@ -574,7 +574,8 @@ def test_voice_connect_parallel_screens_every_destination_against_do_not_call(mo
 
     assert response.status_code == 200
     assert "<Hangup/>" in response.text
-    assert "do not call" in response.text
+    # The DNC lead is dropped; one lead is not a batch, so nothing dials and the rep is told.
+    assert "Fewer than two leads" in response.text
     assert sorted(checked) == ["+15550000001", "+15550000002"]
     start_session.assert_not_awaited()
     create_call.assert_not_awaited()
@@ -683,7 +684,8 @@ def test_rep_overrides_hours_only_for_time_of_day_reasons():
     assert not rep_overrides_hours("outside_calling_hours", "")
     assert not rep_overrides_hours("do_not_call", "1")
     assert not rep_overrides_hours("lead_phone_mismatch", "1")
-    assert not rep_overrides_hours("compliance_unavailable", "1")
+    # The two-step warning also shows when the hours could not be confirmed.
+    assert rep_overrides_hours("compliance_unavailable", "1")
 
 
 def test_voice_connect_blocks_parallel_batch_if_any_number_is_outside_hours(monkeypatch):

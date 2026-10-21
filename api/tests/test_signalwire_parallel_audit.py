@@ -276,6 +276,7 @@ def _start_patches(entries, compliance, expire=None):
               new=AsyncMock(return_value=[{"id": f"leg-{i}"} for i in range(len(entries))])),
         patch(f"{MODULE}._resolve_signalwire_parallel_caller_ids", new=AsyncMock(return_value=caller_ids)),
         patch(f"{MODULE}._check_signalwire_parallel_compliance", new=compliance),
+        patch(f"{MODULE}.callable_batch_entries", new=AsyncMock(side_effect=lambda items: ([entry for entry, _phone in items], {}))),
         patch(f"{MODULE}.signalwire_parallel_store.finish_session", new=AsyncMock(return_value=True)),
         patch(f"{MODULE}.create_dialer_call", new=AsyncMock(return_value=True)),
         patch(f"{CALLING}.originate_call", new=AsyncMock(side_effect=lambda **kw: {"id": "call-" + kw["to_number"]})),
@@ -326,7 +327,9 @@ async def test_one_blocked_destination_still_fails_the_whole_batch_closed():
 
     rep_id, patches = _start_patches(entries, AsyncMock(side_effect=check))
     response = await _start(rep_id, entries, patches)
-    assert _is_hangup(_body(response))
+    # Still fails closed (nothing dials), but the rep now hears why before the hang-up.
+    main = _body(response)["sections"]["main"]
+    assert main[-1] == {"hangup": {}} and main[0]["play"]["url"].startswith("say:")
 
 
 async def test_stale_sessions_are_expired_before_reserving():

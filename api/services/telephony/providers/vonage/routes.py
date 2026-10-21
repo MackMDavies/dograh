@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field
 from api.db import db_client
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer import call_stages, vonage_voicemail
-from api.services.telephony.dialer.compliance import calling_hours_result, phone_block_reason, rep_overrides_hours
+from api.services.telephony.dialer.compliance import calling_hours_result, dial_block_message, phone_block_reason, rep_overrides_hours
 from api.services.telephony.factory import get_telephony_provider_for_run
 from api.services.telephony.providers.twilio.dialer_call_log import (
     create_dialer_call,
@@ -270,7 +270,7 @@ async def start_vonage_dialer_call(
         logger.warning(f"Vonage: rep chose Call anyway past the calling-hours check ({reason}) by {user.provider_id}")
         allowed = True
     if not allowed:
-        raise HTTPException(status_code=403, detail=f"Call blocked by calling-hours check ({reason}).")
+        raise HTTPException(status_code=403, detail=dial_block_message(reason))
     if await call_stages.voicemail_recording_required(str(user.provider_id)):
         raise HTTPException(status_code=409, detail=call_stages.recording_required_detail())
 

@@ -67,10 +67,13 @@ from api.services.telephony.dialer.swml import (
 from api.services.telephony.dialer import call_sorter, call_stages, extra_answer, signalwire_parallel_store, sorter_gate
 from api.services.telephony.dialer import signalwire_call_sorter
 from api.services.telephony.dialer.compliance import (
+    BATCH_TOO_SMALL_MESSAGE,
     calling_hours_allowed,
     calling_hours_result,
+    callable_batch_entries,
     dial_block_message,
     rep_overrides_hours,
+    snap_parallel_lines,
     phone_block_reason,
 )
 from api.services.telephony.dialer.live_transcribe import LiveTranscriber
@@ -717,6 +720,7 @@ async def _start_signalwire_session(
         return _swml(build_say_and_hangup_swml(call_stages.RECORDING_REQUIRED_MESSAGE))
 
     browser_call_id = _extract(payload, query, _CALL_ID_KEYS)
+    hours_override = _extract(payload, query, ("HoursOverride", "hours_override"))
     try:
         if screened_single:
             entry_id = _extract(payload, query, _ENTRY_KEYS)
@@ -754,6 +758,23 @@ async def _start_signalwire_session(
         entries = await _load_signalwire_parallel_entries(entry_ids)
         if len(entries) != line_count:
             raise RuntimeError("one or more selected leads could not be verified")
+        if not screened_single:
+            # A do-not-call lead, or one definitely outside its calling hours, is
+            # dropped and the rest dial (never the whole batch refused); the batch
+            # snaps down to a supported size.
+            keep_ids, skipped = await callable_batch_entries([(e["id"], e["phone"]) for e in entries])
+            if skipped:
+                lines = snap_parallel_lines(len(keep_ids))
+                logger.warning(
+                    f"SignalWire batch skipped {len(skipped)} lead(s) ({sorted(set(skipped.values()))}); "
+                    f"dialing {lines} of {line_count}"
+                )
+                if lines < 2:
+                    return _swml(build_say_and_hangup_swml(BATCH_TOO_SMALL_MESSAGE))
+                kept = set(keep_ids)
+                entries = [e for e in entries if e["id"] in kept][:lines]
+                entry_ids = [e["id"] for e in entries]
+                line_count = lines
 
         session_id = str(uuid.uuid4())
         conference_name = f"sysevo-par-{session_id}"
@@ -804,6 +825,9 @@ async def _start_signalwire_session(
                 _check_signalwire_parallel_compliance(
                     phone=entry["phone"], provider_call_id=f"sw-preflight-{session_id}-{position}",
                     entry_id=entry["id"], rep_user_id=rep_subject,
+                    # Only a single queue call carries the rep's confirmation; a batch's
+                    # closed leads were dropped above.
+                    hours_override=hours_override if screened_single else "",
                 )
                 for position, entry in enumerate(entries)
             ))
@@ -836,9 +860,14 @@ async def _start_signalwire_session(
         return _swml(await _signalwire_parallel_join_swml(
             conference_name=conference_name, session_id=session_id, leg_id="rep"
         ))
+    except SignalWireDialRefused as refused:
+        logger.warning(f"SignalWire queue call refused ({refused.reason})")
+        return _swml(build_say_and_hangup_swml(dial_block_message(refused.reason)))
     except Exception as exc:  # noqa: BLE001 - never fall back to one call
         logger.exception(f"SignalWire parallel batch failed closed: {exc}")
-        return _swml(build_hangup_swml())
+        return _swml(build_say_and_hangup_swml(
+            "The call could not be started. Please try again in a moment."
+        ))
 
 
 async def _originate_signalwire_batch(
@@ -1060,16 +1089,29 @@ async def _resolve_signalwire_parallel_caller_ids(
     return by_entry
 
 
+class SignalWireDialRefused(RuntimeError):
+    """A refusal the rep should hear (the message is spoken before the hang-up)."""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 async def _check_signalwire_parallel_compliance(
-    *, phone: str, provider_call_id: str, entry_id: str, rep_user_id: str
+    *, phone: str, provider_call_id: str, entry_id: str, rep_user_id: str,
+    hours_override: str = "",
 ) -> None:
     del provider_call_id, rep_user_id  # retained in the signature for existing audit call sites
     block_reason = await phone_block_reason(phone)
     if block_reason:
-        raise RuntimeError(f"Dial blocked by server suppression check: {block_reason}")
+        raise SignalWireDialRefused(block_reason)
     allowed, reason = await calling_hours_allowed(phone, entry_id)
-    if not allowed:
-        raise RuntimeError(f"Dial blocked by server calling-hours check: {reason}")
+    if allowed:
+        return
+    if rep_overrides_hours(reason, hours_override):
+        logger.warning(f"SignalWire: rep confirmed the calling-hours warning ({reason}); dialing")
+        return
+    raise SignalWireDialRefused(str(reason or "compliance_unavailable"))
 
 
 async def _load_signalwire_parallel_default_drop(

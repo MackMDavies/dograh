@@ -3,6 +3,8 @@
     POST /api/v1/telephony/dialer/handling/{call_key}/take-over    rep (own call) or manager
     POST /api/v1/telephony/dialer/handling/{call_key}/hand-to-rep  manager / admin
     POST /api/v1/telephony/dialer/handling/{call_key}/end          rep (own call) or manager
+    POST /api/v1/telephony/dialer/calling-hours                    any dialer user (the
+         server's calling-hours decision for the browser's two-step warning)
 
 ``call_key`` is the key the browser polls stages with (the Twilio parent call SID of a
 single call, or the line's own call SID on a parallel line). Auth: the Supabase
@@ -16,6 +18,7 @@ from __future__ import annotations
 import re
 
 from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel
 
 from api.services.auth.sysevo_roles import require_sales_dialer_role
 from api.services.telephony.dialer import call_handling
@@ -50,3 +53,30 @@ async def hand_handled_call_to_rep(call_key: str, user=Depends(require_sales_dia
 @router.post("/dialer/handling/{call_key}/end")
 async def end_handled_call(call_key: str, user=Depends(require_sales_dialer_role)):
     return await _run(call_key, "end", user)
+
+
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+class CallingHoursRequest(BaseModel):
+    phone: str
+    entry_id: str | None = None
+
+
+@router.post("/dialer/calling-hours")
+async def dialer_calling_hours(body: CallingHoursRequest, user=Depends(require_sales_dialer_role)):
+    """The SAME calling-hours decision the call webhooks use, for the browser's warning.
+
+    The browser asks before every outbound dial, so a call the server considers out of
+    hours always shows the two-step warning first and is never refused without it.
+    POST so the prospect's number never appears in a URL or an access log.
+    """
+    from api.services.telephony.dialer.compliance import calling_hours_detail
+    from api.services.telephony.dialer.signalwire_routes import normalize_lead_number
+
+    del user
+    normalized = normalize_lead_number(body.phone or "")
+    if not normalized:
+        raise HTTPException(status_code=400, detail="Not a dialable number.")
+    entry = body.entry_id if body.entry_id and _UUID.fullmatch(body.entry_id) else None
+    return await calling_hours_detail(normalized, entry)
