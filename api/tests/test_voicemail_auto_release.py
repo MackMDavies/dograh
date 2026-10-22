@@ -750,3 +750,29 @@ def test_signalwire_status_says_a_person_answered_after_the_rep_left():
     assert state["state"] == "rejected" and state["failure"] == "person_answered"
     no_answer = {**found, "leg": {**found["leg"], "amd_result": None}}
     assert "failure" not in _signalwire_drop_state(no_answer)
+
+
+def test_twilio_person_is_never_bridged_when_the_rep_leg_already_ended():
+    """21 Oct: the rep's browser leg failed at 0s, the prospect still answered and sat
+    alone in a silent, unrecorded conference for 1m55s. Now: never joined."""
+    with patch(f"{_PATH}.update_dialer_call_child_sid", new=AsyncMock()), \
+         patch(f"{_PATH}.update_dialer_call_amd_result", new=AsyncMock(return_value=True)), \
+         patch(f"{_PATH}.record_twilio_amd_decision", new=AsyncMock()), \
+         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={})), \
+         patch(f"{_PATH}._rep_leg_ended", new=AsyncMock(return_value=True)) as ended, \
+         patch(f"{_PATH}.record_voicemail_playback_failure", new=AsyncMock(return_value=True)) as failed:
+        response = _join("human")
+    ended.assert_awaited_once_with(_PARENT)
+    assert "<Conference" not in response.text
+    # Not a voicemail hand-off, so nothing is reported as a failed voicemail.
+    failed.assert_not_awaited()
+
+
+def test_twilio_person_joins_as_before_while_the_rep_leg_is_live():
+    with patch(f"{_PATH}.update_dialer_call_child_sid", new=AsyncMock()), \
+         patch(f"{_PATH}.update_dialer_call_amd_result", new=AsyncMock(return_value=True)), \
+         patch(f"{_PATH}.record_twilio_amd_decision", new=AsyncMock()), \
+         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={})), \
+         patch(f"{_PATH}._rep_leg_ended", new=AsyncMock(return_value=False)):
+        response = _join("human")
+    assert "<Conference" in response.text

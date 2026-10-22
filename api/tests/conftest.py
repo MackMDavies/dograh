@@ -570,3 +570,23 @@ def three_node_workflow_no_variable_extraction() -> WorkflowGraph:
         ],
     )
     return WorkflowGraph(dto)
+
+
+@pytest.fixture(autouse=True)
+def _rep_leg_live_by_default(request):
+    """The dialer join webhook asks Twilio whether the rep's leg already ended.
+    Tests have no Twilio: default to "still live" (the pre-existing behaviour);
+    tests of the rep-gone path patch it themselves."""
+    if "no_rep_leg_stub" in request.keywords:
+        yield
+        return
+    try:
+        import api.services.telephony.providers.twilio.routes  # noqa: F401
+    except Exception:  # noqa: BLE001 - suites that never load the dialer routes
+        yield
+        return
+    with patch(
+        "api.services.telephony.providers.twilio.routes._rep_leg_ended",
+        AsyncMock(return_value=False),
+    ):
+        yield

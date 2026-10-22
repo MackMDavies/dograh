@@ -2060,10 +2060,17 @@ async def handle_dialer_conference_join(
         # ringing. Whoever answers can no longer reach the rep: never drop a
         # person (or an unplayable machine) into an empty conference.
         evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
-        if evidence.get("rep_detached_at"):
+        detached = bool(evidence.get("rep_detached_at"))
+        # The rep's own leg already ended (their browser call failed to connect,
+        # or they hung up while it rang) but this destination still answered.
+        # Joining would leave the prospect alone in a silent, unrecorded room
+        # (21 Oct: one sat there for 1m55s). Treat it like a rep who moved on.
+        rep_gone = not detached and await _rep_leg_ended(parent_call_sid)
+        if detached or rep_gone:
             lead_sid = str(form_data.get("CallSid") or "")
             if (
-                not answered_by
+                detached
+                and not answered_by
                 and call_sorter.call_sorter_enabled()
                 and _TWILIO_CALL_SID_PATTERN.fullmatch(lead_sid)
             ):
@@ -2119,8 +2126,16 @@ async def handle_dialer_conference_join(
                     # The chain recorded 'extra_answer' on this call already.
                     logger.info(f"Ring-back not possible for {parent_call_sid}: the extra-answer chain took the call")
                     return HTMLResponse(content=chain_twiml, media_type="application/xml")
-            logger.info(f"Rep detached before {parent_call_sid} answered ({answered_by or 'no AMD'}); ending the leg")
-            if not answered_by.startswith("machine") and answered_by != "fax":
+            logger.info(
+                f"Rep {'detached' if detached else 'leg ended'} before {parent_call_sid} answered "
+                f"({answered_by or 'no AMD'}); ending the leg"
+            )
+            if rep_gone and not answered_by.startswith("machine") and answered_by != "fax":
+                background_tasks.add_task(
+                    call_stages.record_call_stage, parent_call_sid, "person",
+                    {"rep_gone": True, "ringback": "unavailable"},
+                )
+            elif not answered_by.startswith("machine") and answered_by != "fax":
                 # The rep is busy (or offline): today's behaviour. Record it so the
                 # rep's background status says "call them back" rather than "no
                 # mailbox", and the call row shows what happened.
@@ -2930,6 +2945,24 @@ async def handle_dialer_recording_callback(request: Request):
                 f"(conference {conference_sid}) to any call"
             )
     return {"status": "success"}
+
+
+_REP_LEG_ENDED_STATUSES = {"completed", "no-answer", "busy", "failed", "canceled"}
+
+
+async def _rep_leg_ended(parent_call_sid: str) -> bool:
+    """Whether the rep's own (browser) leg has already ended, per Twilio.
+    Any doubt (no client, lookup failed) answers False: the prospect is then
+    joined exactly as before, never hung up on a guess."""
+    client = await _twilio_client()
+    if not client:
+        return False
+    try:
+        call = await asyncio.to_thread(client.calls(parent_call_sid).fetch)
+    except Exception as exc:  # noqa: BLE001 - a lookup failure must not fail the join
+        logger.warning(f"Could not read the rep leg {parent_call_sid}: {exc}")
+        return False
+    return str(getattr(call, "status", "") or "").lower() in _REP_LEG_ENDED_STATUSES
 
 
 async def _parent_call_sid_for_conference(conference_sid: str) -> str | None:
