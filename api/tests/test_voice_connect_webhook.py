@@ -1704,6 +1704,33 @@ def test_dialer_recording_callback_handles_missing_conference_sid(monkeypatch):
     mock_update.assert_not_awaited()
 
 
+def test_dialer_recording_callback_attaches_a_voicemail_leg_recording(monkeypatch):
+    """A voicemail plays on the prospect's own leg, outside the recorded
+    conference: that leg's recording (CallSid, no ConferenceSid) is the call's."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+    leg = "CA" + "3" * 32
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_child_call_sid",
+        AsyncMock(return_value=True),
+    ) as by_leg, patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_conference_sid",
+    ) as by_conference:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"CallSid": leg, "RecordingSid": "RE999", "RecordingStatus": "completed"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.json() == {"status": "success", "source": "voicemail_leg"}
+    by_leg.assert_awaited_once_with(child_call_sid=leg, recording_sid="RE999")
+    by_conference.assert_not_awaited()
+
+
 def test_dialer_recording_callback_ignores_non_completed_status(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     client = TestClient(_make_test_app())

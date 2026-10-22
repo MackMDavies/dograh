@@ -1052,6 +1052,30 @@ async def update_dialer_call_recording_by_conference_sid(
         return None
 
 
+async def update_dialer_call_recording_by_child_call_sid(
+    *, child_call_sid: str, recording_sid: str
+) -> bool:
+    """A recording of the prospect's own leg (a voicemail playing into a mailbox,
+    which happens outside the rep's recorded conference). Only fills a call that
+    has no recording yet, so a conference recording is never replaced."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"child_call_sid": f"eq.{child_call_sid}", "recording_sid": "is.null"},
+                json={"recording_sid": recording_sid},
+                headers={**_headers(), "Prefer": "count=exact"},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return bool(_affected_row_count(response.headers.get("Content-Range", "")))
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to attach leg recording {recording_sid} to {child_call_sid}: {exc}")
+        return False
+
+
 async def update_dialer_call_recording_by_parent_call_sid(
     *, parent_call_sid: str, conference_sid: str, recording_sid: str
 ) -> bool:

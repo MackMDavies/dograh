@@ -42,9 +42,10 @@ async def _watch(*, row, stage="beep", trial=True, enabled=False):
          patch(f"{_PATH}._redirect_twilio_child_to_voicemail", new=AsyncMock(return_value=True)) as redirect, \
          patch(f"{_PATH}.release_manual_voicemail_playback", new=AsyncMock(return_value=True)), \
          patch(f"{_PATH}.call_stages.record_call_stage", new=AsyncMock()), \
+         patch(f"{_PATH}._record_voicemail_leg", new=AsyncMock()) as record, \
          patch(f"{_PATH}._release_rep_for_voicemail", new=AsyncMock()) as release:
         result = await routes._beep_trial_watch(parent_call_sid=_PARENT, child_call_sid=_CHILD)
-        mocks.update(start=start, amd=amd, claim=claim, redirect=redirect, release=release)
+        mocks.update(start=start, amd=amd, claim=claim, redirect=redirect, release=release, record=record)
     return result, mocks
 
 
@@ -59,6 +60,7 @@ async def test_queued_send_voicemail_plays_on_the_beep_with_no_pause():
     twiml = m["redirect"].await_args.kwargs["twiml"]
     assert "<Play>" in twiml and "<Pause" not in twiml
     m["release"].assert_not_awaited()  # a queued send already freed the rep
+    m["record"].assert_awaited_once_with(child_call_sid=_CHILD)  # the voicemail gets a recording
 
 
 @pytest.mark.asyncio
