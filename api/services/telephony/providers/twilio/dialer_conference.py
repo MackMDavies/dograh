@@ -48,6 +48,7 @@ async def dial_lead_into_conference(
     machine_detection: bool = False,
     machine_detection_preset: str = "balanced",
     ringing_timeout_seconds: int | None = None,
+    recording_callback_url: str | None = None,
 ) -> str | None:
     """Places the outbound leg to the lead, joining them into the same
     conference as the rep, with status tracking attached the same way the
@@ -75,6 +76,17 @@ async def dial_lead_into_conference(
             "status_callback_event": ["initiated", "ringing", "answered", "completed"],
             "status_callback_method": "POST",
         }
+        if recording_callback_url:
+            # Record the lead's own leg from the moment it answers. The conference
+            # recording only exists once two people are in the room, so a voicemail
+            # played into a mailbox, a greeting the rep left a live message on, or a
+            # line that hung up before joining had no recording at all (22 Oct:
+            # "too many calls have no recording"). The callback attaches it to the
+            # call only when the call has no recording yet.
+            params["record"] = True
+            params["recording_status_callback"] = recording_callback_url
+            params["recording_status_callback_event"] = ["completed"]
+            params["recording_channels"] = "mono"
         if ringing_timeout_seconds is not None:
             # Bound each destination in a parallel batch so an empty round
             # cannot leave its parent conference open indefinitely.

@@ -1147,6 +1147,7 @@ def test_voice_connect_uses_assigned_number_for_recognized_rep(monkeypatch):
         machine_detection=True,
         machine_detection_preset="balanced",
         ringing_timeout_seconds=30,
+        recording_callback_url="https://api.example.com/api/v1/telephony/dialer-recording-callback",
     )
 
 

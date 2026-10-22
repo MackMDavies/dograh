@@ -81,6 +81,33 @@ async def test_dial_lead_into_conference_returns_call_sid_on_success(monkeypatch
     )
 
 
+async def test_dial_lead_records_the_lead_leg_from_answer(monkeypatch):
+    """Every answered call gets a recording: voicemail drops and mailboxes are outside the
+    conference recording, so the lead's own leg is recorded from the moment it answers."""
+    monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")
+    fake_client = MagicMock()
+    fake_client.calls.create.return_value = MagicMock(sid="CA999")
+
+    with patch(
+        "api.services.telephony.providers.twilio.dialer_conference.Client",
+        return_value=fake_client,
+    ):
+        await dial_lead_into_conference(
+            parent_call_sid="CA111",
+            lead_number="+15559876543",
+            caller_id="+15551234567",
+            join_conference_url="https://api.example.com/join",
+            status_callback_url="https://api.example.com/status",
+            recording_callback_url="https://api.example.com/api/v1/telephony/dialer-recording-callback",
+        )
+
+    kwargs = fake_client.calls.create.call_args.kwargs
+    assert kwargs["record"] is True
+    assert kwargs["recording_status_callback"] == "https://api.example.com/api/v1/telephony/dialer-recording-callback"
+    assert kwargs["recording_status_callback_event"] == ["completed"]
+
+
 async def test_dial_lead_only_enables_message_end_detection_when_requested(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_ACCOUNT_SID", "ACtest")
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-token")

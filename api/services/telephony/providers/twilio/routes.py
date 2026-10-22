@@ -532,7 +532,6 @@ async def _play_queued_voicemail_after_greeting(
             await record_voicemail_playback_failure(parent_call_sid=parent_call_sid, reason="playback_not_started")
             return "redirect_failed"
         await call_stages.record_call_stage(parent_call_sid, "vm_playing", {"source": "manual", "drop_id": drop_id})
-        await _record_voicemail_leg(child_call_sid=child_call_sid)
         return "played"
     except Exception as exc:  # noqa: BLE001 - background task
         logger.error(f"Queued voicemail after greeting failed for {parent_call_sid}: {type(exc).__name__}")
@@ -654,7 +653,6 @@ async def control_manual_voicemail_drop(
             # The prospect leg now plays the message on its own: free the rep.
             background_tasks.add_task(_release_rep_for_voicemail, body.parent_call_sid)
             background_tasks.add_task(call_stages.record_call_stage, body.parent_call_sid, "vm_playing", {})
-            background_tasks.add_task(_record_voicemail_leg, child_call_sid=child_call_sid)
             return {"state": "playing", "released": True}
 
     if state == "waiting" and not (current or {}).get("lead_joined_at"):
@@ -1042,30 +1040,6 @@ async def _start_call_sorter_stream(*, call_ref: str, leg_call_sid: str) -> None
         logger.warning(f"Call sorter stream not started for {call_ref}: {type(exc).__name__}")
 
 
-async def _record_voicemail_leg(*, child_call_sid: str) -> None:
-    """Record the prospect's leg while the voicemail plays into the mailbox.
-
-    The message plays on that leg on its own, outside the rep's recorded
-    conference, so 33 voicemail calls in 3 days had no recording, transcript or
-    summary. The recording callback attaches it to the call (by its child leg)
-    and the transcript sweep picks it up like any other. Never raises.
-    """
-    await asyncio.sleep(0.5)  # let Twilio start the playback TwiML first
-    client = await _twilio_client()
-    if not client:
-        return
-    try:
-        backend_endpoint, _ = await get_backend_endpoints()
-        await asyncio.to_thread(
-            client.calls(child_call_sid).recordings.create,
-            recording_status_callback=f"{str(backend_endpoint or '').rstrip('/')}/api/v1/telephony/dialer-recording-callback",
-            recording_status_callback_event=["completed"],
-            recording_channels="mono",
-        )
-    except Exception as exc:  # noqa: BLE001 - the voicemail still plays
-        logger.warning(f"Could not record the voicemail leg {child_call_sid}: {exc}")
-
-
 _LEAVE_SELF_TTL_SECONDS = 15 * 60
 
 
@@ -1209,7 +1183,6 @@ async def _beep_trial_watch(*, parent_call_sid: str, child_call_sid: str) -> str
         await call_stages.record_call_stage(
             parent_call_sid, "vm_playing", {"source": "beep", "manual": manual, "drop_id": drop_id},
         )
-        await _record_voicemail_leg(child_call_sid=child_call_sid)
         if not manual:
             await _release_rep_for_voicemail(parent_call_sid)
         return "played"
@@ -1696,6 +1669,7 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
                 lead_number=target["phone"],
                 caller_id=target["caller_id"],
                 join_conference_url=join_url,
+                recording_callback_url=recording_callback_url,
                 status_callback_url=status_url,
                 ringing_timeout_seconds=30,
                 # Parallel dialing must screen every line before any lead is
@@ -1761,6 +1735,7 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
             lead_number=to_number,
             caller_id=caller_id,
             join_conference_url=lead_join_url,
+            recording_callback_url=recording_callback_url,
             status_callback_url=lead_status_callback_url,
             # Detect on every Twilio outbound call so a rep can request a
             # server-side manual drop while it is still ringing. The saved
@@ -2212,7 +2187,6 @@ async def handle_dialer_conference_join(
                         call_stages.record_call_stage, stage_key, "vm_playing",
                         {"source": "manual" if manual_requested else "auto", "drop_id": drop_id},
                     )
-                    background_tasks.add_task(_record_voicemail_leg, child_call_sid=child_sid)
                     return HTMLResponse(content=twiml, media_type="application/xml")
                 # Twilio retries a TwiML fetch it did not receive. When the
                 # first attempt already claimed this exact leg, replay the same
