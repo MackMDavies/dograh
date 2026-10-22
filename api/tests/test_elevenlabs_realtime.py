@@ -5,6 +5,7 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from pipecat.frames.frames import LLMFullResponseEndFrame, TTSSpeakFrame, TTSStoppedFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.llm_service import LLMSettings
 from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
@@ -320,3 +321,47 @@ async def test_response_without_token_usage_finishes_audio_and_allows_the_next_t
     assert service._current_assistant_response is None
     service.stop_processing_metrics.assert_awaited_once()
     service.start_llm_usage_metrics.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_provider_buffer_clear_notification_does_not_abort_websocket_audio():
+    audio = '{"type":"response.output_audio.delta","delta":"AAECAw=="}'
+
+    class Socket:
+        async def __aiter__(self):
+            yield '{"type":"output_audio_buffer.cleared","response_id":"resp-test"}'
+            yield audio
+
+    assert [message async for message in _ElevenLabsProtocolSocket(Socket())] == [audio]
+
+
+@pytest.mark.asyncio
+async def test_workflow_instruction_change_is_sent_once_on_next_response_without_caller_transcript():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_max", session_properties=SessionProperties(),
+        ),
+    )
+    service._context = LLMContext()
+    service.send_client_event = AsyncMock()
+    await service._update_settings(LLMSettings(system_instruction="Opening node"))
+    assert service._pending_workflow_instruction is None
+    service._handled_initial_context = True
+    service._api_session_ready = True
+    await service._update_settings(LLMSettings(system_instruction="Ask which day to book."))
+    assert service._pending_workflow_instruction == "Ask which day to book."
+    service.send_client_event.reset_mock()
+    with patch(
+        "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
+        new=AsyncMock(),
+    ) as create_response:
+        await service._create_response()
+        await service._create_response()
+    item = service.send_client_event.call_args.args[0].item
+    assert "Ask which day to book." in item.content[0].text
+    assert item.id in service._messages_added_manually
+    assert service._context.messages == []
+    assert service._pending_workflow_instruction is None
+    service.send_client_event.assert_awaited_once()
+    assert create_response.await_count == 2

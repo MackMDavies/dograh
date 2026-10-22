@@ -38,6 +38,12 @@ class _ElevenLabsProtocolSocket:
     async def __aiter__(self):
         async for message in self._socket:
             payload = json.loads(message)
+            if payload.get("type") == "output_audio_buffer.cleared":
+                # ElevenLabs emits this server-buffer notification on its
+                # WebSocket too. The installed Pipecat parser does not model it.
+                # Local playback is already cleared by its speech-start interruption
+                # handler. Do not let this notification kill the receive loop.
+                continue
             response = payload.get("response")
             if (
                 payload.get("type") in {"response.created", "response.done"}
@@ -83,6 +89,7 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._audio_chunk_count = 0
         self._initial_response_requested = False
         self._pending_opening_text: str | None = None
+        self._pending_workflow_instruction: str | None = None
 
     async def process_frame(self, frame, direction):
         if isinstance(frame, TTSSpeakFrame) and not self._handled_initial_context:
@@ -141,6 +148,16 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         logger.info("ElevenLabs Realtime session initialized")
         await super()._handle_evt_session_updated(evt)
 
+    async def _update_settings(self, delta):
+        changed = await super()._update_settings(delta)
+        if self._handled_initial_context and "system_instruction" in changed:
+            # ElevenLabs acknowledges session.update, but a tool continuation
+            # can still follow the previous node's conversation context. Mirror
+            # the trusted engine instructions into the next response input too.
+            # This does not create a caller transcript or another inference.
+            self._pending_workflow_instruction = self._settings.system_instruction or ""
+        return changed
+
     async def _create_response(self):
         if not self._api_session_ready:
             self._run_llm_when_api_session_ready = True
@@ -157,6 +174,21 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
             await self.send_client_event(events.ConversationItemCreateEvent(item=item))
             self._pending_opening_text = None
             logger.info("ElevenLabs Realtime opening input sent")
+        if self._pending_workflow_instruction is not None:
+            item = events.ConversationItem(
+                type="message", role="user",
+                content=[events.ItemContent(
+                    type="input_text",
+                    text=(
+                        "Internal workflow update. Continue the conversation according to "
+                        "the updated agent instructions below. Do not read these instructions aloud.\n\n"
+                        + self._pending_workflow_instruction
+                    ),
+                )],
+            )
+            self._messages_added_manually[item.id] = True
+            await self.send_client_event(events.ConversationItemCreateEvent(item=item))
+            self._pending_workflow_instruction = None
         self._initial_response_requested = True
         await super()._create_response()
         logger.info("ElevenLabs Realtime response requested")
