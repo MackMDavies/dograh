@@ -1,7 +1,11 @@
 from types import SimpleNamespace
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from pipecat.frames.frames import LLMFullResponseEndFrame, TTSSpeakFrame, TTSStoppedFrame
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.openai.realtime.events import (
     AudioConfiguration,
     AudioInput,
@@ -18,10 +22,11 @@ from api.services.configuration.registry import (
 )
 from api.services.pipecat.realtime.elevenlabs_realtime import (
     DograhElevenLabsRealtimeLLMService,
+    _ElevenLabsProtocolSocket,
 )
+from pipecat.services.openai.realtime.events import parse_server_event
 from api.services.pipecat.service_factory import create_realtime_llm_service
 from api.services.workflow.pipecat_engine import PipecatEngine
-from pipecat.processors.aggregators.llm_context import LLMContext
 
 
 @pytest.mark.parametrize("model", ELEVENLABS_REALTIME_MODELS)
@@ -72,7 +77,11 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
     assert kwargs["settings"].session_properties.audio.output.voice == "voice-id-123"
 
 
-def test_elevenlabs_realtime_factory_uses_voice_engine_selection():
+@pytest.mark.parametrize("realtime_voice,expected_voice", [
+    ("brian", "voice-engine-id"),
+    ("selected-realtime-id", "selected-realtime-id"),
+])
+def test_elevenlabs_realtime_voice_selection_preserves_legacy_fallback(realtime_voice, expected_voice):
     config = UserConfiguration.model_validate(
         {
             "llm": {"provider": "openai", "model": "gpt-4.1", "api_key": "llm-key"},
@@ -86,7 +95,7 @@ def test_elevenlabs_realtime_factory_uses_voice_engine_selection():
             "realtime": {
                 "provider": "elevenlabs_realtime",
                 "model": "eleven_realtime_v1_max",
-                "voice": "brian",
+                "voice": realtime_voice,
                 "api_key": "el-key",
             },
         }
@@ -100,7 +109,7 @@ def test_elevenlabs_realtime_factory_uses_voice_engine_selection():
 
     assert (
         service_cls.call_args.kwargs["settings"].session_properties.audio.output.voice
-        == "voice-engine-id"
+        == expected_voice
     )
 
 
@@ -131,7 +140,7 @@ def test_client_secret_config_uses_pcm24k_model_and_selected_voice():
 
 
 @pytest.mark.asyncio
-async def test_session_ready_starts_an_initial_response_when_opening_frame_was_missed():
+async def test_session_ready_alone_does_not_start_an_unconfigured_opening():
     service = DograhElevenLabsRealtimeLLMService(
         api_key="test-key",
         settings=DograhElevenLabsRealtimeLLMService.Settings(
@@ -139,7 +148,7 @@ async def test_session_ready_starts_an_initial_response_when_opening_frame_was_m
             session_properties=SessionProperties(),
         ),
     )
-    context = object()
+    context = LLMContext()
     service._context = context
 
     with patch(
@@ -148,10 +157,10 @@ async def test_session_ready_starts_an_initial_response_when_opening_frame_was_m
     ) as create_response:
         await service._handle_evt_session_updated(object())
 
-    create_response.assert_awaited_once_with()
-    assert service._handled_initial_context is True
+    create_response.assert_not_awaited()
+    assert service._handled_initial_context is False
     assert service._context is context
-    assert service._initial_response_requested is True
+    assert service._initial_response_requested is False
 
 
 @pytest.mark.asyncio
@@ -163,19 +172,74 @@ async def test_session_ready_does_not_duplicate_a_deferred_initial_response():
             session_properties=SessionProperties(),
         ),
     )
-    service._context = object()
-    service._run_llm_when_api_session_ready = True
-    fallback_context = AsyncMock()
-    service._handle_context = fallback_context
+    service._context = LLMContext()
+    service.send_client_event = AsyncMock()
 
     with patch(
         "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
         new=AsyncMock(),
     ) as create_response:
+        await service.process_frame(TTSSpeakFrame("Hello, welcome."), FrameDirection.DOWNSTREAM)
+        service.send_client_event.assert_not_awaited()
+        assert service._initial_response_requested is False
+        await service._handle_evt_session_updated(object())
         await service._handle_evt_session_updated(object())
 
     create_response.assert_awaited_once_with()
-    fallback_context.assert_not_awaited()
+    service.send_client_event.assert_awaited_once()
+    assert "Hello, welcome." in service.send_client_event.call_args.args[0].item.content[0].text
+
+
+@pytest.mark.asyncio
+async def test_authored_greeting_is_sent_as_input_without_polluting_workflow_context():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini", session_properties=SessionProperties(),
+        ),
+    )
+    service._context = LLMContext()
+    service._api_session_ready = True
+    service.send_client_event = AsyncMock()
+    greeting = "Hi, this is Sam from Sysevo — how can I help?"
+
+    with patch(
+        "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
+        new=AsyncMock(),
+    ) as create_response:
+        await service.process_frame(TTSSpeakFrame(greeting), FrameDirection.DOWNSTREAM)
+
+    item = service.send_client_event.call_args.args[0].item
+    assert item.role == "user"
+    assert greeting in item.content[0].text
+    assert item.id in service._messages_added_manually
+    assert service._context.messages == []
+    assert service._pending_opening_text is None
+    create_response.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("has_caller_message", [False, True])
+async def test_initial_context_only_adds_opening_input_when_no_caller_input_exists(has_caller_message):
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini", session_properties=SessionProperties(),
+        ),
+    )
+    messages = [{"role": "user", "content": "Hello"}] if has_caller_message else []
+    context = LLMContext(messages.copy())
+    service._api_session_ready = True
+    service.send_client_event = AsyncMock()
+    with patch(
+        "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
+        new=AsyncMock(),
+    ) as create_response:
+        await service._handle_context(context)
+
+    assert service.send_client_event.await_count == (0 if has_caller_message else 1)
+    assert context.messages == messages
+    create_response.assert_awaited_once_with()
 
 
 @pytest.mark.asyncio
@@ -192,3 +256,67 @@ async def test_workflow_context_replaces_realtime_services_empty_context():
 
     assert engine.llm._context is live_context
     engine.llm._update_settings.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("event_type,status", [("response.created", "in_progress"), ("response.done", "completed")])
+async def test_elevenlabs_response_without_nullable_status_details_is_parseable(event_type, status):
+    payload = {"type": event_type, "event_id": "evt-test", "response": {
+        "id": "resp-test", "object": "realtime.response", "status": status,
+        "output": [], "usage": None, "output_modalities": ["audio"],
+    }}
+    raw = json.dumps(payload)
+
+    class Socket:
+        async def __aiter__(self):
+            yield raw
+
+        send = AsyncMock()
+        close = AsyncMock()
+
+    socket = Socket()
+    compatible = _ElevenLabsProtocolSocket(socket)
+    normalized = [message async for message in compatible]
+    parsed = parse_server_event(normalized[0])
+    assert parsed.response.status_details is None
+    assert parsed.response.status == status
+    await compatible.send("test")
+    socket.send.assert_awaited_once_with("test")
+    await compatible.close()
+    socket.close.assert_awaited_once_with()
+
+
+@pytest.mark.asyncio
+async def test_protocol_socket_preserves_audio_payload_without_reencoding():
+    raw = '{"type":"response.output_audio.delta","delta":"AAECAw=="}'
+
+    class Socket:
+        async def __aiter__(self):
+            yield raw
+
+    assert [message async for message in _ElevenLabsProtocolSocket(Socket())] == [raw]
+
+
+@pytest.mark.asyncio
+async def test_response_without_token_usage_finishes_audio_and_allows_the_next_turn():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini", session_properties=SessionProperties(),
+        ),
+    )
+    service.push_frame = AsyncMock()
+    service.stop_processing_metrics = AsyncMock()
+    service.start_llm_usage_metrics = AsyncMock()
+    service._current_audio_response = object()
+    service._current_assistant_response = object()
+
+    await service._handle_evt_response_done(SimpleNamespace(response=SimpleNamespace(
+        status="completed", usage=None, output=[],
+    )))
+
+    assert isinstance(service.push_frame.call_args_list[0].args[0], TTSStoppedFrame)
+    assert isinstance(service.push_frame.call_args_list[1].args[0], LLMFullResponseEndFrame)
+    assert service._current_assistant_response is None
+    service.stop_processing_metrics.assert_awaited_once()
+    service.start_llm_usage_metrics.assert_not_awaited()

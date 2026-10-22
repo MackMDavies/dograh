@@ -1135,12 +1135,17 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
     api_key = realtime_config.api_key
     voice = getattr(realtime_config, "voice", None)
     if provider == ServiceProviders.ELEVENLABS_REALTIME.value:
-        # Realtime speech-to-speech has a separate model selection but uses the
-        # same ElevenLabs voice selected in Voice Engine. Keep existing agents
-        # that predate model_overrides.realtime.voice wired to that selection.
+        # The active Realtime picker is authoritative. Older agents used the
+        # placeholder "brian" while their selected voice lived only in TTS.
+        # Retain that fallback without letting a hidden TTS control override an
+        # explicitly selected Realtime voice.
         tts_config = getattr(user_config, "tts", None)
         tts_voice = getattr(tts_config, "voice", None)
-        if getattr(tts_config, "provider", None) == ServiceProviders.ELEVENLABS.value and tts_voice:
+        if (
+            (not voice or voice == "brian")
+            and getattr(tts_config, "provider", None) == ServiceProviders.ELEVENLABS.value
+            and tts_voice
+        ):
             voice = tts_voice
     language = getattr(realtime_config, "language", None)
 

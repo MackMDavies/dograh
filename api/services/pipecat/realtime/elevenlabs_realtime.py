@@ -8,10 +8,14 @@ connection so the long-lived account API key never leaves Dograh.
 from __future__ import annotations
 
 import asyncio
+import json
 
 import aiohttp
 from loguru import logger
-from pipecat.frames.frames import StartFrame
+from pipecat.frames.frames import LLMFullResponseEndFrame, StartFrame, TTSSpeakFrame, TTSStoppedFrame
+from pipecat.processors.aggregators.llm_context import LLMContext
+from pipecat.services.openai.realtime import events
+from websockets.asyncio.client import connect as websocket_connect
 
 from api.services.pipecat.realtime.openai_realtime import (
     DograhOpenAIRealtimeLLMService,
@@ -20,6 +24,31 @@ from api.services.pipecat.realtime.openai_realtime import (
 
 CLIENT_SECRET_URL = "https://api.elevenlabs.io/v1/convai/realtime/client_secrets"
 REALTIME_WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/convai/realtime"
+
+
+class _ElevenLabsProtocolSocket:
+    """Normalize ElevenLabs' omitted nullable fields for Pipecat's event models."""
+
+    def __init__(self, socket):
+        self._socket = socket
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+    async def __aiter__(self):
+        async for message in self._socket:
+            payload = json.loads(message)
+            response = payload.get("response")
+            if (
+                payload.get("type") in {"response.created", "response.done"}
+                and isinstance(response, dict)
+                and "status_details" not in response
+            ):
+                # OpenAI returns this nullable key; ElevenLabs omits it. The
+                # Pipecat model requires its presence even when its value is null.
+                response["status_details"] = None
+                message = json.dumps(payload)
+            yield message
 
 
 class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
@@ -53,6 +82,40 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._logged_first_audio_delta = False
         self._audio_chunk_count = 0
         self._initial_response_requested = False
+        self._pending_opening_text: str | None = None
+
+    async def process_frame(self, frame, direction):
+        if isinstance(frame, TTSSpeakFrame) and not self._handled_initial_context:
+            # ElevenLabs requires a conversation input before response.create.
+            # The OpenAI wrapper only uses this frame as a trigger and discards
+            # its text, leaving an empty first turn that never produces audio.
+            self._pending_opening_text = (
+                "Begin the conversation by saying exactly the greeting below. "
+                "Do not add an introduction or any other words.\n\n"
+                f"<greeting>{frame.text}</greeting>"
+            )
+            await self._handle_context(self._context or LLMContext())
+            return
+        await super().process_frame(frame, direction)
+
+    async def _handle_context(self, context):
+        has_caller_input = context is not None and any(
+            message.get("role") == "user"
+            for message in context.messages
+            if isinstance(message, dict)
+        )
+        if (
+            not self._handled_initial_context
+            and context is not None
+            and self._pending_opening_text is None
+            and not has_caller_input
+        ):
+            # An explicit initial LLMContextFrame means the workflow requested
+            # an opening generated from its prompt rather than an authored line.
+            self._pending_opening_text = (
+                "Begin the conversation now, following the current agent instructions."
+            )
+        await super()._handle_context(context)
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -77,22 +140,39 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._elevenlabs_session_ready.set()
         logger.info("ElevenLabs Realtime session initialized")
         await super()._handle_evt_session_updated(evt)
-        # Usually the workflow's opening TTSSpeakFrame (or its initial
-        # LLMContextFrame) starts the first turn. A frame can arrive before
-        # the session is ready, though, and a missed opening frame leaves the
-        # connected call listening forever. At this point the session is
-        # ready and the engine has already seeded the context, so provide one
-        # idempotent fallback. _create_response tracks requests made before
-        # readiness too, preventing this from duplicating a deferred turn.
-        if not self._initial_response_requested and self._context is not None:
-            logger.info(
-                "ElevenLabs Realtime starting initial response after session initialization"
-            )
-            await self._handle_context(self._context)
 
     async def _create_response(self):
+        if not self._api_session_ready:
+            self._run_llm_when_api_session_ready = True
+            return
+        if self._pending_opening_text is not None:
+            item = events.ConversationItem(
+                type="message",
+                role="user",
+                content=[events.ItemContent(type="input_text", text=self._pending_opening_text)],
+            )
+            # Track the synthetic input so it is not mistaken for caller speech
+            # by conversation synchronization or included in the call transcript.
+            self._messages_added_manually[item.id] = True
+            await self.send_client_event(events.ConversationItemCreateEvent(item=item))
+            self._pending_opening_text = None
+            logger.info("ElevenLabs Realtime opening input sent")
         self._initial_response_requested = True
         await super()._create_response()
+        logger.info("ElevenLabs Realtime response requested")
+
+    async def _receive_task_handler(self):
+        try:
+            await super()._receive_task_handler()
+        except Exception as exc:
+            if not self._disconnecting:
+                # Surface a failed receiver instead of leaving a connected call
+                # silently listening. Never include raw provider payloads here.
+                logger.error("ElevenLabs Realtime receiver failed ({})", type(exc).__name__)
+                await self.push_error(
+                    error_msg="ElevenLabs Realtime stopped receiving responses. Please restart the call.",
+                    fatal=True,
+                )
 
     async def _handle_evt_error(self, evt):
         error = getattr(evt, "error", None)
@@ -116,7 +196,24 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
                 status,
                 getattr(error, "code", None) or "unknown",
             )
-        await super()._handle_evt_response_done(evt)
+        if response is None or getattr(response, "usage", None) is not None:
+            await super()._handle_evt_response_done(evt)
+            return
+
+        # ElevenLabs currently returns usage=null. Pipecat's OpenAI completion
+        # handler dereferences usage before emitting its end-of-turn frames,
+        # which strands the bot-speaking state and prevents subsequent turns.
+        # Finish the real response without inventing token counts.
+        await self.stop_processing_metrics()
+        if self._current_audio_response is not None:
+            await self.push_frame(TTSStoppedFrame())
+        await self.push_frame(LLMFullResponseEndFrame())
+        self._current_assistant_response = None
+        if status == "failed":
+            await self.push_error(error_msg="ElevenLabs Realtime could not complete the response.")
+            return
+        for item in response.output:
+            await self._call_event_handler("on_conversation_item_updated", item.id, item)
 
     async def _handle_evt_audio_delta(self, evt):
         self._audio_chunk_count += 1
@@ -197,14 +294,12 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
 
         try:
             client_secret = await self._mint_client_secret()
-            # Pipecat's upstream transport sends Authorization: Bearer <api_key>.
-            # Supply only the short-lived client secret for this socket.
-            account_api_key = self.api_key
-            self.api_key = client_secret
-            try:
-                await super()._connect()
-            finally:
-                self.api_key = account_api_key
+            socket = await websocket_connect(
+                uri=self.base_url,
+                additional_headers={"Authorization": f"Bearer {client_secret}"},
+            )
+            self._websocket = _ElevenLabsProtocolSocket(socket)
+            self._receive_task = self.create_task(self._receive_task_handler())
         except Exception as exc:
             logger.error(f"ElevenLabs Realtime connection setup failed: {exc}")
             await self.push_error(
