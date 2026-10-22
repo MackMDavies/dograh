@@ -30,19 +30,32 @@ from loguru import logger
 _DEEPGRAM_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?encoding=mulaw&sample_rate=8000&channels=1"
-    "&model=nova-2&punctuate=true&smart_format=true"
+    "&model=nova-3&punctuate=true&smart_format=true"
     # Interim results are what make this feel live rather than arriving in paragraphs,
     # and endpointing closes a sentence on a natural pause rather than a fixed timer.
     "&interim_results=true&endpointing=300"
-    # Our own name is not a word: boost it gently (pushed hard, a boosted term
-    # appears in audio that never said it), then correct what is still mis-heard.
-    "&keywords=Sysevo%3A2"
+    # Our own name is not a word. nova-3 keyterm prompting tells the model to expect
+    # it (nova-2's keyword boost still gave Sysco, Cecebo, Sasivo on 22 Oct); what it
+    # still mis-hears is corrected below.
+    "&keyterm=Sysevo&keyterm=calling%20from%20Sysevo&keyterm=Sysevo%20AI"
 )
 
-# The ways speech models have mis-spelt "Sysevo" (Sasebo, Saseo, Sysavo, "Sys evo"…),
+# How "Sysevo" has been mis-heard (Sysavo, Sasebo, Saseo, Sasivo, Siveo, Cecebo, "Sai sevo"…),
 # kept in step with supabase/functions/_shared/brandVocabulary.ts. Whole words only.
 _BRAND_MISHEARINGS = re.compile(
-    r"\b(?:s[iy]s[aeiy]{1,2}[vb][oa]|c[iy]s[aeiy]{1,2}v[oa]|sa?s[aei]{1,2}[vb]?o|s[iy]s\s+[ae]vo)\b",
+    r"\b(?:"
+    r"[scz][aeiouy]{1,2}[scz]{1,2}[aeiouy]{0,2}[vb][aeiouy]{0,2}[oa]"
+    r"|s[aiy][sc][aeiy]{1,2}o"
+    r"|s[iy][vb][aeiy]?[oa]"
+    r"|(?:s[aiy]{1,2}e?|sigh|sci|cy)[\s-]+[scz][aeiy]{1,2}[vb][oa]"
+    r"|s[iy]s[\s-]+[ae]v[oa]"
+    r")\b",
+    re.IGNORECASE,
+)
+# Real names a model reaches for; only replaced where a rep says where they are calling from.
+_BRAND_SOUNDALIKE_AFTER_FROM = re.compile(
+    r"(\b(?:calling|call|ringing|here|it's|it is|this is \w+)\s+(?:you\s+)?from\s+)"
+    r"(?:sysco|cisco|sisco|syscoe|sysco's|seesaw|sicko|psycho)\b",
     re.IGNORECASE,
 )
 
@@ -51,6 +64,7 @@ def correct_brand_spelling(text: str) -> str:
     """Every mis-heard spelling of our name, written as "Sysevo"."""
     if not text:
         return text
+    text = _BRAND_SOUNDALIKE_AFTER_FROM.sub(lambda m: f"{m.group(1)}Sysevo", text)
     return _BRAND_MISHEARINGS.sub(lambda m: m.group(0) if m.group(0) == "SYSEVO" else "Sysevo", text)
 
 _CONNECT_TIMEOUT_SECONDS = 8.0
