@@ -1595,6 +1595,15 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
         await update_dialer_call_child_sid(
             parent_call_sid=parent_call_sid, child_call_sid=child_call_sid
         )
+        # A rep who ends the call while it still rings (or whose browser leg
+        # never connects) never joins the conference, so no conference event
+        # fires and the lead kept ringing: anyone who answered got silence.
+        background_tasks.add_task(
+            _cancel_lead_if_rep_leaves,
+            parent_call_sid=parent_call_sid,
+            child_call_sid=child_call_sid,
+            ring_seconds=call_stages.no_answer_seconds(team_voicemail_policy),
+        )
 
     # No <Say> on the rep's leg: the disclosure belongs on the lead's leg
     # (see handle_dialer_conference_join), both so the called party actually
@@ -2948,6 +2957,31 @@ async def handle_dialer_recording_callback(request: Request):
 
 
 _REP_LEG_ENDED_STATUSES = {"completed", "no-answer", "busy", "failed", "canceled"}
+_REP_WATCH_INTERVAL_SECONDS = 3
+_rep_watch_sleep = asyncio.sleep
+
+
+async def _cancel_lead_if_rep_leaves(
+    *, parent_call_sid: str, child_call_sid: str, ring_seconds: int,
+) -> None:
+    """While the lead's phone rings, cancel it as soon as the rep's own leg has
+    ended. A rep who handed the line to a queued voicemail (rep_detached_at) is
+    left alone: that lead must keep ringing for the mailbox. Only a lead still
+    ringing is cancelled, never one that answered."""
+    window = max(15, int(ring_seconds or 30)) + 15
+    for _ in range(window // _REP_WATCH_INTERVAL_SECONDS):
+        await _rep_watch_sleep(_REP_WATCH_INTERVAL_SECONDS)
+        if not await _rep_leg_ended(parent_call_sid):
+            continue
+        evidence = await get_voicemail_drop_evidence(parent_call_sid=parent_call_sid)
+        if evidence.get("rep_detached_at"):
+            return
+        if await cancel_call_if_ringing(call_sid=child_call_sid):
+            logger.info(
+                f"Rep left {parent_call_sid} while {child_call_sid} rang: cancelled the lead leg"
+            )
+        return
+
 
 
 async def _rep_leg_ended(parent_call_sid: str) -> bool:
