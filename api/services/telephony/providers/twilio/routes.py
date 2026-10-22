@@ -1026,6 +1026,100 @@ async def _start_call_sorter_stream(*, call_ref: str, leg_call_sid: str) -> None
         logger.warning(f"Call sorter stream not started for {call_ref}: {type(exc).__name__}")
 
 
+# How long after the answer the beep watcher keeps listening: past AMD's longest
+# limit (30 s on "accurate") plus a long greeting.
+_BEEP_WATCH_SECONDS = 45.0
+
+
+async def _beep_trial_watch(*, parent_call_sid: str, child_call_sid: str) -> str:
+    """Beep-timed voicemail (trial reps only, see call_sorter.beep_trial_user).
+
+    Twilio's DetectMessageEnd almost never hears the beep here (48 of 48 mailboxes
+    in 14 days ran to its time limit), so the recording started at a fixed moment:
+    over long greetings, or after silence long enough for the mailbox to hang up.
+    The sorter listens to the answered leg; on the beep, a voicemail that should
+    play (a queued Send voicemail, or the rep's automatic mode) starts at once.
+    Anything else (a person, ask mode with no request, a mailbox already handled)
+    leaves the call to the usual AMD path. Background task, never raises.
+    """
+    try:
+        row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        rep_user_id = (row or {}).get("rep_user_id")
+        if not row or row.get("provider") != "twilio" or not call_sorter.beep_trial_user(rep_user_id):
+            return "not_trial"
+        if not call_sorter.call_sorter_enabled():
+            backend_endpoint, _ = await get_backend_endpoints()
+            started = await dialer_call_sorter.start_prospect_stream(
+                await _twilio_client(),
+                backend_endpoint=str(backend_endpoint or ""),
+                call_ref=parent_call_sid,
+                leg_call_sid=child_call_sid,
+                secret=await _resolve_dialer_auth_token() or "",
+                force=True,
+            )
+            if not started:
+                return "no_stream"
+        state = await call_sorter.wait_for_sorter_stage(
+            parent_call_sid, stages=("beep", "mailbox_full", "person"), timeout=_BEEP_WATCH_SECONDS,
+        )
+        stage = (state or {}).get("stage")
+        if stage != "beep":
+            return stage or "no_beep"
+        row = await get_dialer_call_child_leg(parent_call_sid=parent_call_sid)
+        if (
+            not row or row.get("ended_at") or row.get("voicemail_drop_started_at")
+            or row.get("auto_voicemail_sent") or row.get("child_call_sid") != child_call_sid
+        ):
+            return "already_handled"
+        manual = bool(row.get("manual_voicemail_requested_at"))
+        enabled, playback_url, drop_id = await get_auto_voicemail_settings(
+            user_id=rep_user_id, allow_manual_when_disabled=manual, parent_call_sid=parent_call_sid,
+        )
+        policy = await get_team_voicemail_policy(user_id=rep_user_id, parent_call_sid=parent_call_sid)
+        on_machine = str((policy or {}).get("on_machine") or "drop_vm")
+        # Automatic only while the rep is not on the line with the mailbox (ask/self
+        # modes hand it to them; they decide). A queued Send voicemail always plays.
+        should_play = manual or (enabled and on_machine == "drop_vm" and not row.get("lead_joined_at"))
+        if not should_play:
+            return "not_requested"
+        if not playback_url or not playback_url.split("?", 1)[0].lower().endswith(".wav"):
+            return "no_recording"
+        # The beep stands in for AMD's verdict so the one-shot claim applies.
+        await update_dialer_call_amd_result(parent_call_sid=parent_call_sid, answered_by="machine_end_beep")
+        if not await claim_manual_voicemail_playback(
+            parent_call_sid=parent_call_sid, child_call_sid=child_call_sid, manual=manual,
+        ):
+            return "not_claimed"
+        if drop_id:
+            await attach_voicemail_drop_to_call(
+                parent_call_sid=parent_call_sid, child_call_sid=child_call_sid, drop_id=drop_id,
+            )
+        backend_endpoint, _ = await get_backend_endpoints()
+        twiml = _voicemail_playback_twiml(
+            endpoint_root=f"{str(backend_endpoint or '').rstrip('/')}/api/v1/telephony",
+            parent_call_sid=parent_call_sid,
+            playback_url=playback_url,
+            pause_seconds=0,
+            drop_id=drop_id,
+            leg_call_sid=child_call_sid,
+        )
+        if not await _redirect_twilio_child_to_voicemail(child_call_sid=child_call_sid, twiml=twiml):
+            await release_manual_voicemail_playback(
+                parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+            )
+            return "redirect_failed"
+        logger.info(f"beep trial: played the voicemail on the beep for {parent_call_sid}")
+        await call_stages.record_call_stage(
+            parent_call_sid, "vm_playing", {"source": "beep", "manual": manual, "drop_id": drop_id},
+        )
+        if not manual:
+            await _release_rep_for_voicemail(parent_call_sid)
+        return "played"
+    except Exception as exc:  # noqa: BLE001 - a trial must never break the call
+        logger.warning(f"beep trial failed for {parent_call_sid}: {type(exc).__name__}: {exc}")
+        return "error"
+
+
 def _maybe_start_call_sorter(
     background_tasks: BackgroundTasks, *, call_ref: str, leg_call_sid: str | None,
 ) -> None:
@@ -2852,6 +2946,10 @@ async def handle_dialer_call_status(
     )
     if call_status == "in-progress":
         _maybe_start_call_sorter(background_tasks, call_ref=parent_call_sid, leg_call_sid=child_call_sid)
+        if child_call_sid:
+            background_tasks.add_task(
+                _beep_trial_watch, parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+            )
     return {"status": "success"}
 
 

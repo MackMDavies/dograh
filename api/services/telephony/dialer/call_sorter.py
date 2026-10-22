@@ -96,6 +96,17 @@ def call_sorter_enabled() -> bool:
     )
 
 
+def beep_trial_user(rep_user_id: str | None) -> bool:
+    """Beep-timed voicemail trial: the sorter listens to these reps' single calls
+    (SYSEVO_DIALER_BEEP_TRIAL_USERS, comma-separated user ids) and the recording
+    starts on the beep it hears. Everything else about the sorter stays off unless
+    SYSEVO_DIALER_CALL_SORTER is set."""
+    if not rep_user_id or not (os.environ.get("DEEPGRAM_API_KEY") or "").strip():
+        return False
+    users = {u.strip() for u in (os.environ.get("SYSEVO_DIALER_BEEP_TRIAL_USERS") or "").split(",")}
+    return rep_user_id in users
+
+
 def llm_fallback_enabled() -> bool:
     return _env_flag("SYSEVO_DIALER_SORTER_LLM")
 

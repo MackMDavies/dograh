@@ -107,14 +107,15 @@ def stop_stream_twiml(*, leg_call_sid: str) -> str:
 
 async def start_prospect_stream(
     client, *, backend_endpoint: str, call_ref: str, leg_call_sid: str, secret: str,
-    now: int | None = None,
+    now: int | None = None, force: bool = False,
 ) -> str | None:
     """Start the fork on an in-progress prospect leg via the Stream resource.
 
     `client` is a twilio.rest.Client (dialer_conference._twilio_client()). Returns
     the Stream SID, or None when off/misconfigured/refused. Never raises.
+    `force` starts it for a beep-trial rep while the sorter is otherwise off.
     """
-    if client is None or not call_sorter_enabled():
+    if client is None or not (force or call_sorter_enabled()):
         return None
     url, token = _stream_target(
         backend_endpoint=backend_endpoint, call_ref=call_ref,
