@@ -124,6 +124,9 @@ class PipecatEngine:
         has_recordings: bool = False,
         context_compaction_enabled: bool = False,
         transition_filler_enabled: bool = False,
+        voice_expression_instruction: Optional[str] = None,
+        guardrail_instruction: Optional[str] = None,
+        is_realtime: bool = False,
     ):
         self.task = task
         self.llm = llm
@@ -186,6 +189,9 @@ class PipecatEngine:
         self._embeddings_api_key: Optional[str] = embeddings_api_key
         self._embeddings_model: Optional[str] = embeddings_model
         self._embeddings_base_url: Optional[str] = embeddings_base_url
+        self._voice_expression_instruction = voice_expression_instruction
+        self._guardrail_instruction = guardrail_instruction
+        self._is_realtime = is_realtime
 
         # Audio configuration (set via set_audio_config from _run_pipeline)
         self._audio_config = None
@@ -895,6 +901,15 @@ class PipecatEngine:
             format_prompt=self._format_prompt,
             has_recordings=self._has_recordings,
             call_context_vars=self._call_context_vars,
+        )
+        # Agent-wide voice and policy instructions apply to every workflow node,
+        # including the initial greeting and all later transitions.
+        system_prompt = "\n\n".join(
+            part for part in (
+                system_prompt,
+                self._voice_expression_instruction,
+                self._guardrail_instruction,
+            ) if part
         )
         # Only dialer extra-answer runs pass the callback tool's timezone; every other
         # call composes its tools exactly as before.
