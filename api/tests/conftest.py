@@ -594,5 +594,8 @@ def _rep_leg_live_by_default(request):
     ), patch(
         "api.services.telephony.providers.twilio.routes._beep_trial_watch",
         AsyncMock(return_value="not_trial"),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._leave_self_requested",
+        AsyncMock(return_value=False),
     ):
         yield

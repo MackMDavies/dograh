@@ -18,6 +18,7 @@ relaying audio, and the real transcript is produced afterwards regardless.
 import asyncio
 import json
 import os
+import re
 from contextlib import suppress
 from typing import Awaitable, Callable
 
@@ -33,7 +34,24 @@ _DEEPGRAM_URL = (
     # Interim results are what make this feel live rather than arriving in paragraphs,
     # and endpointing closes a sentence on a natural pause rather than a fixed timer.
     "&interim_results=true&endpointing=300"
+    # Our own name is not a word: boost it gently (pushed hard, a boosted term
+    # appears in audio that never said it), then correct what is still mis-heard.
+    "&keywords=Sysevo%3A2"
 )
+
+# The ways speech models have mis-spelt "Sysevo" (Sasebo, Saseo, Sysavo, "Sys evo"…),
+# kept in step with supabase/functions/_shared/brandVocabulary.ts. Whole words only.
+_BRAND_MISHEARINGS = re.compile(
+    r"\b(?:s[iy]s[aeiy]{1,2}[vb][oa]|c[iy]s[aeiy]{1,2}v[oa]|sa?s[aei]{1,2}[vb]?o|s[iy]s\s+[ae]vo)\b",
+    re.IGNORECASE,
+)
+
+
+def correct_brand_spelling(text: str) -> str:
+    """Every mis-heard spelling of our name, written as "Sysevo"."""
+    if not text:
+        return text
+    return _BRAND_MISHEARINGS.sub(lambda m: m.group(0) if m.group(0) == "SYSEVO" else "Sysevo", text)
 
 _CONNECT_TIMEOUT_SECONDS = 8.0
 
@@ -160,7 +178,7 @@ class LiveTranscriber:
                 except Exception:  # noqa: BLE001
                     continue
                 alternatives = (payload.get("channel") or {}).get("alternatives") or []
-                text = (alternatives[0].get("transcript") if alternatives else "") or ""
+                text = correct_brand_spelling((alternatives[0].get("transcript") if alternatives else "") or "")
                 if not text.strip():
                     # Deepgram emits empty results constantly during silence. Publishing
                     # them would clear the caption every time nobody is speaking.

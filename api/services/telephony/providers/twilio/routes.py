@@ -267,7 +267,7 @@ class TelnyxInboundCallAnswerRequest(BaseModel):
 
 class ManualVoicemailDropRequest(BaseModel):
     parent_call_sid: str = Field(pattern=r"^CA[0-9a-f]{32}$")
-    action: Literal["send", "cancel"] = "send"
+    action: Literal["send", "cancel", "self"] = "send"
 
 
 @router.get("/voice-token")
@@ -560,6 +560,19 @@ async def control_manual_voicemail_drop(
     child_call_sid = call_row.get("child_call_sid")
     if not isinstance(child_call_sid, str) or not _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid):
         raise HTTPException(status_code=409, detail="The called party's line is not ready for a voicemail drop.")
+
+    if body.action == "self":
+        # "Leave it myself": put the rep on the line with the mailbox the moment it
+        # answers, instead of after machine detection (16 s, by which time the
+        # greeting and beep are gone and the mailbox records the rep hearing
+        # ringing). Already answered and not yet joined: join it now.
+        await _remember_leave_self(body.parent_call_sid)
+        if call_row.get("status") == "in-progress" and not call_row.get("lead_joined_at"):
+            joined = await _join_mailbox_to_rep_now(
+                parent_call_sid=body.parent_call_sid, child_call_sid=child_call_sid,
+            )
+            return {"state": "joined" if joined else "waiting"}
+        return {"state": "waiting"}
 
     if body.action == "cancel":
         result = await request_manual_voicemail_drop(
@@ -1024,6 +1037,63 @@ async def _start_call_sorter_stream(*, call_ref: str, leg_call_sid: str) -> None
         )
     except Exception as exc:  # noqa: BLE001 - listening is optional; the call is not
         logger.warning(f"Call sorter stream not started for {call_ref}: {type(exc).__name__}")
+
+
+_LEAVE_SELF_TTL_SECONDS = 15 * 60
+
+
+def _leave_self_key(parent_call_sid: str) -> str:
+    return f"dialer:leave_self:{parent_call_sid}"
+
+
+async def _remember_leave_self(parent_call_sid: str) -> None:
+    """Shared across workers: the status callback may land on another one. Never raises."""
+    try:
+        client = call_sorter._redis_client()
+        try:
+            await client.set(_leave_self_key(parent_call_sid), "1", ex=_LEAVE_SELF_TTL_SECONDS)
+        finally:
+            await client.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not remember leave-it-myself for {parent_call_sid}: {exc}")
+
+
+async def _leave_self_requested(parent_call_sid: str) -> bool:
+    try:
+        client = call_sorter._redis_client()
+        try:
+            return bool(await client.get(_leave_self_key(parent_call_sid)))
+        finally:
+            await client.aclose()
+    except Exception:  # noqa: BLE001 - unknown means the usual AMD path
+        return False
+
+
+async def _join_mailbox_to_rep_now(*, parent_call_sid: str, child_call_sid: str) -> bool:
+    """Send the answered lead leg straight into the rep's conference (ending the
+    AMD hold), so the rep hears the greeting and the beep and speaks after it."""
+    client = await _twilio_client()
+    if not client:
+        return False
+    backend_endpoint, _ = await get_backend_endpoints()
+    root = f"{str(backend_endpoint or '').rstrip('/')}/api/v1/telephony"
+    join_url = f"{root}/dialer-conference-join?" + urlencode({
+        "conference_name": conference_name_for(parent_call_sid),
+        "muted": "false",
+        "end_on_exit": "true",
+        "start_on_enter": "true",
+        "events_url": f"{root}/dialer-conference-events",
+        "recording_url": f"{root}/dialer-recording-callback",
+        "parent_call_sid": parent_call_sid,
+        "handled": "self",
+    })
+    try:
+        await asyncio.to_thread(client.calls(child_call_sid).update, url=join_url, method="POST")
+    except Exception as exc:  # noqa: BLE001 - the AMD path still joins it later
+        logger.warning(f"Could not join the mailbox to the rep on {parent_call_sid}: {exc}")
+        return False
+    logger.info(f"leave-it-myself: joined {child_call_sid} to the rep on {parent_call_sid}")
+    return True
 
 
 # How long after the answer the beep watcher keeps listening: past AMD's longest
@@ -1880,8 +1950,12 @@ async def handle_dialer_conference_join(
     # Dialer Phases 2 + 3: the handling agent hands the leg back through this same
     # signed URL with handled=person|timeout (a person / the fail-safe: to the rep) or
     # handled=machine (a mailbox: Phase 1 voicemail rules). Only our server builds it.
-    handled = handled if handled in {"person", "machine", "timeout"} else ""
-    if handled:
+    handled = handled if handled in {"person", "machine", "timeout", "self"} else ""
+    if handled == "self":
+        # The rep chose to leave the voicemail themselves and is joined before
+        # detection decides: no verdict to record, and no notice into a mailbox.
+        answered_by = ""
+    elif handled:
         answered_by = "machine_end_beep" if handled == "machine" else "human"
     elif call_sorter.call_sorter_enabled():
         handling_ref = parallel_call_sid if parallel_leg_id else parent_call_sid
@@ -2283,11 +2357,18 @@ async def handle_dialer_conference_join(
     # called party is actually listening to. A manager's listen-in leg does
     # NOT come through here (it has its own dialer-listen-connect endpoint),
     # so this never announces a silent monitor.
+    # Never to a mailbox: when the rep leaves a voicemail themselves (ask/self
+    # modes hand the mailbox to them), the notice was recorded as the first words
+    # of their message. It is for a person on the line, not a recording.
+    disclosure = (
+        "" if answered_by.startswith("machine") or answered_by == "fax" or handled == "self"
+        else "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+    )
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
-        "<Say>This call may be recorded and monitored for quality assurance.</Say>"
-        "<Dial>"
+        + disclosure
+        + "<Dial>"
         f"<Conference {telemetry_attributes}muted={quoteattr(muted)} "
         f"endConferenceOnExit={quoteattr(end_on_exit)} "
         f'startConferenceOnEnter={quoteattr(start_on_enter)} beep="false">'
@@ -2946,6 +3027,10 @@ async def handle_dialer_call_status(
     )
     if call_status == "in-progress":
         _maybe_start_call_sorter(background_tasks, call_ref=parent_call_sid, leg_call_sid=child_call_sid)
+        if child_call_sid and await _leave_self_requested(parent_call_sid):
+            background_tasks.add_task(
+                _join_mailbox_to_rep_now, parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,
+            )
         if child_call_sid:
             background_tasks.add_task(
                 _beep_trial_watch, parent_call_sid=parent_call_sid, child_call_sid=child_call_sid,

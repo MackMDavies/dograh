@@ -776,3 +776,58 @@ def test_twilio_person_joins_as_before_while_the_rep_leg_is_live():
          patch(f"{_PATH}._rep_leg_ended", new=AsyncMock(return_value=False)):
         response = _join("human")
     assert "<Conference" in response.text
+
+
+_NOTICE = "This call may be recorded and monitored for quality assurance."
+
+
+def test_mailbox_handed_to_the_rep_hears_no_recording_notice():
+    """22 Oct: the rep left it themselves and the notice became the first words of
+    their voicemail. A mailbox never gets it."""
+    stack, _ = _enter(_single_call_mocks(enabled=False))  # ask mode: no automatic play
+    with stack:
+        response = _join("machine_end_beep")
+    assert "<Conference" in response.text
+    assert _NOTICE not in response.text
+
+
+def test_a_person_still_hears_the_recording_notice_first():
+    stack, _ = _enter(_single_call_mocks(enabled=False))
+    with stack:
+        response = _join("human")
+    assert response.text.index(_NOTICE) < response.text.index("<Dial>")
+
+
+def _self_press(row: dict):
+    with patch(f"{_PATH}.get_dialer_call_child_leg", new=AsyncMock(return_value=row)), \
+         patch(f"{_PATH}._remember_leave_self", new=AsyncMock()) as remember, \
+         patch(f"{_PATH}._join_mailbox_to_rep_now", new=AsyncMock(return_value=True)) as join:
+        response = _app(authenticated=True).post(
+            "/dialer/manual-voicemail-drop", json={"parent_call_sid": _PARENT, "action": "self"},
+        )
+    return response, remember, join
+
+
+def test_leave_it_myself_on_an_answered_mailbox_joins_the_rep_straight_away():
+    """22 Oct: the rep was joined only after detection (16 s), past the greeting and
+    beep, and the mailbox kept 9 s of the notice and silence."""
+    response, remember, join = _self_press(_twilio_row(status="in-progress", manual_voicemail_requested_at=None))
+    assert response.json() == {"state": "joined"}
+    remember.assert_awaited_once_with(_PARENT)
+    join.assert_awaited_once_with(parent_call_sid=_PARENT, child_call_sid=_CHILD)
+
+
+def test_leave_it_myself_while_ringing_is_remembered_for_the_answer():
+    response, remember, join = _self_press(_twilio_row(status="ringing", manual_voicemail_requested_at=None))
+    assert response.json() == {"state": "waiting"}
+    remember.assert_awaited_once_with(_PARENT)
+    join.assert_not_awaited()
+
+
+def test_rep_leaving_it_themselves_joins_with_no_notice_and_no_verdict():
+    with patch(f"{_PATH}.update_dialer_call_amd_result", new=AsyncMock()) as amd, \
+         patch(f"{_PATH}.get_voicemail_drop_evidence", new=AsyncMock(return_value={})):
+        response = _join("", handled="self")
+    assert "<Conference" in response.text
+    assert _NOTICE not in response.text
+    amd.assert_not_awaited()
