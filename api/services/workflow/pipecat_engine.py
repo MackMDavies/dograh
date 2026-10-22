@@ -286,9 +286,12 @@ class PipecatEngine:
             tools_schema = ToolsSchema(standard_tools=functions)
             self.context.set_tools(tools_schema)
 
-        # For Gemini Live, set context on the LLM before _update_settings so that
-        # _connect (triggered by reconnect) can read tools from it.
-        if hasattr(self.llm, "_context") and not self.llm._context and self.context:
+        # Realtime adapters hold their own context reference and receive an
+        # opening TTSSpeakFrame before the first LLMContextFrame. Always point
+        # that reference at the engine's live context: the service may have
+        # initialized an empty LLMContext already, which is truthy but is not
+        # the context the engine populates for this workflow.
+        if hasattr(self.llm, "_context") and self.context:
             self.llm._context = self.context
 
         await self.llm._update_settings(LLMSettings(system_instruction=system_prompt))

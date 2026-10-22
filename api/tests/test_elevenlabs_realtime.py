@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -19,6 +20,8 @@ from api.services.pipecat.realtime.elevenlabs_realtime import (
     DograhElevenLabsRealtimeLLMService,
 )
 from api.services.pipecat.service_factory import create_realtime_llm_service
+from api.services.workflow.pipecat_engine import PipecatEngine
+from pipecat.processors.aggregators.llm_context import LLMContext
 
 
 @pytest.mark.parametrize("model", ELEVENLABS_REALTIME_MODELS)
@@ -173,3 +176,19 @@ async def test_session_ready_does_not_duplicate_a_deferred_initial_response():
 
     create_response.assert_awaited_once_with()
     fallback_context.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_workflow_context_replaces_realtime_services_empty_context():
+    engine = object.__new__(PipecatEngine)
+    live_context = LLMContext()
+    engine.context = live_context
+    engine.llm = SimpleNamespace(
+        _context=LLMContext(),
+        _update_settings=AsyncMock(),
+    )
+
+    await engine._update_llm_context("Agent instructions", [])
+
+    assert engine.llm._context is live_context
+    engine.llm._update_settings.assert_awaited_once()
