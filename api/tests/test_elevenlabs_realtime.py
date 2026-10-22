@@ -1,4 +1,4 @@
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from pipecat.services.openai.realtime.events import (
@@ -58,6 +58,7 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
     with patch(
         "api.services.pipecat.realtime.elevenlabs_realtime.DograhElevenLabsRealtimeLLMService"
     ) as service_cls:
+        service_cls.Settings = DograhElevenLabsRealtimeLLMService.Settings
         result = create_realtime_llm_service(config, audio_config=None)
 
     assert result is service_cls.return_value
@@ -91,6 +92,7 @@ def test_elevenlabs_realtime_factory_uses_voice_engine_selection():
     with patch(
         "api.services.pipecat.realtime.elevenlabs_realtime.DograhElevenLabsRealtimeLLMService"
     ) as service_cls:
+        service_cls.Settings = DograhElevenLabsRealtimeLLMService.Settings
         create_realtime_llm_service(config, audio_config=None)
 
     assert (
@@ -123,3 +125,51 @@ def test_client_secret_config_uses_pcm24k_model_and_selected_voice():
     assert service._settings.session_properties.audio.input.transcription is None
     assert session["audio"]["output"]["format"] == {"type": "audio/pcm"}
     assert session["audio"]["output"]["voice"] == "brian"
+
+
+@pytest.mark.asyncio
+async def test_session_ready_starts_an_initial_response_when_opening_frame_was_missed():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini",
+            session_properties=SessionProperties(),
+        ),
+    )
+    context = object()
+    service._context = context
+
+    with patch(
+        "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
+        new=AsyncMock(),
+    ) as create_response:
+        await service._handle_evt_session_updated(object())
+
+    create_response.assert_awaited_once_with()
+    assert service._handled_initial_context is True
+    assert service._context is context
+    assert service._initial_response_requested is True
+
+
+@pytest.mark.asyncio
+async def test_session_ready_does_not_duplicate_a_deferred_initial_response():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini",
+            session_properties=SessionProperties(),
+        ),
+    )
+    service._context = object()
+    service._run_llm_when_api_session_ready = True
+    fallback_context = AsyncMock()
+    service._handle_context = fallback_context
+
+    with patch(
+        "api.services.pipecat.realtime.openai_realtime.OpenAIRealtimeLLMService._create_response",
+        new=AsyncMock(),
+    ) as create_response:
+        await service._handle_evt_session_updated(object())
+
+    create_response.assert_awaited_once_with()
+    fallback_context.assert_not_awaited()
