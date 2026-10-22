@@ -1005,16 +1005,19 @@ def _affected_row_count(content_range: str) -> int | None:
 
 async def update_dialer_call_recording_by_conference_sid(
     *, conference_sid: str, recording_sid: str
-) -> None:
+) -> bool | None:
     """Update recording_sid from a Conference's recordingStatusCallback -
     correlates via conference_sid (populated by dialer-conference-events),
     not parent_call_sid, since a Conference recording's own callback
     identifies the conference via ConferenceSid, not any participant's
     CallSid - a genuinely different correlation key from the old
-    <Dial record> callback shape."""
+    <Dial record> callback shape.
+
+    Returns False when no row has this conference_sid (the caller can then
+    correlate another way), True when one matched, None when unknown."""
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot update dialer_calls recording")
-        return
+        return None
     try:
         async with httpx.AsyncClient() as client:
             response = await client.patch(
@@ -1035,11 +1038,40 @@ async def update_dialer_call_recording_by_conference_sid(
                 timeout=5.0,
             )
             response.raise_for_status()
-            if _affected_row_count(response.headers.get("Content-Range", "")) == 0:
+            affected = _affected_row_count(response.headers.get("Content-Range", ""))
+            if affected == 0:
                 logger.warning(
                     f"dialer_calls recording update matched 0 rows for conference "
-                    f"{conference_sid} - recording {recording_sid} is orphaned, no row has "
-                    "this conference_sid (did dialer-conference-events miss conference-start?)"
+                    f"{conference_sid} - recording {recording_sid} has no row with this "
+                    "conference_sid (did dialer-conference-events miss conference-start?)"
                 )
+                return False
+            return True if affected else None
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to update dialer_calls recording for conference {conference_sid}: {exc}")
+        return None
+
+
+async def update_dialer_call_recording_by_parent_call_sid(
+    *, parent_call_sid: str, conference_sid: str, recording_sid: str
+) -> bool:
+    """The fallback for an orphaned conference recording: the conference is
+    named after the rep's call (call-<parent_call_sid>), so once that name is
+    known the recording and the missed conference_sid are written by the
+    call's own key. Only fills a row that has no recording yet."""
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        return False
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.patch(
+                f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
+                params={"parent_call_sid": f"eq.{parent_call_sid}", "recording_sid": "is.null"},
+                json={"recording_sid": recording_sid, "conference_sid": conference_sid},
+                headers={**_headers(), "Prefer": "count=exact"},
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            return bool(_affected_row_count(response.headers.get("Content-Range", "")))
+    except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
+        logger.error(f"Failed to attach orphaned recording {recording_sid} to {parent_call_sid}: {exc}")
+        return False

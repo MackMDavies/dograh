@@ -81,6 +81,7 @@ from api.services.telephony.providers.twilio.dialer_call_log import (
     update_dialer_call_child_sid,
     update_dialer_call_conference_sid,
     update_dialer_call_recording_by_conference_sid,
+    update_dialer_call_recording_by_parent_call_sid,
     update_dialer_call_status,
 )
 from api.services.telephony.providers.twilio.dialer_conference import (
@@ -2384,6 +2385,13 @@ async def handle_dialer_conference_events(request: Request):
             parent_call_sid=parent_call_sid, conference_sid=conference_sid
         )
     elif event_type in {"participant-join", "join"} and parent_call_sid:
+        if conference_sid:
+            # Every join carries the ConferenceSid too. Writing it again (same
+            # value) means one lost conference-start no longer orphans the
+            # recording.
+            await update_dialer_call_conference_sid(
+                parent_call_sid=parent_call_sid, conference_sid=conference_sid
+            )
         child_call_sid = str(form_data.get("CallSid") or form_data.get("ParticipantCallSid") or "")
         event_at = _twilio_event_time(form_data.get("Timestamp"))
         if event_at and child_call_sid and _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid):
@@ -2898,10 +2906,44 @@ async def handle_dialer_recording_callback(request: Request):
         )
         return {"status": "ignored", "reason": "recording_not_completed"}
 
-    await update_dialer_call_recording_by_conference_sid(
+    matched = await update_dialer_call_recording_by_conference_sid(
         conference_sid=conference_sid, recording_sid=recording_sid
     )
+    if matched is False:
+        # conference-start never reached us (or its write failed), so no row
+        # carries this conference_sid. The conference is named after the rep's
+        # call: ask Twilio for that name and attach the recording by it, so an
+        # answered, recorded call never ends up with no audio or transcript.
+        parent_call_sid = await _parent_call_sid_for_conference(conference_sid)
+        if parent_call_sid and await update_dialer_call_recording_by_parent_call_sid(
+            parent_call_sid=parent_call_sid,
+            conference_sid=conference_sid,
+            recording_sid=recording_sid,
+        ):
+            logger.info(
+                f"dialer-recording-callback attached orphaned recording {recording_sid} "
+                f"to {parent_call_sid} by conference name"
+            )
+        else:
+            logger.error(
+                f"dialer-recording-callback could not attach recording {recording_sid} "
+                f"(conference {conference_sid}) to any call"
+            )
     return {"status": "success"}
+
+
+async def _parent_call_sid_for_conference(conference_sid: str) -> str | None:
+    """The rep's call SID from the conference's own name (call-<parent>)."""
+    client = await _twilio_client()
+    if not client:
+        return None
+    try:
+        conference = await asyncio.to_thread(client.conferences(conference_sid).fetch)
+    except Exception as exc:  # noqa: BLE001 - a lookup failure must not fail the webhook
+        logger.error(f"Could not fetch conference {conference_sid}: {exc}")
+        return None
+    parent = parent_call_sid_from_conference_name(getattr(conference, "friendly_name", "") or "")
+    return parent if parent and _TWILIO_CALL_SID_PATTERN.fullmatch(parent) else None
 
 
 @router.post("/twiml", include_in_schema=False)

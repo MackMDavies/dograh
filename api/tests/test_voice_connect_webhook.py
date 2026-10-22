@@ -1579,6 +1579,63 @@ def test_dialer_recording_callback_updates_on_valid_signature(monkeypatch):
     mock_update.assert_awaited_once_with(conference_sid="CF999", recording_sid="RE999")
 
 
+def test_dialer_recording_callback_attaches_orphaned_recording_by_conference_name(monkeypatch):
+    """conference-start was missed, so no row has the conference_sid: the
+    recording is attached by the conference's name (call-<parent>)."""
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+    parent = "CA" + "0" * 32
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_conference_sid",
+        AsyncMock(return_value=False),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._parent_call_sid_for_conference",
+        AsyncMock(return_value=parent),
+    ) as mock_lookup, patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_parent_call_sid",
+        AsyncMock(return_value=True),
+    ) as mock_fallback:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"ConferenceSid": "CF999", "RecordingSid": "RE999", "RecordingStatus": "completed"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_lookup.assert_awaited_once_with("CF999")
+    mock_fallback.assert_awaited_once_with(
+        parent_call_sid=parent, conference_sid="CF999", recording_sid="RE999",
+    )
+
+
+def test_dialer_recording_callback_skips_fallback_when_conference_matched(monkeypatch):
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
+    client = TestClient(_make_test_app())
+
+    with patch(
+        "api.services.telephony.providers.twilio.routes.RequestValidator.validate",
+        return_value=True,
+    ), patch(
+        "api.services.telephony.providers.twilio.routes.update_dialer_call_recording_by_conference_sid",
+        AsyncMock(return_value=True),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._parent_call_sid_for_conference",
+        AsyncMock(),
+    ) as mock_lookup:
+        response = client.post(
+            "/dialer-recording-callback",
+            data={"ConferenceSid": "CF999", "RecordingSid": "RE999", "RecordingStatus": "completed"},
+            headers={"X-Twilio-Signature": "fake-signature"},
+        )
+
+    assert response.status_code == 200
+    mock_lookup.assert_not_awaited()
+
+
 def test_dialer_recording_callback_rejects_invalid_signature(monkeypatch):
     monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "test-auth-token")
     client = TestClient(_make_test_app())
