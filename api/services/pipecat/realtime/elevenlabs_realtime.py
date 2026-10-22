@@ -52,6 +52,7 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._elevenlabs_session_ready = asyncio.Event()
         self._logged_first_audio_delta = False
         self._audio_chunk_count = 0
+        self._initial_response_requested = False
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -76,6 +77,22 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._elevenlabs_session_ready.set()
         logger.info("ElevenLabs Realtime session initialized")
         await super()._handle_evt_session_updated(evt)
+        # Usually the workflow's opening TTSSpeakFrame (or its initial
+        # LLMContextFrame) starts the first turn. A frame can arrive before
+        # the session is ready, though, and a missed opening frame leaves the
+        # connected call listening forever. At this point the session is
+        # ready and the engine has already seeded the context, so provide one
+        # idempotent fallback. _create_response tracks requests made before
+        # readiness too, preventing this from duplicating a deferred turn.
+        if not self._initial_response_requested and self._context is not None:
+            logger.info(
+                "ElevenLabs Realtime starting initial response after session initialization"
+            )
+            await self._handle_context(self._context)
+
+    async def _create_response(self):
+        self._initial_response_requested = True
+        await super()._create_response()
 
     async def _handle_evt_error(self, evt):
         error = getattr(evt, "error", None)
