@@ -7,8 +7,11 @@ connection so the long-lived account API key never leaves Dograh.
 
 from __future__ import annotations
 
+import asyncio
+
 import aiohttp
 from loguru import logger
+from pipecat.frames.frames import StartFrame
 
 from api.services.pipecat.realtime.openai_realtime import (
     DograhOpenAIRealtimeLLMService,
@@ -46,6 +49,64 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         super().__init__(api_key=api_key, **kwargs)
         self._elevenlabs_api_key = api_key
         self._elevenlabs_voice = voice
+        self._elevenlabs_session_ready = asyncio.Event()
+        self._logged_first_audio_delta = False
+        self._audio_chunk_count = 0
+
+    async def start(self, frame: StartFrame):
+        await super().start(frame)
+        self.create_task(self._watch_session_initialization())
+
+    async def _watch_session_initialization(self):
+        try:
+            await asyncio.wait_for(self._elevenlabs_session_ready.wait(), timeout=15)
+        except asyncio.TimeoutError:
+            logger.error(
+                "ElevenLabs Realtime did not initialize its session within 15 seconds"
+            )
+            await self.push_error(
+                error_msg="ElevenLabs Realtime did not initialize. Check the ElevenLabs API connection and try again."
+            )
+
+    async def _handle_evt_session_created(self, evt):
+        logger.info("ElevenLabs Realtime WebSocket connected; configuring session")
+        await super()._handle_evt_session_created(evt)
+
+    async def _handle_evt_session_updated(self, evt):
+        self._elevenlabs_session_ready.set()
+        logger.info("ElevenLabs Realtime session initialized")
+        await super()._handle_evt_session_updated(evt)
+
+    async def _handle_evt_error(self, evt):
+        error = getattr(evt, "error", None)
+        code = getattr(error, "code", None)
+        logger.error("ElevenLabs Realtime returned a server error (code={})", code or "unknown")
+        await super()._handle_evt_error(evt)
+
+    async def _handle_evt_response_done(self, evt):
+        response = getattr(evt, "response", None)
+        status = getattr(response, "status", None)
+        logger.info(
+            "ElevenLabs Realtime response ended (status={}, audio_received={})",
+            status or "unknown",
+            self._audio_chunk_count,
+        )
+        if status and status != "completed":
+            details = getattr(response, "status_details", None)
+            error = getattr(details, "error", None)
+            logger.warning(
+                "ElevenLabs Realtime response ended with status={} code={}",
+                status,
+                getattr(error, "code", None) or "unknown",
+            )
+        await super()._handle_evt_response_done(evt)
+
+    async def _handle_evt_audio_delta(self, evt):
+        self._audio_chunk_count += 1
+        if not self._logged_first_audio_delta:
+            self._logged_first_audio_delta = True
+            logger.info("ElevenLabs Realtime produced its first audio chunk")
+        await super()._handle_evt_audio_delta(evt)
 
     def _client_secret_session(self) -> dict:
         settings = self._settings

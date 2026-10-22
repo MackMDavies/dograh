@@ -68,6 +68,37 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
     assert kwargs["settings"].session_properties.audio.output.voice == "voice-id-123"
 
 
+def test_elevenlabs_realtime_factory_uses_voice_engine_selection():
+    config = UserConfiguration.model_validate(
+        {
+            "llm": {"provider": "openai", "model": "gpt-4.1", "api_key": "llm-key"},
+            "tts": {
+                "provider": "elevenlabs",
+                "model": "eleven_v4",
+                "voice": "voice-engine-id",
+                "api_key": "tts-key",
+            },
+            "is_realtime": True,
+            "realtime": {
+                "provider": "elevenlabs_realtime",
+                "model": "eleven_realtime_v1_max",
+                "voice": "brian",
+                "api_key": "el-key",
+            },
+        }
+    )
+
+    with patch(
+        "api.services.pipecat.realtime.elevenlabs_realtime.DograhElevenLabsRealtimeLLMService"
+    ) as service_cls:
+        create_realtime_llm_service(config, audio_config=None)
+
+    assert (
+        service_cls.call_args.kwargs["settings"].session_properties.audio.output.voice
+        == "voice-engine-id"
+    )
+
+
 def test_client_secret_config_uses_pcm24k_model_and_selected_voice():
     service = DograhElevenLabsRealtimeLLMService(
         api_key="secret-never-assert-or-log",
