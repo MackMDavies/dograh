@@ -9,6 +9,9 @@ from loguru import logger
 from api.db import db_client
 from api.enums import WorkflowRunMode
 from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.voice_expression import build_voice_expression_instruction
+from api.services.pipecat.voice_guardrails import build_guardrail_prompt_instruction
+from api.services.pipecat.guardrail_runtime import create_guardrail_processors
 from api.services.integrations import (
     IntegrationRuntimeContext,
     create_runtime_sessions,
@@ -792,6 +795,13 @@ async def _run_pipeline(
         logger.info("Disabling transition_filler_enabled for realtime workflow run")
         transition_filler_enabled = False
 
+    voice_expression_instruction = build_voice_expression_instruction(
+        user_config.tts, user_config.realtime if is_realtime else None,
+        run_configs.get("voice_expression"),
+    )
+    guardrail_config = run_configs.get("voice_guardrails")
+    guardrail_instruction = build_guardrail_prompt_instruction(guardrail_config)
+
     engine = PipecatEngine(
         llm=llm,
         inference_llm=inference_llm,
@@ -805,6 +815,9 @@ async def _run_pipeline(
         has_recordings=has_recordings,
         context_compaction_enabled=context_compaction_enabled,
         transition_filler_enabled=transition_filler_enabled,
+        voice_expression_instruction=voice_expression_instruction,
+        guardrail_instruction=guardrail_instruction,
+        is_realtime=is_realtime,
     )
 
     engine.configure_test_sandbox(workflow_run)
@@ -1004,6 +1017,21 @@ async def _run_pipeline(
             )
         )
 
+    async def record_guardrail_event(event):
+        await in_memory_logs_buffer.append(event)
+        if ws_sender:
+            try:
+                await ws_sender(event)
+            except Exception:
+                logger.debug("Guardrail live monitor disconnected")
+
+    input_guardrail_processor, output_guardrail_processor = await create_guardrail_processors(
+        config=guardrail_config, engine=engine, llm=create_llm_service(user_config) if guardrail_instruction else inference_llm or llm,
+        organization_id=workflow.organization_id, db=db_client,
+        factory=create_llm_service_from_provider, on_event=record_guardrail_event,
+        realtime=is_realtime,
+    )
+
     # Build the pipeline
     if is_realtime:
         pipeline = build_realtime_pipeline(
@@ -1015,6 +1043,8 @@ async def _run_pipeline(
             pipeline_engine_callback_processor,
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
+            input_guardrail_processor=input_guardrail_processor,
+            output_guardrail_processor=output_guardrail_processor,
         )
     else:
         pipeline = build_pipeline(
@@ -1028,6 +1058,8 @@ async def _run_pipeline(
             pipeline_engine_callback_processor,
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
+            input_guardrail_processor=input_guardrail_processor,
+            output_guardrail_processor=output_guardrail_processor,
             recording_router=recording_router,
         )
 

@@ -1025,7 +1025,7 @@ class DeepgramTTSConfiguration(BaseServiceConfiguration):
             return "aura-2"
 
 
-ELEVENLABS_TTS_MODELS = ["eleven_v4", "eleven_flash_v2_5"]
+ELEVENLABS_TTS_MODELS = ["eleven_v4", "eleven_v4_turbo", "eleven_v3", "eleven_v3_conversational", "eleven_flash_v2_5", "eleven_multilingual_v2"]
 
 
 @register_tts
@@ -1052,6 +1052,14 @@ class ElevenlabsTTSConfiguration(BaseServiceConfiguration):
     use_speaker_boost: bool = Field(
         default=False,
         description="Boost similarity to the speaker at the cost of some latency.",
+    )
+    expressive_mode: bool | None = Field(
+        default=None,
+        description="Allow supported ElevenLabs models to use expressive audio tags.",
+    )
+    suggested_audio_tags: list[str] = Field(
+        default_factory=list,
+        description="ElevenLabs expressive audio tags to prepend to generated speech.",
     )
     model: str = Field(
         default="eleven_flash_v2_5",
