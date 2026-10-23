@@ -31,6 +31,7 @@ def build_user_transcription_event(
     final: bool,
     timestamp: str | None = None,
     user_id: str | None = None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "text": text,
@@ -40,6 +41,8 @@ def build_user_transcription_event(
         payload["timestamp"] = timestamp
     if user_id is not None:
         payload["user_id"] = user_id
+    if item_id is not None:
+        payload["item_id"] = item_id
     return {
         "type": RealtimeFeedbackType.USER_TRANSCRIPTION.value,
         "payload": payload,
@@ -50,14 +53,17 @@ def build_bot_text_event(
     *,
     text: str,
     timestamp: str | None = None,
+    item_id: str | None = None,
+    includes_inter_frame_spaces: bool | None = None,
 ) -> dict[str, Any]:
     payload: dict[str, Any] = {"text": text}
     if timestamp is not None:
         payload["timestamp"] = timestamp
-    return {
-        "type": RealtimeFeedbackType.BOT_TEXT.value,
-        "payload": payload,
-    }
+    if item_id is not None:
+        payload["item_id"] = item_id
+    if includes_inter_frame_spaces is not None:
+        payload["includes_inter_frame_spaces"] = includes_inter_frame_spaces
+    return {"type": RealtimeFeedbackType.BOT_TEXT.value, "payload": payload}
 
 
 def build_function_call_start_event(

@@ -3,7 +3,7 @@ import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
-from pipecat.frames.frames import LLMFullResponseEndFrame, TTSSpeakFrame, TTSStoppedFrame
+from pipecat.frames.frames import LLMFullResponseEndFrame, LLMTextFrame, TTSTextFrame, TTSSpeakFrame, TTSStoppedFrame
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.llm_service import LLMSettings
 from pipecat.processors.frame_processor import FrameDirection
@@ -26,6 +26,7 @@ from api.services.pipecat.realtime.elevenlabs_realtime import (
     _ElevenLabsProtocolSocket,
 )
 from pipecat.services.openai.realtime.events import parse_server_event
+from api.services.pipecat.realtime.openai_realtime import DograhOpenAIRealtimeLLMService
 from api.services.pipecat.service_factory import create_realtime_llm_service
 from api.services.workflow.pipecat_engine import PipecatEngine
 
@@ -365,3 +366,37 @@ async def test_workflow_instruction_change_is_sent_once_on_next_response_without
     assert service._pending_workflow_instruction is None
     service.send_client_event.assert_awaited_once()
     assert create_response.await_count == 2
+
+@pytest.mark.asyncio
+async def test_caller_transcript_uses_speech_start_not_late_asr_completion():
+    service = DograhElevenLabsRealtimeLLMService(api_key="test-key")
+    service.broadcast_frame = AsyncMock()
+    service._call_event_handler = AsyncMock()
+    service._handle_user_transcription = AsyncMock()
+    event = SimpleNamespace(item_id="caller-1", transcript="What do you do?")
+    with patch("api.services.pipecat.realtime.elevenlabs_realtime.time_now_iso8601", return_value="2026-10-23T04:00:01Z"), patch.object(
+        DograhOpenAIRealtimeLLMService, "_handle_evt_speech_started", new=AsyncMock()
+    ):
+        await service._handle_evt_speech_started(SimpleNamespace(item_id="caller-1"))
+    with patch("api.services.pipecat.realtime.elevenlabs_realtime.time_now_iso8601", return_value="2026-10-23T04:00:09Z"):
+        await service.handle_evt_input_audio_transcription_completed(event)
+    assert service.broadcast_frame.call_args.kwargs["timestamp"] == "2026-10-23T04:00:01Z"
+    assert service.broadcast_frame.call_args.kwargs["result"] is event
+    assert service.broadcast_frame.call_args.kwargs["finalized"] is True
+
+
+@pytest.mark.asyncio
+async def test_assistant_deltas_keep_item_identity_timestamp_and_original_spacing():
+    service = DograhElevenLabsRealtimeLLMService(api_key="test-key")
+    service.push_frame = AsyncMock()
+    for delta in ["book", "ing?"]:
+        await service._handle_evt_audio_transcript_delta(SimpleNamespace(item_id="assistant-1", delta=delta))
+    frames = [args.args[0] for args in service.push_frame.call_args_list]
+    text_frames = [frame for frame in frames if isinstance(frame, TTSTextFrame)]
+    assert [frame.text for frame in text_frames] == ["book", "ing?"]
+    assert all(frame.transcript_item_id == "assistant-1" for frame in text_frames)
+    assert text_frames[0].transcript_timestamp == text_frames[1].transcript_timestamp
+    assert all(frame.includes_inter_frame_spaces for frame in text_frames)
+    llm_frames = [frame for frame in frames if isinstance(frame, LLMTextFrame)]
+    assert len(llm_frames) == 2
+    assert all(frame.append_to_context is False for frame in llm_frames)

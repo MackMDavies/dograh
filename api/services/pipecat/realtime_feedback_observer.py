@@ -225,6 +225,7 @@ class RealtimeFeedbackObserver(BaseObserver):
                     final=False,
                     user_id=frame.user_id,
                     timestamp=frame.timestamp,
+                    item_id=getattr(frame.result, "item_id", None),
                 )
             )
         # Handle user transcriptions (final) - WebSocket only
@@ -236,6 +237,7 @@ class RealtimeFeedbackObserver(BaseObserver):
                     final=True,
                     user_id=frame.user_id,
                     timestamp=frame.timestamp,
+                    item_id=getattr(frame.result, "item_id", None),
                 )
             )
         # Handle engine-queued speech (transition/tool messages) marked for
@@ -250,7 +252,12 @@ class RealtimeFeedbackObserver(BaseObserver):
         # except for frames explicitly flagged persist_to_logs (e.g. recording
         # transcripts from play_audio) which bypass the aggregator path.
         elif isinstance(frame, TTSTextFrame):
-            message = build_bot_text_event(text=frame.text)
+            message = build_bot_text_event(
+                text=frame.text,
+                timestamp=getattr(frame, "transcript_timestamp", None),
+                item_id=getattr(frame, "transcript_item_id", None),
+                includes_inter_frame_spaces=getattr(frame, "includes_inter_frame_spaces", None),
+            )
 
             # If frame has pts, queue it for timed delivery
             if frame.pts:

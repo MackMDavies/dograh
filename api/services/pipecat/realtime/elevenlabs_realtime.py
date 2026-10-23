@@ -9,10 +9,22 @@ from __future__ import annotations
 
 import asyncio
 import json
+from collections import OrderedDict
 
 import aiohttp
 from loguru import logger
-from pipecat.frames.frames import LLMFullResponseEndFrame, StartFrame, TTSSpeakFrame, TTSStoppedFrame
+from pipecat.frames.frames import (
+    AggregationType,
+    LLMFullResponseEndFrame,
+    LLMTextFrame,
+    StartFrame,
+    TranscriptionFrame,
+    TTSSpeakFrame,
+    TTSTextFrame,
+    TTSStoppedFrame,
+)
+from pipecat.utils.time import time_now_iso8601
+from pipecat.transcriptions.language import Language
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.services.openai.realtime import events
 from websockets.asyncio.client import connect as websocket_connect
@@ -90,6 +102,47 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         self._initial_response_requested = False
         self._pending_opening_text: str | None = None
         self._pending_workflow_instruction: str | None = None
+        # ASR can finish after the assistant starts speaking. Keep the original
+        # speech time keyed by provider item, independently of event arrival.
+        self._transcript_times: OrderedDict[str, str] = OrderedDict()
+
+    def _transcript_time(self, item_id: str) -> str:
+        if item_id not in self._transcript_times:
+            self._transcript_times[item_id] = time_now_iso8601()
+            # Bound memory for long calls (including items with no ASR result).
+            if len(self._transcript_times) > 256:
+                self._transcript_times.popitem(last=False)
+        return self._transcript_times[item_id]
+
+    async def _handle_evt_speech_started(self, evt):
+        self._transcript_time(evt.item_id)
+        await super()._handle_evt_speech_started(evt)
+
+    async def handle_evt_input_audio_transcription_completed(self, evt):
+        await self._call_event_handler("on_conversation_item_updated", evt.item_id, None)
+        await self.broadcast_frame(
+            TranscriptionFrame,
+            text=evt.transcript,
+            user_id="",
+            timestamp=self._transcript_time(evt.item_id),
+            result=evt,
+            finalized=True,
+        )
+        await self._handle_user_transcription(evt.transcript, True, Language.EN)
+
+    async def _handle_evt_audio_transcript_delta(self, evt):
+        if not evt.delta:
+            return
+        # Preserve upstream context/RTVI behavior while carrying provider item
+        # identity to feedback. Metadata never delays or buffers audio output.
+        llm_frame = LLMTextFrame(evt.delta)
+        llm_frame.append_to_context = False
+        await self.push_frame(llm_frame)
+        frame = TTSTextFrame(evt.delta, aggregated_by=AggregationType.SENTENCE)
+        frame.includes_inter_frame_spaces = True
+        frame.transcript_item_id = evt.item_id
+        frame.transcript_timestamp = self._transcript_time(evt.item_id)
+        await self.push_frame(frame)
 
     async def process_frame(self, frame, direction):
         if isinstance(frame, TTSSpeakFrame) and not self._handled_initial_context:
