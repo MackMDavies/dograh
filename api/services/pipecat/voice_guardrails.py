@@ -69,7 +69,24 @@ def normalize_guardrails_config(value: Any) -> dict[str, Any]:
             if key not in content:
                 normalized_content[key] = normalized_content[group]
         normalized_content[group] = False
-    custom = config.get("custom") if isinstance(config.get("custom"), list) else []
+    custom_value = config.get("custom")
+    if config.get("enabled", False) and custom_value is not None:
+        if not isinstance(custom_value, list):
+            raise ValueError("Agent guardrails custom rules must be a list.")
+        for index, rule in enumerate(custom_value, 1):
+            if not isinstance(rule, dict):
+                raise ValueError(f"Custom guardrail {index} must be a rule object.")
+            if not rule.get("enabled", True):
+                continue
+            if any(
+                not isinstance(rule.get(field), str) or not rule[field].strip()
+                for field in ("name", "prompt")
+            ):
+                raise ValueError(
+                    f"Custom guardrail {index} needs a name and policy. "
+                    "Complete or disable it before starting a call."
+                )
+    custom = custom_value if isinstance(custom_value, list) else []
     custom = [
         rule
         for rule in custom
@@ -172,7 +189,11 @@ def build_guardrail_validation_rules(value: Any) -> list[dict[str, str]]:
                 if rule.get("action") in {"end_call", "redirect_topic", "safe_response", "retry"}
                 else config["action"],
                 "direction": rule.get("direction") if rule.get("direction") in {"input", "output", "both"} else "output",
-                "evaluation_model_id": rule.get("evaluation_model_id", config["evaluation_model_id"]),
+                "evaluation_model_id": (
+                    config["evaluation_model_id"]
+                    if rule.get("evaluation_model_id") is None
+                    else rule["evaluation_model_id"]
+                ),
                 "mode": rule.get("execution_mode", config["execution_mode"])
                 if rule.get("execution_mode") in {"streaming", "blocking"}
                 else config["execution_mode"],

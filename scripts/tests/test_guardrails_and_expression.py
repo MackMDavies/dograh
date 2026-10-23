@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from pipecat.frames.frames import LLMFullResponseStartFrame, LLMFullResponseEndFrame, TTSTextFrame, OutputAudioRawFrame, TranscriptionFrame, InterruptionFrame, TTSSpeakFrame
 from pipecat.processors.frame_processor import FrameProcessor, FrameDirection
 from api.services.configuration.voice_expression import build_voice_expression_instruction
-from api.services.pipecat.voice_guardrails import GuardrailJudge, VoiceInputGuardrailProcessor, RealtimeVoiceOutputGuardrailProcessor, VoiceOutputGuardrailProcessor, build_guardrail_validation_rules, evaluate_response_guardrails
+from api.services.pipecat.voice_guardrails import GuardrailJudge, VoiceInputGuardrailProcessor, RealtimeVoiceOutputGuardrailProcessor, VoiceOutputGuardrailProcessor, build_guardrail_validation_rules, build_guardrail_prompt_instruction, evaluate_response_guardrails
 from api.services.pipecat.guardrail_runtime import resolve_guardrail_models, create_guardrail_processors
 
 D = FrameDirection.DOWNSTREAM
@@ -169,6 +169,27 @@ class GuardrailTests(unittest.IsolatedAsyncioTestCase):
         engine = NS(context=NS(get_messages=lambda: [], messages=[]), llm=NS(_settings=NS(system_instruction="Only help callers book dental appointments.")), _call_disposed=False)
         _, output = await create_guardrail_processors(config=POLICY, engine=engine, llm=self.llm, organization_id=7, db=None, factory=None, on_event=AsyncMock(), realtime=True)
         self.assertIn("book dental appointments", output._judge.context_provider())
+
+    async def test_incomplete_enabled_rule_cannot_silently_disable_protection(self):
+        for rule in [
+            {"name": "Refunds", "prompt": "   ", "enabled": True},
+            {"name": "", "prompt": "Do not promise unapproved refunds."},
+        ]:
+            config = {"enabled": True, "custom": [rule]}
+            for build in [build_guardrail_validation_rules, build_guardrail_prompt_instruction]:
+                with self.subTest(rule=rule, build=build.__name__), self.assertRaisesRegex(ValueError, "Custom guardrail 1"):
+                    build(config)
+            with self.assertRaises(ValueError):
+                await create_guardrail_processors(config=config, engine=None, llm=self.llm, organization_id=7, db=None, factory=None, on_event=AsyncMock(), realtime=True)
+
+    async def test_disabled_incomplete_drafts_are_preserved_without_blocking_calls(self):
+        blank = {"name": "", "prompt": ""}
+        self.assertEqual(build_guardrail_validation_rules({"enabled": False, "custom": [blank]}), [])
+        self.assertEqual(build_guardrail_validation_rules({"enabled": True, "custom": [{**blank, "enabled": False}]}), [])
+
+    async def test_explicit_null_rule_model_inherits_the_configured_default(self):
+        config = {**POLICY, "evaluation_model_id": 42, "custom": [{**POLICY["custom"][0], "evaluation_model_id": None}]}
+        self.assertEqual(build_guardrail_validation_rules(config)[0]["evaluation_model_id"], 42)
 
 
 if __name__ == "__main__":
