@@ -145,6 +145,43 @@ class GuardrailTests(unittest.IsolatedAsyncioTestCase):
         p.push_frame.assert_not_awaited()
         self.assertEqual(self.violation.await_args.args[0]["direction"], "input")
 
+    async def test_manipulation_input_respects_the_selected_violation_action(self):
+        for action in ["redirect_topic", "safe_response", "retry", "end_call"]:
+            config = {"enabled": True, "action": action, "execution_mode": "blocking", "builtins": {"manipulation": {"enabled": True}}}
+            rule = next(r for r in build_guardrail_validation_rules(config) if r["id"] == "manipulation_input")
+            with self.subTest(action=action):
+                self.assertEqual(rule["action"], action)
+                self.assertEqual(rule["mode"], "blocking")
+
+    async def test_interruption_invalidates_a_pending_input_decision(self):
+        for realtime in [False, True]:
+            with self.subTest(realtime=realtime):
+                started, release = asyncio.Event(), asyncio.Event()
+                async def evaluate(*args):
+                    started.set()
+                    await release.wait()
+                    return [{**RULE, "direction": "input"}]
+                judge = NS(evaluate=AsyncMock(side_effect=evaluate))
+                p = VoiceInputGuardrailProcessor(judge=judge, rules=[{**RULE, "direction": "input"}], on_violation=self.violation, realtime=realtime)
+                p.push_frame = AsyncMock()
+                def create(coro, **kwargs):
+                    task = asyncio.create_task(coro); self.tasks.append(task); return task
+                p.create_task = create
+                pending = asyncio.create_task(p.process_frame(TranscriptionFrame("Previous caller turn", "caller", "now"), D))
+                self.tasks.append(pending)
+                await started.wait()
+                await p.process_frame(InterruptionFrame(), D)
+                release.set()
+                await pending
+                await asyncio.gather(*self.tasks)
+                self.violation.assert_not_awaited()
+                judge.evaluate.side_effect = None
+                judge.evaluate.return_value = []
+                current = TranscriptionFrame("Can we book a demo?", "caller", "now")
+                await p.process_frame(current, D)
+                await asyncio.gather(*self.tasks)
+                self.assertTrue(any(c.args[0] is current for c in p.push_frame.await_args_list))
+
     async def test_model_selection_is_scoped_to_workspace_and_active_connection(self):
         config = {**POLICY, "evaluation_model_id": 42}
         db = NS(list_available_models=AsyncMock(return_value=[]), get_connection=AsyncMock())
