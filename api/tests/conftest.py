@@ -597,5 +597,13 @@ def _rep_leg_live_by_default(request):
     ), patch(
         "api.services.telephony.providers.twilio.routes._leave_self_requested",
         AsyncMock(return_value=False),
+    ), patch(
+        # No Redis in tests: the notice is not deferred, so it plays before the join
+        # (the fallback); tests of the deferred path patch these themselves.
+        "api.services.telephony.providers.twilio.routes._defer_disclosure",
+        AsyncMock(return_value=False),
+    ), patch(
+        "api.services.telephony.providers.twilio.routes._take_deferred_disclosure",
+        AsyncMock(return_value=False),
     ):
         yield

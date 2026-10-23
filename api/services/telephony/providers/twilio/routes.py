@@ -1070,6 +1070,61 @@ async def _leave_self_requested(parent_call_sid: str) -> bool:
         return False
 
 
+_DISCLOSURE_TEXT = "This call may be recorded and monitored for quality assurance."
+_DISCLOSURE_TTL_SECONDS = 120
+
+
+def _disclosure_key(call_sid: str) -> str:
+    return f"dialer:disclose:{call_sid}"
+
+
+async def _defer_disclosure(call_sid: str) -> bool:
+    """Note that this lead leg is owed the recording notice once it is in the rep's
+    room. False when it could not be noted: the caller then plays the notice before
+    the join, the old way, so it is never lost. Never raises."""
+    try:
+        client = call_sorter._redis_client()
+        try:
+            await client.set(_disclosure_key(call_sid), "1", ex=_DISCLOSURE_TTL_SECONDS)
+            return True
+        finally:
+            await client.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"Could not defer the recording notice for {call_sid}: {exc}")
+        return False
+
+
+async def _take_deferred_disclosure(call_sid: str) -> bool:
+    """Whether this leg is owed the notice, claiming it so only one join plays it."""
+    try:
+        client = call_sorter._redis_client()
+        try:
+            return bool(await client.getdel(_disclosure_key(call_sid)))
+        finally:
+            await client.aclose()
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Could not read the deferred recording notice for {call_sid}: {exc}")
+        return False
+
+
+async def _announce_disclosure(conference_sid: str) -> bool:
+    """Play the recording notice into the rep's room: the prospect and the rep hear
+    it together, with the rep already on the line. Never raises."""
+    client = await _twilio_client()
+    if not client:
+        return False
+    try:
+        backend_endpoint, _ = await get_backend_endpoints()
+        url = f"{str(backend_endpoint or '').rstrip('/')}/api/v1/telephony/dialer-disclosure"
+        await asyncio.to_thread(
+            client.conferences(conference_sid).update, announce_url=url, announce_method="POST",
+        )
+        return True
+    except Exception as exc:  # noqa: BLE001
+        logger.error(f"Could not announce the recording notice into {conference_sid}: {exc}")
+        return False
+
+
 async def _join_mailbox_to_rep_now(*, parent_call_sid: str, child_call_sid: str) -> bool:
     """Send the answered lead leg straight into the rep's conference (ending the
     AMD hold), so the rep hears the greeting and the beep and speaks after it."""
@@ -2363,10 +2418,17 @@ async def handle_dialer_conference_join(
     # Never to a mailbox: when the rep leaves a voicemail themselves (ask/self
     # modes hand the mailbox to them), the notice was recorded as the first words
     # of their message. It is for a person on the line, not a recording.
-    disclosure = (
-        "" if answered_by.startswith("machine") or answered_by == "fax" or handled == "self"
-        else "<Say>This call may be recorded and monitored for quality assurance.</Say>"
+    # 23 Oct: the notice used to play BEFORE the join, so a person who answered heard
+    # ~3 s of it on top of machine detection before reaching the rep (9-12 s in all).
+    # It now plays into the room once they are in it, the rep already on the line;
+    # if that cannot be arranged it still plays first, never skipped.
+    owed_notice = not (answered_by.startswith("machine") or answered_by == "fax" or handled == "self")
+    deferred = (
+        owed_notice
+        and bool(_TWILIO_CALL_SID_PATTERN.fullmatch(parallel_call_sid))
+        and await _defer_disclosure(parallel_call_sid)
     )
+    disclosure = f"<Say>{_DISCLOSURE_TEXT}</Say>" if owed_notice and not deferred else ""
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?>'
         "<Response>"
@@ -2563,6 +2625,21 @@ async def _cancel_orphaned_lead_leg(parent_call_sid: str) -> None:
         logger.error(f"Failed orphaned lead leg cleanup for {parent_call_sid}: {exc}")
 
 
+@router.post("/dialer-disclosure", include_in_schema=False)
+async def handle_dialer_disclosure(request: Request):
+    """The recording notice, announced into a rep's room once the prospect is in it."""
+    form_data = dict(await request.form())
+    if not await _verify_twilio_signature(request, form_data):
+        logger.warning("Invalid Twilio signature on dialer-disclosure webhook")
+        return HTMLResponse(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response/>', media_type="application/xml",
+        )
+    return HTMLResponse(
+        content=f'<?xml version="1.0" encoding="UTF-8"?><Response><Say>{_DISCLOSURE_TEXT}</Say></Response>',
+        media_type="application/xml",
+    )
+
+
 @router.post("/dialer-conference-events", include_in_schema=False)
 async def handle_dialer_conference_events(request: Request):
     """Conference lifecycle callback. Unlike the TwiML-serving endpoints this
@@ -2595,6 +2672,12 @@ async def handle_dialer_conference_events(request: Request):
                 parent_call_sid=parent_call_sid, conference_sid=conference_sid
             )
         child_call_sid = str(form_data.get("CallSid") or form_data.get("ParticipantCallSid") or "")
+        if (
+            conference_sid and child_call_sid and child_call_sid != parent_call_sid
+            and await _take_deferred_disclosure(child_call_sid)
+            and not await _announce_disclosure(conference_sid)
+        ):
+            logger.error(f"Recording notice owed to {child_call_sid} could not be played")
         event_at = _twilio_event_time(form_data.get("Timestamp"))
         if event_at and child_call_sid and _TWILIO_CALL_SID_PATTERN.fullmatch(child_call_sid):
             parallel_session = await dialer_parallel.parallel_session(
