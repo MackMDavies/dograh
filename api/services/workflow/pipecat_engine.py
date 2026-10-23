@@ -192,6 +192,7 @@ class PipecatEngine:
         self._voice_expression_instruction = voice_expression_instruction
         self._guardrail_instruction = guardrail_instruction
         self._is_realtime = is_realtime
+        self._agent_test_sandbox: Optional[dict] = None
 
         # Audio configuration (set via set_audio_config from _run_pipeline)
         self._audio_config = None
@@ -258,6 +259,26 @@ class PipecatEngine:
         if not tracing_ctx:
             return None
         return tracing_ctx.get_turn_context() or tracing_ctx.get_conversation_context()
+
+    def configure_test_sandbox(self, workflow_run) -> None:
+        """Bind tool isolation only from the server-owned run annotations.
+
+        An incomplete enabled marker remains truthy, so restricted tool paths
+        fail closed rather than falling through to live customer actions.
+        """
+        from api.services.workflow.test_sandbox_mode import (
+            is_sandbox_test_run,
+            sandbox_test_run_context,
+        )
+        if not is_sandbox_test_run(workflow_run):
+            self._agent_test_sandbox = None
+            return
+        context = sandbox_test_run_context(workflow_run) or {}
+        self._agent_test_sandbox = {
+            "test_run_id": context.get("agent_test_run_id"),
+            "scenario_id": context.get("scenario_id"),
+            "workflow_id": getattr(workflow_run, "workflow_id", None),
+        }
 
     async def initialize(self):
         # TODO: May be set_node in a separate task so that we return from initialize immediately

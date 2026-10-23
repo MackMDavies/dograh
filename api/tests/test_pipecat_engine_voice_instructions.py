@@ -56,3 +56,20 @@ def test_pipeline_engine_constructor_keywords_match_the_engine_signature():
     for call in calls:
         arguments = {keyword.arg: None for keyword in call.keywords if keyword.arg}
         signature.bind(**arguments)
+
+
+def test_normal_call_has_no_private_tool_isolation_context():
+    engine = PipecatEngine(workflow=workflow(), call_context_vars={})
+    assert engine._agent_test_sandbox is None
+    engine.configure_test_sandbox(SimpleNamespace(annotations={}, workflow_id=214))
+    assert engine._agent_test_sandbox is None
+
+
+def test_server_owned_private_run_context_restricts_tools_and_incomplete_markers_stay_restricted():
+    engine = PipecatEngine(workflow=workflow(), call_context_vars={})
+    marker = {"enabled": True, "agent_test_run_id": "3e9ef77d-5054-4333-902d-879612f54429", "scenario_id": "booking-check"}
+    engine.configure_test_sandbox(SimpleNamespace(annotations={"sysevo_test_sandbox": marker}, workflow_id=214))
+    assert engine._agent_test_sandbox == {"test_run_id": marker["agent_test_run_id"], "scenario_id": "booking-check", "workflow_id": 214}
+    engine.configure_test_sandbox(SimpleNamespace(annotations={"sysevo_test_sandbox": {"enabled": True}}, workflow_id=214))
+    assert engine._agent_test_sandbox
+    assert engine._agent_test_sandbox["test_run_id"] is None

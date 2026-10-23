@@ -807,6 +807,8 @@ async def _run_pipeline(
         transition_filler_enabled=transition_filler_enabled,
     )
 
+    engine.configure_test_sandbox(workflow_run)
+
     # Create pipeline components
     audio_buffer, context = create_pipeline_components(audio_config)
 
