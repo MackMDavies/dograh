@@ -56,9 +56,10 @@ NEUTRAL_GOODBYE = "Sorry we missed you, we'll call you back shortly. Bye for now
 # Repeated (with short pauses, never more than about 2 s of quiet) while a softphone joins.
 CONNECTING_LINE = "Just connecting you now."
 RECORDING_DISCLOSURE = "This call may be recorded and monitored for quality assurance."
-# 24 Oct: no automatic recording notice when a person is put through to a rep on an
-# outbound call. The rep says it themselves; a robotic line at the start of every call
-# cost the conversation. AI-agent hand-offs and inbound calls keep theirs (no rep to say it).
+# 24 Oct: no automatic recording notice anywhere in the dialer - outbound answers, extra
+# answers, ring-backs, the parallel hold, AI-agent hand-offs and inbound calls to a rep.
+# The rep says it themselves; a robotic line at the start of every call cost the
+# conversation. This one switch governs every path that could play it.
 AUTO_RECORDING_NOTICE = False
 
 _CLIP_KINDS = frozenset({"hello", "apology"})

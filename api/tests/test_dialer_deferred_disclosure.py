@@ -149,3 +149,39 @@ def test_by_default_a_person_hears_no_automatic_notice(monkeypatch):
     assert "<Conference" in response.text
     assert _NOTICE not in response.text
     defer.assert_not_awaited()
+
+
+def test_the_announce_endpoint_is_silent_while_the_notice_is_off(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", False)
+    with patch(f"{_R}.RequestValidator.validate", return_value=True):
+        response = _client().post("/dialer-disclosure", data={"CallSid": WINNER},
+                                  headers={"X-Twilio-Signature": "sig"})
+    assert response.status_code == 200
+    assert "<Say>" not in response.text
+
+
+def test_every_spoken_notice_goes_through_the_one_switch():
+    """24 Oct: the notice must never play on its own. Its words live in exactly two
+    constants; every path that speaks them reads AUTO_RECORDING_NOTICE first."""
+    from pathlib import Path
+
+    root = Path(__file__).resolve().parents[1] / "services"
+    hits = [
+        f"{path.relative_to(root)}:{n}"
+        for path in root.rglob("*.py")
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if "may be recorded" in line
+    ]
+    assert sorted(hits) == sorted([
+        "telephony/dialer/extra_answer.py:" + str(next(
+            n for n, line in enumerate((root / "telephony/dialer/extra_answer.py").read_text().splitlines(), 1)
+            if line.startswith("RECORDING_DISCLOSURE =")
+        )),
+        "telephony/providers/twilio/routes.py:" + str(next(
+            n for n, line in enumerate((root / "telephony/providers/twilio/routes.py").read_text().splitlines(), 1)
+            if line.startswith("_DISCLOSURE_TEXT =")
+        )),
+    ])
+    import importlib.util
+    spec = importlib.util.find_spec("api.services.telephony.dialer.extra_answer")
+    assert "\nAUTO_RECORDING_NOTICE = False\n" in Path(spec.origin).read_text()

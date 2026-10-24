@@ -19,6 +19,7 @@ from loguru import logger
 from api.constants import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.db import db_client
 from api.services.quota_service import check_dograh_quota_by_user_id
+from api.services.telephony.dialer import extra_answer
 from api.services.telephony.call_concurrency import (
     acquire_call_slot, bind_slot, release_call_slot, release_slot_for_failed_start,
 )
@@ -254,7 +255,8 @@ async def _materialize_handoff(
     stream_url = f"{str(websocket_endpoint).rstrip('/')}/api/v1/telephony/dialer-agent-media/{run.id}"
     status_url = f"{str(backend_endpoint).rstrip('/')}/api/v1/telephony/dialer-agent-stream-status?workflow_run_id={run.id}"
     token = media_token(auth_token=provider.auth_token, run_id=run.id, call_id=child_call_sid)
-    notice = '<Say>This call may be recorded and monitored for quality assurance.</Say>' if disclose else ''
+    notice = (f'<Say>{extra_answer.RECORDING_DISCLOSURE}</Say>'
+              if disclose and extra_answer.AUTO_RECORDING_NOTICE else '')
     twiml = (
         '<?xml version="1.0" encoding="UTF-8"?><Response>'
         + notice +

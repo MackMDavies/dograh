@@ -1344,8 +1344,8 @@ async def handle_voice_connect(request: Request, background_tasks: BackgroundTas
             '<?xml version="1.0" encoding="UTF-8"?>'
             "<Response>"
             + live_stream
-            + "<Say>This call may be recorded and monitored for quality assurance.</Say>"
-            "<Dial><Conference "
+            + (f"<Say>{_DISCLOSURE_TEXT}</Say>" if extra_answer.AUTO_RECORDING_NOTICE else "")
+            + "<Dial><Conference "
             + telemetry_attributes
             + 'startConferenceOnEnter="true" endConferenceOnExit="true" beep="false">'
             + escape(inbound_conference)
@@ -2637,8 +2637,10 @@ async def handle_dialer_disclosure(request: Request):
         return HTMLResponse(
             content='<?xml version="1.0" encoding="UTF-8"?><Response/>', media_type="application/xml",
         )
+    # Silent while the automatic notice is off, even if Twilio is ever pointed here.
+    say = f"<Say>{_DISCLOSURE_TEXT}</Say>" if extra_answer.AUTO_RECORDING_NOTICE else ""
     return HTMLResponse(
-        content=f'<?xml version="1.0" encoding="UTF-8"?><Response><Say>{_DISCLOSURE_TEXT}</Say></Response>',
+        content=f'<?xml version="1.0" encoding="UTF-8"?><Response>{say}</Response>',
         media_type="application/xml",
     )
 

@@ -266,7 +266,7 @@ def test_voice_connect_joins_only_a_conference_claimed_by_this_rep(monkeypatch):
     assert response.status_code == 200
     assert f"<{conference_name}" not in response.text
     assert f">{conference_name}</Conference>" in response.text
-    assert _DISCLOSURE in response.text
+    assert _DISCLOSURE not in response.text  # 24 Oct: no automatic notice; the rep says it
     claim.assert_awaited_once_with(
         conference_name=conference_name,
         rep_user_id=rep.provider_id,
@@ -3522,4 +3522,4 @@ def test_inbound_rep_join_streams_captions_keyed_by_the_callers_call(monkeypatch
     text = response.text
     assert f'<Parameter name="channel_key" value="{parent_sid}"/>' in text
     assert text.index("<Start>") < text.index("<Dial>")
-    assert _DISCLOSURE in text
+    assert _DISCLOSURE not in text  # 24 Oct: no automatic notice; the rep says it
