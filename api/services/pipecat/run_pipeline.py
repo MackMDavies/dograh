@@ -1041,6 +1041,10 @@ async def _run_pipeline(
         await load_phone_tools_policy(workflow.organization_id if workflow else None),
         caller_keypad=caller_keypad,
         logs_buffer=in_memory_logs_buffer,
+        audio_buffer=audio_buffer,
+        caller_number=_lead_number,
+        workflow_id=workflow_id,
+        sandbox=bool(is_agent_test_sandbox),
     )
 
     # Build the pipeline
