@@ -10,6 +10,7 @@ from dataclasses import dataclass
 
 from api.services.workflow.voice_test_control import VoiceControlError, VoiceSession
 from api.services.workflow.voice_test_audio_evidence import PrivateVoiceAudioEvidence
+from api.services.workflow.voice_test_timing_evidence import PrivateVoiceTimingEvidence
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -42,12 +43,14 @@ class VoiceTurnObserver(BaseObserver):
         self.failure: str | None = None
         self.tool_trace = None
         self.audio_evidence = PrivateVoiceAudioEvidence()
+        self.timing_evidence = PrivateVoiceTimingEvidence(self.responses)
 
     @property
     def current(self):
         return self.responses[-1] if self.responses else None
 
     async def on_pipeline_started(self):
+        self.timing_evidence.observe(asyncio.get_running_loop().time())
         self.ready.set()
         self.changed.set()
 
@@ -58,6 +61,7 @@ class VoiceTurnObserver(BaseObserver):
         if direction != FrameDirection.DOWNSTREAM:
             return
         now = asyncio.get_running_loop().time()
+        self.timing_evidence.observe(now)
         current = self.current
         if isinstance(frame, BotStartedSpeakingFrame):
             if current is None or current.stopped_at is not None:
@@ -81,6 +85,8 @@ class VoiceTurnObserver(BaseObserver):
         current = self.current
         self.audio_evidence.record(pcm_start_byte, size,
                                    current.sequence if current is not None and current.stopped_at is None else None)
+        self.timing_evidence.record_output(at, size,
+                                          current.sequence if current is not None and current.stopped_at is None else None)
         if (
             size
             and current is not None
@@ -177,7 +183,7 @@ async def run_voice_script(
             observer.tool_trace.begin_caller_step(step.file_name)
         try:
             async with asyncio.timeout_at(deadline):
-                await transport.play_wav(fixtures[step.file_name])
+                await transport.play_wav(fixtures[step.file_name], fixture_id=step.file_name)
         except TimeoutError:
             raise VoiceControlError("voice_duration_limit_reached") from None
         caller_finished_at = loop.time()

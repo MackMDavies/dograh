@@ -154,7 +154,7 @@ def setup():
             cancel=AsyncMock(side_effect=lambda **_: closed.set()),
         )
 
-        async def play(encoded):
+        async def play(encoded, *, fixture_id=None):
             assert encoded == wav_bytes()
             observer.observe_output(
                 BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM

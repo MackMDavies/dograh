@@ -426,6 +426,7 @@ async def execute_voice_job(
                         audio_evidence=make_voice_audio_evidence_report(
                             report, session, observer.audio_evidence.snapshot(
                                 pcm_bytes=len(transport.capture.pcm), responses=observer.responses, pipeline_stopped=stopped,
+                                timing=observer.timing_evidence.snapshot(pipeline_stopped=stopped),
                             ),
                         ),
                     ):

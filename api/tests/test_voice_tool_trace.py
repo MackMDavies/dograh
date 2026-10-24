@@ -142,9 +142,9 @@ async def completed_trace():
         async def started():
             original = transport.play_wav
 
-            async def play(encoded):
+            async def play(encoded, *, fixture_id=None):
                 await llm.run_function_calls([call()])
-                await original(encoded)
+                await original(encoded, fixture_id=fixture_id)
 
             transport.play_wav = play
             await ready()

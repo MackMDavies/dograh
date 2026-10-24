@@ -54,7 +54,7 @@ def setup(*, mode="caller_first", delivery="after_response", next_delivery=None)
         await asyncio.sleep(0.04)
         observer.observe_output(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
-    async def play(encoded):
+    async def play(encoded, *, fixture_id=None):
         played.append(encoded)
         current = observer.current
         if current and current.stopped_at is None:
@@ -220,7 +220,7 @@ async def test_no_response_after_caller_is_a_timeout_and_not_a_pass():
     session, fixtures, transport, observer, played, _ = setup()
     await observer.on_pipeline_started()
 
-    async def no_reply(encoded):
+    async def no_reply(encoded, *, fixture_id=None):
         played.append(encoded)
 
     transport.play_wav = no_reply
@@ -287,6 +287,16 @@ async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
         assert observer.current.stopped_at is not None
         assert result["turns"][0]["caller_end_to_first_audio_ms"] >= 0
         assert result["quality_evaluated"] is False
+        timing = observer.timing_evidence.snapshot(pipeline_stopped=True)
+        assert timing["complete"] is True
+        from api.services.workflow.voice_test_timing_evidence import validate_voice_timing_evidence
+        spans = observer.audio_evidence.snapshot(
+            pcm_bytes=len(transport.capture.pcm), responses=observer.responses, pipeline_stopped=True,
+        )["spans"]
+        assert validate_voice_timing_evidence(
+            timing, duration_ms=5000, fixtures=session.fixtures, spans=spans,
+        ) is timing
+        assert timing["caller_steps"][0]["sha256"] == session.fixtures[0].sha256
     finally:
         await task.cancel()
         await asyncio.wait_for(running, timeout=5)
