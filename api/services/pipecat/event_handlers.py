@@ -238,7 +238,12 @@ def register_event_handlers(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _participant):
         logger.debug("In on_client_connected callback handler")
-        await audio_buffer.start_recording()
+        if engine.recording_should_start():
+            await audio_buffer.start_recording()
+        else:
+            # The organization starts calls unrecorded until the caller agrees
+            # (phone tools: recording, start_paused); set_recording turns it on.
+            logger.info(f"Recording paused at the start of run {workflow_run_id}")
         ready_state["client_connected"] = True
         await maybe_trigger_initial_response()
 
