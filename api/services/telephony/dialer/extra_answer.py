@@ -56,6 +56,10 @@ NEUTRAL_GOODBYE = "Sorry we missed you, we'll call you back shortly. Bye for now
 # Repeated (with short pauses, never more than about 2 s of quiet) while a softphone joins.
 CONNECTING_LINE = "Just connecting you now."
 RECORDING_DISCLOSURE = "This call may be recorded and monitored for quality assurance."
+# 24 Oct: no automatic recording notice when a person is put through to a rep on an
+# outbound call. The rep says it themselves; a robotic line at the start of every call
+# cost the conversation. AI-agent hand-offs and inbound calls keep theirs (no rep to say it).
+AUTO_RECORDING_NOTICE = False
 
 _CLIP_KINDS = frozenset({"hello", "apology"})
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
@@ -95,7 +99,7 @@ async def _rpc_dict(name: str, payload: dict[str, Any]) -> dict[str, Any] | None
 
 def offer_seconds(*, disclose: bool) -> int:
     """How long an offer may ring: about 3 s, counted from after the recording notice."""
-    return OFFER_SECONDS + (DISCLOSURE_SECONDS if disclose else 0)
+    return OFFER_SECONDS + (DISCLOSURE_SECONDS if disclose and AUTO_RECORDING_NOTICE else 0)
 
 
 def first_name(name: Any) -> str:

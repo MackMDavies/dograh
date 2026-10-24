@@ -75,7 +75,7 @@ def conference_twiml(*, prospect_call_sid: str, root: str, disclose: bool) -> st
         events_url=f"{root}/dialer-conference-events",
         recording_url=f"{root}/dialer-recording-callback",
     )
-    notice = _say(extra_answer.RECORDING_DISCLOSURE) if disclose else ""
+    notice = _say(extra_answer.RECORDING_DISCLOSURE) if disclose and extra_answer.AUTO_RECORDING_NOTICE else ""
     return (
         f"{_XML}<Response>{notice}<Dial><Conference {attrs}"
         'startConferenceOnEnter="false" endConferenceOnExit="true" beep="false" '

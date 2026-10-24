@@ -73,7 +73,8 @@ def _sw_app() -> TestClient:
 # ── 1. ring-back not possible -> the chain ───────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_twilio_ringback_unavailable_starts_the_chain_with_a_short_offer():
+async def test_twilio_ringback_unavailable_starts_the_chain_with_a_short_offer(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)  # the notice's own mechanics
     begin = AsyncMock(return_value={"status": "active", "step": "start", "rep_user_id": _REP})
     advance = AsyncMock(return_value={"action": "teammate", "prospect_call_id": _SID, "inbound_call_id": "ic-1"})
     spawned = []
@@ -123,7 +124,8 @@ def test_twilio_join_with_busy_rep_hands_the_person_to_the_chain_not_a_hangup():
 
 
 @pytest.mark.asyncio
-async def test_signalwire_ringback_unavailable_starts_the_chain_in_a_fresh_room():
+async def test_signalwire_ringback_unavailable_starts_the_chain_in_a_fresh_room(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)  # the notice's own mechanics
     begin = AsyncMock(return_value={"status": "active", "step": "start", "rep_user_id": _REP})
     advance = AsyncMock(return_value={"action": "apology", "prospect_call_id": "sw-1", "rep_user_id": _REP})
     with patch(f"{_XA}.begin", new=begin), patch(f"{_XA}.advance", new=advance), \
@@ -148,7 +150,8 @@ async def test_twilio_wait_plays_hello_then_a_spoken_line_with_short_pauses():
     assert "<Play>" not in twiml  # no clip here, and never music
 
 
-def test_offer_windows_are_about_three_seconds_after_the_notice():
+def test_offer_windows_are_about_three_seconds_after_the_notice(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)  # the notice's own mechanics
     assert extra_answer.OFFER_SECONDS == 3
     assert extra_answer.offer_seconds(disclose=False) == 3
     assert extra_answer.offer_seconds(disclose=True) == 3 + extra_answer.DISCLOSURE_SECONDS

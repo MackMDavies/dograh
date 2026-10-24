@@ -2422,7 +2422,10 @@ async def handle_dialer_conference_join(
     # ~3 s of it on top of machine detection before reaching the rep (9-12 s in all).
     # It now plays into the room once they are in it, the rep already on the line;
     # if that cannot be arranged it still plays first, never skipped.
-    owed_notice = not (answered_by.startswith("machine") or answered_by == "fax" or handled == "self")
+    # 24 Oct: off for outbound (extra_answer.AUTO_RECORDING_NOTICE) - the rep says it.
+    owed_notice = extra_answer.AUTO_RECORDING_NOTICE and not (
+        answered_by.startswith("machine") or answered_by == "fax" or handled == "self"
+    )
     deferred = (
         owed_notice
         and bool(_TWILIO_CALL_SID_PATTERN.fullmatch(parallel_call_sid))

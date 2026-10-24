@@ -856,7 +856,8 @@ def test_parallel_join_bridges_only_atomic_human_winner(monkeypatch, amd_answer)
 
     assert response.status_code == 200
     claim.assert_awaited_once()
-    assert _DISCLOSURE in response.text
+    # 24 Oct: no automatic recording notice on outbound; the rep says it.
+    assert _DISCLOSURE not in response.text
     assert "<Conference" in response.text
     # The accepted human winner must receive a valid conference-join document;
     # malformed TwiML here would leave the rep waiting with no connected lead.
@@ -921,7 +922,7 @@ def test_second_human_auto_connects_a_teammate_and_is_never_held(monkeypatch, am
         call.args[0].close()
     assert response.status_code == 200
     assert "<Hangup/>" not in response.text
-    assert _DISCLOSURE in response.text
+    assert _DISCLOSURE not in response.text
     doc = xml.dom.minidom.parseString(response.text)
     conference = doc.getElementsByTagName("Conference")[0]
     assert conference.firstChild.data == f"call-{_EXTRA_CHILD}"
@@ -930,8 +931,8 @@ def test_second_human_auto_connects_a_teammate_and_is_never_held(monkeypatch, am
     assert conference.getAttribute("waitUrl").endswith(f"/dialer-extra-answer-wait?call={_EXTRA_CHILD}")
     assert begin.await_args.kwargs["source"] == "parallel"
     assert begin.await_args.kwargs["leg_id"] == _EXTRA_LEG
-    # The person hears the recording notice first: the offer runs ~3 s after it.
-    assert adv.await_args.kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD, "offer_seconds": 7}
+    # No automatic notice (24 Oct), so the offer runs its ~3 s from the answer.
+    assert adv.await_args.kwargs == {"provider": "twilio", "prospect_call_id": _EXTRA_CHILD, "offer_seconds": 3}
     notify.assert_called_once_with("inbound-1")
     assert spawn.call_count == 1   # the 8 s offer expiry
     old_route.assert_not_awaited()
@@ -1777,10 +1778,8 @@ def test_dialer_conference_join_returns_conference_twiml(monkeypatch):
     assert 'endConferenceOnExit="true"' in response.text
     assert 'startConferenceOnEnter="true"' in response.text
     assert 'beep="false"' in response.text
-    # This is the lead's leg, so this is where the called party hears the
-    # recording/monitoring disclosure.
-    assert _DISCLOSURE in response.text
-    assert response.text.index(_DISCLOSURE) < response.text.index("<Dial>")
+    # 24 Oct: no automatic recording notice on outbound; the rep says it.
+    assert _DISCLOSURE not in response.text
 
 
 def test_dialer_conference_join_plays_saved_voicemail_after_confirmed_beep(monkeypatch):

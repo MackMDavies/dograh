@@ -90,7 +90,7 @@ async def teammate_swml(
     if not (conference_name.startswith("sysevo-overflow-") or conference_name.startswith("sysevo-ringback-")):
         raise ValueError("invalid SignalWire extra-answer room")
     steps: list[dict] = []
-    if disclose:
+    if disclose and extra_answer.AUTO_RECORDING_NOTICE:
         steps.append({"play": {"url": f"say:{extra_answer.RECORDING_DISCLOSURE}"}})
     steps.append(_play(await extra_answer.clip_url(rep_user_id, "hello"), extra_answer.NEUTRAL_HELLO))
     conference: dict[str, Any] = {"name": conference_name, "start_on_enter": False, "end_on_exit": True}

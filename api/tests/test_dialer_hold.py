@@ -25,7 +25,9 @@ def deps():
 
 async def test_hold_starts_with_a_message_and_signed_callback_target(deps):
     root = ElementTree.fromstring(await hold.hold_twiml(**ARGS,begin=True))
-    assert "connecting you" in root.findall("Say")[1].text
+    says = [say.text for say in root.findall("Say")]
+    # 24 Oct: no automatic recording notice on outbound; the rep says it.
+    assert says == ["Thanks for picking up, connecting you now."]
     assert root.find("Pause").attrib["length"] == "1"
     redirect = root.find("Redirect")
     assert redirect.attrib["method"] == "POST"

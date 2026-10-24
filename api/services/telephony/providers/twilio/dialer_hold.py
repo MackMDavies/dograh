@@ -2,6 +2,7 @@
 from urllib.parse import urlencode
 from xml.sax.saxutils import escape
 
+from api.services.telephony.dialer import extra_answer
 from api.services.telephony.dialer.inbound_call_log import notify_inbound_call
 from api.services.telephony.providers.twilio import dialer_agent_handoff
 from api.services.telephony.providers.twilio.dialer_twiml import conference_telemetry_attributes
@@ -51,8 +52,8 @@ async def hold_twiml(*, parent_call_sid: str, child_call_sid: str, leg_id: str, 
     if state.get("status") != "waiting":
         raise dialer_agent_handoff.AgentHandoffUnavailable("Unknown Hold state",retryable=True)
     redirect = endpoint+"/dialer-parallel-hold-next?"+urlencode({"parent_call_sid":parent_call_sid,"leg_id":leg_id})
-    intro = ('<Say>This call may be recorded and monitored for quality assurance.</Say>'
-        '<Say>Thanks for picking up, connecting you now.</Say>') if begin else ''
+    notice = ('<Say>'+extra_answer.RECORDING_DISCLOSURE+'</Say>') if extra_answer.AUTO_RECORDING_NOTICE else ''
+    intro = (notice+'<Say>Thanks for picking up, connecting you now.</Say>') if begin else ''
     return ('<?xml version="1.0" encoding="UTF-8"?><Response>'+intro+
         '<Pause length="1"/><Redirect method="POST">'+escape(redirect)+'</Redirect></Response>')
 

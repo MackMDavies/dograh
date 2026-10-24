@@ -22,7 +22,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.services.auth.sysevo_roles import require_sales_dialer_role
-from api.services.telephony.dialer import call_stages
+from api.services.telephony.dialer import call_stages, extra_answer
 from api.services.telephony.dialer.swml import (
     build_say_and_hangup_swml,
     build_signalwire_ringback_wait_swml,
@@ -487,7 +487,8 @@ def _sw_env(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_signalwire_person_after_the_hand_off_rings_the_original_rep_back(_sw_env):
+async def test_signalwire_person_after_the_hand_off_rings_the_original_rep_back(_sw_env, monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)  # the notice's own mechanics
     from api.services.telephony.dialer.signalwire_routes import handle_sw_parallel_decision
     spawned = []
     with patch(f"{_SW}.signalwire_parallel_store.get_leg_context", new=AsyncMock(return_value=_sw_context())), \
@@ -631,7 +632,7 @@ def test_ringback_wait_swml_refuses_other_rooms():
     with pytest.raises(ValueError):
         build_signalwire_ringback_wait_swml(conference_name="sysevo-par-x")
     doc = build_signalwire_ringback_wait_swml(conference_name="sysevo-ringback-1")
-    assert doc["sections"]["main"][1]["join_conference"] == {
+    assert doc["sections"]["main"][-1]["join_conference"] == {
         "name": "sysevo-ringback-1", "start_on_enter": False, "end_on_exit": True,
     }
 

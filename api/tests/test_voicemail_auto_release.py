@@ -24,6 +24,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from api.services.auth.sysevo_roles import require_sales_dialer_role
+from api.services.telephony.dialer import extra_answer
 from api.services.telephony.providers.twilio import routes as twilio_routes
 from api.services.telephony.providers.twilio.dialer_call_log import effective_auto_send
 from api.services.telephony.providers.twilio.routes import router
@@ -791,7 +792,8 @@ def test_mailbox_handed_to_the_rep_hears_no_recording_notice():
     assert _NOTICE not in response.text
 
 
-def test_a_person_still_hears_the_recording_notice_first():
+def test_a_person_still_hears_the_recording_notice_first(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)  # the notice's own mechanics
     stack, _ = _enter(_single_call_mocks(enabled=False))
     with stack:
         response = _join("human")

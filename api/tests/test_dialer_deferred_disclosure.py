@@ -1,10 +1,14 @@
 """The recording notice plays into the rep's room once the prospect is in it, not
-before the join (23 Oct: it added ~3 s of waiting to every answered call)."""
+before the join (23 Oct: it added ~3 s of waiting to every answered call).
+
+24 Oct: the automatic notice is off on outbound calls (the rep says it). These tests
+switch it back on to keep its mechanics covered, and one checks it is off by default."""
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
+from api.services.telephony.dialer import extra_answer
 from api.services.telephony.providers.twilio import routes
 from api.services.telephony.providers.twilio.routes import router
 
@@ -22,6 +26,7 @@ import pytest
 @pytest.fixture(autouse=True)
 def _signed(monkeypatch):
     monkeypatch.setattr(routes, "_resolve_dialer_auth_token", AsyncMock(return_value="test-auth-token"))
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", True)
 
 
 def _client() -> TestClient:
@@ -131,3 +136,16 @@ def test_announce_asks_twilio_to_play_into_the_room():
     conf.update.assert_called_once_with(
         announce_url="https://api.example.com/api/v1/telephony/dialer-disclosure", announce_method="POST",
     )
+
+
+
+def test_by_default_a_person_hears_no_automatic_notice(monkeypatch):
+    monkeypatch.setattr(extra_answer, "AUTO_RECORDING_NOTICE", False)
+    monkeypatch.setenv("SYSEVO_TWILIO_AUTH_TOKEN", "t")
+    a, b, c, d = _join_patches()
+    with a, b, c, d, patch(f"{_R}._defer_disclosure", AsyncMock(return_value=True)) as defer:
+        response = _join(_client())
+    assert response.status_code == 200
+    assert "<Conference" in response.text
+    assert _NOTICE not in response.text
+    defer.assert_not_awaited()

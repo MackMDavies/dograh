@@ -7,6 +7,8 @@ Twilio TwiML path needed xml.sax.saxutils to defend against.
 SCOPE: dialer only. Campaigns and agent calls do not use SWML.
 """
 
+from api.services.telephony.dialer import extra_answer
+
 
 def build_hangup_swml() -> dict:
     """Refuse the call politely. Used for bad signatures and bad input."""
@@ -466,8 +468,12 @@ def build_signalwire_ringback_wait_swml(*, conference_name: str) -> dict:
     """
     if not conference_name.startswith("sysevo-ringback-"):
         raise ValueError("invalid SignalWire ring-back conference name")
+    notice = (
+        [{"play": {"url": "say:" + extra_answer.RECORDING_DISCLOSURE}}]
+        if extra_answer.AUTO_RECORDING_NOTICE else []
+    )
     return {"sections": {"main": [
-        {"play": {"url": "say:This call may be recorded and monitored for quality assurance."}},
+        *notice,
         {"join_conference": {
             "name": conference_name, "start_on_enter": False, "end_on_exit": True,
         }},
