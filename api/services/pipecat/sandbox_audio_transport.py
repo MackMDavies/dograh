@@ -222,9 +222,10 @@ class _CapturedOutput(BaseOutputTransport):
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         try:
             at = asyncio.get_running_loop().time()
+            pcm_start_byte = len(self.owner.capture.pcm)
             self.owner.capture.append(frame, at)
             if self.owner.voice_observer is not None:
-                self.owner.voice_observer.record_audio(at, len(frame.audio))
+                self.owner.voice_observer.record_audio(at, len(frame.audio), pcm_start_byte=pcm_start_byte)
         except ValueError as exc:
             self.owner.failure = str(exc)
             return False

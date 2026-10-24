@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import math
+from api.services.workflow.voice_test_audio_evidence import make_voice_audio_evidence_report, validate_voice_audio_evidence_report
 from dataclasses import asdict, dataclass
 from uuid import uuid4
 
@@ -422,6 +423,11 @@ async def execute_voice_job(
                         tool_trace=make_voice_tool_trace_report(
                             report, session, observer.tool_trace.snapshot(pipeline_stopped=stopped)
                         ),
+                        audio_evidence=make_voice_audio_evidence_report(
+                            report, session, observer.audio_evidence.snapshot(
+                                pcm_bytes=len(transport.capture.pcm), responses=observer.responses, pipeline_stopped=stopped,
+                            ),
+                        ),
                     ):
                         raise VoiceControlError("voice_report_persistence_failed")
         except asyncio.CancelledError:
@@ -486,6 +492,16 @@ async def read_voice_job_tool_trace(db, control, context, signing_secret):
     run, report = await _read_completed_voice_result(db, session, context, signing_secret)
     return validate_voice_tool_trace_report(
         run.annotations.get("agent_test_voice_tool_trace"), report, session,
+    )
+
+
+async def read_voice_job_audio_evidence(db, control, context, signing_secret):
+    _, session, _ = await prepare_voice_job(db, control, context)
+    if session.status != "completed":
+        raise VoiceControlError("voice_audio_evidence_not_sealed")
+    run, report = await _read_completed_voice_result(db, session, context, signing_secret)
+    return validate_voice_audio_evidence_report(
+        run.annotations.get("agent_test_voice_audio_evidence"), report, session,
     )
 
 

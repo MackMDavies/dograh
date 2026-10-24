@@ -24,7 +24,7 @@ from api.services.workflow.variable_resolution import sanitize_context_variables
 
 class WorkflowRunClient(BaseDBClient):
     async def save_agent_test_voice_result(
-        self, run_id, workflow_id, organization_id, session_id, result, *, tool_trace=None
+        self, run_id, workflow_id, organization_id, session_id, result, *, tool_trace=None, audio_evidence=None
     ):
         """Atomically add immutable private evidence without replacing annotations."""
         async with self.async_session() as session:
@@ -40,6 +40,13 @@ class WorkflowRunClient(BaseDBClient):
                 updated_annotations = func.jsonb_set(
                     updated_annotations, array(["agent_test_voice_tool_trace"], type_=Text),
                     literal(tool_trace, JSONB), True,
+                )
+            if audio_evidence is not None:
+                saved_audio = annotations.op("->")("agent_test_voice_audio_evidence")
+                trace_guards.append(or_(saved_audio.is_(None), saved_audio == literal(audio_evidence, JSONB)))
+                updated_annotations = func.jsonb_set(
+                    updated_annotations, array(["agent_test_voice_audio_evidence"], type_=Text),
+                    literal(audio_evidence, JSONB), True,
                 )
             written = await session.execute(
                 update(WorkflowRunModel)

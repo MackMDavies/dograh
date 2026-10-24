@@ -56,10 +56,10 @@ async def isolated_trace_database():
             await connection.execute(text("insert into workflow_runs values(123,185,cast(:annotations as jsonb))"), {"annotations": json.dumps(marker)})
         client = SimpleNamespace(async_session=async_sessionmaker(engine, expire_on_commit=False))
 
-        async def save(result=REPORT, trace=TRACE, **scope):
+        async def save(result=REPORT, trace=TRACE, audio_evidence=None, **scope):
             return await WorkflowRunClient.save_agent_test_voice_result(
                 client, scope.get("run_id",123), scope.get("workflow_id",185), scope.get("organization_id",42),
-                scope.get("session_id",SESSION), result, tool_trace=trace,
+                scope.get("session_id",SESSION), result, tool_trace=trace, audio_evidence=audio_evidence,
             )
 
         async def read():

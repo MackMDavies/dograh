@@ -9,6 +9,7 @@ import hashlib
 from dataclasses import dataclass
 
 from api.services.workflow.voice_test_control import VoiceControlError, VoiceSession
+from api.services.workflow.voice_test_audio_evidence import PrivateVoiceAudioEvidence
 from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
@@ -40,6 +41,7 @@ class VoiceTurnObserver(BaseObserver):
         self.closed = False
         self.failure: str | None = None
         self.tool_trace = None
+        self.audio_evidence = PrivateVoiceAudioEvidence()
 
     @property
     def current(self):
@@ -74,9 +76,11 @@ class VoiceTurnObserver(BaseObserver):
             return
         self.changed.set()
 
-    def record_audio(self, at: float, size: int):
+    def record_audio(self, at: float, size: int, *, pcm_start_byte=None):
         """Called by the private PCM writer, at actual output, after validation."""
         current = self.current
+        self.audio_evidence.record(pcm_start_byte, size,
+                                   current.sequence if current is not None and current.stopped_at is None else None)
         if (
             size
             and current is not None
