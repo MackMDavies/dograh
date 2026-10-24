@@ -292,7 +292,7 @@ class TestPerCallCaching:
 
         captured: list[list[str]] = []
 
-        async def _capture(*, node, custom_tool_manager, kb_document_uuids):
+        async def _capture(*, node, custom_tool_manager, kb_document_uuids, **_):
             captured.append(list(kb_document_uuids or []))
             return []
 
