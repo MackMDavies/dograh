@@ -18,6 +18,7 @@ from api.services.telephony.base import (
     ProviderSyncResult,
     TelephonyProvider,
 )
+from api.services.telephony.warm_transfer import twilio_transfer_twiml
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_address import normalize_telephony_address
 
@@ -558,10 +559,14 @@ class TwilioProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Initiate a call transfer via Twilio.
+
+        With an introduction (warm transfer) the destination hears it and must press
+        1; /telephony/transfer-accept/{transfer_id} then joins them to the conference.
 
         Uses inline TwiML to put the destination into a conference when they answer,
         and a status callback to track the transfer outcome.
@@ -594,13 +599,14 @@ class TwilioProvider(TelephonyProvider):
         )
 
         # Inline TwiML: when the destination answers, put them into the conference
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>You have answered a transfer call. Connecting you now.</Say>
-    <Dial>
-        <Conference endConferenceOnExit="true">{conference_name}</Conference>
-    </Dial>
-</Response>"""
+        # (warm: read them the introduction and wait for them to press 1 first).
+        twiml = twilio_transfer_twiml(
+            conference_name,
+            introduction,
+            f"{backend_endpoint}/api/v1/telephony/transfer-accept/{transfer_id}"
+            if introduction
+            else None,
+        )
 
         # Prepare Twilio API call data
         endpoint = f"{self.base_url}/Calls.json"
@@ -666,6 +672,9 @@ class TwilioProvider(TelephonyProvider):
         except Exception as e:
             logger.error(f"Exception during Twilio transfer call: {e}")
             raise
+
+    def supports_warm_transfer(self) -> bool:
+        return True
 
     def supports_transfers(self) -> bool:
         """

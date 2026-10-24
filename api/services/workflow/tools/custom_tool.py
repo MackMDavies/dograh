@@ -66,6 +66,19 @@ def tool_to_function_schema(tool: Any) -> Dict[str, Any]:
         }
         required.append("reason")
 
+    # A warm transfer tool asks the model for the introduction the colleague hears
+    # before taking the call (services/telephony/warm_transfer.py).
+    if definition.get("type") == "transfer_call" and config.get("transfer_mode") == "warm":
+        properties["introduction"] = {
+            "type": "string",
+            "description": (
+                "One or two sentences for the colleague before they are connected: "
+                "who is calling (their name if you know it) and what they need, so "
+                "the caller does not have to repeat themselves."
+            ),
+        }
+        required.append("introduction")
+
     # Sanitize tool name for function name (lowercase, underscores only)
     function_name = re.sub(r"[^a-z0-9_]", "_", tool.name.lower())
     # Remove consecutive underscores and trim

@@ -37,6 +37,11 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.services.telephony.warm_transfer import (
+    ACCEPT_KEY,
+    twilio_accept_twiml,
+    twilio_decline_twiml,
+)
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_helper import (
     generic_hangup_response,
@@ -1083,6 +1088,14 @@ async def complete_transfer_function_call(transfer_id: str, request: Request):
     original_call_sid = transfer_context.original_call_sid if transfer_context else None
     conference_name = transfer_context.conference_name if transfer_context else None
 
+    if transfer_context and transfer_context.warm:
+        # Warm transfer: answering is not taking the call — /transfer-accept decides.
+        if transfer_context.resolved or call_status in ("in-progress", "answered"):
+            return {"status": "pending"}
+        if call_status == "completed":
+            # Answered, then hung up (or voicemail took it) without pressing 1.
+            call_status = "declined"
+
     # Determine the result based on call status with user-friendly messaging
     if call_status in ("in-progress", "answered"):
         result = {
@@ -1108,6 +1121,15 @@ async def complete_transfer_function_call(transfer_id: str, request: Request):
             "status": "transfer_failed",
             "reason": "busy",
             "message": "The transfer call encountered a busy signal. The person is likely on another call.",
+            "action": "transfer_failed",
+            "call_sid": call_sid,
+            "end_call": True,
+        }
+    elif call_status == "declined":
+        result = {
+            "status": "transfer_failed",
+            "reason": "declined",
+            "message": "The person answered but did not take the call.",
             "action": "transfer_failed",
             "call_sid": call_sid,
             "end_call": True,
@@ -1148,6 +1170,10 @@ async def complete_transfer_function_call(transfer_id: str, request: Request):
             reason=result.get("reason"),
         )
 
+        if transfer_context and transfer_context.warm:
+            transfer_context.resolved = True
+            await call_transfer_manager.store_transfer_context(transfer_context)
+
         # Publish the event via Redis
         await call_transfer_manager.publish_transfer_event(transfer_event)
         logger.info(
@@ -1158,6 +1184,51 @@ async def complete_transfer_function_call(transfer_id: str, request: Request):
         logger.error(f"Error completing transfer {transfer_id}: {e}")
 
     return {"status": "completed", "result": result}
+
+
+@router.post("/transfer-accept/{transfer_id}")
+async def accept_warm_transfer(transfer_id: str, request: Request):
+    """Twilio <Gather> action for a warm transfer: the colleague heard the
+    introduction; pressing 1 connects the caller, anything else declines."""
+    from fastapi import Response
+
+    data = dict(await request.form())
+    digits = str(data.get("Digits") or "")
+    call_sid = str(data.get("CallSid") or "")
+
+    call_transfer_manager = await get_call_transfer_manager()
+    transfer_context = await call_transfer_manager.get_transfer_context(transfer_id)
+    if not transfer_context or transfer_context.resolved:
+        return Response(content=twilio_decline_twiml(), media_type="application/xml")
+
+    accepted = digits == ACCEPT_KEY
+    transfer_context.resolved = True
+    transfer_context.accepted = accepted
+    await call_transfer_manager.store_transfer_context(transfer_context)
+    logger.info(f"Warm transfer {transfer_id} {'accepted' if accepted else 'declined'}")
+
+    await call_transfer_manager.publish_transfer_event(
+        TransferEvent(
+            type=TransferEventType.DESTINATION_ANSWERED
+            if accepted
+            else TransferEventType.TRANSFER_FAILED,
+            transfer_id=transfer_id,
+            original_call_sid=transfer_context.original_call_sid or "",
+            transfer_call_sid=call_sid,
+            conference_name=transfer_context.conference_name,
+            status="success" if accepted else "transfer_failed",
+            action="destination_answered" if accepted else "transfer_failed",
+            reason=None if accepted else "declined",
+            message="The person took the call." if accepted else "The person answered but did not take the call.",
+            end_call=not accepted,
+        )
+    )
+    if accepted:
+        return Response(
+            content=twilio_accept_twiml(transfer_context.conference_name),
+            media_type="application/xml",
+        )
+    return Response(content=twilio_decline_twiml(), media_type="application/xml")
 
 
 # Mount per-provider routers (webhook, status callbacks, answer URLs).
