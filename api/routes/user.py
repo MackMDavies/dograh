@@ -20,6 +20,7 @@ from api.services.configuration.masking import check_for_masked_keys, mask_user_
 from api.services.configuration.merge import merge_user_configurations
 from api.services.configuration.registry import REGISTRY, ServiceType
 from api.services.mps_service_key_client import mps_service_key_client
+from api.services.voice_library.elevenlabs_service import get_configuration_voices
 
 router = APIRouter(prefix="/user")
 
@@ -343,17 +344,22 @@ async def get_voices(
 ) -> VoicesResponse:
     """Get available voices for a TTS provider."""
     try:
-        result = await mps_service_key_client.get_voices(
-            provider=provider,
-            model=model,
-            language=language,
-            organization_id=user.selected_organization_id,
-            created_by=user.provider_id,
-        )
+        if provider == "elevenlabs":
+            result = await get_configuration_voices(user)
+        else:
+            result = await mps_service_key_client.get_voices(
+                provider=provider,
+                model=model,
+                language=language,
+                organization_id=user.selected_organization_id,
+                created_by=user.provider_id,
+            )
         return VoicesResponse(
             provider=result.get("provider", provider),
             voices=[VoiceInfo(**voice) for voice in result.get("voices", [])],
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Failed to fetch voices for {provider}: {e}")
         raise HTTPException(

@@ -3,6 +3,7 @@
 from typing import Optional
 
 import httpx
+from fastapi import HTTPException
 from loguru import logger
 from sqlalchemy import select
 
@@ -105,6 +106,50 @@ async def fetch_elevenlabs_catalog(api_key: str) -> list[dict]:
         )
         response.raise_for_status()
         return response.json().get("voices", [])
+
+
+async def get_configuration_voices(user: UserModel) -> dict:
+    """Serve builder voice choices directly; MPS does not support ElevenLabs.
+
+    Match the voice-library credential cascade, including the platform key for
+    managed demo organizations, without looking up another tenant's connection.
+    ElevenLabs voices are multilingual, so model/language do not narrow this list.
+    """
+    api_key = await get_caller_elevenlabs_api_key(user.id)
+    if not api_key and user.selected_organization_id:
+        connection = await db_client.get_connection_by_provider(
+            user.selected_organization_id, "tts", "elevenlabs"
+        )
+        api_key = connection.api_key if connection else None
+    if not api_key:
+        api_key = await get_system_elevenlabs_api_key()
+    if not api_key:
+        raise HTTPException(
+            status_code=400,
+            detail="ElevenLabs API key not configured in Voice Models settings",
+        )
+
+    try:
+        catalog = await fetch_elevenlabs_catalog(api_key)
+    except Exception as exc:
+        # Provider exceptions may contain request headers; never log their values.
+        logger.warning("ElevenLabs voice catalogue request failed ({})", type(exc).__name__)
+        raise HTTPException(status_code=502, detail="Failed to fetch ElevenLabs catalog") from exc
+
+    return {
+        "provider": "elevenlabs",
+        "voices": [
+            {
+                "voice_id": voice["voice_id"],
+                "name": voice["name"],
+                "description": voice.get("description"),
+                "preview_url": voice.get("preview_url"),
+                **{field: (voice.get("labels") or {}).get(field)
+                   for field in ("accent", "gender", "language")},
+            }
+            for voice in catalog
+        ],
+    }
 
 
 async def fetch_elevenlabs_shared_voices(
