@@ -28,7 +28,11 @@ from api.enums import ToolCategory, WorkflowRunMode
 from api.services.pipecat.audio_playback import play_audio, play_audio_loop
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.factory import get_telephony_provider_for_run
-from api.services.telephony.transfer_event_protocol import TransferContext
+from api.services.telephony.transfer_event_protocol import (
+    TransferContext,
+    TransferEventType,
+)
+from api.services.telephony.warm_transfer import clean_introduction, masked_destination
 from api.services.workflow.test_sandbox_mode import (
     is_sandbox_test_run,
     resolve_sandbox_http_action,
@@ -43,6 +47,17 @@ from api.services.workflow.tools.custom_tool import (
 if TYPE_CHECKING:
     from api.services.workflow.mcp_tool_session import McpToolSession
     from api.services.workflow.pipecat_engine import PipecatEngine
+
+
+_E164 = re.compile(r"^\+[1-9]\d{1,14}$")
+_SIP_ENDPOINT = re.compile(r"^(PJSIP|SIP)\/[\w\-\.@]+$")
+
+
+def _valid_transfer_destination(destination: str, mode: str) -> bool:
+    """E.164 everywhere; Asterisk (ARI) lines also accept SIP endpoints."""
+    if _E164.match(destination):
+        return True
+    return mode == WorkflowRunMode.ARI.value and bool(_SIP_ENDPOINT.match(destination))
 
 
 def get_function_schema(
@@ -674,40 +689,26 @@ class CustomToolManager:
                     )
                     return
 
-                # Validate destination format based on workflow run mode
-                if workflow_run.mode == WorkflowRunMode.ARI.value:
-                    # For ARI provider, also accept SIP endpoints
-                    SIP_ENDPOINT_REGEX = r"^(PJSIP|SIP)\/[\w\-\.@]+$"
-                    E164_PHONE_REGEX = r"^\+[1-9]\d{1,14}$"
+                if not _valid_transfer_destination(destination, workflow_run.mode):
+                    validation_error_result = {
+                        "status": "failed",
+                        "message": "I'm sorry, but the transfer destination appears to be invalid. Please contact support to verify the transfer settings.",
+                        "action": "transfer_failed",
+                        "reason": "invalid_destination",
+                    }
+                    await self._handle_transfer_result(
+                        validation_error_result, function_call_params, properties
+                    )
+                    return
 
-                    is_valid_sip = re.match(SIP_ENDPOINT_REGEX, destination)
-                    is_valid_e164 = re.match(E164_PHONE_REGEX, destination)
-
-                    if not (is_valid_sip or is_valid_e164):
-                        validation_error_result = {
-                            "status": "failed",
-                            "message": "I'm sorry, but the transfer destination appears to be invalid. Please contact support to verify the transfer settings.",
-                            "action": "transfer_failed",
-                            "reason": "invalid_destination",
-                        }
-                        await self._handle_transfer_result(
-                            validation_error_result, function_call_params, properties
-                        )
-                        return
-                else:
-                    # For non-ARI providers (Twilio, etc), use E.164 validation
-                    E164_PHONE_REGEX = r"^\+[1-9]\d{1,14}$"
-                    if not re.match(E164_PHONE_REGEX, destination):
-                        validation_error_result = {
-                            "status": "failed",
-                            "message": "I'm sorry, but the transfer phone number appears to be invalid. Please contact support to verify the transfer settings.",
-                            "action": "transfer_failed",
-                            "reason": "invalid_destination",
-                        }
-                        await self._handle_transfer_result(
-                            validation_error_result, function_call_params, properties
-                        )
-                        return
+                # A backup number is tried when the first person does not take the call.
+                destinations = [destination]
+                fallback = str(config.get("fallback_destination") or "").strip()
+                if fallback and fallback != destination:
+                    if _valid_transfer_destination(fallback, workflow_run.mode):
+                        destinations.append(fallback)
+                    else:
+                        logger.warning(f"Ignoring invalid backup transfer number on tool {tool.tool_uuid}")
 
                 played = await self._play_config_message(config)
                 if played:
@@ -742,54 +743,33 @@ class CustomToolManager:
                     )
                     return
 
-                original_call_sid = workflow_run.gathered_context.get("call_id")
+                # Warm transfer: the colleague hears the agent's introduction and must
+                # press 1. Carriers that can't read it to them keep the cold transfer.
+                introduction = None
+                if config.get("transfer_mode") == "warm":
+                    if provider.supports_warm_transfer():
+                        introduction = clean_introduction(
+                            (function_call_params.arguments or {}).get("introduction")
+                        ) or "A caller is waiting to speak with you."
+                    else:
+                        logger.info(
+                            f"{type(provider).__name__} cannot introduce the caller; "
+                            "transferring without an introduction"
+                        )
 
-                # Generate a unique transfer ID for tracking this transfer
-                transfer_id = str(uuid.uuid4())
+                original_call_sid = workflow_run.gathered_context.get("call_id")
 
                 # Compute conference name from original call SID
                 conference_name = f"transfer-{original_call_sid}"
 
-                # Store initial transfer context in Redis before provider call to avoid race condition
-                call_transfer_manager = await get_call_transfer_manager()
-                transfer_context = TransferContext(
-                    transfer_id=transfer_id,
-                    call_sid=None,  # Will be updated after provider response
-                    target_number=destination,
-                    tool_uuid=tool.tool_uuid,
-                    original_call_sid=original_call_sid,
-                    conference_name=conference_name,
-                    initiated_at=time.time(),
-                    workflow_run_id=self._engine._workflow_run_id,
-                )
-                await call_transfer_manager.store_transfer_context(transfer_context)
-
                 # Mute the pipeline
                 self._engine.set_mute_pipeline(True)
 
-                # Initiate transfer via provider with inline TwiML
-                transfer_result = await provider.transfer_call(
-                    destination=destination,
-                    transfer_id=transfer_id,
-                    conference_name=conference_name,
-                    timeout=timeout_seconds,
-                )
-
-                call_sid = transfer_result.get("call_sid")
-                logger.info(f"Transfer call initiated successfully: {call_sid}")
-
-                # Update transfer context with actual call_sid from provider response
-                transfer_context.call_sid = call_sid
-                await call_transfer_manager.store_transfer_context(transfer_context)
-
-                # Wait for status callback completion using Redis pub/sub
-                logger.info(
-                    f"Transfer call initiated for {destination} (transfer_id={transfer_id}), waiting for completion..."
-                )
-
-                # Start hold music during transfer waiting period
+                # Start hold music for the whole transfer, backup number included
                 hold_music_stop_event = asyncio.Event()
                 hold_music_task = None
+                transfer_event = None
+                last_reason = "timeout"
 
                 try:
                     # Use audio config for sample rate (set during pipeline setup)
@@ -812,13 +792,30 @@ class CustomToolManager:
                         )
                     )
 
-                    # Wait for transfer completion using Redis pub/sub
-                    logger.info("Waiting for transfer completion via Redis pub/sub...")
-                    transfer_event = (
-                        await call_transfer_manager.wait_for_transfer_completion(
-                            transfer_id, timeout_seconds
+                    for target in destinations:
+                        transfer_event, reason = await self._dial_transfer_destination(
+                            provider=provider,
+                            tool=tool,
+                            destination=target,
+                            original_call_sid=original_call_sid,
+                            conference_name=conference_name,
+                            timeout_seconds=timeout_seconds,
+                            introduction=introduction,
                         )
-                    )
+                        connected = bool(
+                            transfer_event
+                            and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
+                        )
+                        await self._engine.log_phone_tool_event(
+                            "transfer",
+                            destination=masked_destination(target),
+                            warm=bool(introduction),
+                            outcome="connected" if connected else reason,
+                        )
+                        if connected:
+                            break
+                        last_reason = reason
+                        transfer_event = None
 
                 except Exception as e:
                     logger.error(f"Error during transfer wait: {e}")
@@ -843,16 +840,22 @@ class CustomToolManager:
                     )
                 else:
                     logger.error(
-                        f"Transfer call timed out or failed after {timeout_seconds} seconds"
+                        f"Transfer did not connect ({last_reason}) after trying "
+                        f"{len(destinations)} destination(s)"
                     )
-                    timeout_result = {
-                        "status": "failed",
-                        "message": "I'm sorry, but the call is taking longer than expected to connect. The person might not be available right now. Please try calling back later.",
-                        "action": "transfer_failed",
-                        "reason": "timeout",
-                    }
                     await self._handle_transfer_result(
-                        timeout_result, function_call_params, properties
+                        {
+                            "status": "failed",
+                            "message": "Nobody could take the call.",
+                            "action": "transfer_failed",
+                            "reason": last_reason,
+                            "next_step": (
+                                "Tell the caller nobody is free to take the call right "
+                                "now, and offer to take a message or arrange a callback."
+                            ),
+                        },
+                        function_call_params,
+                        properties,
                     )
 
             except Exception as e:
@@ -874,6 +877,75 @@ class CustomToolManager:
                 )
 
         return transfer_call_handler
+
+    async def _dial_transfer_destination(
+        self,
+        *,
+        provider: Any,
+        tool: Any,
+        destination: str,
+        original_call_sid: Optional[str],
+        conference_name: str,
+        timeout_seconds: int,
+        introduction: Optional[str],
+    ) -> tuple[Optional[Any], str]:
+        """Ring one destination and wait for the outcome.
+
+        Returns (DESTINATION_ANSWERED event or None, failure reason).
+        """
+        transfer_id = str(uuid.uuid4())
+        call_transfer_manager = await get_call_transfer_manager()
+        # Store the context before the provider call to avoid a race with its webhooks
+        transfer_context = TransferContext(
+            transfer_id=transfer_id,
+            call_sid=None,  # Will be updated after provider response
+            target_number=destination,
+            tool_uuid=tool.tool_uuid,
+            original_call_sid=original_call_sid,
+            conference_name=conference_name,
+            initiated_at=time.time(),
+            workflow_run_id=self._engine._workflow_run_id,
+            warm=bool(introduction),
+            introduction=introduction,
+        )
+        await call_transfer_manager.store_transfer_context(transfer_context)
+
+        try:
+            warm_kwargs = {"introduction": introduction} if introduction else {}
+            transfer_result = await provider.transfer_call(
+                destination=destination,
+                transfer_id=transfer_id,
+                conference_name=conference_name,
+                timeout=timeout_seconds,
+                **warm_kwargs,
+            )
+        except Exception as e:
+            logger.error(f"Transfer dial failed (transfer_id={transfer_id}): {e}")
+            await call_transfer_manager.remove_transfer_context(transfer_id)
+            return None, "call_failed"
+
+        call_sid = transfer_result.get("call_sid")
+        logger.info(
+            f"Transfer call initiated: {call_sid} (transfer_id={transfer_id}), waiting for completion..."
+        )
+        # The webhooks may already have written to the context; only fill in the call id.
+        latest = await call_transfer_manager.get_transfer_context(transfer_id)
+        latest = latest or transfer_context
+        if not latest.call_sid:
+            latest.call_sid = call_sid
+            await call_transfer_manager.store_transfer_context(latest)
+
+        # Warm transfers wait a little longer: the colleague hears the introduction first.
+        wait_seconds = timeout_seconds + (20 if introduction else 0)
+        transfer_event = await call_transfer_manager.wait_for_transfer_completion(
+            transfer_id, wait_seconds
+        )
+        if transfer_event and transfer_event.type == TransferEventType.DESTINATION_ANSWERED:
+            return transfer_event, "connected"
+        reason = (transfer_event.reason if transfer_event else None) or "timeout"
+        # A failed attempt must not be found by the strategy that bridges the caller.
+        await call_transfer_manager.remove_transfer_context(transfer_id)
+        return None, reason
 
     async def _handle_transfer_result(
         self, result: dict, function_call_params, properties
@@ -925,13 +997,14 @@ class CustomToolManager:
             reason = result.get("reason", "unknown")
             logger.info(f"Transfer failed ({reason}), informing user via LLM")
 
-            await function_call_params.result_callback(
-                {
-                    "status": "transfer_failed",
-                    "reason": reason,
-                    "message": "Transfer failed",
-                }
-            )
+            failure = {
+                "status": "transfer_failed",
+                "reason": reason,
+                "message": "Transfer failed",
+            }
+            if result.get("next_step"):
+                failure["next_step"] = result["next_step"]
+            await function_call_params.result_callback(failure)
         else:
             # Unknown action, treat as generic success
             logger.warning(f"Unknown transfer action: {action}, treating as success")

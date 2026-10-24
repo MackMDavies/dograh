@@ -400,3 +400,36 @@ async def test_assistant_deltas_keep_item_identity_timestamp_and_original_spacin
     llm_frames = [frame for frame in frames if isinstance(frame, LLMTextFrame)]
     assert len(llm_frames) == 2
     assert all(frame.append_to_context is False for frame in llm_frames)
+
+
+@pytest.mark.asyncio
+async def test_caller_key_presses_are_sent_as_input_and_answered():
+    """Keypad & Native Phone Tools: a caller pressing 1 reaches the realtime model."""
+    from pipecat.frames.frames import LLMMessagesAppendFrame
+
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini", session_properties=SessionProperties(),
+        ),
+    )
+    service._context = LLMContext()
+    service._handled_initial_context = True
+    service._api_session_ready = True
+    service.send_client_event = AsyncMock()
+    service.push_frame = AsyncMock()
+    service.start_processing_metrics = AsyncMock()
+    service.start_ttfb_metrics = AsyncMock()
+
+    await service.process_frame(
+        LLMMessagesAppendFrame(
+            [{"role": "user", "content": "[The caller pressed these keys on their phone keypad: 1]"}],
+            run_llm=True,
+        ),
+        FrameDirection.DOWNSTREAM,
+    )
+
+    sent = [call.args[0] for call in service.send_client_event.await_args_list]
+    assert sent[0].type == "conversation.item.create"
+    assert "keypad: 1" in sent[0].item.content[0].text
+    assert sent[1].type == "response.create"

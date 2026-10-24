@@ -92,6 +92,8 @@ class OrganizationConfigurationKey(Enum):
     LANGFUSE_CREDENTIALS = (
         "LANGFUSE_CREDENTIALS"  # Org-level Langfuse tracing credentials
     )
+    # When agents may use the built-in phone tools (services/phone_tools/policy.py)
+    PHONE_TOOLS_POLICY = "PHONE_TOOLS_POLICY"
 
 
 class WorkflowStatus(Enum):

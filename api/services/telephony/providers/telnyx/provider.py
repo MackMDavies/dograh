@@ -712,9 +712,13 @@ class TelnyxProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Dial the destination as a plain call; conference is seeded later.
+
+        A warm transfer's introduction travels on the TransferContext: the
+        transfer-result webhook reads it to the destination on ``call.answered``.
 
         Webhook (``call.answered``) seeds the conference with this leg;
         ``TelnyxConferenceStrategy`` joins the caller on pipeline teardown.
@@ -788,6 +792,33 @@ class TelnyxProvider(TelephonyProvider):
 
     def supports_transfers(self) -> bool:
         return True
+
+    def supports_warm_transfer(self) -> bool:
+        return True
+
+    async def call_action(
+        self, call_control_id: str, action: str, payload: Optional[Dict[str, Any]] = None
+    ) -> bool:
+        """POST /calls/{id}/actions/{action}; True on success, never raises.
+
+        https://developers.telnyx.com/api-reference/call-commands
+        """
+        endpoint = f"{self.TELNYX_API_BASE}/calls/{call_control_id}/actions/{action}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    endpoint, json=payload or {}, headers=self._headers()
+                ) as response:
+                    if response.status != 200:
+                        body = await response.text()
+                        logger.error(
+                            f"Telnyx {action} failed: status={response.status} body={body}"
+                        )
+                        return False
+                    return True
+        except Exception as e:
+            logger.error(f"Exception during Telnyx {action}: {e}")
+            return False
 
     async def create_conference(
         self, seed_call_control_id: str, name: str

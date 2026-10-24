@@ -17,6 +17,8 @@ from api.services.integrations import (
     create_runtime_sessions,
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.caller_keypad import CallerKeypadProcessor
+from api.services.phone_tools.policy import load_policy as load_phone_tools_policy
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -1037,6 +1039,15 @@ async def _run_pipeline(
         realtime=is_realtime,
     )
 
+    # Keypad & native phone tools: the organization's rules (Voice AI -> Tools) and
+    # the keys the caller presses, which every serializer reports as InputDTMFFrame.
+    caller_keypad = CallerKeypadProcessor()
+    engine.set_phone_tools(
+        await load_phone_tools_policy(workflow.organization_id if workflow else None),
+        caller_keypad=caller_keypad,
+        logs_buffer=in_memory_logs_buffer,
+    )
+
     # Build the pipeline
     if is_realtime:
         pipeline = build_realtime_pipeline(
@@ -1050,6 +1061,7 @@ async def _run_pipeline(
             voicemail_detector=voicemail_detector,
             input_guardrail_processor=input_guardrail_processor,
             output_guardrail_processor=output_guardrail_processor,
+            caller_keypad=caller_keypad,
         )
     else:
         pipeline = build_pipeline(
@@ -1066,6 +1078,7 @@ async def _run_pipeline(
             input_guardrail_processor=input_guardrail_processor,
             output_guardrail_processor=output_guardrail_processor,
             recording_router=recording_router,
+            caller_keypad=caller_keypad,
         )
 
     # Create pipeline task with audio configuration

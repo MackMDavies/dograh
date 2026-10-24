@@ -39,6 +39,7 @@ def build_pipeline(
     recording_router=None,
     input_guardrail_processor=None,
     output_guardrail_processor=None,
+    caller_keypad=None,
 ):
     """Build the main pipeline with all components.
 
@@ -50,10 +51,13 @@ def build_pipeline(
         recording_router: Optional RecordingRouterProcessor. When provided,
             inserts between callback processor and TTS to route between
             pre-recorded audio playback and dynamic TTS.
+        caller_keypad: Optional CallerKeypadProcessor, directly after the
+            transport input so the caller's key presses reach the agent.
     """
     # Build processors list with optional voicemail detection
     processors = [
         transport.input(),  # Transport user input
+        *([caller_keypad] if caller_keypad else []),
         stt,
     ]
 
@@ -109,6 +113,7 @@ def build_realtime_pipeline(
     voicemail_detector=None,
     input_guardrail_processor=None,
     output_guardrail_processor=None,
+    caller_keypad=None,
 ):
     """Build a pipeline for realtime (speech-to-speech) LLM services.
 
@@ -137,6 +142,7 @@ def build_realtime_pipeline(
     """
     processors = [
         transport.input(),
+        *([caller_keypad] if caller_keypad else []),
         user_context_aggregator,
         realtime_llm,
     ]

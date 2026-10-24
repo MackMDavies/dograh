@@ -18,6 +18,7 @@ from pipecat.utils.enums import EndTaskReason
 
 from api.db import db_client
 from api.enums import ToolCategory
+from api.services.phone_tools.policy import PhoneToolsPolicy, normalize_policy
 from api.services.pipecat.audio_playback import play_audio
 from api.services.workflow.disposition_mapper import apply_disposition_mapping
 from api.services.workflow.workflow_graph import Node, WorkflowGraph
@@ -226,6 +227,11 @@ class PipecatEngine:
         self._context_summarization_manager: Optional[ContextSummarizationManager] = (
             None
         )
+        # Built-in phone tools and the organization's rules for them
+        # (set via set_phone_tools from _run_pipeline; defaults = every tool on).
+        self._phone_tools: PhoneToolsPolicy = normalize_policy(None)
+        self._caller_keypad = None
+        self._logs_buffer = None
 
     async def _get_organization_id(self) -> Optional[int]:
         """Get and cache the organization ID from workflow run."""
@@ -628,6 +634,7 @@ class PipecatEngine:
                     raise RuntimeError("no pipeline task available")
                 await self.task.queue_frame(OutputDTMFFrame.from_string(digits))
                 self._gathered_context.setdefault("dtmf_pressed", []).append(digits)
+                await self.log_phone_tool_event("keypad", keys=digits)
                 await function_call_params.result_callback(
                     {
                         "status": "pressed",
@@ -909,8 +916,10 @@ class PipecatEngine:
             await self._register_knowledge_base_function(kb_doc_uuids)
 
         # SYSEVO_DTMF: available on every node — an IVR or call-control gate can
-        # appear at any point, not just when the call is answered.
-        await self._register_dtmf_function()
+        # appear at any point, not just when the call is answered — unless the
+        # organization switched the keypad tool off.
+        if self._phone_tools.enabled("keypad"):
+            await self._register_dtmf_function()
         dialer_callback = self._dialer_callback_enabled()
         if dialer_callback:
             await self._register_dialer_callback_function()
@@ -942,6 +951,7 @@ class PipecatEngine:
             node=node,
             custom_tool_manager=self._custom_tool_manager,
             kb_document_uuids=kb_doc_uuids,
+            phone_tools_policy=self._phone_tools,
             **dialer_kwargs,
         )
         await self._update_llm_context(system_prompt, functions)
@@ -1377,6 +1387,71 @@ class PipecatEngine:
     def set_fetch_recording_audio(self, fetch_fn) -> None:
         """Set the recording audio fetcher callback."""
         self._fetch_recording_audio = fetch_fn
+
+    def set_phone_tools(self, policy: PhoneToolsPolicy, caller_keypad=None, logs_buffer=None) -> None:
+        """Install the organization's phone tool rules (Voice AI -> Tools).
+
+        caller_keypad is the pipeline's CallerKeypadProcessor; it only passes key
+        presses on when the organization allows the caller keypad tool.
+        """
+        self._phone_tools = policy
+        self._logs_buffer = logs_buffer
+        self._caller_keypad = caller_keypad
+        if caller_keypad is not None:
+            if policy.enabled("caller_keypad"):
+                caller_keypad.set_handler(self._on_caller_keys, self._caller_keys_accepted)
+            else:
+                caller_keypad.set_handler(None)
+
+    async def inject_caller_key(self, key: str) -> None:
+        """A caller key press reported outside the media stream (Asterisk ARI)."""
+        if self._caller_keypad is not None:
+            await self._caller_keypad.inject_key(key)
+
+    def _caller_keys_accepted(self) -> bool:
+        """Key presses follow the same rule as speech: none while the line is held for a
+        transfer, and none over speech the agent must finish (allow_interrupt=False)."""
+        if self._mute_pipeline or self._queued_speech_mute_state != "idle":
+            return False
+        return not (
+            self._bot_is_speaking
+            and self._current_node is not None
+            and not self._current_node.allow_interrupt
+        )
+
+    async def log_phone_tool_event(self, tool: str, **details: Any) -> None:
+        """Record a phone tool use in the call's history (logs.realtime_feedback_events)."""
+        if self._logs_buffer is None:
+            return
+        try:
+            await self._logs_buffer.append(
+                {"type": "phone_tool", "payload": {"tool": tool, **details}}
+            )
+        except Exception as e:  # noqa: BLE001 -- history is best effort, the call is not
+            logger.warning(f"could not record phone tool event {tool}: {e}")
+
+    async def _on_caller_keys(self, keys: str) -> Optional["Frame"]:
+        """The caller finished pressing keys: tell the model, and record it."""
+        from pipecat.frames.frames import LLMMessagesAppendFrame
+
+        logger.info(f"Caller pressed keypad keys ({len(keys)} keys)")
+        self._gathered_context.setdefault("caller_keys_pressed", []).append(keys)
+        await self.log_phone_tool_event("caller_keypad", keys=keys)
+
+        content = f"[The caller pressed these keys on their phone keypad: {keys}]"
+        rule = self._phone_tools.rule("caller_keypad")
+        if rule:
+            content += (
+                f"\n[Only act on key presses when: {rule}. Otherwise carry on "
+                "with the conversation as if no key was pressed.]"
+            )
+        frame = LLMMessagesAppendFrame([{"role": "user", "content": content}], run_llm=True)
+        if self._is_realtime:
+            # The realtime model sits after the user aggregator, which would swallow
+            # the message into the local context without the model ever hearing it.
+            await self.llm.queue_frame(frame)
+            return None
+        return frame
 
     def set_mute_pipeline(self, mute: bool) -> None:
         """Set the pipeline mute state.
