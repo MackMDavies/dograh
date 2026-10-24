@@ -1092,6 +1092,7 @@ async def _run_pipeline(
     feedback_observer = RealtimeFeedbackObserver(
         ws_sender=ws_sender,
         logs_buffer=in_memory_logs_buffer,
+        redact_tool_values=is_agent_test_sandbox,
     )
     task.add_observer(feedback_observer)
 
