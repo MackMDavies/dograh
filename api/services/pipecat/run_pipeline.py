@@ -801,6 +801,12 @@ async def _run_pipeline(
         user_config.tts, user_config.realtime if is_realtime else None,
         run_configs.get("voice_expression"),
     )
+    # A callback run carries why the person asked and the earlier call's notes.
+    from api.services.callbacks.standing import callback_instruction
+
+    voice_expression_instruction = "\n\n".join(
+        part for part in (voice_expression_instruction, callback_instruction(merged_call_context_vars)) if part
+    ) or None
     guardrail_config = run_configs.get("voice_guardrails")
     guardrail_instruction = build_guardrail_prompt_instruction(guardrail_config)
 

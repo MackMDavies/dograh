@@ -297,6 +297,11 @@ class CampaignOrchestrator:
             f"campaign_id: {campaign_id} - Queued run {queued_run.id} finally failed after max retries, "
             f"last reason: {reason}"
         )
+        if campaign is not None and getattr(campaign, "is_standing", False):
+            # A promised callback nobody answered becomes a task for the team.
+            from api.services.callbacks.standing import report_final_failure
+
+            await report_final_failure(campaign, queued_run, reason)
 
     def _is_within_schedule(self, campaign: CampaignModel) -> bool:
         """Check if the current time falls within the campaign's schedule windows.

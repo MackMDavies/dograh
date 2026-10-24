@@ -102,6 +102,21 @@ class CampaignClient(BaseDBClient):
             await session.refresh(campaign)
             return campaign
 
+    async def get_standing_campaign_for_workflow(self, workflow_id: int) -> Optional[CampaignModel]:
+        """The workflow's callback queue (services/callbacks/standing.py), if it has one."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(CampaignModel)
+                .where(
+                    CampaignModel.workflow_id == workflow_id,
+                    CampaignModel.is_standing.is_(True),
+                    CampaignModel.state == "running",
+                )
+                .order_by(CampaignModel.id)
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
+
     async def get_campaigns(
         self,
         organization_id: int,
