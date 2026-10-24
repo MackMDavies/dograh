@@ -1337,3 +1337,40 @@ async def delete_api_key(key_id: int, user: UserModel = Depends(get_user)):
         raise HTTPException(status_code=404, detail="API key not found")
 
     return {"message": "API key deleted"}
+
+
+# ======== PHONE TOOLS (Keypad & Native Phone Tools) ========
+
+
+class PhoneToolRuleModel(BaseModel):
+    mode: str = "on"
+    rule: str = ""
+
+
+class PhoneToolsPolicyModel(BaseModel):
+    tools: dict[str, PhoneToolRuleModel] = {}
+
+
+@router.get("/phone-tools", response_model=PhoneToolsPolicyModel)
+async def get_phone_tools_policy(user: UserModel = Depends(get_user)):
+    """When this organization's agents may use the built-in phone tools."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    from api.services.phone_tools.policy import load_policy
+
+    policy = await load_policy(user.selected_organization_id)
+    return policy.to_dict()
+
+
+@router.put("/phone-tools", response_model=PhoneToolsPolicyModel)
+async def save_phone_tools_policy(
+    request: PhoneToolsPolicyModel,
+    user: UserModel = Depends(get_user),
+):
+    """Save the rules. Unknown tools and modes are dropped; a rule with no words is "on"."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    from api.services.phone_tools.policy import save_policy
+
+    policy = await save_policy(user.selected_organization_id, request.model_dump())
+    return policy.to_dict()

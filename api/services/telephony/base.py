@@ -413,3 +413,8 @@ class TelephonyProvider(ABC):
             True if provider supports call transfers, False otherwise
         """
         pass
+
+    def supports_warm_transfer(self) -> bool:
+        """True when transfer_call accepts introduction= and only connects the
+        destination once they press 1 (services/telephony/warm_transfer.py)."""
+        return False

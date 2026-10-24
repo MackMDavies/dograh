@@ -27,6 +27,11 @@ from api.services.telephony.transfer_event_protocol import (
     TransferEvent,
     TransferEventType,
 )
+from api.services.telephony.warm_transfer import (
+    ACCEPT_KEY,
+    ACCEPT_TIMEOUT_SECONDS,
+    briefing_speech,
+)
 
 router = APIRouter()
 
@@ -176,6 +181,13 @@ async def handle_telnyx_transfer_result(transfer_id: str, request: Request):
     original_call_sid = transfer_context.original_call_sid if transfer_context else ""
     conference_name = transfer_context.conference_name if transfer_context else None
 
+    if transfer_context and transfer_context.warm:
+        handled = await _handle_warm_transfer_event(
+            event_type, payload, transfer_context, call_control_id
+        )
+        if handled is not None:
+            return handled
+
     if event_type == "call.answered":
         # Seed the conference now with the destination's live call_control_id
         # from the webhook payload. The strategy at pipeline-end then only has
@@ -267,6 +279,107 @@ async def handle_telnyx_transfer_result(transfer_id: str, request: Request):
     )
 
     return {"status": "success"}
+
+
+async def _handle_warm_transfer_event(
+    event_type: str,
+    payload: dict,
+    transfer_context: TransferContext,
+    call_control_id: str,
+) -> dict | None:
+    """Warm transfer legs (services/telephony/warm_transfer.py).
+
+    call.answered reads the introduction and gathers one key; call.gather.ended
+    connects on 1 and declines otherwise; a hang-up after the leg was answered but
+    before it was accepted is a decline. Returns None to fall through to the cold
+    handling (e.g. the introduction could not be played: better connected than lost).
+    """
+    call_transfer_manager = await get_call_transfer_manager()
+    transfer_id = transfer_context.transfer_id
+
+    if transfer_context.resolved:
+        if event_type == "call.hangup" and transfer_context.accepted:
+            return None  # accepted and bridged: the cold teardown path applies
+        return {"status": "ignored"}
+
+    if event_type == "call.answered":
+        provider = await _resolve_telnyx_provider(transfer_context)
+        asked = bool(provider) and await provider.call_action(
+            call_control_id,
+            "gather_using_speak",
+            {
+                "payload": briefing_speech(transfer_context.introduction or ""),
+                "voice": "female",
+                "language": "en-US",
+                "minimum_digits": 1,
+                "maximum_digits": 1,
+                "timeout_millis": ACCEPT_TIMEOUT_SECONDS * 1000,
+            },
+        )
+        if not asked:
+            return None
+        transfer_context.call_sid = call_control_id
+        transfer_context.answered = True
+        await call_transfer_manager.store_transfer_context(transfer_context)
+        return {"status": "pending"}
+
+    if event_type == "call.gather.ended":
+        accepted = str(payload.get("digits") or "").startswith(ACCEPT_KEY)
+        if accepted:
+            conference_id = await _seed_destination_conference(
+                transfer_context=transfer_context,
+                destination_call_control_id=call_control_id,
+            )
+            accepted = bool(conference_id)
+            transfer_context.conference_id = conference_id
+        transfer_context.resolved = True
+        transfer_context.accepted = accepted
+        await call_transfer_manager.store_transfer_context(transfer_context)
+        if not accepted:
+            provider = await _resolve_telnyx_provider(transfer_context)
+            if provider:
+                await provider.call_action(call_control_id, "hangup")
+        await call_transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.DESTINATION_ANSWERED
+                if accepted
+                else TransferEventType.TRANSFER_FAILED,
+                transfer_id=transfer_id,
+                original_call_sid=transfer_context.original_call_sid,
+                transfer_call_sid=call_control_id,
+                conference_name=transfer_context.conference_name,
+                status="success" if accepted else "transfer_failed",
+                action="destination_answered" if accepted else "transfer_failed",
+                reason=None if accepted else "declined",
+                message="The person took the call."
+                if accepted
+                else "The person answered but did not take the call.",
+                end_call=not accepted,
+            )
+        )
+        return {"status": "success"}
+
+    if event_type == "call.hangup" and transfer_context.answered:
+        # Answered (the introduction was being read) and hung up without pressing 1.
+        transfer_context.resolved = True
+        await call_transfer_manager.store_transfer_context(transfer_context)
+        await call_transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.TRANSFER_FAILED,
+                transfer_id=transfer_id,
+                original_call_sid=transfer_context.original_call_sid,
+                transfer_call_sid=call_control_id,
+                conference_name=transfer_context.conference_name,
+                status="transfer_failed",
+                action="transfer_failed",
+                reason="declined",
+                message="The person answered but did not take the call.",
+                end_call=True,
+            )
+        )
+        return {"status": "success"}
+
+    return None
 
 
 async def _resolve_telnyx_provider(

@@ -136,13 +136,21 @@ class TransferCallConfig(BaseModel):
         le=120,
         description="Maximum time in seconds to wait for destination to answer (5-120 seconds)",
     )
+    transfer_mode: Literal["cold", "warm"] = Field(
+        default="cold",
+        description="warm: the agent introduces the caller and the colleague presses 1 to take the call",
+    )
+    fallback_destination: Optional[str] = Field(
+        default=None,
+        description="Backup number or SIP endpoint, tried when the first destination does not take the call",
+    )
 
-    @field_validator("destination")
+    @field_validator("destination", "fallback_destination")
     @classmethod
-    def validate_destination(cls, v: str) -> str:
+    def validate_destination(cls, v: Optional[str]) -> Optional[str]:
         """Validate that destination is a valid E.164 phone number or SIP endpoint."""
         # Allow empty string for initial creation (like HTTP API tools with empty URL)
-        if not v.strip():
+        if v is None or not v.strip():
             return v
 
         # E.164 format: +[1-9]\d{1,14}

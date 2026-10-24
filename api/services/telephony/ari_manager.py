@@ -402,11 +402,29 @@ class ARIConnection:
                 f"[ARI org={self.organization_id}] DTMF: "
                 f"channel={channel_id}, digit={digit}"
             )
+            # Hand the caller's key press to the pipeline running their call.
+            workflow_run_id = await self._get_channel_run(channel_id)
+            if workflow_run_id and digit:
+                asyncio.create_task(self._forward_caller_key(workflow_run_id, digit))
 
         else:
             logger.debug(
                 f"[ARI org={self.organization_id}] Event: {event_type} "
                 f"channel={channel_id}"
+            )
+
+    async def _forward_caller_key(self, workflow_run_id: str, digit: str) -> None:
+        from api.services.supervisor.live_control import (
+            caller_keypad_command,
+            publish_command,
+        )
+
+        try:
+            await publish_command(workflow_run_id, caller_keypad_command(digit))
+        except Exception as e:  # noqa: BLE001 -- a key press must never break the call
+            logger.warning(
+                f"[ARI org={self.organization_id}] could not forward key press "
+                f"for run {workflow_run_id}: {e}"
             )
 
     async def _ari_request(self, method: str, path: str, **kwargs) -> dict:
