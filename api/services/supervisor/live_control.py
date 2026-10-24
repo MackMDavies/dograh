@@ -77,6 +77,17 @@ DIALER_TRANSFER_TOOL_ID = "dialer-extra-answer"
 DIALER_SUMMARY = "dialer_summary"
 
 
+# Internal (server-published): a key the caller pressed on an Asterisk (ARI) call. ARI
+# reports presses as events to the ari_manager process, not in the media stream, so
+# they reach the pipeline here. Never accepted from the portal.
+CALLER_KEYPAD = "caller_keypad"
+_CALLER_KEYS = frozenset("0123456789*#")
+
+
+def caller_keypad_command(key: str) -> dict[str, Any]:
+    return {"type": CALLER_KEYPAD, "key": key}
+
+
 def dialer_summary_command() -> dict[str, Any]:
     return {"type": DIALER_SUMMARY}
 
@@ -239,6 +250,12 @@ class SupervisorControl:
                 await client.aclose()
 
     async def _handle(self, command: dict[str, Any]) -> None:
+        if isinstance(command, dict) and command.get("type") == CALLER_KEYPAD:
+            key = str(command.get("key") or "")
+            if key in _CALLER_KEYS:
+                with suppress(Exception):
+                    await self._engine.inject_caller_key(key)
+            return
         if isinstance(command, dict) and command.get("type") == DIALER_SUMMARY:
             try:
                 await self.dialer_summary()
