@@ -612,6 +612,11 @@ async def _run_pipeline(
         llm = create_llm_service(user_config)
         inference_llm = None
 
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        trace = transport.voice_observer.tool_trace
+        if trace is not None:
+            trace.attach(llm)
+
     # Stamp the providers/models actually resolved for this run onto
     # initial_context so they're available for post-call analytics
     # (model_overrides may have shifted them away from the org-level

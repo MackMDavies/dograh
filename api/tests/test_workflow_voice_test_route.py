@@ -27,6 +27,47 @@ def setup(monkeypatch):
     return TestClient(app), user, pool, enqueue
 
 
+@pytest.mark.parametrize("secret", [None, "wrong"])
+def test_tool_trace_requires_internal_auth_before_reading_any_evidence(monkeypatch, secret):
+    client, _, pool, _ = setup(monkeypatch)
+    read = AsyncMock()
+    monkeypatch.setattr(workflow_voice_test, "read_voice_job_tool_trace", read)
+    response = client.post("/workflow/185/test-voice/tool-trace", json={"session_id": SESSION, "lease_token": LEASE},
+                           headers={"x-sysevo-secret": secret} if secret else {})
+    assert response.status_code == 403
+    read.assert_not_awaited(); pool.assert_not_awaited()
+
+
+def test_tool_trace_uses_authenticated_scope_and_never_acquires_worker_capacity(monkeypatch):
+    client, _, pool, enqueue = setup(monkeypatch)
+    read = AsyncMock(return_value={"trace": {"complete": False}})
+    monkeypatch.setattr(workflow_voice_test, "read_voice_job_tool_trace", read)
+    response = client.post("/workflow/185/test-voice/tool-trace", json={"session_id": SESSION, "lease_token": LEASE}, headers={"x-sysevo-secret": SECRET})
+    assert response.status_code == 200
+    context = read.await_args.args[2]
+    assert (context.organization_id, context.requested_by_user_id, context.workflow_id) == (42, 9, 185)
+    assert SECRET not in response.text and LEASE not in response.text
+    pool.assert_not_awaited(); enqueue.assert_not_awaited()
+
+
+@pytest.mark.parametrize("extra", [{"organization_id": 43}, {"recipient": "private@example.invalid"}, {"url": "https://client.invalid"}])
+def test_tool_trace_rejects_caller_scope_and_routes(monkeypatch, extra):
+    client, _, pool, _ = setup(monkeypatch)
+    read = AsyncMock(); monkeypatch.setattr(workflow_voice_test, "read_voice_job_tool_trace", read)
+    response = client.post("/workflow/185/test-voice/tool-trace", json={"session_id": SESSION, "lease_token": LEASE, **extra}, headers={"x-sysevo-secret": SECRET})
+    assert response.status_code == 422
+    read.assert_not_awaited(); pool.assert_not_awaited()
+
+
+def test_tool_trace_redacts_unexpected_reader_failures(monkeypatch):
+    client, _, _, _ = setup(monkeypatch)
+    read = AsyncMock(side_effect=RuntimeError("private provider detail"))
+    monkeypatch.setattr(workflow_voice_test, "read_voice_job_tool_trace", read)
+    response = client.post("/workflow/185/test-voice/tool-trace", json={"session_id": SESSION, "lease_token": LEASE}, headers={"x-sysevo-secret": SECRET})
+    assert response.status_code == 503
+    assert "private provider detail" not in response.text
+
+
 def intent_request():
     return {
         "workflow_version": 3,

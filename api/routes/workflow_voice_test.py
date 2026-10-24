@@ -22,6 +22,7 @@ from api.services.workflow.voice_test_job import (
     VoiceJobContext,
     enqueue_voice_job,
     read_voice_job_status,
+    read_voice_job_tool_trace,
 )
 
 router = APIRouter(prefix="/workflow")
@@ -37,6 +38,29 @@ class VoiceTestRequest(BaseModel):
     lease_token: str = Field(
         min_length=36, max_length=36, pattern=UUID_PATTERN, repr=False
     )
+
+
+@router.post("/{workflow_id}/test-voice/tool-trace")
+async def voice_test_tool_trace(
+    workflow_id: Annotated[int, Path(gt=0)],
+    request: VoiceTestRequest,
+    user: Annotated[UserModel, Depends(get_user)],
+    x_sysevo_secret: Annotated[str | None, Header(alias="x-sysevo-secret")] = None,
+):
+    secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not sandbox_secret_matches(x_sysevo_secret, secret):
+        raise HTTPException(status_code=403, detail="Internal sandbox authorization required")
+    if not positive_int(user.selected_organization_id) or not positive_int(user.id):
+        raise HTTPException(status_code=400, detail="An authenticated organization is required")
+    context = VoiceJobContext(request.session_id, request.lease_token, workflow_id,
+                              user.selected_organization_id, user.id)
+    try:
+        async with asyncio.timeout(VOICE_HTTP_DEADLINE_SECONDS), httpx.AsyncClient() as http:
+            return await read_voice_job_tool_trace(db_client, VoiceControlClient(http, secret), context, secret)
+    except VoiceControlError as exc:
+        raise HTTPException(status_code=exc.status_code or 409, detail=exc.code) from None
+    except Exception:
+        raise HTTPException(status_code=503, detail="voice_tool_trace_unavailable") from None
 
 
 class VoiceProviderIntentRequest(BaseModel):
