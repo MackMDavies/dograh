@@ -259,6 +259,41 @@ def test_registry_growth_requires_an_explicit_field_classification(monkeypatch):
         provider_schema_fingerprint("llm", "openai")
 
 
+def test_elevenlabs_expressive_settings_survive_private_qa_replacement():
+    from api.services.workflow.voice_test_providers import provider_behavior_intent
+
+    source, packet = fixture("tts", "elevenlabs")
+    source.expressive_mode = True
+    source.suggested_audio_tags = ["laughs", "whispers"]
+    intent = provider_behavior_intent("tts", source)
+    result = build_private_provider_section("tts", source, packet, SIGNING_SECRET)
+    assert intent["expressive_mode"] is True
+    assert intent["suggested_audio_tags"] == ["laughs", "whispers"]
+    assert result.expressive_mode is True
+    assert result.suggested_audio_tags == source.suggested_audio_tags
+    assert result.api_key == QA_KEY
+    result.suggested_audio_tags.append("sighs")
+    assert source.suggested_audio_tags == ["laughs", "whispers"]
+
+
+@pytest.mark.parametrize("tags", [
+    ["https://client.example.invalid"], ["bad\nvalue"], [""], ["x" * 65],
+    ["laughs"] * 17, {"private": "value"}, [1], None,
+])
+def test_private_qa_audio_tags_are_bounded_behavior_only(tags):
+    from api.services.workflow.voice_test_providers import validate_provider_behavior_intent
+
+    model = REGISTRY[ServiceType.TTS]["elevenlabs"]
+    source = model(api_key=CLIENT_KEY)
+    value = {"provider": "elevenlabs", **{
+        name: getattr(source, name)
+        for name in (BEHAVIOR_FIELDS | {"expressive_mode", "suggested_audio_tags"}) & set(model.model_fields)
+    }}
+    value["suggested_audio_tags"] = tags
+    with pytest.raises(VoiceControlError, match="voice_test_provider_behavior_invalid"):
+        validate_provider_behavior_intent("tts", value)
+
+
 @pytest.mark.parametrize(
     "patch",
     [

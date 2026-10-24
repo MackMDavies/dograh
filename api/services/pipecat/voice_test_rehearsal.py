@@ -39,6 +39,7 @@ class VoiceTurnObserver(BaseObserver):
         self.responses: list[AudioResponse] = []
         self.closed = False
         self.failure: str | None = None
+        self.tool_trace = None
 
     @property
     def current(self):
@@ -168,6 +169,8 @@ async def run_voice_script(
         if loop.time() >= deadline:
             raise VoiceControlError("voice_duration_limit_reached")
         baseline = len(observer.responses)
+        if observer.tool_trace is not None:
+            observer.tool_trace.begin_caller_step(step.file_name)
         try:
             async with asyncio.timeout_at(deadline):
                 await transport.play_wav(fixtures[step.file_name])

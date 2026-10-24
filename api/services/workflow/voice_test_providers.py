@@ -35,6 +35,8 @@ BEHAVIOR_FIELDS = frozenset(
         "stability",
         "style",
         "use_speaker_boost",
+        "expressive_mode",
+        "suggested_audio_tags",
         "volume",
         "latency",
         "normalize",
@@ -118,6 +120,15 @@ def _canonical(value):
     ).encode("utf-8")
 
 
+def _validate_audio_tags(value):
+    if not isinstance(value, list) or len(value) > 16 or any(
+        not isinstance(tag, str) or not tag or len(tag) > 64
+        or re.search(r"[\x00-\x1f\x7f]", tag) or "://" in tag
+        for tag in value
+    ):
+        raise _invalid("voice_test_provider_behavior_invalid")
+
+
 def validate_provider_behavior_intent(service_type, value):
     """Validate complete behavior without needing or retaining production keys."""
     try:
@@ -131,6 +142,8 @@ def validate_provider_behavior_intent(service_type, value):
         for name in names:
             adapter = TypeAdapter(model.model_fields[name].rebuild_annotation())
             item = adapter.validate_python(value[name], strict=True)
+            if name == "suggested_audio_tags":
+                _validate_audio_tags(item)
             if isinstance(item, str) and (
                 not item or len(item) > 4096 or re.search(r"[\x00-\x1f\x7f]", item)
                 or "://" in item and not (
@@ -367,6 +380,8 @@ def _build_private_provider_section(service_type, source, connection):
             for name in BEHAVIOR_FIELDS
             if name in model.model_fields
         }
+        if "suggested_audio_tags" in values:
+            _validate_audio_tags(values["suggested_audio_tags"])
         values.update(copy.deepcopy(connection.settings))
         values.update(copy.deepcopy(connection.secrets))
         values["provider"] = connection.provider

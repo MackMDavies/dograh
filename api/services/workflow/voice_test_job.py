@@ -34,6 +34,11 @@ from api.services.workflow.voice_test_result import (
     validate_rehearsal,
     validate_voice_report,
 )
+from api.services.workflow.voice_test_tool_trace import (
+    PrivateVoiceToolTrace,
+    make_voice_tool_trace_report,
+    validate_voice_tool_trace_report,
+)
 
 JOB_NAME = "run_agent_test_voice_v2"
 CONTEXT_TTL_SECONDS = 600
@@ -278,6 +283,7 @@ async def execute_voice_job(
     deadline = started_at + session.duration_seconds
     transport = SandboxAudioTransport(duration_limit=session.duration_seconds)
     observer = VoiceTurnObserver(transport.output())
+    observer.tool_trace = PrivateVoiceToolTrace(step.file_name for step in session.script.steps)
     transport.set_voice_observer(observer)
     pipeline = None
     driver = None
@@ -412,7 +418,10 @@ async def execute_voice_job(
                         "rehearsal": result,
                     }
                     if not await db.save_agent_test_voice_result(
-                        run.id, workflow.id, context.organization_id, session.id, report
+                        run.id, workflow.id, context.organization_id, session.id, report,
+                        tool_trace=make_voice_tool_trace_report(
+                            report, session, observer.tool_trace.snapshot(pipeline_stopped=stopped)
+                        ),
                     ):
                         raise VoiceControlError("voice_report_persistence_failed")
         except asyncio.CancelledError:
@@ -451,6 +460,35 @@ async def execute_voice_job(
     }
 
 
+async def _read_completed_voice_result(db, session, context, signing_secret):
+    run = await db.get_workflow_run_by_id(session.runtime_workflow_run_id)
+    if run is None or run.workflow_id != session.workflow_id:
+        raise VoiceControlError("voice_report_runtime_invalid")
+    validate_sandbox_pipeline_binding(run, session.workflow_id, run.id, signing_secret)
+    marker = run.annotations[SANDBOX_ANNOTATION]
+    if (
+        marker.get("voice_session_id") != session.id
+        or marker.get("organization_id") != context.organization_id
+        or marker.get("agent_test_run_id") != session.run_id
+        or marker.get("scenario_id") != session.scenario_id
+    ):
+        raise VoiceControlError("voice_report_runtime_invalid")
+    report = validate_voice_report(
+        run.annotations.get("agent_test_voice_result"), session, context.organization_id,
+    )
+    return run, report
+
+
+async def read_voice_job_tool_trace(db, control, context, signing_secret):
+    _, session, _ = await prepare_voice_job(db, control, context)
+    if session.status != "completed":
+        raise VoiceControlError("voice_tool_trace_not_sealed")
+    run, report = await _read_completed_voice_result(db, session, context, signing_secret)
+    return validate_voice_tool_trace_report(
+        run.annotations.get("agent_test_voice_tool_trace"), report, session,
+    )
+
+
 async def read_voice_job_status(db, control, redis, context, signing_secret):
     _, session, _ = await prepare_voice_job(db, control, context)
     response = {
@@ -463,25 +501,7 @@ async def read_voice_job_status(db, control, redis, context, signing_secret):
         "quality_evaluated": False,
     }
     if session.status == "completed":
-        run = await db.get_workflow_run_by_id(session.runtime_workflow_run_id)
-        if run is None or run.workflow_id != session.workflow_id:
-            raise VoiceControlError("voice_report_runtime_invalid")
-        validate_sandbox_pipeline_binding(
-            run, session.workflow_id, run.id, signing_secret
-        )
-        marker = run.annotations[SANDBOX_ANNOTATION]
-        if (
-            marker.get("voice_session_id") != session.id
-            or marker.get("organization_id") != context.organization_id
-            or marker.get("agent_test_run_id") != session.run_id
-            or marker.get("scenario_id") != session.scenario_id
-        ):
-            raise VoiceControlError("voice_report_runtime_invalid")
-        report = validate_voice_report(
-            run.annotations.get("agent_test_voice_result"),
-            session,
-            context.organization_id,
-        )
+        _, report = await _read_completed_voice_result(db, session, context, signing_secret)
         response.update(report_status="verified", rehearsal=report["rehearsal"])
     elif session.status in {"reserved", "running"}:
         from arq.jobs import Job

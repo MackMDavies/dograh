@@ -97,7 +97,7 @@ def setup():
         run.annotations = copy.deepcopy(kwargs.get("annotations", run.annotations))
         return run
 
-    async def save_result(run_id, workflow_id, organization_id, session_id, report):
+    async def save_result(run_id, workflow_id, organization_id, session_id, report, *, tool_trace=None):
         assert (run_id, workflow_id, organization_id, session_id) == (
             123,
             185,
@@ -105,6 +105,8 @@ def setup():
             SESSION,
         )
         run.annotations["agent_test_voice_result"] = copy.deepcopy(report)
+        if tool_trace is not None:
+            run.annotations["agent_test_voice_tool_trace"] = copy.deepcopy(tool_trace)
         return True
 
     db = SimpleNamespace(
