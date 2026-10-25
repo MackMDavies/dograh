@@ -161,9 +161,10 @@ class PipecatEngine:
 
         # Controls whether user input should be muted
         self._mute_pipeline: bool = False
-        # Set only for the isolated private voice-test transport. Captures the
-        # existing callback decision without changing the runtime mute policy.
-        self._voice_test_timing_evidence = None
+        # Enabled only for the isolated voice-test transport; the observing
+        # strategy wrapper reads this fixed reason after the callback returns.
+        self._voice_test_mute_observation_enabled = False
+        self._voice_test_mute_reason = None
 
         # Mute state for queued TTSSpeakFrames (transition speech, custom tool messages)
         # "idle" = not muting, "waiting" = speech queued, "playing" = bot speaking it
@@ -1311,15 +1312,15 @@ class PipecatEngine:
             and not self._current_node.allow_interrupt
         )
 
-        timing_evidence = self._voice_test_timing_evidence
-        if timing_evidence is not None:
-            state = (
-                "pipeline_shutdown" if self._mute_pipeline else
-                "queued_speech" if self._queued_speech_mute_state != "idle" else
-                "node_forbids_interruption" if self._bot_is_speaking and self._current_node is not None
-                and not self._current_node.allow_interrupt else "unmuted"
-            )
-            timing_evidence.record_mute_policy(time.monotonic(), state)
+        if self._voice_test_mute_observation_enabled:
+            if self._mute_pipeline:
+                self._voice_test_mute_reason = "pipeline_shutdown"
+            elif self._queued_speech_mute_state != "idle":
+                self._voice_test_mute_reason = "queued_speech"
+            elif self._bot_is_speaking and self._current_node is not None and not self._current_node.allow_interrupt:
+                self._voice_test_mute_reason = "node_forbids_interruption"
+            else:
+                self._voice_test_mute_reason = "unmuted"
 
         if muted:
             now = time.monotonic()
@@ -1337,8 +1338,8 @@ class PipecatEngine:
                 self._bot_is_speaking = False
                 self._queued_speech_mute_state = "idle"
                 self._mute_active_since = None
-                if timing_evidence is not None:
-                    timing_evidence.record_mute_policy(time.monotonic(), "self_heal_release")
+                if self._voice_test_mute_observation_enabled:
+                    self._voice_test_mute_reason = "self_heal_release"
                 return False
             return True
 

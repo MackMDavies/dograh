@@ -54,6 +54,7 @@ from api.services.pipecat.recording_audio_cache import (
 from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
 from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+from api.services.pipecat.observed_user_mute_strategy import ObservedUserMuteStrategy
 from api.services.pipecat.service_factory import (
     create_llm_service,
     create_llm_service_from_provider,
@@ -856,11 +857,20 @@ async def _run_pipeline(
         correct_aggregation_callback=engine.create_aggregation_correction_callback(),
     )
 
-    user_mute_strategies = [
-        MuteUntilFirstBotCompleteUserMuteStrategy(),
-        FunctionCallUserMuteStrategy(),
-        CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
-    ]
+    first_bot_mute = MuteUntilFirstBotCompleteUserMuteStrategy()
+    function_call_mute = FunctionCallUserMuteStrategy()
+    workflow_mute = CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user)
+    user_mute_strategies = [first_bot_mute, function_call_mute, workflow_mute]
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        timing_evidence = transport.voice_observer.timing_evidence
+        engine._voice_test_mute_observation_enabled = True
+        engine._voice_test_mute_reason = None
+        user_mute_strategies = [
+            ObservedUserMuteStrategy(first_bot_mute, "first_bot_complete", timing_evidence),
+            ObservedUserMuteStrategy(function_call_mute, "function_call", timing_evidence),
+            ObservedUserMuteStrategy(workflow_mute, "workflow_callback", timing_evidence,
+                reason=lambda: engine._voice_test_mute_reason),
+        ]
     user_vad_analyzer = SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
 
     # Configure turn strategies based on STT provider, model, and workflow configuration

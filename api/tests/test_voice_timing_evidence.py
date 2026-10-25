@@ -64,7 +64,9 @@ async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_paci
     original_input = observer.timing_evidence.record_input
     def record_input(item, at, offset, size, padded_size):
         original_input(item, at, offset, size, padded_size)
-        observer.timing_evidence.record_mute_policy(at, "unmuted")
+        observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
+        observer.timing_evidence.record_strategy_mute(at, "function_call", False)
+        observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
     observer.timing_evidence.record_input = record_input
     task = PipelineTask(Pipeline([transport.input(), FixtureResponder(), transport.output()]),
         params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000), observers=[observer])
@@ -83,7 +85,7 @@ async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_paci
             responses=observer.responses, pipeline_stopped=True)["spans"]
         fixtures = [SimpleNamespace(file_name="caller-001.wav", sha256=hashlib.sha256(encoded).hexdigest(), duration_ms=80)]
         assert validate_voice_timing_evidence(timing, duration_ms=5000, fixtures=fixtures, spans=spans) is timing
-        assert timing["version"] == 3
+        assert timing["version"] == 4
         assert segment["cancelled_write"]["pcm_end_byte"] == spans[0]["pcm_end_byte"]
         assert segment["cancelled_write"]["cancelled_ms"] <= segment["stopped_ms"]
         assert timing["interruptions"][0]["response_sequence"] == 1
@@ -270,6 +272,8 @@ def test_unfinished_input_or_response_cannot_make_a_complete_timing_claim():
     evidence.record_output(1.01, 640, 1)
     caller = evidence.begin_caller("caller-001.wav", "c"*64, 640)
     evidence.record_input(caller, 1.1, 0, 640, 640)
+    evidence.record_strategy_mute(1.11, "first_bot_complete", False)
+    evidence.record_strategy_mute(1.11, "function_call", False)
     evidence.record_mute_policy(1.11, "unmuted")
     assert evidence.snapshot(pipeline_stopped=True)["complete"] is False
     response.stopped_at = 1.04
@@ -322,7 +326,9 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
         original_input = observer.timing_evidence.record_input
         def record_input(item, at, offset, size, padded_size):
             original_input(item, at, offset, size, padded_size)
-            observer.timing_evidence.record_mute_policy(at, "unmuted")
+            observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
+            observer.timing_evidence.record_strategy_mute(at, "function_call", False)
+            observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
         observer.timing_evidence.record_input = record_input
         task = PipelineTask(
             Pipeline([transport.input(), responder, transport.output()]),
@@ -343,7 +349,7 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
     assert value["evidence"]["timing"]["caller_steps"][0]["sha256"] == session.fixtures[0].sha256
     if interrupt:
         timing = value["evidence"]["timing"]
-        assert timing["version"] == 3
+        assert timing["version"] == 4
         assert timing["interruptions"][0]["response_sequence"] == 1
         assert timing["interruptions"][0]["caller_step"] == 1
         assert timing["interruptions"][0]["caller_active"] is True

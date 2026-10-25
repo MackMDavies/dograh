@@ -1,5 +1,6 @@
 """Shared protocol: cancellation is separate from nominal submitted PCM duration."""
 import copy
+import asyncio
 import json
 from pathlib import Path
 import pytest
@@ -38,30 +39,68 @@ def test_v3_records_only_bounded_callback_policy_changes_and_marks_other_strateg
     ]
 
 
+def test_v4_persists_the_three_fixed_strategy_sources_with_bounded_decisions():
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v4.json").read_text())
+    timing = value["timing"]
+    _, fixtures, spans = protocol()
+    assert validate_voice_timing_evidence(timing, duration_ms=1000, fixtures=fixtures, spans=spans) is timing
+    assert timing["mute_policy"]["strategies"] == ["first_bot_complete", "function_call", "workflow_callback"]
+    assert timing["mute_policy"]["samples"][5]["reason"] == "node_forbids_interruption"
+
+
 @pytest.mark.asyncio
 async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_return_value():
+    from api.services.pipecat.observed_user_mute_strategy import ObservedUserMuteStrategy
     from api.services.workflow.pipecat_engine import PipecatEngine
     from api.services.workflow.voice_test_timing_evidence import PrivateVoiceTimingEvidence
+    from pipecat.frames.frames import (
+        BotStoppedSpeakingFrame,
+        FunctionCallFromLLM,
+        FunctionCallResultFrame,
+        FunctionCallsStartedFrame,
+        UserStartedSpeakingFrame,
+    )
+    from pipecat.turns.user_mute import (
+        CallbackUserMuteStrategy,
+        FunctionCallUserMuteStrategy,
+        MuteUntilFirstBotCompleteUserMuteStrategy,
+    )
 
     response = SimpleNamespace(sequence=1, started_at=1.0, stopped_at=None)
     timing = PrivateVoiceTimingEvidence([response])
-    timing.observe(1.0)
+    timing.observe(asyncio.get_running_loop().time())
     caller = timing.begin_caller("caller-001.wav", "c" * 64, 640)
-    timing.record_input(caller, 1.01, 0, 640, 640)
+    first = asyncio.get_running_loop().time()
+    timing.record_input(caller, first, 0, 640, 640)
     engine = PipecatEngine.__new__(PipecatEngine)
-    engine._voice_test_timing_evidence = timing
     engine._queued_speech_mute_state = "idle"
     engine._bot_is_speaking = True
     engine._current_node = SimpleNamespace(allow_interrupt=False)
     engine._mute_pipeline = False
     engine._mute_active_since = None
     engine._max_bot_mute_seconds = 15.0
+    engine._voice_test_mute_observation_enabled = True
+    engine._voice_test_mute_reason = None
+    first_strategy = ObservedUserMuteStrategy(MuteUntilFirstBotCompleteUserMuteStrategy(), "first_bot_complete", timing)
+    function_strategy = ObservedUserMuteStrategy(FunctionCallUserMuteStrategy(), "function_call", timing)
+    callback = CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user)
+    callback_strategy = ObservedUserMuteStrategy(callback, "workflow_callback", timing,
+        reason=lambda: engine._voice_test_mute_reason)
 
-    assert await engine.should_mute_user(object()) is True
+    assert await first_strategy.process_frame(UserStartedSpeakingFrame()) is True
+    assert await first_strategy.process_frame(BotStoppedSpeakingFrame()) is False
+    call = FunctionCallFromLLM("lookup", "opaque-id", {}, None)
+    assert await function_strategy.process_frame(FunctionCallsStartedFrame([call])) is True
+    assert await function_strategy.process_frame(FunctionCallResultFrame("lookup", "opaque-id", {}, {})) is False
+    assert await callback_strategy.process_frame(UserStartedSpeakingFrame()) is True
     engine._current_node.allow_interrupt = True
-    assert await engine.should_mute_user(object()) is False
-    samples = timing.snapshot(pipeline_stopped=False)["callback_mute_policy"]["samples"]
-    assert [sample["state"] for sample in samples] == ["node_forbids_interruption", "unmuted"]
+    assert await callback_strategy.process_frame(UserStartedSpeakingFrame()) is False
+    samples = timing.snapshot(pipeline_stopped=False)["mute_policy"]["samples"]
+    assert [(sample["strategy"], sample["muted"]) for sample in samples] == [
+        ("first_bot_complete", True), ("first_bot_complete", False),
+        ("function_call", True), ("function_call", False),
+        ("workflow_callback", True), ("workflow_callback", False),
+    ]
 
 
 @pytest.mark.parametrize("change", [
@@ -76,6 +115,23 @@ async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_retu
 ])
 def test_v3_rejects_policy_samples_that_are_unbounded_or_ambiguous(change):
     value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v3.json").read_text())["timing"]
+    change(value)
+    with pytest.raises(VoiceControlError, match="voice_timing_evidence_invalid"):
+        parse(value)
+
+
+@pytest.mark.parametrize("change", [
+    lambda v: v["mute_policy"].update(strategies=["function_call", "first_bot_complete", "workflow_callback"]),
+    lambda v: v["mute_policy"]["samples"].pop(),
+    lambda v: v["mute_policy"]["samples"][0].update(muted=1),
+    lambda v: v["mute_policy"]["samples"][0].update(reason="private"),
+    lambda v: v["mute_policy"]["samples"][2].update(reason="node_forbids_interruption"),
+    lambda v: v["mute_policy"]["samples"][2].update(muted=True),
+    lambda v: v["mute_policy"]["samples"][2].update(sequence=True),
+    lambda v: v["mute_policy"]["samples"][0].update(at_ms=21),
+])
+def test_v4_rejects_incomplete_or_inconsistent_strategy_evidence(change):
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v4.json").read_text())["timing"]
     change(value)
     with pytest.raises(VoiceControlError, match="voice_timing_evidence_invalid"):
         parse(value)
