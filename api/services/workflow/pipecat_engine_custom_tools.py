@@ -360,7 +360,7 @@ class CustomToolManager:
                     for fs in mcp_schemas:
                         self._engine.llm.register_function(
                             fs.name,
-                            self._create_mcp_handler(session, fs.name),
+                            self._with_hold_music(self._create_mcp_handler(session, fs.name)),
                             timeout_secs=session.call_timeout_secs,
                         )
                     logger.debug(
@@ -410,9 +410,52 @@ class CustomToolManager:
                 "timeout_ms", 5000
             )
             timeout_secs = float(timeout_ms) / 1000
-            handler = self._create_http_tool_handler(tool, function_name)
+            handler = self._with_hold_music(self._create_http_tool_handler(tool, function_name))
 
         return handler, timeout_secs
+
+    def _with_hold_music(self, handler):
+        """Phone tools "hold": a lookup still running after a moment plays hold music
+        to the caller until it returns, instead of dead air."""
+        from api.services.phone_tools.builtin import HOLD_AFTER_SECONDS
+
+        engine = self._engine
+
+        async def held(function_call_params: FunctionCallParams) -> None:
+            if not engine.hold_music_allowed():
+                await handler(function_call_params)
+                return
+            finished = asyncio.Event()
+            stop_music = asyncio.Event()
+
+            async def hold() -> None:
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=HOLD_AFTER_SECONDS)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                await engine.log_phone_tool_event("hold", outcome="started")
+                sample_rate = (
+                    engine._audio_config.transport_out_sample_rate if engine._audio_config else 8000
+                )
+                await play_audio_loop(
+                    stop_event=stop_music,
+                    sample_rate=sample_rate,
+                    queue_frame=engine._transport_output.queue_frame,
+                )
+
+            music = asyncio.create_task(hold())
+            try:
+                await handler(function_call_params)
+            finally:
+                finished.set()
+                stop_music.set()
+                try:
+                    await music
+                except Exception as e:  # noqa: BLE001 -- the music must never fail the lookup
+                    logger.warning(f"hold music failed: {e}")
+
+        return held
 
     def _register_calculator_handler(self) -> None:
         """Register the built-in calculator function with the LLM."""

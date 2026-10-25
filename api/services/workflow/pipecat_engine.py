@@ -238,6 +238,8 @@ class PipecatEngine:
         self._phone_tool_workflow_id: Optional[int] = None
         self._phone_tools_sandbox = False
         self._texts_sent = 0
+        self._payment_links: list[dict] = []
+        self._payment_links_task: Optional[asyncio.Task] = None
 
     async def _get_organization_id(self) -> Optional[int]:
         """Get and cache the organization ID from workflow run."""
@@ -926,6 +928,7 @@ class PipecatEngine:
         # organization switched the keypad tool off.
         if self._phone_tools.enabled("keypad"):
             await self._register_dtmf_function()
+        await self._collect_payment_links()
         builtin_phone_tools = self._builtin_phone_tools()
         if builtin_phone_tools:
             await self._register_builtin_phone_tools(builtin_phone_tools)
@@ -962,6 +965,7 @@ class PipecatEngine:
             kb_document_uuids=kb_doc_uuids,
             phone_tools_policy=self._phone_tools,
             builtin_phone_tools=builtin_phone_tools,
+            payment_links=self._payment_links,
             **dialer_kwargs,
         )
         await self._update_llm_context(system_prompt, functions)
@@ -1425,6 +1429,16 @@ class PipecatEngine:
         self._phone_tools_sandbox = sandbox
         self._recording_paused = audio_buffer is not None and policy.recording_starts_paused()
         self._caller_keypad = caller_keypad
+        if self._can_text_caller() and policy.enabled("payments"):
+            # Fetched while the call connects; the tool is offered once they arrive.
+            from api.services.phone_tools import builtin
+
+            try:
+                self._payment_links_task = asyncio.get_running_loop().create_task(
+                    builtin.list_payment_links(workflow_id)
+                )
+            except RuntimeError:
+                self._payment_links_task = None
         if caller_keypad is not None:
             if policy.enabled("caller_keypad"):
                 caller_keypad.set_handler(self._on_caller_keys, self._caller_keys_accepted)
@@ -1435,18 +1449,37 @@ class PipecatEngine:
         """False when the organization starts every call with the recording paused."""
         return not self._recording_paused
 
+    def _can_text_caller(self) -> bool:
+        from api.services.phone_tools import builtin
+
+        return bool(
+            self._phone_tool_caller_number
+            and not self._phone_tools_sandbox
+            and builtin.sms_hook_url()
+        )
+
+    def hold_music_allowed(self) -> bool:
+        return self._phone_tools.enabled("hold") and self._transport_output is not None
+
+    async def _collect_payment_links(self) -> None:
+        task, self._payment_links_task = self._payment_links_task, None
+        if task is None:
+            return
+        try:
+            self._payment_links = await asyncio.wait_for(task, timeout=2.0)
+        except Exception as e:  # noqa: BLE001 -- no links, no tool; the call goes on
+            logger.info(f"payment links unavailable for this call: {e}")
+            self._payment_links = []
+
     def _builtin_phone_tools(self) -> set[str]:
         """The built-in phone tools this call can offer (besides press_keys)."""
         from api.services.phone_tools import builtin
 
         tools: set[str] = set()
-        if (
-            self._phone_tools.enabled("sms")
-            and self._phone_tool_caller_number
-            and not self._phone_tools_sandbox
-            and builtin.sms_hook_url()
-        ):
+        if self._phone_tools.enabled("sms") and self._can_text_caller():
             tools.add(builtin.SEND_TEXT)
+        if self._phone_tools.enabled("payments") and self._can_text_caller() and self._payment_links:
+            tools.add(builtin.SEND_PAYMENT_LINK)
         if self._phone_tools.enabled("recording") and self._audio_buffer is not None:
             tools.add(builtin.SET_RECORDING)
         return tools
@@ -1503,6 +1536,43 @@ class PipecatEngine:
                 {"status": "recording" if wanted == "on" else "paused"}
             )
 
+        async def send_payment_link_func(function_call_params: FunctionCallParams) -> None:
+            wanted = str((function_call_params.arguments or {}).get("link") or "").strip().lower()
+            link = next((l for l in self._payment_links if str(l["title"]).strip().lower() == wanted), None)
+            if link is None:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "choose one of the listed payment links"}
+                )
+                return
+            if self._texts_sent >= builtin.MAX_TEXTS_PER_CALL:
+                await function_call_params.result_callback(
+                    {"status": "not_sent", "reason": "the most texts allowed on one call were already sent"}
+                )
+                return
+            self._texts_sent += 1
+            result = await builtin.send_payment_link(
+                workflow_id=self._phone_tool_workflow_id,
+                workflow_run_id=self._workflow_run_id,
+                to=self._phone_tool_caller_number or "",
+                slug=str(link["slug"]),
+            )
+            sent = result["status"] in ("sent", "queued")
+            await self.log_phone_tool_event(
+                "payment_link", outcome="sent" if sent else (result.get("reason") or result["status"]),
+                link=str(link["title"]),
+            )
+            await function_call_params.result_callback(
+                {"status": "sent", "note": "The payment link is on its way; tell the caller."}
+                if sent else
+                {
+                    "status": "not_sent",
+                    "reason": result.get("readable_reason") or "The link could not be sent.",
+                    "note": "Tell the caller the link could not be sent. Do not take card details by voice.",
+                }
+            )
+
+        if builtin.SEND_PAYMENT_LINK in names:
+            self.llm.register_function(builtin.SEND_PAYMENT_LINK, send_payment_link_func)
         if builtin.SEND_TEXT in names:
             self.llm.register_function(builtin.SEND_TEXT, send_text_func)
         if builtin.SET_RECORDING in names:
