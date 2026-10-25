@@ -414,6 +414,11 @@ class TelephonyProvider(ABC):
         """
         pass
 
+    def supports_three_way(self) -> bool:
+        """True when a colleague can join the caller and the agent on one line
+        (transfer_mode three_way); other providers fall back to a warm transfer."""
+        return False
+
     def supports_warm_transfer(self) -> bool:
         """True when transfer_call accepts introduction= and only connects the
         destination once they press 1 (services/telephony/warm_transfer.py)."""

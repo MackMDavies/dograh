@@ -789,7 +789,14 @@ class CustomToolManager:
                 # Warm transfer: the colleague hears the agent's introduction and must
                 # press 1. Carriers that can't read it to them keep the cold transfer.
                 introduction = None
-                if config.get("transfer_mode") == "warm":
+                mode = config.get("transfer_mode")
+                three_way = mode == "three_way" and provider.supports_three_way()
+                if mode == "three_way" and not three_way:
+                    logger.info(
+                        f"{type(provider).__name__} cannot hold a three-way call; transferring warm"
+                    )
+                    mode = "warm"
+                if mode == "warm":
                     if provider.supports_warm_transfer():
                         introduction = clean_introduction(
                             (function_call_params.arguments or {}).get("introduction")
@@ -844,13 +851,14 @@ class CustomToolManager:
                             conference_name=conference_name,
                             timeout_seconds=timeout_seconds,
                             introduction=introduction,
+                            three_way=three_way,
                         )
                         connected = bool(
                             transfer_event
                             and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
                         )
                         await self._engine.log_phone_tool_event(
-                            "transfer",
+                            "conference" if three_way else "transfer",
                             destination=masked_destination(target),
                             warm=bool(introduction),
                             outcome="connected" if connected else reason,
@@ -876,7 +884,19 @@ class CustomToolManager:
                     self._engine.set_mute_pipeline(False)
 
                 # Handle result (after cleanup)
-                if transfer_event:
+                if transfer_event and three_way:
+                    # Nobody is handed off: the agent carries on with both of them.
+                    await function_call_params.result_callback(
+                        {
+                            "status": "colleague_joined",
+                            "note": (
+                                "Your colleague is now on the line with you and the caller. "
+                                "Introduce them to each other and carry on as a three-way "
+                                "conversation."
+                            ),
+                        }
+                    )
+                elif transfer_event:
                     final_result = transfer_event.to_result_dict()
                     await self._handle_transfer_result(
                         final_result, function_call_params, properties
@@ -931,6 +951,7 @@ class CustomToolManager:
         conference_name: str,
         timeout_seconds: int,
         introduction: Optional[str],
+        three_way: bool = False,
     ) -> tuple[Optional[Any], str]:
         """Ring one destination and wait for the outcome.
 
@@ -950,6 +971,7 @@ class CustomToolManager:
             workflow_run_id=self._engine._workflow_run_id,
             warm=bool(introduction),
             introduction=introduction,
+            three_way=three_way,
         )
         await call_transfer_manager.store_transfer_context(transfer_context)
 

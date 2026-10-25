@@ -365,6 +365,11 @@ class ARIProvider(TelephonyProvider):
     def supports_warm_transfer(self) -> bool:
         return True
 
+    def supports_three_way(self) -> bool:
+        """The caller and the agent's media channel already share a mixing bridge;
+        ari_manager adds the colleague to it."""
+        return True
+
     async def transfer_call(
         self,
         destination: str,

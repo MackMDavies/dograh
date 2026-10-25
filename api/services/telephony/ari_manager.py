@@ -849,8 +849,9 @@ class ARIConnection:
             if bridge_id:
                 await self._delete_bridge(bridge_id)
 
-            # Destroy both channels, skipping the one that already ended
-            for cid in (call_id, ext_channel_id):
+            # Destroy both channels (and any colleague who joined a three-way call),
+            # skipping the one that already ended
+            for cid in (call_id, ext_channel_id, *ctx.get("three_way_channels", [])):
                 if cid and cid != channel_id:
                     await self._delete_channel(cid)
 
@@ -962,6 +963,10 @@ class ARIConnection:
                 )
                 return
 
+            if context.three_way and not context.resolved:
+                await self._join_three_way(context, destination_channel_id)
+                return
+
             if context.warm and context.introduction and not context.resolved:
                 await self._play_warm_introduction(transfer_id, destination_channel_id)
                 return
@@ -992,6 +997,48 @@ class ARIConnection:
             await self._handle_transfer_failed(
                 transfer_id, destination_channel_id, f"Transfer processing error: {e}"
             )
+
+    async def _join_three_way(self, context, channel_id: str) -> None:
+        """Add the colleague to the bridge the caller and the agent are already in."""
+        transfer_manager = await self._get_transfer_manager()
+        run = await db_client.get_workflow_run_by_id(int(context.workflow_run_id or 0))
+        gathered = (run.gathered_context or {}) if run else {}
+        bridge_id = gathered.get("bridge_id")
+        joined = bool(bridge_id) and bool(
+            await self._ari_request(
+                "POST", f"/bridges/{bridge_id}/addChannel", params={"channel": channel_id}
+            )
+            is not None
+        )
+        if joined:
+            # _ari_request returns {} on failure and on an empty 204 alike, so check the bridge.
+            bridge = await self._ari_request("GET", f"/bridges/{bridge_id}")
+            joined = channel_id in (bridge.get("channels") or [])
+        context.resolved = True
+        context.accepted = joined
+        await transfer_manager.store_transfer_context(context)
+        if joined:
+            await db_client.update_workflow_run(
+                run_id=int(context.workflow_run_id),
+                gathered_context={
+                    "three_way_channels": [*gathered.get("three_way_channels", []), channel_id]
+                },
+            )
+        await transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.DESTINATION_ANSWERED if joined else TransferEventType.TRANSFER_FAILED,
+                transfer_id=context.transfer_id,
+                original_call_sid=context.original_call_sid,
+                transfer_call_sid=channel_id,
+                conference_name=context.conference_name,
+                message="The colleague joined the call." if joined else "The colleague could not be added.",
+                status="success" if joined else "failed",
+                action="colleague_joined" if joined else "transfer_failed",
+                reason=None if joined else "join_failed",
+            )
+        )
+        if not joined:
+            await self._delete_channel(channel_id)
 
     async def _play_warm_introduction(self, transfer_id: str, channel_id: str) -> None:
         """Warm transfer: the colleague hears the introduction and must press 1
@@ -1071,6 +1118,8 @@ class ARIConnection:
 
             transfer_manager = await self._get_transfer_manager()
             context = await transfer_manager.get_transfer_context(transfer_id)
+            if context is not None and context.three_way and context.resolved:
+                return  # a colleague leaving a three-way call is not a failed transfer
             if context is not None and context.warm:
                 if context.resolved:
                     return  # already reported (accepted and bridged, or declined)
