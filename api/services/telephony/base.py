@@ -414,6 +414,11 @@ class TelephonyProvider(ABC):
         """
         pass
 
+    def supports_companion(self) -> bool:
+        """True when a three-way colleague can be dialled as a second media stream that
+        Dograh mixes into the call (transfer_call(..., three_way=True); companion.py)."""
+        return False
+
     def supports_three_way(self) -> bool:
         """True when a colleague can join the caller and the agent on one line
         (transfer_mode three_way); other providers fall back to a warm transfer."""

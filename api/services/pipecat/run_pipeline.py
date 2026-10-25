@@ -1043,6 +1043,12 @@ async def _run_pipeline(
     # Keypad & native phone tools: the organization's rules (Voice AI -> Tools) and
     # the keys the caller presses, which every serializer reports as InputDTMFFrame.
     caller_keypad = CallerKeypadProcessor()
+    # Three-way calls on stream carriers: the colleague is mixed in by Dograh.
+    from api.services.pipecat.companion import CompanionInputProcessor, install_companion_mixer
+
+    companion_mixer = install_companion_mixer(transport)
+    companion_input = CompanionInputProcessor() if companion_mixer else None
+    engine.set_companion(companion_mixer, companion_input)
     engine.set_phone_tools(
         await load_phone_tools_policy(workflow.organization_id if workflow else None),
         caller_keypad=caller_keypad,
@@ -1067,6 +1073,7 @@ async def _run_pipeline(
             input_guardrail_processor=input_guardrail_processor,
             output_guardrail_processor=output_guardrail_processor,
             caller_keypad=caller_keypad,
+            companion_input=companion_input,
         )
     else:
         pipeline = build_pipeline(
@@ -1084,6 +1091,7 @@ async def _run_pipeline(
             output_guardrail_processor=output_guardrail_processor,
             recording_router=recording_router,
             caller_keypad=caller_keypad,
+            companion_input=companion_input,
         )
 
     # Create pipeline task with audio configuration
@@ -1199,5 +1207,7 @@ async def _run_pipeline(
         if supervisor:
             with suppress(Exception):
                 await supervisor.stop()
+        with suppress(Exception):
+            await engine.stop_companion()
         await feedback_observer.cleanup()
         logger.debug(f"Cleaned up context providers for workflow run {workflow_run_id}")

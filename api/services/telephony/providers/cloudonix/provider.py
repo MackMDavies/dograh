@@ -955,6 +955,7 @@ class CloudonixProvider(TelephonyProvider):
         conference_name: str,
         timeout: int = 30,
         introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Ring the destination. Their CXML is a redirect Cloudonix only follows once
@@ -986,6 +987,9 @@ class CloudonixProvider(TelephonyProvider):
         return {"call_sid": leg, "status": "initiated", "provider": self.PROVIDER_NAME}
 
     def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
         return True
 
     def supports_transfers(self) -> bool:

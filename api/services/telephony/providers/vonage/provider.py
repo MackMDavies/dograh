@@ -600,9 +600,13 @@ class VonageProvider(TelephonyProvider):
         conference_name: str,
         timeout: int = 30,
         introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Ring the destination with an inline NCCO that joins the named conversation.
+
+        Three-way: the NCCO streams their audio to /telephony/companion/{transfer_id}
+        instead, and Dograh mixes them into the call.
 
         Warm: the NCCO reads them the introduction and waits for one key;
         /telephony/vonage/transfer-accept/{id} answers with the conversation (1) or
@@ -635,6 +639,21 @@ class VonageProvider(TelephonyProvider):
                 {"action": "talk", "text": "You have answered a transfer call. Connecting you now."},
                 *vonage_conversation_ncco(conference_name),
             ]
+        if three_way:
+            from api.services.telephony.warm_transfer import companion_socket_url
+
+            ncco = [
+                {
+                    "action": "connect",
+                    "endpoint": [
+                        {
+                            "type": "websocket",
+                            "uri": await companion_socket_url(transfer_id),
+                            "content-type": "audio/l16;rate=16000",
+                        }
+                    ],
+                }
+            ]
         data = {
             "to": [{"type": "phone", "number": destination.replace("+", "")}],
             "from": {"type": "phone", "number": random.choice(self.from_numbers).replace("+", "")},
@@ -653,6 +672,9 @@ class VonageProvider(TelephonyProvider):
         return {"call_sid": body["uuid"], "status": body.get("status", "started"), "provider": self.PROVIDER_NAME}
 
     def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
         return True
 
     def supports_transfers(self) -> bool:

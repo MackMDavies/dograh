@@ -713,9 +713,13 @@ class TelnyxProvider(TelephonyProvider):
         conference_name: str,
         timeout: int = 30,
         introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Dial the destination as a plain call; conference is seeded later.
+
+        Three-way: the colleague's leg streams to /telephony/companion/{transfer_id}
+        (same stream settings as the caller's leg) and Dograh mixes them in.
 
         A warm transfer's introduction travels on the TransferContext: the
         transfer-result webhook reads it to the destination on ``call.answered``.
@@ -743,6 +747,17 @@ class TelnyxProvider(TelephonyProvider):
             "webhook_url": webhook_url,
             "webhook_url_method": "POST",
         }
+        if three_way:
+            from api.services.telephony.warm_transfer import companion_socket_url
+
+            payload.update(
+                {
+                    "stream_url": await companion_socket_url(transfer_id),
+                    "stream_track": "inbound_track",
+                    "stream_bidirectional_mode": "rtp",
+                    "stream_bidirectional_codec": "PCMU",
+                }
+            )
         payload.update(kwargs)
 
         endpoint = f"{self.TELNYX_API_BASE}/calls"
@@ -794,6 +809,9 @@ class TelnyxProvider(TelephonyProvider):
         return True
 
     def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
         return True
 
     async def call_action(
