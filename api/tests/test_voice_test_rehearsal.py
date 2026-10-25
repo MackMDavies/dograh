@@ -296,6 +296,14 @@ async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
     transport = SandboxAudioTransport(duration_limit=5)
     observer = VoiceTurnObserver(transport.output())
     transport.set_voice_observer(observer)
+    observer.timing_evidence.set_turn_detection_source("vad_transcription_speech_timeout")
+    original_record_input = observer.timing_evidence.record_input
+    def record_input(item, at, offset, size, padded_size):
+        original_record_input(item, at, offset, size, padded_size)
+        observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
+        observer.timing_evidence.record_strategy_mute(at, "function_call", False)
+        observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
+    observer.timing_evidence.record_input = record_input
     responder = FixtureResponder()
     task = PipelineTask(
         Pipeline([transport.input(), responder, transport.output()]),

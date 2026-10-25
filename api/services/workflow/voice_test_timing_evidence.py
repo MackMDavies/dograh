@@ -7,6 +7,11 @@ TIMING_SCOPE = "native monotonic PCM delivery; excludes phonetic pauses, carrier
 TIMING_SCOPE_V2 = "native monotonic PCM submission and interruption events; nominal packet end includes cancelled pacing; excludes phonetic pauses, carrier and network latency"
 TIMING_SCOPE_V3 = "native monotonic PCM submission, interruption events and sampled callback mute policy; other mute strategies are not observed; excludes phonetic pauses, carrier and network latency"
 TIMING_SCOPE_V4 = "native monotonic PCM submission, interruption events and sampled outputs of the three configured mute strategies; excludes provider-owned turn detection, phonetic pauses, carrier and network latency"
+TIMING_SCOPE_V5 = "native monotonic PCM submission, interruption events, three mute-strategy outputs and configured turn-start source; excludes provider turn-detection internals, phonetic pauses, carrier and network latency"
+TURN_DETECTION_SOURCES = {
+    "google_server_vad", "realtime_external_events", "realtime_local_vad",
+    "deepgram_flux_vad_external", "vad_transcription_turn_analyzer", "vad_transcription_speech_timeout",
+}
 RESPONSE_KEYS = {"response_sequence", "pcm_bytes", "started_ms", "first_pcm_ms", "last_pcm_end_ms",
                  "stopped_ms", "delivery_gap_count", "max_delivery_gap_ms", "total_delivery_gap_ms"}
 CALLER_KEYS = {"file_name", "sha256", "pcm_bytes", "submitted_pcm_bytes", "first_frame_ms",
@@ -24,6 +29,24 @@ class PrivateVoiceTimingEvidence:
         self.cancelled = {}
         self.mute_policy = []
         self.last_mute_policy = {}
+        self.turn_detection_source = None
+        self.turn_signals = []
+
+    def set_turn_detection_source(self, source):
+        if type(source) is not str or source not in TURN_DETECTION_SOURCES:
+            self.invalid = True
+            return
+        self.turn_detection_source = source
+
+    def record_turn_start(self, at, signal):
+        self.observe(at)
+        caller = self.callers[-1] if self.callers else None
+        if caller is None or caller["first"] is None or caller["finished"] is not None:
+            return
+        if type(signal) is not str or signal not in {"user_turn_started", "vad_user_started"} or len(self.turn_signals) >= 128:
+            self.invalid = True
+            return
+        self.turn_signals.append(dict(at=at, caller_step=len(self.callers), signal=signal))
 
     def observe(self, at):
         if type(at) not in (int, float) or not math.isfinite(at):
@@ -140,13 +163,16 @@ class PrivateVoiceTimingEvidence:
     def snapshot(self, *, pipeline_stopped):
         v2 = bool(self.interruptions or self.cancelled)
         v4 = bool(self.callers)
-        result = dict(version=4 if v4 else 1 if not v2 else 2,
-                      scope=TIMING_SCOPE_V4 if v4 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE,
+        v5 = bool(self.callers)
+        result = dict(version=5 if v5 else 1 if not v2 else 2,
+                      scope=TIMING_SCOPE_V5 if v5 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE,
                       complete=False, caller_steps=[], responses=[])
         if v2 or v4:
             result["interruptions"] = []
         if v4:
             result["mute_policy"] = {"strategies": ["first_bot_complete", "function_call", "workflow_callback"], "samples": []}
+        if v5:
+            result["turn_detection"] = {"source": self.turn_detection_source, "signals": []}
         if self.origin is None:
             return result
         relative = lambda at: round((at - self.origin) * 1000, 3)
@@ -186,11 +212,16 @@ class PrivateVoiceTimingEvidence:
             result["mute_policy"]["samples"] = [dict(sequence=index + 1, at_ms=relative(item["at"]),
                 caller_step=item["caller_step"], strategy=item["strategy"], muted=item["muted"], reason=item["reason"])
                 for index, item in enumerate(self.mute_policy)]
+        if v5:
+            result["turn_detection"]["signals"] = [dict(sequence=index + 1, at_ms=relative(item["at"]),
+                caller_step=item["caller_step"], signal=item["signal"])
+                for index, item in enumerate(self.turn_signals)]
         result["complete"] = bool(pipeline_stopped is True and valid and self.responses and self.callers
                                   and len(self.audio) == len(self.responses)
                                   and (not v4 or {(item["caller_step"], item["strategy"]) for item in self.mute_policy}
                                        >= {(step, strategy) for step in range(1, len(self.callers) + 1)
-                                           for strategy in ("first_bot_complete", "function_call", "workflow_callback")}))
+                                           for strategy in ("first_bot_complete", "function_call", "workflow_callback")})
+                                  and (not v5 or self.turn_detection_source in TURN_DETECTION_SOURCES))
         return result
 
 
@@ -202,13 +233,14 @@ def validate_voice_timing_evidence(value, *, duration_ms, fixtures, spans):
         return type(item) in (int, float) and math.isfinite(item) and 0 <= item <= duration_ms
 
     version = value.get("version") if isinstance(value, dict) else None
-    v2 = type(version) is int and version in (2, 3, 4)
+    v2 = type(version) is int and version in (2, 3, 4, 5)
     v3 = type(version) is int and version == 3
-    v4 = type(version) is int and version == 4
-    keys = {"version", "scope", "complete", "caller_steps", "responses"} | ({"interruptions"} if v2 else set()) | ({"callback_mute_policy"} if v3 else set()) | ({"mute_policy"} if v4 else set())
+    v4 = type(version) is int and version in (4, 5)
+    v5 = type(version) is int and version == 5
+    keys = {"version", "scope", "complete", "caller_steps", "responses"} | ({"interruptions"} if v2 else set()) | ({"callback_mute_policy"} if v3 else set()) | ({"mute_policy"} if v4 else set()) | ({"turn_detection"} if v5 else set())
     if not isinstance(value, dict) or set(value) != keys \
-            or type(value["version"]) is not int or value["version"] not in (1, 2, 3, 4) \
-            or value["scope"] != (TIMING_SCOPE_V4 if v4 else TIMING_SCOPE_V3 if v3 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE) \
+            or type(value["version"]) is not int or value["version"] not in (1, 2, 3, 4, 5) \
+            or value["scope"] != (TIMING_SCOPE_V5 if v5 else TIMING_SCOPE_V4 if v4 else TIMING_SCOPE_V3 if v3 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE) \
             or type(value["complete"]) is not bool or not isinstance(value["caller_steps"], list) \
             or len(value["caller_steps"]) > len(fixtures) or not isinstance(value["responses"], list) \
             or len(value["responses"]) > 128:
@@ -358,5 +390,25 @@ def validate_voice_timing_evidence(value, *, duration_ms, fixtures, spans):
             previous_at = sample["at_ms"]
         required = {(step, strategy) for step in range(1, len(value["caller_steps"]) + 1) for strategy in strategies}
         if value["complete"] and sampled != required:
+            invalid()
+    if v5:
+        turn = value["turn_detection"]
+        if not isinstance(turn, dict) or set(turn) != {"source", "signals"} \
+                or (turn["source"] is not None and (type(turn["source"]) is not str or turn["source"] not in TURN_DETECTION_SOURCES)) \
+                or not isinstance(turn["signals"], list) or len(turn["signals"]) > 128:
+            invalid()
+        previous_at = 0
+        for index, signal in enumerate(turn["signals"]):
+            if not isinstance(signal, dict) or set(signal) != {"sequence", "at_ms", "caller_step", "signal"} \
+                    or type(signal["sequence"]) is not int or signal["sequence"] != index + 1 \
+                    or not number(signal["at_ms"]) or signal["at_ms"] < previous_at \
+                    or type(signal["caller_step"]) is not int or not 1 <= signal["caller_step"] <= len(value["caller_steps"]) \
+                    or type(signal["signal"]) is not str or signal["signal"] not in {"user_turn_started", "vad_user_started"}:
+                invalid()
+            caller = value["caller_steps"][signal["caller_step"] - 1]
+            if not caller["first_frame_ms"] <= signal["at_ms"] <= caller["playback_finished_ms"]:
+                invalid()
+            previous_at = signal["at_ms"]
+        if value["complete"] and turn["source"] not in TURN_DETECTION_SOURCES:
             invalid()
     return value

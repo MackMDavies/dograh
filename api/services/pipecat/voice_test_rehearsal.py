@@ -18,6 +18,8 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     InterruptionFrame,
+    UserStartedSpeakingFrame,
+    VADUserStartedSpeakingFrame,
 )
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.processors.frame_processor import FrameDirection
@@ -63,6 +65,14 @@ class VoiceTurnObserver(BaseObserver):
             return
         now = asyncio.get_running_loop().time()
         self.timing_evidence.observe(now)
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            self.timing_evidence.record_turn_start(now, "vad_user_started")
+            self.changed.set()
+            return
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self.timing_evidence.record_turn_start(now, "user_turn_started")
+            self.changed.set()
+            return
         current = self.current
         if isinstance(frame, BotStartedSpeakingFrame):
             if current is None or current.stopped_at is not None:

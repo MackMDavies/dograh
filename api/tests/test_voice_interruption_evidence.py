@@ -48,6 +48,19 @@ def test_v4_persists_the_three_fixed_strategy_sources_with_bounded_decisions():
     assert timing["mute_policy"]["samples"][5]["reason"] == "node_forbids_interruption"
 
 
+def test_v5_binds_turn_start_source_and_signal_to_caller_frames():
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v5.json").read_text())
+    timing = value["timing"]
+    _, fixtures, spans = protocol()
+    assert validate_voice_timing_evidence(timing, duration_ms=1000, fixtures=fixtures, spans=spans) is timing
+    assert timing["turn_detection"]["source"] == "realtime_external_events"
+    assert [signal["signal"] for signal in timing["turn_detection"]["signals"]] == [
+        "user_turn_started", "vad_user_started"
+    ]
+    timing["turn_detection"]["signals"] = []
+    assert parse(timing) is timing
+
+
 @pytest.mark.asyncio
 async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_return_value():
     from api.services.pipecat.observed_user_mute_strategy import ObservedUserMuteStrategy
@@ -103,6 +116,26 @@ async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_retu
     ]
 
 
+@pytest.mark.asyncio
+async def test_private_voice_observer_records_only_turn_start_frame_kinds():
+    from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
+    from api.services.workflow.voice_test_timing_evidence import PrivateVoiceTimingEvidence
+    from pipecat.frames.frames import UserStartedSpeakingFrame, VADUserStartedSpeakingFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    observer = VoiceTurnObserver(None)
+    observer.timing_evidence.set_turn_detection_source("realtime_external_events")
+    now = asyncio.get_running_loop().time()
+    observer.timing_evidence.observe(now)
+    caller = observer.timing_evidence.begin_caller("caller-001.wav", "c" * 64, 640)
+    observer.timing_evidence.record_input(caller, now, 0, 640, 640)
+    observer.observe_output(UserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    observer.observe_output(VADUserStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    observer.timing_evidence.finish_input(caller, now + 0.02)
+    signals = observer.timing_evidence.snapshot(pipeline_stopped=False)["turn_detection"]["signals"]
+    assert [signal["signal"] for signal in signals] == ["user_turn_started", "vad_user_started"]
+
+
 @pytest.mark.parametrize("change", [
     lambda v: v["callback_mute_policy"].update(other_mute_strategies_observed=True),
     lambda v: v["callback_mute_policy"]["samples"][0].update(state="allow_interrupt_true"),
@@ -132,6 +165,22 @@ def test_v3_rejects_policy_samples_that_are_unbounded_or_ambiguous(change):
 ])
 def test_v4_rejects_incomplete_or_inconsistent_strategy_evidence(change):
     value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v4.json").read_text())["timing"]
+    change(value)
+    with pytest.raises(VoiceControlError, match="voice_timing_evidence_invalid"):
+        parse(value)
+
+
+@pytest.mark.parametrize("change", [
+    lambda v: v["turn_detection"].update(source="provider_private_name"),
+    lambda v: v["turn_detection"].update(source=[]),
+    lambda v: v["turn_detection"]["signals"][0].update(sequence=True),
+    lambda v: v["turn_detection"]["signals"][0].update(at_ms=21),
+    lambda v: v["turn_detection"]["signals"][0].update(caller_step=0),
+    lambda v: v["turn_detection"]["signals"][0].update(signal="private"),
+    lambda v: v["turn_detection"]["signals"].append("private"),
+])
+def test_v5_rejects_unknown_or_unbound_turn_source_and_signal(change):
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v5.json").read_text())["timing"]
     change(value)
     with pytest.raises(VoiceControlError, match="voice_timing_evidence_invalid"):
         parse(value)

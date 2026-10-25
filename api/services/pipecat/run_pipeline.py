@@ -877,9 +877,15 @@ async def _run_pipeline(
     if is_realtime:
         # Realtime services still need user-turn tracking even when the model
         # itself owns speech generation and interruption behavior.
-        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(
-            user_config.realtime.provider
-        )
+        realtime_provider = user_config.realtime.provider
+        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(realtime_provider)
+        if realtime_provider in {ServiceProviders.GOOGLE_REALTIME.value, ServiceProviders.GOOGLE_VERTEX_REALTIME.value}:
+            turn_detection_source = "google_server_vad"
+        elif realtime_provider in {ServiceProviders.OPENAI_REALTIME.value, ServiceProviders.ELEVENLABS_REALTIME.value,
+                                    ServiceProviders.GROK_REALTIME.value}:
+            turn_detection_source = "realtime_external_events"
+        else:
+            turn_detection_source = "realtime_local_vad"
     else:
         # Deepgram Flux uses external turn detection (VAD + External start/stop)
         # Other models use configurable turn detection strategy
@@ -889,6 +895,7 @@ async def _run_pipeline(
         )
 
         if is_deepgram_flux:
+            turn_detection_source = "deepgram_flux_vad_external"
             user_turn_strategies = UserTurnStrategies(
                 start=[
                     VADUserTurnStartStrategy(),
@@ -897,6 +904,7 @@ async def _run_pipeline(
                 stop=[ExternalUserTurnStopStrategy()],
             )
         elif turn_stop_strategy == "turn_analyzer":
+            turn_detection_source = "vad_transcription_turn_analyzer"
             # Smart Turn Analyzer: best for longer responses with natural pauses
             smart_turn_params = SmartTurnParams(stop_secs=smart_turn_stop_secs)
             user_turn_strategies = UserTurnStrategies(
@@ -911,6 +919,7 @@ async def _run_pipeline(
                 ],
             )
         else:
+            turn_detection_source = "vad_transcription_speech_timeout"
             # Transcription-based (default): best for short 1-2 word responses
             user_turn_strategies = UserTurnStrategies(
                 start=[
@@ -919,6 +928,9 @@ async def _run_pipeline(
                 ],
                 stop=[SpeechTimeoutUserTurnStopStrategy()],
             )
+
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        transport.voice_observer.timing_evidence.set_turn_detection_source(turn_detection_source)
 
     user_params = LLMUserAggregatorParams(
         user_turn_strategies=user_turn_strategies,

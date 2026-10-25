@@ -52,6 +52,7 @@ async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_paci
     transport = SandboxAudioTransport(duration_limit=5)
     observer = VoiceTurnObserver(transport.output())
     transport.set_voice_observer(observer)
+    observer.timing_evidence.set_turn_detection_source("vad_transcription_speech_timeout")
     submitted = asyncio.Event()
     original = observer.record_audio
 
@@ -64,6 +65,8 @@ async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_paci
     original_input = observer.timing_evidence.record_input
     def record_input(item, at, offset, size, padded_size):
         original_input(item, at, offset, size, padded_size)
+        if not observer.timing_evidence.turn_signals:
+            observer.timing_evidence.record_turn_start(at, "user_turn_started")
         observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
         observer.timing_evidence.record_strategy_mute(at, "function_call", False)
         observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
@@ -85,7 +88,7 @@ async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_paci
             responses=observer.responses, pipeline_stopped=True)["spans"]
         fixtures = [SimpleNamespace(file_name="caller-001.wav", sha256=hashlib.sha256(encoded).hexdigest(), duration_ms=80)]
         assert validate_voice_timing_evidence(timing, duration_ms=5000, fixtures=fixtures, spans=spans) is timing
-        assert timing["version"] == 4
+        assert timing["version"] == 5
         assert segment["cancelled_write"]["pcm_end_byte"] == spans[0]["pcm_end_byte"]
         assert segment["cancelled_write"]["cancelled_ms"] <= segment["stopped_ms"]
         assert timing["interruptions"][0]["response_sequence"] == 1
@@ -271,7 +274,9 @@ def test_unfinished_input_or_response_cannot_make_a_complete_timing_claim():
     evidence.observe(1)
     evidence.record_output(1.01, 640, 1)
     caller = evidence.begin_caller("caller-001.wav", "c"*64, 640)
+    evidence.set_turn_detection_source("vad_transcription_speech_timeout")
     evidence.record_input(caller, 1.1, 0, 640, 640)
+    evidence.record_turn_start(1.105, "user_turn_started")
     evidence.record_strategy_mute(1.11, "first_bot_complete", False)
     evidence.record_strategy_mute(1.11, "function_call", False)
     evidence.record_mute_policy(1.11, "unmuted")
@@ -323,9 +328,15 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
     async def actual_transport(transport, *_):
         responder = FixtureInterruptResponder() if interrupt else FixtureResponder()
         observer = transport.voice_observer
+        observer.timing_evidence.set_turn_detection_source("vad_transcription_speech_timeout")
         original_input = observer.timing_evidence.record_input
+        turn_recorded = False
         def record_input(item, at, offset, size, padded_size):
+            nonlocal turn_recorded
             original_input(item, at, offset, size, padded_size)
+            if not turn_recorded:
+                observer.timing_evidence.record_turn_start(at, "user_turn_started")
+                turn_recorded = True
             observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
             observer.timing_evidence.record_strategy_mute(at, "function_call", False)
             observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
@@ -349,7 +360,7 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
     assert value["evidence"]["timing"]["caller_steps"][0]["sha256"] == session.fixtures[0].sha256
     if interrupt:
         timing = value["evidence"]["timing"]
-        assert timing["version"] == 4
+        assert timing["version"] == 5
         assert timing["interruptions"][0]["response_sequence"] == 1
         assert timing["interruptions"][0]["caller_step"] == 1
         assert timing["interruptions"][0]["caller_active"] is True
