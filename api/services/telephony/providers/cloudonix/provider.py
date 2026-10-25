@@ -126,6 +126,7 @@ class CloudonixProvider(TelephonyProvider):
     <Connect>
         <Stream url="{wss_backend_endpoint}/api/v1/telephony/ws/{workflow_id}/{user_id}/{workflow_run_id}"></Stream>
     </Connect>
+    <Redirect method="POST">{backend_endpoint}/api/v1/telephony/cloudonix/after-stream/{workflow_run_id}</Redirect>
     <Pause length="40"/>
 </Response>""",
             "caller-id": from_number,  # Required field
@@ -869,6 +870,7 @@ class CloudonixProvider(TelephonyProvider):
     <Connect>
         <Stream url="{websocket_url}"></Stream>
     </Connect>
+    <Redirect method="POST">{backend_endpoint}/api/v1/telephony/cloudonix/after-stream/{workflow_run_id}</Redirect>
     <Pause length="40"/>
 </Response>"""
 
@@ -952,35 +954,39 @@ class CloudonixProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
+        """Ring the destination. Their CXML is a redirect Cloudonix only follows once
+        they answer, so answering is reported without status callbacks:
+        /cloudonix/transfer-answer/{id} returns the conference (or, warm, the
+        introduction and a one-key Gather). The caller's own CXML redirects to
+        /cloudonix/after-stream/{run} when the agent hands off, which joins them.
         """
-        Initiate a call transfer via Cloudonix.
+        if not self.validate_config():
+            raise ValueError("Cloudonix provider not properly configured")
+        backend_endpoint, _ = await get_backend_endpoints()
+        data = {
+            "destination": destination,
+            "caller-id": random.choice(self.from_numbers),
+            "cxml": (
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                f'<Redirect method="POST">{backend_endpoint}/api/v1/telephony/cloudonix/transfer-answer/{transfer_id}</Redirect>'
+                "</Response>"
+            ),
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/calls/{self.domain_id}/application", json=data, headers=self._get_auth_headers()
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status not in (200, 201):
+                    raise Exception(f"Cloudonix transfer call failed ({response.status}): {body}")
+        leg = body.get("token") or body.get("id") or (body.get("session") or {}).get("token")
+        return {"call_sid": leg, "status": "initiated", "provider": self.PROVIDER_NAME}
 
-        Uses inline CXML to put the destination into a conference when they answer,
-        and a status callback to track the transfer outcome.
-
-        Args:
-            destination: The destination phone number (E.164 format)
-            transfer_id: Unique identifier for tracking this transfer
-            conference_name: Name of the conference to join the destination into
-            timeout: Transfer timeout in seconds
-            **kwargs: Additional Twilio-specific parameters
-
-        Returns:
-            Dict containing transfer result information
-
-        Raises:
-            ValueError: If provider configuration is invalid
-            Exception: If Twilio API call fails
-        """
-        raise NotImplementedError("Cloudonix provider does not support call transfers")
+    def supports_warm_transfer(self) -> bool:
+        return True
 
     def supports_transfers(self) -> bool:
-        """
-        Cloudonix does not support call transfers.
-
-        Returns:
-            False - Cloudonix provider does not support call transfers
-        """
-        return False
+        return True

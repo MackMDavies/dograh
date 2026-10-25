@@ -155,3 +155,75 @@ async def handle_cloudonix_cdr(request: Request):
     )
 
     return {"status": "success"}
+
+
+# ── Transfers (Keypad & Native Phone Tools) ───────────────────────────────────────
+# CXML is Twilio-compatible, so the colleague's leg uses the same TwiML as Twilio's
+# transfers. transfer_id is an unguessable uuid4 known only to Cloudonix and Redis.
+
+
+def _cxml(body: str):
+    from fastapi import Response
+
+    return Response(content=body, media_type="application/xml")
+
+
+@router.post("/cloudonix/transfer-answer/{transfer_id}", include_in_schema=False)
+async def cloudonix_transfer_answer(transfer_id: str):
+    from api.services.telephony.call_transfer_manager import get_call_transfer_manager
+    from api.services.telephony.warm_transfer import (
+        report_transfer_leg,
+        twilio_accept_twiml,
+        twilio_decline_twiml,
+        twilio_transfer_twiml,
+    )
+    from api.utils.common import get_backend_endpoints
+
+    context = await (await get_call_transfer_manager()).get_transfer_context(transfer_id)
+    if context is None or context.resolved:
+        return _cxml(twilio_decline_twiml())
+    await report_transfer_leg(transfer_id, "answered")
+    if context.warm and context.introduction:
+        backend, _ = await get_backend_endpoints()
+        return _cxml(twilio_transfer_twiml(
+            context.conference_name, context.introduction,
+            f"{backend}/api/v1/telephony/cloudonix/transfer-accept/{transfer_id}",
+        ))
+    return _cxml(twilio_accept_twiml(context.conference_name))
+
+
+@router.post("/cloudonix/transfer-accept/{transfer_id}", include_in_schema=False)
+async def cloudonix_transfer_accept(transfer_id: str, request: Request):
+    from api.services.telephony.warm_transfer import (
+        report_transfer_accept,
+        twilio_accept_twiml,
+        twilio_decline_twiml,
+    )
+
+    form = dict(await request.form())
+    conference = await report_transfer_accept(transfer_id, str(form.get("Digits") or ""))
+    return _cxml(twilio_accept_twiml(conference) if conference else twilio_decline_twiml())
+
+
+@router.post("/cloudonix/after-stream/{workflow_run_id}", include_in_schema=False)
+async def cloudonix_after_stream(workflow_run_id: int):
+    """The caller's CXML continues here when the agent's stream ends. A connected
+    transfer joins them to the colleague; otherwise the call simply ends."""
+    from api.db import db_client
+    from api.services.telephony.call_transfer_manager import get_call_transfer_manager
+
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    call_id = (run.gathered_context or {}).get("call_id") if run else None
+    if not call_id:
+        return _cxml(hangup)
+    manager = await get_call_transfer_manager()
+    transfer = await manager.find_transfer_context_for_call(call_id)
+    if transfer is None or not transfer.accepted:
+        return _cxml(hangup)
+    await manager.remove_transfer_context(transfer.transfer_id)
+    return _cxml(
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Dial>'
+        f'<Conference endConferenceOnExit="true">{transfer.conference_name}</Conference>'
+        "</Dial></Response>"
+    )
