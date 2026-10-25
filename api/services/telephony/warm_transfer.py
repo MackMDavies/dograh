@@ -161,3 +161,54 @@ async def report_transfer_accept(transfer_id: str, digits: str, leg_id: str = ""
 def vonage_conversation_ncco(conference_name: str) -> list[dict]:
     """NCCO joining a leg to the transfer's conversation; it ends when the colleague leaves."""
     return [{"action": "conversation", "name": conference_name, "endOnExit": True}]
+
+
+# ── Asterisk (ARI): the introduction as audio ─────────────────────────────────────
+# Asterisk cannot read text, so the introduction is synthesised when the transfer
+# starts (platform ElevenLabs key, 8 kHz mu-law WAV, as the dialer's screener does),
+# kept in Redis for a few minutes and played to the colleague from
+# /telephony/ari/transfer-intro/{id}.wav.
+
+ARI_INTRO_VOICE_ID = "21m00Tcm4TlvDq8ikWAM"  # ElevenLabs "Rachel", a neutral stock voice
+ARI_INTRO_TTL_SECONDS = 300
+# Introduction + the press-1 window; after this an unanswered prompt is a decline.
+ARI_ACCEPT_WINDOW_SECONDS = 40
+
+
+def _intro_key(transfer_id: str) -> str:
+    return f"transfer:intro:{transfer_id}"
+
+
+async def prepare_ari_introduction(transfer_id: str, introduction: str) -> bool:
+    """Synthesise and store the introduction. False means play nothing (go cold)."""
+    import redis.asyncio as aioredis
+    from loguru import logger
+
+    from api.constants import REDIS_URL
+    from api.services.telephony.dialer.screener_voice import _elevenlabs_audio, mulaw_wav
+
+    try:
+        audio = await _elevenlabs_audio(ARI_INTRO_VOICE_ID, briefing_speech(introduction))
+        if not audio:
+            return False
+        client = aioredis.from_url(REDIS_URL)
+        try:
+            await client.set(_intro_key(transfer_id), mulaw_wav(audio), ex=ARI_INTRO_TTL_SECONDS)
+        finally:
+            await client.aclose()
+        return True
+    except Exception as e:  # noqa: BLE001 -- the transfer goes ahead cold
+        logger.warning(f"[ARI Transfer] could not prepare the introduction for {transfer_id}: {e}")
+        return False
+
+
+async def ari_introduction_audio(transfer_id: str) -> Optional[bytes]:
+    import redis.asyncio as aioredis
+
+    from api.constants import REDIS_URL
+
+    client = aioredis.from_url(REDIS_URL)
+    try:
+        return await client.get(_intro_key(transfer_id))
+    finally:
+        await client.aclose()

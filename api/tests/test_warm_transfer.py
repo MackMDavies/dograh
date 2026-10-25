@@ -32,6 +32,9 @@ class FakeTransfers:
     async def remove_transfer_context(self, transfer_id):
         self.contexts.pop(transfer_id, None)
 
+    async def store_transfer_channel_mapping(self, channel_id, transfer_id):
+        self.channels = {**getattr(self, "channels", {}), channel_id: transfer_id}
+
     async def publish_transfer_event(self, event):
         self.events.append(event)
 

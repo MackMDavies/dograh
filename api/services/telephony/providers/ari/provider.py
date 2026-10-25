@@ -362,12 +362,21 @@ class ARIProvider(TelephonyProvider):
         """ARI supports call transfers via bridge manipulation."""
         return True
 
+    def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_three_way(self) -> bool:
+        """The caller and the agent's media channel already share a mixing bridge;
+        ari_manager adds the colleague to it."""
+        return True
+
     async def transfer_call(
         self,
         destination: str,
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Initiate ARI call transfer by creating an outbound channel to the destination.
@@ -392,6 +401,20 @@ class ARIProvider(TelephonyProvider):
         """
         if not self.validate_config():
             raise ValueError("ARI provider not properly configured")
+
+        if introduction:
+            # Warm: ari_manager plays this to the colleague and waits for 1. If it
+            # cannot be synthesised, the transfer is made cold before they ring.
+            from api.services.telephony.call_transfer_manager import get_call_transfer_manager as _manager
+            from api.services.telephony.warm_transfer import prepare_ari_introduction
+
+            if not await prepare_ari_introduction(transfer_id, introduction):
+                manager = await _manager()
+                context = await manager.get_transfer_context(transfer_id)
+                if context is not None:
+                    context.warm = False
+                    context.introduction = None
+                    await manager.store_transfer_context(context)
 
         logger.info(
             f"[ARI Transfer] Initiating transfer {transfer_id} to {destination} "
