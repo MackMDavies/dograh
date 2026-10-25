@@ -302,7 +302,7 @@ async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
         original_record_input(item, at, offset, size, padded_size)
         observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
         observer.timing_evidence.record_strategy_mute(at, "function_call", False)
-        observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted")
+        observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted", True)
     observer.timing_evidence.record_input = record_input
     responder = FixtureResponder()
     task = PipelineTask(

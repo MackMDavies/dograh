@@ -869,7 +869,8 @@ async def _run_pipeline(
             ObservedUserMuteStrategy(first_bot_mute, "first_bot_complete", timing_evidence),
             ObservedUserMuteStrategy(function_call_mute, "function_call", timing_evidence),
             ObservedUserMuteStrategy(workflow_mute, "workflow_callback", timing_evidence,
-                reason=lambda: engine._voice_test_mute_reason),
+                reason=lambda: engine._voice_test_mute_reason,
+                node_allows_interrupt=lambda: getattr(engine._current_node, "allow_interrupt", None)),
         ]
     user_vad_analyzer = SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
 

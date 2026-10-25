@@ -98,7 +98,8 @@ async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_retu
     function_strategy = ObservedUserMuteStrategy(FunctionCallUserMuteStrategy(), "function_call", timing)
     callback = CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user)
     callback_strategy = ObservedUserMuteStrategy(callback, "workflow_callback", timing,
-        reason=lambda: engine._voice_test_mute_reason)
+        reason=lambda: engine._voice_test_mute_reason,
+        node_allows_interrupt=lambda: getattr(engine._current_node, "allow_interrupt", None))
 
     assert await first_strategy.process_frame(UserStartedSpeakingFrame()) is True
     assert await first_strategy.process_frame(BotStoppedSpeakingFrame()) is False
@@ -114,6 +115,7 @@ async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_retu
         ("function_call", True), ("function_call", False),
         ("workflow_callback", True), ("workflow_callback", False),
     ]
+    assert [sample["node_allows_interrupt"] for sample in samples if sample["strategy"] == "workflow_callback"] == [False, True]
 
 
 @pytest.mark.asyncio
