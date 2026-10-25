@@ -2,9 +2,8 @@
 import copy
 import json
 from pathlib import Path
-from types import SimpleNamespace
-
 import pytest
+from types import SimpleNamespace
 
 from api.services.workflow.voice_test_control import VoiceControlError
 from api.services.workflow.voice_test_timing_evidence import validate_voice_timing_evidence
@@ -26,6 +25,60 @@ def test_cancelled_packet_and_active_caller_interruption_remain_distinct():
     assert parse(value) is value
     assert value["responses"][0]["stopped_ms"] < value["responses"][0]["last_pcm_end_ms"]
     assert value["interruptions"][0]["caller_active"] is True
+
+
+def test_v3_records_only_bounded_callback_policy_changes_and_marks_other_strategies_unobserved():
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v3.json").read_text())
+    timing = value["timing"]
+    _, fixtures, spans = protocol()
+    assert validate_voice_timing_evidence(timing, duration_ms=1000, fixtures=fixtures, spans=spans) is timing
+    assert timing["callback_mute_policy"]["other_mute_strategies_observed"] is False
+    assert [sample["state"] for sample in timing["callback_mute_policy"]["samples"]] == [
+        "unmuted", "node_forbids_interruption"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_runtime_mute_callback_records_the_node_policy_and_its_actual_return_value():
+    from api.services.workflow.pipecat_engine import PipecatEngine
+    from api.services.workflow.voice_test_timing_evidence import PrivateVoiceTimingEvidence
+
+    response = SimpleNamespace(sequence=1, started_at=1.0, stopped_at=None)
+    timing = PrivateVoiceTimingEvidence([response])
+    timing.observe(1.0)
+    caller = timing.begin_caller("caller-001.wav", "c" * 64, 640)
+    timing.record_input(caller, 1.01, 0, 640, 640)
+    engine = PipecatEngine.__new__(PipecatEngine)
+    engine._voice_test_timing_evidence = timing
+    engine._queued_speech_mute_state = "idle"
+    engine._bot_is_speaking = True
+    engine._current_node = SimpleNamespace(allow_interrupt=False)
+    engine._mute_pipeline = False
+    engine._mute_active_since = None
+    engine._max_bot_mute_seconds = 15.0
+
+    assert await engine.should_mute_user(object()) is True
+    engine._current_node.allow_interrupt = True
+    assert await engine.should_mute_user(object()) is False
+    samples = timing.snapshot(pipeline_stopped=False)["callback_mute_policy"]["samples"]
+    assert [sample["state"] for sample in samples] == ["node_forbids_interruption", "unmuted"]
+
+
+@pytest.mark.parametrize("change", [
+    lambda v: v["callback_mute_policy"].update(other_mute_strategies_observed=True),
+    lambda v: v["callback_mute_policy"]["samples"][0].update(state="allow_interrupt_true"),
+    lambda v: v["callback_mute_policy"]["samples"][0].update(at_ms=21),
+    lambda v: v["callback_mute_policy"]["samples"][1].update(caller_step=1),
+    lambda v: v["callback_mute_policy"]["samples"][1].update(sequence=3),
+    lambda v: v["callback_mute_policy"]["samples"][0].update(sequence=True),
+    lambda v: v["callback_mute_policy"]["samples"][0].update(state={"private": True}),
+    lambda v: v["callback_mute_policy"]["samples"].append(dict(v["callback_mute_policy"]["samples"][1], sequence=3)),
+])
+def test_v3_rejects_policy_samples_that_are_unbounded_or_ambiguous(change):
+    value = json.loads((Path(__file__).parent / "fixtures/voiceTimingEvidence.v3.json").read_text())["timing"]
+    change(value)
+    with pytest.raises(VoiceControlError, match="voice_timing_evidence_invalid"):
+        parse(value)
 
 
 @pytest.mark.parametrize("change", [

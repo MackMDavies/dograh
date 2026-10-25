@@ -5,6 +5,7 @@ from api.services.workflow.voice_test_control import VoiceControlError
 
 TIMING_SCOPE = "native monotonic PCM delivery; excludes phonetic pauses, carrier and network latency"
 TIMING_SCOPE_V2 = "native monotonic PCM submission and interruption events; nominal packet end includes cancelled pacing; excludes phonetic pauses, carrier and network latency"
+TIMING_SCOPE_V3 = "native monotonic PCM submission, interruption events and sampled callback mute policy; other mute strategies are not observed; excludes phonetic pauses, carrier and network latency"
 RESPONSE_KEYS = {"response_sequence", "pcm_bytes", "started_ms", "first_pcm_ms", "last_pcm_end_ms",
                  "stopped_ms", "delivery_gap_count", "max_delivery_gap_ms", "total_delivery_gap_ms"}
 CALLER_KEYS = {"file_name", "sha256", "pcm_bytes", "submitted_pcm_bytes", "first_frame_ms",
@@ -20,6 +21,8 @@ class PrivateVoiceTimingEvidence:
         self.invalid = False
         self.interruptions = []
         self.cancelled = {}
+        self.mute_policy = []
+        self.last_mute_policy = {}
 
     def observe(self, at):
         if type(at) not in (int, float) or not math.isfinite(at):
@@ -71,6 +74,24 @@ class PrivateVoiceTimingEvidence:
         self.interruptions.append(dict(at=at, response_sequence=sequence, caller_step=len(self.callers),
             caller_active=caller is not None and caller["first"] is not None and caller["finished"] is None))
 
+    def record_mute_policy(self, at, state):
+        """Record changes in the node/queued-speech mute callback during a caller turn."""
+        self.observe(at)
+        caller = self.callers[-1] if self.callers else None
+        if caller is None or caller["first"] is None or caller["finished"] is not None:
+            return
+        if state not in {"pipeline_shutdown", "queued_speech", "node_forbids_interruption", "unmuted", "self_heal_release"}:
+            self.invalid = True
+            return
+        step = len(self.callers)
+        if self.last_mute_policy.get(step) == state:
+            return
+        if len(self.mute_policy) >= 128:
+            self.invalid = True
+            return
+        self.last_mute_policy[step] = state
+        self.mute_policy.append(dict(at=at, caller_step=step, state=state))
+
     def begin_caller(self, file_name, sha256, pcm_bytes):
         if len(self.callers) >= 10 or any(item["file_name"] == file_name for item in self.callers):
             self.invalid = True
@@ -102,10 +123,14 @@ class PrivateVoiceTimingEvidence:
 
     def snapshot(self, *, pipeline_stopped):
         v2 = bool(self.interruptions or self.cancelled)
-        result = dict(version=2 if v2 else 1, scope=TIMING_SCOPE_V2 if v2 else TIMING_SCOPE,
+        v3 = bool(self.callers)
+        result = dict(version=3 if v3 else 1 if not v2 else 2,
+                      scope=TIMING_SCOPE_V3 if v3 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE,
                       complete=False, caller_steps=[], responses=[])
-        if v2:
+        if v2 or v3:
             result["interruptions"] = []
+        if v3:
+            result["callback_mute_policy"] = {"other_mute_strategies_observed": False, "samples": []}
         if self.origin is None:
             return result
         relative = lambda at: round((at - self.origin) * 1000, 3)
@@ -122,7 +147,7 @@ class PrivateVoiceTimingEvidence:
                 delivery_gap_count=audio["gaps"], max_delivery_gap_ms=round(audio["maximum"], 3),
                 total_delivery_gap_ms=round(audio["total"], 3),
             ))
-            if v2:
+            if v2 or v3:
                 cancelled = self.cancelled.get(response.sequence)
                 result["responses"][-1]["cancelled_write"] = None if cancelled is None else dict(
                     pcm_start_byte=cancelled["pcm_start_byte"], pcm_end_byte=cancelled["pcm_end_byte"],
@@ -137,12 +162,17 @@ class PrivateVoiceTimingEvidence:
                 playback_finished_ms=relative(item["finished"]),
             ))
             valid = valid and item["submitted_pcm_bytes"] == item["pcm_bytes"]
-        if v2:
+        if v2 or v3:
             result["interruptions"] = [dict(sequence=index + 1, at_ms=relative(item["at"]),
                 response_sequence=item["response_sequence"], caller_step=item["caller_step"], caller_active=item["caller_active"])
                 for index, item in enumerate(self.interruptions)]
+        if v3:
+            result["callback_mute_policy"]["samples"] = [dict(sequence=index + 1, at_ms=relative(item["at"]),
+                caller_step=item["caller_step"], state=item["state"])
+                for index, item in enumerate(self.mute_policy)]
         result["complete"] = bool(pipeline_stopped is True and valid and self.responses and self.callers
-                                  and len(self.audio) == len(self.responses))
+                                  and len(self.audio) == len(self.responses)
+                                  and (not v3 or {item["caller_step"] for item in self.mute_policy} == set(range(1, len(self.callers) + 1))))
         return result
 
 
@@ -153,11 +183,13 @@ def validate_voice_timing_evidence(value, *, duration_ms, fixtures, spans):
     def number(item):
         return type(item) in (int, float) and math.isfinite(item) and 0 <= item <= duration_ms
 
-    v2 = isinstance(value, dict) and type(value.get("version")) is int and value["version"] == 2
-    keys = {"version", "scope", "complete", "caller_steps", "responses"} | ({"interruptions"} if v2 else set())
+    version = value.get("version") if isinstance(value, dict) else None
+    v2 = type(version) is int and version in (2, 3)
+    v3 = type(version) is int and version == 3
+    keys = {"version", "scope", "complete", "caller_steps", "responses"} | ({"interruptions"} if v2 else set()) | ({"callback_mute_policy"} if v3 else set())
     if not isinstance(value, dict) or set(value) != keys \
-            or type(value["version"]) is not int or value["version"] not in (1, 2) \
-            or value["scope"] != (TIMING_SCOPE_V2 if v2 else TIMING_SCOPE) \
+            or type(value["version"]) is not int or value["version"] not in (1, 2, 3) \
+            or value["scope"] != (TIMING_SCOPE_V3 if v3 else TIMING_SCOPE_V2 if v2 else TIMING_SCOPE) \
             or type(value["complete"]) is not bool or not isinstance(value["caller_steps"], list) \
             or len(value["caller_steps"]) > len(fixtures) or not isinstance(value["responses"], list) \
             or len(value["responses"]) > 128:
@@ -244,4 +276,30 @@ def validate_voice_timing_evidence(value, *, duration_ms, fixtures, spans):
                 if not caller["first_frame_ms"] <= event["at_ms"] <= caller["playback_finished_ms"]:
                     invalid()
             previous_at = event["at_ms"]
+    if v3:
+        policy = value["callback_mute_policy"]
+        if not isinstance(policy, dict) or set(policy) != {"other_mute_strategies_observed", "samples"} \
+                or policy["other_mute_strategies_observed"] is not False or not isinstance(policy["samples"], list) \
+                or len(policy["samples"]) > 128:
+            invalid()
+        previous_at = 0
+        last_state = {}
+        sampled_steps = set()
+        for index, sample in enumerate(policy["samples"]):
+            if not isinstance(sample, dict) or set(sample) != {"sequence", "at_ms", "caller_step", "state"} \
+                    or type(sample["sequence"]) is not int or sample["sequence"] != index + 1 \
+                    or not number(sample["at_ms"]) or sample["at_ms"] < previous_at \
+                    or type(sample["caller_step"]) is not int or not 1 <= sample["caller_step"] <= len(value["caller_steps"]) \
+                    or type(sample["state"]) is not str \
+                    or sample["state"] not in {"pipeline_shutdown", "queued_speech", "node_forbids_interruption", "unmuted", "self_heal_release"} \
+                    or last_state.get(sample["caller_step"]) == sample["state"]:
+                invalid()
+            caller = value["caller_steps"][sample["caller_step"] - 1]
+            if not caller["first_frame_ms"] <= sample["at_ms"] <= caller["playback_finished_ms"]:
+                invalid()
+            last_state[sample["caller_step"]] = sample["state"]
+            sampled_steps.add(sample["caller_step"])
+            previous_at = sample["at_ms"]
+        if value["complete"] and sampled_steps != set(range(1, len(value["caller_steps"]) + 1)):
+            invalid()
     return value

@@ -828,6 +828,10 @@ async def _run_pipeline(
     )
 
     engine.configure_test_sandbox(workflow_run)
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        # Observe the existing callback policy only in the isolated test path;
+        # this does not alter or bypass any user-mute strategy.
+        engine._voice_test_timing_evidence = transport.voice_observer.timing_evidence
 
     # Create pipeline components
     audio_buffer, context = create_pipeline_components(audio_config)

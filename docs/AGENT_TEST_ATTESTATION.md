@@ -110,6 +110,14 @@ separate. The retained WAV is unchanged; a cancelled packet's nominal end does
 not prove completed playback. Existing timing v1 and voice-status v1 stay
 readable. Missing evidence does not establish an interruption or speech verdict.
 
+Timing v3 includes bounded changes in the existing callback's shutdown,
+queued-speech, node-forbids-interruption and unmuted states during caller
+playback. Samples bind to the caller timing and contain no node IDs or
+conversation text. The record explicitly leaves the first-bot-complete and
+function-call mute strategies unobserved. This telemetry does not change mute
+behavior; a complete v3 record requires at least one callback sample per caller,
+and the data cannot alone decide whether an interruption was correct.
+
 Input submission can yield to downstream processing before its coroutine
 resumes. The private input records the active caller before yielding and marks
 timing invalid if submission fails. A deterministic race test failed before this
