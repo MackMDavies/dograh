@@ -162,6 +162,10 @@ class PipecatEngine:
 
         # Controls whether user input should be muted
         self._mute_pipeline: bool = False
+        # Enabled only for the isolated voice-test transport; the observing
+        # strategy wrapper reads this fixed reason after the callback returns.
+        self._voice_test_mute_observation_enabled = False
+        self._voice_test_mute_reason = None
 
         # Mute state for queued TTSSpeakFrames (transition speech, custom tool messages)
         # "idle" = not muting, "waiting" = speech queued, "playing" = bot speaking it
@@ -1326,6 +1330,16 @@ class PipecatEngine:
             and not self._current_node.allow_interrupt
         )
 
+        if self._voice_test_mute_observation_enabled:
+            if self._mute_pipeline:
+                self._voice_test_mute_reason = "pipeline_shutdown"
+            elif self._queued_speech_mute_state != "idle":
+                self._voice_test_mute_reason = "queued_speech"
+            elif self._bot_is_speaking and self._current_node is not None and not self._current_node.allow_interrupt:
+                self._voice_test_mute_reason = "node_forbids_interruption"
+            else:
+                self._voice_test_mute_reason = "unmuted"
+
         if muted:
             now = time.monotonic()
             if self._mute_active_since is None:
@@ -1342,6 +1356,8 @@ class PipecatEngine:
                 self._bot_is_speaking = False
                 self._queued_speech_mute_state = "idle"
                 self._mute_active_since = None
+                if self._voice_test_mute_observation_enabled:
+                    self._voice_test_mute_reason = "self_heal_release"
                 return False
             return True
 

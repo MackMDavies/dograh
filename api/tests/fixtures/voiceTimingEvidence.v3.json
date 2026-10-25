@@ -1,0 +1,24 @@
+{
+  "fixtures": [
+    {"file_name":"caller-001.wav","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","duration_ms":20},
+    {"file_name":"caller-002.wav","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","duration_ms":20}
+  ],
+  "timing": {
+    "version":3,
+    "scope":"native monotonic PCM submission, interruption events and sampled callback mute policy; other mute strategies are not observed; excludes phonetic pauses, carrier and network latency",
+    "complete":true,
+    "caller_steps":[
+      {"file_name":"caller-001.wav","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","pcm_bytes":640,"submitted_pcm_bytes":640,"first_frame_ms":0,"last_frame_end_ms":20,"playback_finished_ms":20},
+      {"file_name":"caller-002.wav","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","pcm_bytes":640,"submitted_pcm_bytes":640,"first_frame_ms":60,"last_frame_end_ms":80,"playback_finished_ms":80}
+    ],
+    "responses":[
+      {"response_sequence":1,"pcm_bytes":64,"started_ms":15,"first_pcm_ms":16,"last_pcm_end_ms":18,"stopped_ms":17.5,"delivery_gap_count":0,"max_delivery_gap_ms":0,"total_delivery_gap_ms":0,"cancelled_write":{"pcm_start_byte":0,"pcm_end_byte":64,"submitted_ms":16,"cancelled_ms":17}},
+      {"response_sequence":2,"pcm_bytes":64,"started_ms":85,"first_pcm_ms":86,"last_pcm_end_ms":88,"stopped_ms":89,"delivery_gap_count":0,"max_delivery_gap_ms":0,"total_delivery_gap_ms":0,"cancelled_write":null}
+    ],
+    "interruptions":[{"sequence":1,"at_ms":16.5,"response_sequence":1,"caller_step":1,"caller_active":true}],
+    "callback_mute_policy":{"other_mute_strategies_observed":false,"samples":[
+      {"sequence":1,"at_ms":1,"caller_step":1,"state":"unmuted"},
+      {"sequence":2,"at_ms":61,"caller_step":2,"state":"node_forbids_interruption"}
+    ]}
+  }
+}

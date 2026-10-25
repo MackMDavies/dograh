@@ -24,12 +24,30 @@ from api.services.workflow.variable_resolution import sanitize_context_variables
 
 class WorkflowRunClient(BaseDBClient):
     async def save_agent_test_voice_result(
-        self, run_id, workflow_id, organization_id, session_id, result
+        self, run_id, workflow_id, organization_id, session_id, result, *, tool_trace=None, audio_evidence=None
     ):
         """Atomically add immutable private evidence without replacing annotations."""
         async with self.async_session() as session:
             annotations = cast(WorkflowRunModel.annotations, JSONB)
             saved = annotations.op("->")("agent_test_voice_result")
+            updated_annotations = func.jsonb_set(
+                annotations, array(["agent_test_voice_result"], type_=Text), literal(result, JSONB), True,
+            )
+            trace_guards = []
+            if tool_trace is not None:
+                saved_trace = annotations.op("->")("agent_test_voice_tool_trace")
+                trace_guards.append(or_(saved_trace.is_(None), saved_trace == literal(tool_trace, JSONB)))
+                updated_annotations = func.jsonb_set(
+                    updated_annotations, array(["agent_test_voice_tool_trace"], type_=Text),
+                    literal(tool_trace, JSONB), True,
+                )
+            if audio_evidence is not None:
+                saved_audio = annotations.op("->")("agent_test_voice_audio_evidence")
+                trace_guards.append(or_(saved_audio.is_(None), saved_audio == literal(audio_evidence, JSONB)))
+                updated_annotations = func.jsonb_set(
+                    updated_annotations, array(["agent_test_voice_audio_evidence"], type_=Text),
+                    literal(audio_evidence, JSONB), True,
+                )
             written = await session.execute(
                 update(WorkflowRunModel)
                 .where(
@@ -48,11 +66,9 @@ class WorkflowRunClient(BaseDBClient):
                         }
                     }),
                     or_(saved.is_(None), saved == literal(result, JSONB)),
+                    *trace_guards,
                 )
-                .values(annotations=cast(func.jsonb_set(
-                    annotations, array(["agent_test_voice_result"], type_=Text),
-                    literal(result, JSONB), True,
-                ), JSON))
+                .values(annotations=cast(updated_annotations, JSON))
                 .returning(WorkflowRunModel.id)
             )
             exists = written.scalar_one_or_none() is not None

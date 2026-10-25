@@ -9,6 +9,8 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     InputAudioRawFrame,
+    InterruptionFrame,
+    StartFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
@@ -27,7 +29,10 @@ from api.tests.test_sandbox_audio_transport import wav_fixture
 from api.tests.test_voice_test_control import SESSION, metadata, wav_bytes
 
 
-def setup(*, mode="caller_first", delivery="after_response", next_delivery=None):
+def setup(
+    *, mode="caller_first", delivery="after_response", next_delivery=None,
+    response_delay=0.04,
+):
     data = metadata()
     data["script"].update(start_mode=mode, opening_timeout_ms=500)
     data["script"]["steps"][0].update(delivery=delivery, response_timeout_ms=500)
@@ -51,10 +56,10 @@ def setup(*, mode="caller_first", delivery="after_response", next_delivery=None)
     async def speak():
         observer.observe_output(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         observer.record_audio(asyncio.get_running_loop().time(), 640)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(response_delay)
         observer.observe_output(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
-    async def play(encoded):
+    async def play(encoded, *, fixture_id=None):
         played.append(encoded)
         current = observer.current
         if current and current.stopped_at is None:
@@ -104,7 +109,9 @@ async def test_saved_script_drives_complete_exchanges_without_claiming_quality(
     mode, next_delivery
 ):
     session, fixtures, transport, observer, played, tasks = setup(
-        mode=mode, next_delivery=next_delivery
+        mode=mode,
+        next_delivery=next_delivery,
+        response_delay=0.2 if mode == "agent_first" and next_delivery == "interrupt" else 0.04,
     )
     await observer.on_pipeline_started()
     if mode == "agent_first":
@@ -220,7 +227,7 @@ async def test_no_response_after_caller_is_a_timeout_and_not_a_pass():
     session, fixtures, transport, observer, played, _ = setup()
     await observer.on_pipeline_started()
 
-    async def no_reply(encoded):
+    async def no_reply(encoded, *, fixture_id=None):
         played.append(encoded)
 
     transport.play_wav = no_reply
@@ -253,6 +260,31 @@ class FixtureResponder(FrameProcessor):
             await self.push_frame(frame, direction)
 
 
+class FixtureInterruptResponder(FrameProcessor):
+    """Synthetic speaker/VAD stand-in, using actual SDK output cancellation."""
+
+    def __init__(self):
+        super().__init__()
+        self.receiving = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            await self.push_frame(frame, direction)
+            await self.push_frame(TTSAudioRawFrame(b"\x01\x00" * 16000, 16000, 1))
+            await self.push_frame(TTSStoppedFrame())
+        elif isinstance(frame, InputAudioRawFrame):
+            if any(frame.audio) and not self.receiving:
+                self.receiving = True
+                await self.push_frame(InterruptionFrame())
+            elif not any(frame.audio) and self.receiving:
+                self.receiving = False
+                await self.push_frame(TTSAudioRawFrame(b"\x02\x00" * 1280, 16000, 1))
+                await self.push_frame(TTSStoppedFrame())
+        else:
+            await self.push_frame(frame, direction)
+
+
 @pytest.mark.asyncio
 async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
     import hashlib
@@ -269,6 +301,14 @@ async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
     transport = SandboxAudioTransport(duration_limit=5)
     observer = VoiceTurnObserver(transport.output())
     transport.set_voice_observer(observer)
+    observer.timing_evidence.set_turn_detection_source("vad_transcription_speech_timeout")
+    original_record_input = observer.timing_evidence.record_input
+    def record_input(item, at, offset, size, padded_size):
+        original_record_input(item, at, offset, size, padded_size)
+        observer.timing_evidence.record_strategy_mute(at, "first_bot_complete", False)
+        observer.timing_evidence.record_strategy_mute(at, "function_call", False)
+        observer.timing_evidence.record_strategy_mute(at, "workflow_callback", False, "unmuted", True)
+    observer.timing_evidence.record_input = record_input
     responder = FixtureResponder()
     task = PipelineTask(
         Pipeline([transport.input(), responder, transport.output()]),
@@ -287,6 +327,16 @@ async def test_saved_script_runs_through_actual_paced_pcm_and_speaking_events():
         assert observer.current.stopped_at is not None
         assert result["turns"][0]["caller_end_to_first_audio_ms"] >= 0
         assert result["quality_evaluated"] is False
+        timing = observer.timing_evidence.snapshot(pipeline_stopped=True)
+        assert timing["complete"] is True
+        from api.services.workflow.voice_test_timing_evidence import validate_voice_timing_evidence
+        spans = observer.audio_evidence.snapshot(
+            pcm_bytes=len(transport.capture.pcm), responses=observer.responses, pipeline_stopped=True,
+        )["spans"]
+        assert validate_voice_timing_evidence(
+            timing, duration_ms=5000, fixtures=session.fixtures, spans=spans,
+        ) is timing
+        assert timing["caller_steps"][0]["sha256"] == session.fixtures[0].sha256
     finally:
         await task.cancel()
         await asyncio.wait_for(running, timeout=5)

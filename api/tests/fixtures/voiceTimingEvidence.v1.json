@@ -1,0 +1,63 @@
+{
+  "fixtures": [
+    {
+      "file_name": "caller-001.wav",
+      "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "duration_ms": 20
+    },
+    {
+      "file_name": "caller-002.wav",
+      "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "duration_ms": 20
+    }
+  ],
+  "timing": {
+    "version": 1,
+    "scope": "native monotonic PCM delivery; excludes phonetic pauses, carrier and network latency",
+    "complete": true,
+    "caller_steps": [
+      {
+        "file_name": "caller-001.wav",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "pcm_bytes": 640,
+        "submitted_pcm_bytes": 640,
+        "first_frame_ms": 0,
+        "last_frame_end_ms": 20,
+        "playback_finished_ms": 20
+      },
+      {
+        "file_name": "caller-002.wav",
+        "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "pcm_bytes": 640,
+        "submitted_pcm_bytes": 640,
+        "first_frame_ms": 60,
+        "last_frame_end_ms": 80,
+        "playback_finished_ms": 80
+      }
+    ],
+    "responses": [
+      {
+        "response_sequence": 1,
+        "pcm_bytes": 64,
+        "started_ms": 25,
+        "first_pcm_ms": 26,
+        "last_pcm_end_ms": 28,
+        "stopped_ms": 29,
+        "delivery_gap_count": 0,
+        "max_delivery_gap_ms": 0,
+        "total_delivery_gap_ms": 0
+      },
+      {
+        "response_sequence": 2,
+        "pcm_bytes": 64,
+        "started_ms": 85,
+        "first_pcm_ms": 86,
+        "last_pcm_end_ms": 88,
+        "stopped_ms": 89,
+        "delivery_gap_count": 0,
+        "max_delivery_gap_ms": 0,
+        "total_delivery_gap_ms": 0
+      }
+    ]
+  }
+}

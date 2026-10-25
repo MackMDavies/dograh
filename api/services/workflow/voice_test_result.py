@@ -28,14 +28,15 @@ def validate_rehearsal(value, session):
         or len(turns) != len(session.script.steps)
     ):
         raise VoiceControlError("voice_report_invalid")
-    previous = 0
+    previous = 1 if session.script.start_mode == "agent_first" else 0
     for turn, step in zip(turns, session.script.steps):
-        if not isinstance(turn, dict) or set(turn) != {
+        expected_keys = {
             "file_name",
             "delivery",
             "response_sequence",
             "caller_end_to_first_audio_ms",
-        }:
+        } | ({"interruption_outcome"} if step.delivery == "interrupt" else set())
+        if not isinstance(turn, dict) or set(turn) != expected_keys:
             raise VoiceControlError("voice_report_invalid")
         sequence = turn["response_sequence"]
         latency = turn["caller_end_to_first_audio_ms"]
@@ -43,15 +44,28 @@ def validate_rehearsal(value, session):
             turn["file_name"] != step.file_name
             or turn["delivery"] != step.delivery
             or type(sequence) is not int
-            or not previous < sequence <= 128
+            or not 0 < sequence <= 128
         ):
             raise VoiceControlError("voice_report_invalid")
-        if (
-            type(latency) not in (int, float)
-            or not math.isfinite(latency)
-            or abs(latency) > session.duration_seconds * 1000
-        ):
+
+        latency_valid = type(latency) in (int, float) and math.isfinite(latency) \
+            and abs(latency) <= session.duration_seconds * 1000
+        if step.delivery == "after_response" and (not previous < sequence or not latency_valid):
             raise VoiceControlError("voice_report_invalid")
+        if step.delivery == "interrupt":
+            outcome = turn["interruption_outcome"]
+            if outcome not in {"interrupted_and_replied", "interrupted_without_reply",
+                               "suppressed_by_node_policy", "unverified"}:
+                raise VoiceControlError("voice_report_invalid")
+            if outcome == "interrupted_and_replied" and (not previous < sequence or not latency_valid):
+                raise VoiceControlError("voice_report_invalid")
+            if outcome in {"interrupted_without_reply", "suppressed_by_node_policy"} \
+                    and (sequence != previous or latency is not None):
+                raise VoiceControlError("voice_report_invalid")
+            if outcome == "unverified" and not (
+                (sequence == previous and latency is None) or (previous < sequence and latency_valid)
+            ):
+                raise VoiceControlError("voice_report_invalid")
         previous = sequence
     return value
 

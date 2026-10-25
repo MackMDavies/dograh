@@ -97,7 +97,7 @@ def setup():
         run.annotations = copy.deepcopy(kwargs.get("annotations", run.annotations))
         return run
 
-    async def save_result(run_id, workflow_id, organization_id, session_id, report):
+    async def save_result(run_id, workflow_id, organization_id, session_id, report, *, tool_trace=None, audio_evidence=None):
         assert (run_id, workflow_id, organization_id, session_id) == (
             123,
             185,
@@ -105,6 +105,10 @@ def setup():
             SESSION,
         )
         run.annotations["agent_test_voice_result"] = copy.deepcopy(report)
+        if tool_trace is not None:
+            run.annotations["agent_test_voice_tool_trace"] = copy.deepcopy(tool_trace)
+        if audio_evidence is not None:
+            run.annotations["agent_test_voice_audio_evidence"] = copy.deepcopy(audio_evidence)
         return True
 
     db = SimpleNamespace(
@@ -150,15 +154,16 @@ def setup():
             cancel=AsyncMock(side_effect=lambda **_: closed.set()),
         )
 
-        async def play(encoded):
+        async def play(encoded, *, fixture_id=None):
             assert encoded == wav_bytes()
             observer.observe_output(
                 BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM
             )
             at = asyncio.get_running_loop().time()
             frame = OutputAudioRawFrame(b"\x01\x00" * 320, 16000, 1)
+            pcm_start_byte = len(transport.capture.pcm)
             transport.capture.append(frame, at)
-            observer.record_audio(at, len(frame.audio))
+            observer.record_audio(at, len(frame.audio), pcm_start_byte=pcm_start_byte)
             await asyncio.sleep(0.025)
             observer.observe_output(
                 BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM

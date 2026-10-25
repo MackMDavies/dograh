@@ -100,6 +100,58 @@ The final media/client/rehearsal run passed 91 checks, including six invalid
 duration cases and an opening with speaking events but no actual PCM. The latter
 must time out before any caller fixture plays.
 
+### Interruption timing follow-up (local source, 25 October 2026)
+
+The immutable audio-evidence sidecar can include timing v2 when an output
+interruption or write cancellation was observed. It retains bounded native
+interruption events, active caller/response identities and the exact cancelled
+PCM tail. Submission, cancellation, nominal packet end and bot stop remain
+separate. The retained WAV is unchanged; a cancelled packet's nominal end does
+not prove completed playback. Existing timing v1 and voice-status v1 stay
+readable. Missing evidence does not establish an interruption or speech verdict.
+
+Timing v4 samples the boolean result from each of the three existing user-mute
+strategies in the isolated voice-test pipeline. The workflow callback adds only
+a fixed reason enum. Samples bind to caller timing and contain no node IDs,
+function arguments or conversation text. A complete v4 record requires all
+three strategies to be observed for every caller step. The strategy wrappers
+preserve their original return values and delegation behavior; realtime provider
+turn detection remains outside the mute results, so the telemetry does not alone
+score whether an interruption was correct. Timing v1/v2/v3 remain readable.
+Focused v4 validation passed 58 protocol/runtime-strategy checks and four
+persisted synthetic interrupted-job/readback checks on Linux Python 3.13.17.
+
+Timing v5 adds the configured native turn-start strategy and caller-bound
+downstream user-start/VAD-start signals. Fixed strategy labels distinguish
+Google server VAD, realtime external events, Deepgram Flux plus VAD, and local
+VAD/transcription modes. An empty signal list is valid evidence and is not a
+pass or fail. The v4 mute decisions remain present; native and engine readers
+retain v1 through v4 and strictly validate v5. These labels and output frames do
+not expose provider internals or prove that an interruption was correct.
+Focused v5 protocol checks passed 67 native and 64 engine assertions. The
+complete selected native private-voice timing file passed within a 682-check
+private-runtime selection; the wider pinned Linux/Python 3.13 private-voice
+selection passed 723 checks. The full application suite was not rerun for this
+local evidence change.
+
+Input submission can yield to downstream processing before its coroutine
+resumes. The private input records the active caller before yielding and marks
+timing invalid if submission fails. A deterministic race test failed before this
+ordering fix. The failed-submission check prevents a prepared frame from becoming
+complete evidence.
+
+The final 695-check Linux/Python 3.13.17 selection passed against the pinned
+Pipecat source. It includes actual paced output cancellation and ordinary and
+interrupted scripts through job persistence and the authenticated reader. The
+speaker/VAD stand-ins are synthetic; no speech provider, carrier or production
+service was used. Engine input/result retention has separate PostgreSQL checks.
+
+These observations do not score configured interruption policy. Initial-opening
+muting, queued transition/tool speech, per-node `allow_interrupt` and provider
+turn strategies must inform the eventual criteria. Purpose-authored coverage,
+speech calibration and authenticated release acceptance remain unfinished. This
+local source is not a production rollout.
+
 ## Durable private voice jobs and reports (local source, 19 October 2026)
 
 The authenticated internal voice routes accept only a reserved session UUID and

@@ -88,16 +88,21 @@ class RealtimeFeedbackObserver(BaseObserver):
         self,
         ws_sender: Callable[[dict], Awaitable[None]],
         logs_buffer: Optional["InMemoryLogsBuffer"] = None,
+        *,
+        redact_tool_values: bool = False,
     ):
         """
         Args:
             ws_sender: Async function to send messages over WebSocket.
                        Expected signature: async def send(message: dict) -> None
             logs_buffer: Optional InMemoryLogsBuffer to persist events for post-call analysis.
+            redact_tool_values: Omit sandbox tool inputs/results before streaming,
+                persistence or frame logging. Runtime frames remain unchanged.
         """
         super().__init__()
         self._ws_sender = ws_sender
         self._logs_buffer = logs_buffer
+        self._redact_tool_values = redact_tool_values
         self._frames_seen: Set[str] = set()
 
         # Clock/timing for pts-based frames (similar to base_output.py)
@@ -191,7 +196,14 @@ class RealtimeFeedbackObserver(BaseObserver):
             return
         self._frames_seen.add(frame.id)
 
-        logger.trace(f"{self} Received Frame: {frame} Direction: {frame_direction}")
+        if self._redact_tool_values:
+            # Even diagnostic frame formatting can serialize tool arguments or
+            # provider results. Private feedback never formats the frame itself.
+            logger.trace(
+                f"{self} Received Frame: {type(frame).__name__} Direction: {frame_direction}"
+            )
+        else:
+            logger.trace(f"{self} Received Frame: {frame} Direction: {frame_direction}")
 
         # Handle pipeline termination - stop clock task
         if isinstance(frame, (EndFrame, CancelFrame, StopFrame)):
@@ -279,25 +291,29 @@ class RealtimeFeedbackObserver(BaseObserver):
             isinstance(frame, FunctionCallInProgressFrame)
             and frame_direction == FrameDirection.DOWNSTREAM
         ):
-            await self._send_message(
-                build_function_call_start_event(
-                    function_name=frame.function_name,
-                    tool_call_id=frame.tool_call_id,
-                    arguments=dict(frame.arguments or {}),
-                )
+            message = build_function_call_start_event(
+                function_name=frame.function_name,
+                tool_call_id=frame.tool_call_id,
+                arguments=(
+                    None if self._redact_tool_values else dict(frame.arguments or {})
+                ),
             )
+            if self._redact_tool_values:
+                message["payload"]["values_redacted"] = True
+            await self._send_message(message)
         # Handle function call result
         elif (
             isinstance(frame, FunctionCallResultFrame)
             and frame_direction == FrameDirection.DOWNSTREAM
         ):
-            await self._send_message(
-                build_function_call_end_event(
-                    function_name=frame.function_name,
-                    tool_call_id=frame.tool_call_id,
-                    result=frame.result,
-                )
+            message = build_function_call_end_event(
+                function_name=frame.function_name,
+                tool_call_id=frame.tool_call_id,
+                result=None if self._redact_tool_values else frame.result,
             )
+            if self._redact_tool_values:
+                message["payload"]["values_redacted"] = True
+            await self._send_message(message)
         # Handle TTFB metrics — the two stages a caller actually waits on
         elif isinstance(frame, MetricsFrame):
             for metric_data in frame.data:

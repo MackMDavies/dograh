@@ -54,6 +54,7 @@ from api.services.pipecat.recording_audio_cache import (
 from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
 from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+from api.services.pipecat.observed_user_mute_strategy import ObservedUserMuteStrategy
 from api.services.pipecat.service_factory import (
     create_llm_service,
     create_llm_service_from_provider,
@@ -614,6 +615,11 @@ async def _run_pipeline(
         llm = create_llm_service(user_config)
         inference_llm = None
 
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        trace = transport.voice_observer.tool_trace
+        if trace is not None:
+            trace.attach(llm)
+
     # Stamp the providers/models actually resolved for this run onto
     # initial_context so they're available for post-call analytics
     # (model_overrides may have shifted them away from the org-level
@@ -829,6 +835,10 @@ async def _run_pipeline(
     )
 
     engine.configure_test_sandbox(workflow_run)
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        # Observe the existing callback policy only in the isolated test path;
+        # this does not alter or bypass any user-mute strategy.
+        engine._voice_test_timing_evidence = transport.voice_observer.timing_evidence
 
     # Create pipeline components
     audio_buffer, context = create_pipeline_components(audio_config)
@@ -853,20 +863,36 @@ async def _run_pipeline(
         correct_aggregation_callback=engine.create_aggregation_correction_callback(),
     )
 
-    user_mute_strategies = [
-        MuteUntilFirstBotCompleteUserMuteStrategy(),
-        FunctionCallUserMuteStrategy(),
-        CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
-    ]
+    first_bot_mute = MuteUntilFirstBotCompleteUserMuteStrategy()
+    function_call_mute = FunctionCallUserMuteStrategy()
+    workflow_mute = CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user)
+    user_mute_strategies = [first_bot_mute, function_call_mute, workflow_mute]
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        timing_evidence = transport.voice_observer.timing_evidence
+        engine._voice_test_mute_observation_enabled = True
+        engine._voice_test_mute_reason = None
+        user_mute_strategies = [
+            ObservedUserMuteStrategy(first_bot_mute, "first_bot_complete", timing_evidence),
+            ObservedUserMuteStrategy(function_call_mute, "function_call", timing_evidence),
+            ObservedUserMuteStrategy(workflow_mute, "workflow_callback", timing_evidence,
+                reason=lambda: engine._voice_test_mute_reason,
+                node_allows_interrupt=lambda: getattr(engine._current_node, "allow_interrupt", None)),
+        ]
     user_vad_analyzer = SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
 
     # Configure turn strategies based on STT provider, model, and workflow configuration
     if is_realtime:
         # Realtime services still need user-turn tracking even when the model
         # itself owns speech generation and interruption behavior.
-        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(
-            user_config.realtime.provider
-        )
+        realtime_provider = user_config.realtime.provider
+        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(realtime_provider)
+        if realtime_provider in {ServiceProviders.GOOGLE_REALTIME.value, ServiceProviders.GOOGLE_VERTEX_REALTIME.value}:
+            turn_detection_source = "google_server_vad"
+        elif realtime_provider in {ServiceProviders.OPENAI_REALTIME.value, ServiceProviders.ELEVENLABS_REALTIME.value,
+                                    ServiceProviders.GROK_REALTIME.value}:
+            turn_detection_source = "realtime_external_events"
+        else:
+            turn_detection_source = "realtime_local_vad"
     else:
         # Deepgram Flux uses external turn detection (VAD + External start/stop)
         # Other models use configurable turn detection strategy
@@ -876,6 +902,7 @@ async def _run_pipeline(
         )
 
         if is_deepgram_flux:
+            turn_detection_source = "deepgram_flux_vad_external"
             user_turn_strategies = UserTurnStrategies(
                 start=[
                     VADUserTurnStartStrategy(),
@@ -884,6 +911,7 @@ async def _run_pipeline(
                 stop=[ExternalUserTurnStopStrategy()],
             )
         elif turn_stop_strategy == "turn_analyzer":
+            turn_detection_source = "vad_transcription_turn_analyzer"
             # Smart Turn Analyzer: best for longer responses with natural pauses
             smart_turn_params = SmartTurnParams(stop_secs=smart_turn_stop_secs)
             user_turn_strategies = UserTurnStrategies(
@@ -898,6 +926,7 @@ async def _run_pipeline(
                 ],
             )
         else:
+            turn_detection_source = "vad_transcription_speech_timeout"
             # Transcription-based (default): best for short 1-2 word responses
             user_turn_strategies = UserTurnStrategies(
                 start=[
@@ -906,6 +935,9 @@ async def _run_pipeline(
                 ],
                 stop=[SpeechTimeoutUserTurnStopStrategy()],
             )
+
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        transport.voice_observer.timing_evidence.set_turn_detection_source(turn_detection_source)
 
     user_params = LLMUserAggregatorParams(
         user_turn_strategies=user_turn_strategies,
@@ -1123,6 +1155,7 @@ async def _run_pipeline(
     feedback_observer = RealtimeFeedbackObserver(
         ws_sender=ws_sender,
         logs_buffer=in_memory_logs_buffer,
+        redact_tool_values=is_agent_test_sandbox,
     )
     task.add_observer(feedback_observer)
 

@@ -124,6 +124,7 @@ class _FixtureInput(BaseInputTransport):
         self.active: tuple[bytes, asyncio.Future] | None = None
         self.cursor = 0
         self.deadline = 0.0
+        self.active_evidence = None
 
     async def start(self, frame: StartFrame):
         await super().start(frame)
@@ -133,7 +134,7 @@ class _FixtureInput(BaseInputTransport):
         self.started.set()
         await self.owner._call_event_handler("on_client_connected", None)
 
-    async def play(self, fixture: AudioFixture) -> None:
+    async def play(self, fixture: AudioFixture, *, evidence_identity=None) -> None:
         await asyncio.wait_for(self.started.wait(), timeout=5)
         async with self.play_lock:
             if self.closed:
@@ -146,12 +147,17 @@ class _FixtureInput(BaseInputTransport):
                     "The fixture does not fit in the remaining audio budget"
                 )
             done = asyncio.get_running_loop().create_future()
+            if self.owner.voice_observer is not None and evidence_identity is not None:
+                self.active_evidence = self.owner.voice_observer.timing_evidence.begin_caller(
+                    *evidence_identity, len(fixture.pcm)
+                )
             self.active = (fixture.pcm, done)
             self.cursor = 0
             try:
                 await done
             finally:
                 self.active = None
+                self.active_evidence = None
 
     async def _stream(self):
         loop = asyncio.get_running_loop()
@@ -170,11 +176,25 @@ class _FixtureInput(BaseInputTransport):
                 else bytes(CHUNK_BYTES)
             )
             audio = audio.ljust(CHUNK_BYTES, b"\0")
-            await self.push_audio_frame(InputAudioRawFrame(audio, SAMPLE_RATE, 1))
+            evidence = self.owner.voice_observer.timing_evidence if active and self.owner.voice_observer is not None else None
+            # Submitting can yield to downstream VAD/provider signals. Record
+            # the active caller before that handoff; failed submission can
+            # never certify a completed input or timing snapshot.
+            if evidence is not None:
+                evidence.record_input(self.active_evidence, frame_started_at, self.cursor,
+                    min(CHUNK_BYTES, len(active[0]) - self.cursor), len(audio))
+            try:
+                await self.push_audio_frame(InputAudioRawFrame(audio, SAMPLE_RATE, 1))
+            except BaseException:
+                if evidence is not None:
+                    evidence.invalid = True
+                raise
             if active:
                 self.cursor += CHUNK_BYTES
             await asyncio.sleep(max(0, frame_started_at + CHUNK_SECONDS - loop.time()))
             if active and self.cursor >= len(active[0]) and not active[1].done():
+                if self.owner.voice_observer is not None:
+                    self.owner.voice_observer.timing_evidence.finish_input(self.active_evidence, loop.time())
                 # Clear before waking the sender so trailing silence cannot
                 # replay the last fixture while it awaits the next response.
                 self.active = None
@@ -222,15 +242,23 @@ class _CapturedOutput(BaseOutputTransport):
     async def write_audio_frame(self, frame: OutputAudioRawFrame) -> bool:
         try:
             at = asyncio.get_running_loop().time()
+            pcm_start_byte = len(self.owner.capture.pcm)
             self.owner.capture.append(frame, at)
+            sequence = None
             if self.owner.voice_observer is not None:
-                self.owner.voice_observer.record_audio(at, len(frame.audio))
+                sequence = self.owner.voice_observer.record_audio(at, len(frame.audio), pcm_start_byte=pcm_start_byte)
         except ValueError as exc:
             self.owner.failure = str(exc)
             return False
         # Native MediaSender must experience the same PCM playback pacing as
         # a live transport; collecting bytes instantly would falsify timing.
-        await asyncio.sleep(len(frame.audio) / (SAMPLE_RATE * 2))
+        try:
+            await asyncio.sleep(len(frame.audio) / (SAMPLE_RATE * 2))
+        except asyncio.CancelledError:
+            if frame.audio and self.owner.voice_observer is not None:
+                self.owner.voice_observer.timing_evidence.record_cancelled_output(
+                    asyncio.get_running_loop().time(), sequence, pcm_start_byte, len(frame.audio))
+            raise
         return True
 
 
@@ -283,5 +311,7 @@ class SandboxAudioTransport(BaseTransport):
             )
         self.voice_observer = observer
 
-    async def play_wav(self, encoded: bytes) -> None:
-        await self._input.play(AudioFixture.from_wav(encoded))
+    async def play_wav(self, encoded: bytes, *, fixture_id=None) -> None:
+        await self._input.play(AudioFixture.from_wav(encoded), evidence_identity=(
+            fixture_id, hashlib.sha256(encoded).hexdigest()
+        ) if fixture_id is not None else None)
