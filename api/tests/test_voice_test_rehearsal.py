@@ -29,7 +29,10 @@ from api.tests.test_sandbox_audio_transport import wav_fixture
 from api.tests.test_voice_test_control import SESSION, metadata, wav_bytes
 
 
-def setup(*, mode="caller_first", delivery="after_response", next_delivery=None):
+def setup(
+    *, mode="caller_first", delivery="after_response", next_delivery=None,
+    response_delay=0.04,
+):
     data = metadata()
     data["script"].update(start_mode=mode, opening_timeout_ms=500)
     data["script"]["steps"][0].update(delivery=delivery, response_timeout_ms=500)
@@ -53,7 +56,7 @@ def setup(*, mode="caller_first", delivery="after_response", next_delivery=None)
     async def speak():
         observer.observe_output(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
         observer.record_audio(asyncio.get_running_loop().time(), 640)
-        await asyncio.sleep(0.04)
+        await asyncio.sleep(response_delay)
         observer.observe_output(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
 
     async def play(encoded, *, fixture_id=None):
@@ -106,7 +109,9 @@ async def test_saved_script_drives_complete_exchanges_without_claiming_quality(
     mode, next_delivery
 ):
     session, fixtures, transport, observer, played, tasks = setup(
-        mode=mode, next_delivery=next_delivery
+        mode=mode,
+        next_delivery=next_delivery,
+        response_delay=0.2 if mode == "agent_first" and next_delivery == "interrupt" else 0.04,
     )
     await observer.on_pipeline_started()
     if mode == "agent_first":

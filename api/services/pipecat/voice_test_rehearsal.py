@@ -171,7 +171,8 @@ async def run_voice_script(
             lambda: pending.first_audio_at is not None, response_deadline
         )
     evidence = []
-    for step in script.steps:
+    for index, step in enumerate(script.steps):
+        caller_step = index + 1
         if pending is not None:
             if step.delivery == "after_response":
                 await observer.wait_for(
@@ -205,27 +206,92 @@ async def run_voice_script(
         response_deadline = min(
             deadline, caller_finished_at + step.response_timeout_ms / 1000
         )
-        await observer.wait_for(
-            lambda previous=baseline: len(observer.responses) > previous,
-            response_deadline,
-        )
+        previous_response = pending
+        try:
+            await observer.wait_for(
+                lambda previous=baseline: len(observer.responses) > previous,
+                response_deadline,
+            )
+        except VoiceControlError as exc:
+            if step.delivery != "interrupt" or exc.code != "voice_response_timeout":
+                raise
+            caller = (
+                observer.timing_evidence.callers[-1]
+                if observer.timing_evidence.callers else None
+            )
+            samples = [item for item in observer.timing_evidence.mute_policy
+                       if item["caller_step"] == caller_step and caller is not None and caller["first"] is not None
+                       and caller["first"] <= item["at"] <= caller["finished"]]
+            callback_samples = [item for item in samples if item["strategy"] == "workflow_callback"]
+            blocked_by_node = bool(callback_samples) and all(item["muted"]
+                and item["reason"] == "node_forbids_interruption" and item["node_allows_interrupt"] is False
+                for item in callback_samples)
+            interrupted = any(item["caller_step"] == caller_step and item["caller_active"]
+                and item["response_sequence"] == previous_response.sequence
+                and caller is not None and caller["first"] is not None
+                and caller["first"] <= item["at"] <= caller["finished"]
+                for item in observer.timing_evidence.interruptions)
+            cancelled = observer.timing_evidence.cancelled.get(previous_response.sequence)
+            cancelled_during_caller = cancelled is not None and caller is not None and caller["first"] is not None and caller["first"] <= cancelled["cancelled_at"] <= caller["finished"]
+            if blocked_by_node and not interrupted and not cancelled_during_caller:
+                outcome = "suppressed_by_node_policy"
+            elif interrupted and cancelled_during_caller:
+                outcome = "interrupted_without_reply"
+            else:
+                outcome = "unverified"
+            await observer.wait_for(lambda response=previous_response: response.stopped_at is not None, deadline)
+            evidence.append({"file_name": step.file_name, "response_sequence": previous_response.sequence,
+                "caller_end_to_first_audio_ms": None, "delivery": step.delivery,
+                "interruption_outcome": outcome})
+            continue
+
         pending = observer.responses[baseline]
         await observer.wait_for(
             lambda response=pending: response.first_audio_at is not None,
             response_deadline,
         )
-        evidence.append(
-            {
-                "file_name": step.file_name,
-                "response_sequence": pending.sequence,
-                # A negative value records overlapping speech; it must not be
-                # counted as a successful low-latency, non-interrupted turn.
-                "caller_end_to_first_audio_ms": round(
-                    (pending.first_audio_at - caller_finished_at) * 1000, 3
-                ),
-                "delivery": step.delivery,
-            }
-        )
+        turn = {
+            "file_name": step.file_name,
+            "response_sequence": pending.sequence,
+            # A negative value records overlapping speech; it must not be
+            # counted as a successful low-latency, non-interrupted turn.
+            "caller_end_to_first_audio_ms": round(
+                (pending.first_audio_at - caller_finished_at) * 1000, 3
+            ),
+            "delivery": step.delivery,
+        }
+        if step.delivery == "interrupt":
+            caller = (
+                observer.timing_evidence.callers[-1]
+                if observer.timing_evidence.callers else None
+            )
+            samples = [item for item in observer.timing_evidence.mute_policy
+                       if item["caller_step"] == caller_step and caller is not None and caller["first"] is not None
+                       and caller["first"] <= item["at"] <= caller["finished"]]
+            callback_samples = [item for item in samples if item["strategy"] == "workflow_callback"]
+            interrupted = any(item["caller_step"] == caller_step and item["caller_active"]
+                and item["response_sequence"] == previous_response.sequence
+                and caller is not None and caller["first"] is not None
+                and caller["first"] <= item["at"] <= caller["finished"]
+                for item in observer.timing_evidence.interruptions)
+            cancelled = observer.timing_evidence.cancelled.get(previous_response.sequence)
+            cancelled_during_caller = cancelled is not None and caller is not None and caller["first"] is not None and caller["first"] <= cancelled["cancelled_at"] <= caller["finished"]
+            callback_allows = bool(callback_samples) and all(not item["muted"]
+                and item["reason"] == "unmuted" and item["node_allows_interrupt"] is True
+                for item in callback_samples)
+            strategies_unmuted = all(
+                any(item["strategy"] == strategy for item in samples)
+                and all(not item["muted"] for item in samples if item["strategy"] == strategy)
+                for strategy in ("first_bot_complete", "function_call"))
+            turn_detected = any(item["caller_step"] == caller_step
+                and caller is not None and caller["first"] is not None
+                and caller["first"] <= item["at"] <= caller["finished"]
+                for item in observer.timing_evidence.turn_signals)
+            turn["interruption_outcome"] = "interrupted_and_replied" if (
+                interrupted and cancelled_during_caller and callback_allows and strategies_unmuted and turn_detected
+                and pending.sequence > previous_response.sequence
+            ) else "unverified"
+        evidence.append(turn)
     await observer.wait_for(lambda: pending.stopped_at is not None, response_deadline)
     if transport.failure:
         raise VoiceControlError("voice_pipeline_failed")

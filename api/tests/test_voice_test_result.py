@@ -11,6 +11,7 @@ from api.services.workflow.voice_test_job import (
     read_voice_job_status,
 )
 from api.services.workflow.voice_test_result import validate_voice_report
+from api.services.workflow.voice_test_result import validate_rehearsal
 from api.tests.test_voice_test_control import SECRET
 from api.tests.test_voice_test_job import MemoryRedis, setup
 
@@ -109,6 +110,58 @@ async def test_private_runtime_binding_tampering_cannot_be_exposed_as_verified_r
     run.annotations["sysevo_test_sandbox"]["workflow_binding"]["signature"] = "bad"
     with pytest.raises(ValueError):
         await read_voice_job_status(db, control, MemoryRedis(), context, SECRET)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "outcome,sequence,latency",
+    [
+        ("interrupted_and_replied", 2, 120.0),
+        ("interrupted_without_reply", 1, None),
+        ("suppressed_by_node_policy", 1, None),
+        ("unverified", 1, None),
+    ],
+)
+async def test_interruption_rehearsal_records_reply_or_policy_suppression_explicitly(outcome, sequence, latency):
+    _, _, _, _, session, _ = await completed()
+    first = replace(session.script.steps[0], delivery="after_response")
+    second = replace(first, file_name="caller-002.wav", delivery="interrupt")
+    session = replace(session, fixtures=(*session.fixtures, replace(session.fixtures[0], file_name="caller-002.wav")),
+                      script=replace(session.script, start_mode="caller_first", steps=(first, second)))
+    rehearsal = {
+        "status": "script_executed",
+        "turns": [
+            {"file_name": "caller-001.wav", "delivery": "after_response", "response_sequence": 1,
+             "caller_end_to_first_audio_ms": 100.0},
+            {"file_name": "caller-002.wav", "delivery": "interrupt", "response_sequence": sequence,
+             "caller_end_to_first_audio_ms": latency, "interruption_outcome": outcome},
+        ],
+        "measurement_scope": "saved caller PCM to native output speech segments; excludes carrier and network latency",
+        "quality_evaluated": False,
+    }
+    assert validate_rehearsal(rehearsal, session) is rehearsal
+
+
+@pytest.mark.asyncio
+async def test_interruption_report_cannot_claim_a_new_reply_with_the_previous_response_sequence():
+    _, _, _, _, session, _ = await completed()
+    first = replace(session.script.steps[0], delivery="after_response")
+    second = replace(first, file_name="caller-002.wav", delivery="interrupt")
+    session = replace(session, fixtures=(*session.fixtures, replace(session.fixtures[0], file_name="caller-002.wav")),
+                      script=replace(session.script, start_mode="caller_first", steps=(first, second)))
+    rehearsal = {
+        "status": "script_executed",
+        "turns": [
+            {"file_name": "caller-001.wav", "delivery": "after_response", "response_sequence": 1,
+             "caller_end_to_first_audio_ms": 100.0},
+            {"file_name": "caller-002.wav", "delivery": "interrupt", "response_sequence": 1,
+             "caller_end_to_first_audio_ms": 120.0, "interruption_outcome": "interrupted_and_replied"},
+        ],
+        "measurement_scope": "saved caller PCM to native output speech segments; excludes carrier and network latency",
+        "quality_evaluated": False,
+    }
+    with pytest.raises(VoiceControlError, match="voice_report_invalid"):
+        validate_rehearsal(rehearsal, session)
 
 
 @pytest.mark.asyncio
