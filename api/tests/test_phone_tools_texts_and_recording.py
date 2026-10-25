@@ -51,15 +51,21 @@ def test_texting_needs_a_number_the_hook_and_a_real_call(monkeypatch):
     off = normalize_policy({"tools": {"sms": {"mode": "off"}}})
     assert builtin.SEND_TEXT not in _engine(off, caller_number="+15550001111")._builtin_phone_tools()
     monkeypatch.delenv("SYSEVO_CALL_LIVE_URL")
+    monkeypatch.delenv("SYSEVO_PRE_CALL_CHECK_URL", raising=False)
     assert builtin.SEND_TEXT not in _engine(caller_number="+15550001111")._builtin_phone_tools()
 
 
-def test_the_hook_url_sits_next_to_the_live_call_hook(monkeypatch):
-    monkeypatch.delenv("SYSEVO_AGENT_SMS_URL", raising=False)
-    monkeypatch.setenv("SYSEVO_CALL_LIVE_URL", LIVE_URL)
+def test_the_hook_url_sits_next_to_the_other_sysevo_hooks(monkeypatch):
+    for env in ("SYSEVO_AGENT_SMS_URL", "SYSEVO_CALL_LIVE_URL", "SYSEVO_MEMORY_PRE_CALL_URL", "SYSEVO_WALLET_DEBIT_URL"):
+        monkeypatch.delenv(env, raising=False)
+    # Production has no SYSEVO_CALL_LIVE_URL; the pre-call check is always set.
+    monkeypatch.setenv("SYSEVO_PRE_CALL_CHECK_URL", "https://ref.supabase.co/functions/v1/dograh-pre-call-check")
     assert builtin.sms_hook_url() == "https://ref.supabase.co/functions/v1/dograh-agent-sms"
     monkeypatch.setenv("SYSEVO_AGENT_SMS_URL", "https://x/y")
     assert builtin.sms_hook_url() == "https://x/y"
+    for env in ("SYSEVO_AGENT_SMS_URL", "SYSEVO_PRE_CALL_CHECK_URL"):
+        monkeypatch.delenv(env)
+    assert builtin.sms_hook_url() is None
 
 
 def test_recording_control_needs_the_recorder():

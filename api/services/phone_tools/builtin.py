@@ -51,15 +51,10 @@ SET_RECORDING_PROPERTIES = {
 
 
 def sms_hook_url() -> Optional[str]:
-    """SYSEVO_AGENT_SMS_URL, else the dograh-agent-sms function next to the live-call
-    hook (both are Sysevo edge functions on the same project)."""
-    explicit = os.getenv("SYSEVO_AGENT_SMS_URL")
-    if explicit:
-        return explicit
-    live = os.getenv("SYSEVO_CALL_LIVE_URL") or ""
-    if live.rstrip("/").endswith("/dograh-call-live"):
-        return live.rstrip("/")[: -len("dograh-call-live")] + "dograh-agent-sms"
-    return None
+    """SYSEVO_AGENT_SMS_URL, else dograh-agent-sms next to the other Sysevo hooks."""
+    from api.services.sysevo_functions import sysevo_function_url
+
+    return sysevo_function_url("dograh-agent-sms", "SYSEVO_AGENT_SMS_URL")
 
 
 def clean_text(message: Any) -> str:
