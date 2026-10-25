@@ -76,13 +76,9 @@ def callback_instruction(context: dict) -> Optional[str]:
 
 
 def _hook_url() -> Optional[str]:
-    explicit = os.getenv("SYSEVO_CALLBACK_FAILED_URL")
-    if explicit:
-        return explicit
-    live = (os.getenv("SYSEVO_CALL_LIVE_URL") or "").rstrip("/")
-    if live.endswith("/dograh-call-live"):
-        return live[: -len("dograh-call-live")] + "dograh-callback-failed"
-    return None
+    from api.services.sysevo_functions import sysevo_function_url
+
+    return sysevo_function_url("dograh-callback-failed", "SYSEVO_CALLBACK_FAILED_URL")
 
 
 async def report_final_failure(campaign: Any, queued_run: Any, reason: str) -> None:

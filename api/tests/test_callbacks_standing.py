@@ -47,7 +47,7 @@ def test_the_agent_is_told_why_it_is_calling_back():
 
 @pytest.mark.asyncio
 async def test_an_unanswered_callback_is_reported_for_a_task(monkeypatch):
-    monkeypatch.setenv("SYSEVO_CALL_LIVE_URL", "https://ref.supabase.co/functions/v1/dograh-call-live")
+    monkeypatch.setenv("SYSEVO_PRE_CALL_CHECK_URL", "https://ref.supabase.co/functions/v1/dograh-pre-call-check")
     monkeypatch.setenv("SYSEVO_MEMORY_SECRET", "s")
     monkeypatch.delenv("SYSEVO_CALLBACK_FAILED_URL", raising=False)
     posted = {}
