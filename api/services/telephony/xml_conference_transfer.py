@@ -159,6 +159,14 @@ def build_router(carrier: str) -> APIRouter:
         if context is None or context.resolved:
             return _xml(hangup_xml("This transfer is no longer waiting. Goodbye."))
         await report_transfer_leg(transfer_id, "answered", leg)
+        if context.three_way:
+            from api.services.telephony.warm_transfer import companion_socket_url
+
+            return _xml(
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Stream bidirectional="true" keepCallAlive="true" contentType="audio/x-mulaw;rate=8000">'
+                f"{escape(await companion_socket_url(transfer_id))}</Stream></Response>"
+            )
         if context.warm and context.introduction:
             backend, _ = await get_backend_endpoints()
             return _xml(warm_xml(context.introduction, f"{backend}/api/v1/telephony/{carrier}/transfer-accept/{transfer_id}"))

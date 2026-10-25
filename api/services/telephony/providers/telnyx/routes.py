@@ -181,6 +181,18 @@ async def handle_telnyx_transfer_result(transfer_id: str, request: Request):
     original_call_sid = transfer_context.original_call_sid if transfer_context else ""
     conference_name = transfer_context.conference_name if transfer_context else None
 
+    if transfer_context and transfer_context.three_way:
+        # Three-way: the leg streams to the companion socket; answering is joining.
+        from api.services.telephony.warm_transfer import report_transfer_leg
+
+        outcome = {"call.answered": "answered", "call.hangup": "completed"}.get(event_type)
+        if event_type == "call.hangup" and not transfer_context.resolved:
+            outcome = _HANGUP_CAUSE_TO_REASON.get(payload.get("hangup_cause", ""), "failed")
+            outcome = {"call_failed": "failed"}.get(outcome, outcome)
+        if outcome:
+            return {"status": await report_transfer_leg(transfer_id, outcome, call_control_id)}
+        return {"status": "pending"}
+
     if transfer_context and transfer_context.warm:
         handled = await _handle_warm_transfer_event(
             event_type, payload, transfer_context, call_control_id

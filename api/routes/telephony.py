@@ -1303,3 +1303,13 @@ def _mount_signalwire_dialer_router() -> None:
 
 
 _mount_signalwire_dialer_router()
+
+
+def _mount_companion_router() -> None:
+    # Three-way calls: the colleague's media stream (services/telephony/companion_ws.py).
+    from api.services.telephony.companion_ws import router as companion_router
+
+    router.include_router(companion_router)
+
+
+_mount_companion_router()

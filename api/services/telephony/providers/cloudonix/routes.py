@@ -183,6 +183,10 @@ async def cloudonix_transfer_answer(transfer_id: str):
     if context is None or context.resolved:
         return _cxml(twilio_decline_twiml())
     await report_transfer_leg(transfer_id, "answered")
+    if context.three_way:
+        from api.services.telephony.warm_transfer import companion_socket_url, companion_stream_twiml
+
+        return _cxml(companion_stream_twiml(await companion_socket_url(transfer_id)))
     if context.warm and context.introduction:
         backend, _ = await get_backend_endpoints()
         return _cxml(twilio_transfer_twiml(

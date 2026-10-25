@@ -643,6 +643,7 @@ class VobizProvider(TelephonyProvider):
         conference_name: str,
         timeout: int = 30,
         introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """Ring the destination; their answer_url joins them to the conference (warm:
@@ -658,6 +659,9 @@ class VobizProvider(TelephonyProvider):
         )
 
     def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
         return True
 
     def supports_transfers(self) -> bool:

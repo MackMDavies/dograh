@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 import asyncio
 import time
+from contextlib import suppress
 
 from loguru import logger
 
@@ -239,6 +240,9 @@ class PipecatEngine:
         self._phone_tools_sandbox = False
         self._texts_sent = 0
         self._payment_links: list[dict] = []
+        self._companion_mixer = None
+        self._companion_input = None
+        self._companion_bridge = None
         self._payment_links_task: Optional[asyncio.Task] = None
 
     async def _get_organization_id(self) -> Optional[int]:
@@ -1444,6 +1448,53 @@ class PipecatEngine:
                 caller_keypad.set_handler(self._on_caller_keys, self._caller_keys_accepted)
             else:
                 caller_keypad.set_handler(None)
+
+    def set_companion(self, mixer, input_processor) -> None:
+        """Where a three-way colleague is mixed in (services/pipecat/companion.py)."""
+        self._companion_mixer = mixer
+        self._companion_input = input_processor
+
+    def companion_available(self) -> bool:
+        return self._companion_mixer is not None and self._companion_input is not None
+
+    async def start_companion(self, transfer_id: str) -> bool:
+        """The colleague answered: mix them in. The agent stays on the call."""
+        from api.constants import REDIS_URL
+        from api.services.pipecat.companion import CompanionBridge
+
+        if not self.companion_available() or self._audio_config is None:
+            return False
+        await self.stop_companion()
+
+        async def colleague_left() -> None:
+            from pipecat.frames.frames import LLMMessagesAppendFrame
+
+            await self.log_phone_tool_event("conference", outcome="colleague_left")
+            note = LLMMessagesAppendFrame(
+                [{"role": "user", "content": "[Your colleague has left the call. Carry on with the caller.]"}],
+                run_llm=False,
+            )
+            with suppress(Exception):
+                await (self.llm.queue_frame(note) if self._is_realtime else self.task.queue_frame(note))
+
+        bridge = CompanionBridge(
+            transfer_id, self._audio_config.transport_out_sample_rate, REDIS_URL, on_left=colleague_left
+        )
+        await bridge.start()
+        self._companion_bridge = bridge
+        self._companion_mixer.bridge = bridge
+        self._companion_input.bridge = bridge
+        return True
+
+    async def stop_companion(self) -> None:
+        bridge, self._companion_bridge = self._companion_bridge, None
+        if bridge is None:
+            return
+        if self._companion_mixer is not None:
+            self._companion_mixer.bridge = None
+        if self._companion_input is not None:
+            self._companion_input.bridge = None
+        await bridge.stop()
 
     def recording_should_start(self) -> bool:
         """False when the organization starts every call with the recording paused."""

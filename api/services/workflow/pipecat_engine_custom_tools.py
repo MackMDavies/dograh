@@ -790,7 +790,15 @@ class CustomToolManager:
                 # press 1. Carriers that can't read it to them keep the cold transfer.
                 introduction = None
                 mode = config.get("transfer_mode")
-                three_way = mode == "three_way" and provider.supports_three_way()
+                # SIP lines join the colleague in the call's own bridge; stream carriers
+                # dial them as a second media stream that Dograh mixes in.
+                companion = (
+                    mode == "three_way"
+                    and not provider.supports_three_way()
+                    and provider.supports_companion()
+                    and self._engine.companion_available()
+                )
+                three_way = mode == "three_way" and (provider.supports_three_way() or companion)
                 if mode == "three_way" and not three_way:
                     logger.info(
                         f"{type(provider).__name__} cannot hold a three-way call; transferring warm"
@@ -852,7 +860,15 @@ class CustomToolManager:
                             timeout_seconds=timeout_seconds,
                             introduction=introduction,
                             three_way=three_way,
+                            companion=companion,
                         )
+                        if (
+                            companion
+                            and transfer_event
+                            and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
+                            and not await self._engine.start_companion(transfer_event.transfer_id)
+                        ):
+                            transfer_event, reason = None, "join_failed"
                         connected = bool(
                             transfer_event
                             and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
@@ -952,6 +968,7 @@ class CustomToolManager:
         timeout_seconds: int,
         introduction: Optional[str],
         three_way: bool = False,
+        companion: bool = False,
     ) -> tuple[Optional[Any], str]:
         """Ring one destination and wait for the outcome.
 
@@ -977,6 +994,8 @@ class CustomToolManager:
 
         try:
             warm_kwargs = {"introduction": introduction} if introduction else {}
+            if companion:
+                warm_kwargs["three_way"] = True
             transfer_result = await provider.transfer_call(
                 destination=destination,
                 transfer_id=transfer_id,

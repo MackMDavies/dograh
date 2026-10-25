@@ -212,3 +212,21 @@ async def ari_introduction_audio(transfer_id: str) -> Optional[bytes]:
         return await client.get(_intro_key(transfer_id))
     finally:
         await client.aclose()
+
+
+# ── Three-way on stream carriers: the colleague's media stream ────────────────────
+
+
+async def companion_socket_url(transfer_id: str) -> str:
+    from api.utils.common import get_backend_endpoints
+
+    _, wss = await get_backend_endpoints()
+    return f"{wss}/api/v1/telephony/companion/{transfer_id}"
+
+
+def companion_stream_twiml(socket_url: str) -> str:
+    """TwiML/CXML for the colleague's leg: stream to Dograh; hang up when it ends."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?><Response><Connect>'
+        f'<Stream url="{escape(socket_url)}"/></Connect><Hangup/></Response>'
+    )

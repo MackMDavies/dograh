@@ -266,6 +266,7 @@ def _provider(warm=True):
     return Mock(
         supports_transfers=lambda: True, validate_config=lambda: True,
         supports_warm_transfer=lambda: warm,
+        supports_three_way=lambda: False, supports_companion=lambda: False,
         transfer_call=AsyncMock(return_value={"call_sid": "CA-dest"}),
     )
 
