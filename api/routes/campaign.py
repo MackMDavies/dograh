@@ -1526,6 +1526,31 @@ async def delete_campaign_post(
     return await _do_delete_campaign(campaign_id, user)
 
 
+class StandingCampaignRequest(BaseModel):
+    workflow_id: int
+
+
+@router.post("/standing")
+async def ensure_standing_campaign_endpoint(
+    request: StandingCampaignRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Get or create the agent's callback queue (a standing campaign)."""
+    from api.services.callbacks.standing import ensure_standing_campaign
+
+    workflow = await db_client.get_workflow_by_id(request.workflow_id)
+    if not workflow or (
+        not user.is_superuser and workflow.organization_id != user.selected_organization_id
+    ):
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    campaign, created = await ensure_standing_campaign(workflow)
+    return {
+        "campaign_id": campaign.id,
+        "created": created,
+        "retry_config": campaign.retry_config,
+    }
+
+
 @router.post("/{campaign_id}/enqueue")
 async def enqueue_run(
     campaign_id: int,

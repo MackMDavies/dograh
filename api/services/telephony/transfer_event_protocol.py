@@ -80,6 +80,8 @@ class TransferContext:
     answered: bool = False
     accepted: bool = False
     resolved: bool = False
+    # Three-way: the colleague joins the caller and the agent; nobody is handed off.
+    three_way: bool = False
 
     def to_json(self) -> str:
         """Convert context to JSON string."""

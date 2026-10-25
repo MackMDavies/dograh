@@ -131,3 +131,9 @@ async def handle_plivo_ring_callback(
 ):
     """Handle Plivo ring callbacks."""
     return await _handle_plivo_status_callback(workflow_run_id, request)
+
+
+# Transfers (Keypad & Native Phone Tools): see xml_conference_transfer.py.
+from api.services.telephony.xml_conference_transfer import build_router as _build_transfer_router  # noqa: E402
+
+router.include_router(_build_transfer_router("plivo"))

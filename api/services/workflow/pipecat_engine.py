@@ -34,6 +34,7 @@ if TYPE_CHECKING:
 
 import asyncio
 import time
+from contextlib import suppress
 
 from loguru import logger
 
@@ -236,6 +237,17 @@ class PipecatEngine:
         self._phone_tools: PhoneToolsPolicy = normalize_policy(None)
         self._caller_keypad = None
         self._logs_buffer = None
+        self._audio_buffer = None
+        self._recording_paused = False
+        self._phone_tool_caller_number: Optional[str] = None
+        self._phone_tool_workflow_id: Optional[int] = None
+        self._phone_tools_sandbox = False
+        self._texts_sent = 0
+        self._payment_links: list[dict] = []
+        self._companion_mixer = None
+        self._companion_input = None
+        self._companion_bridge = None
+        self._payment_links_task: Optional[asyncio.Task] = None
 
     async def _get_organization_id(self) -> Optional[int]:
         """Get and cache the organization ID from workflow run."""
@@ -924,6 +936,10 @@ class PipecatEngine:
         # organization switched the keypad tool off.
         if self._phone_tools.enabled("keypad"):
             await self._register_dtmf_function()
+        await self._collect_payment_links()
+        builtin_phone_tools = self._builtin_phone_tools()
+        if builtin_phone_tools:
+            await self._register_builtin_phone_tools(builtin_phone_tools)
         dialer_callback = self._dialer_callback_enabled()
         if dialer_callback:
             await self._register_dialer_callback_function()
@@ -956,6 +972,8 @@ class PipecatEngine:
             custom_tool_manager=self._custom_tool_manager,
             kb_document_uuids=kb_doc_uuids,
             phone_tools_policy=self._phone_tools,
+            builtin_phone_tools=builtin_phone_tools,
+            payment_links=self._payment_links,
             **dialer_kwargs,
         )
         await self._update_llm_context(system_prompt, functions)
@@ -1404,20 +1422,241 @@ class PipecatEngine:
         """Set the recording audio fetcher callback."""
         self._fetch_recording_audio = fetch_fn
 
-    def set_phone_tools(self, policy: PhoneToolsPolicy, caller_keypad=None, logs_buffer=None) -> None:
+    def set_phone_tools(
+        self,
+        policy: PhoneToolsPolicy,
+        caller_keypad=None,
+        logs_buffer=None,
+        *,
+        audio_buffer=None,
+        caller_number: Optional[str] = None,
+        workflow_id: Optional[int] = None,
+        sandbox: bool = False,
+    ) -> None:
         """Install the organization's phone tool rules (Voice AI -> Tools).
 
         caller_keypad is the pipeline's CallerKeypadProcessor; it only passes key
         presses on when the organization allows the caller keypad tool.
+        audio_buffer (the call recorder) enables pausing the recording;
+        caller_number (the other party) enables texting them. Agent test
+        sandboxes never send texts.
         """
         self._phone_tools = policy
         self._logs_buffer = logs_buffer
+        self._audio_buffer = audio_buffer
+        self._phone_tool_caller_number = caller_number or None
+        self._phone_tool_workflow_id = workflow_id
+        self._phone_tools_sandbox = sandbox
+        self._recording_paused = audio_buffer is not None and policy.recording_starts_paused()
         self._caller_keypad = caller_keypad
+        if self._can_text_caller() and policy.enabled("payments"):
+            # Fetched while the call connects; the tool is offered once they arrive.
+            from api.services.phone_tools import builtin
+
+            try:
+                self._payment_links_task = asyncio.get_running_loop().create_task(
+                    builtin.list_payment_links(workflow_id)
+                )
+            except RuntimeError:
+                self._payment_links_task = None
         if caller_keypad is not None:
             if policy.enabled("caller_keypad"):
                 caller_keypad.set_handler(self._on_caller_keys, self._caller_keys_accepted)
             else:
                 caller_keypad.set_handler(None)
+
+    def set_companion(self, mixer, input_processor) -> None:
+        """Where a three-way colleague is mixed in (services/pipecat/companion.py)."""
+        self._companion_mixer = mixer
+        self._companion_input = input_processor
+
+    def companion_available(self) -> bool:
+        return self._companion_mixer is not None and self._companion_input is not None
+
+    async def start_companion(self, transfer_id: str) -> bool:
+        """The colleague answered: mix them in. The agent stays on the call."""
+        from api.constants import REDIS_URL
+        from api.services.pipecat.companion import CompanionBridge
+
+        if not self.companion_available() or self._audio_config is None:
+            return False
+        await self.stop_companion()
+
+        async def colleague_left() -> None:
+            from pipecat.frames.frames import LLMMessagesAppendFrame
+
+            await self.log_phone_tool_event("conference", outcome="colleague_left")
+            note = LLMMessagesAppendFrame(
+                [{"role": "user", "content": "[Your colleague has left the call. Carry on with the caller.]"}],
+                run_llm=False,
+            )
+            with suppress(Exception):
+                await (self.llm.queue_frame(note) if self._is_realtime else self.task.queue_frame(note))
+
+        bridge = CompanionBridge(
+            transfer_id, self._audio_config.transport_out_sample_rate, REDIS_URL, on_left=colleague_left
+        )
+        await bridge.start()
+        self._companion_bridge = bridge
+        self._companion_mixer.bridge = bridge
+        self._companion_input.bridge = bridge
+        return True
+
+    async def stop_companion(self) -> None:
+        bridge, self._companion_bridge = self._companion_bridge, None
+        if bridge is None:
+            return
+        if self._companion_mixer is not None:
+            self._companion_mixer.bridge = None
+        if self._companion_input is not None:
+            self._companion_input.bridge = None
+        await bridge.stop()
+
+    def recording_should_start(self) -> bool:
+        """False when the organization starts every call with the recording paused."""
+        return not self._recording_paused
+
+    def _can_text_caller(self) -> bool:
+        from api.services.phone_tools import builtin
+
+        return bool(
+            self._phone_tool_caller_number
+            and not self._phone_tools_sandbox
+            and builtin.sms_hook_url()
+        )
+
+    def hold_music_allowed(self) -> bool:
+        return self._phone_tools.enabled("hold") and self._transport_output is not None
+
+    async def _collect_payment_links(self) -> None:
+        task, self._payment_links_task = self._payment_links_task, None
+        if task is None:
+            return
+        try:
+            self._payment_links = await asyncio.wait_for(task, timeout=2.0)
+        except Exception as e:  # noqa: BLE001 -- no links, no tool; the call goes on
+            logger.info(f"payment links unavailable for this call: {e}")
+            self._payment_links = []
+
+    def _builtin_phone_tools(self) -> set[str]:
+        """The built-in phone tools this call can offer (besides press_keys)."""
+        from api.services.phone_tools import builtin
+
+        tools: set[str] = set()
+        if self._phone_tools.enabled("sms") and self._can_text_caller():
+            tools.add(builtin.SEND_TEXT)
+        if self._phone_tools.enabled("payments") and self._can_text_caller() and self._payment_links:
+            tools.add(builtin.SEND_PAYMENT_LINK)
+        if self._phone_tools.enabled("recording") and self._audio_buffer is not None:
+            tools.add(builtin.SET_RECORDING)
+        return tools
+
+    async def _register_builtin_phone_tools(self, names: set[str]) -> None:
+        from api.services.phone_tools import builtin
+
+        async def send_text_func(function_call_params: FunctionCallParams) -> None:
+            body = builtin.clean_text((function_call_params.arguments or {}).get("message"))
+            if not body:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "write the text to send first"}
+                )
+                return
+            if self._texts_sent >= builtin.MAX_TEXTS_PER_CALL:
+                await function_call_params.result_callback(
+                    {"status": "not_sent", "reason": "the most texts allowed on one call were already sent"}
+                )
+                return
+            self._texts_sent += 1
+            result = await builtin.send_caller_text(
+                workflow_id=self._phone_tool_workflow_id,
+                workflow_run_id=self._workflow_run_id,
+                to=self._phone_tool_caller_number or "",
+                body=body,
+            )
+            sent = result["status"] in ("sent", "queued")
+            await self.log_phone_tool_event(
+                "sms", outcome="sent" if sent else (result.get("reason") or result["status"]),
+                characters=len(body),
+            )
+            if sent:
+                await function_call_params.result_callback(
+                    {"status": "sent", "note": "The text is on its way; tell the caller."}
+                )
+            else:
+                await function_call_params.result_callback(
+                    {
+                        "status": "not_sent",
+                        "reason": result.get("readable_reason") or "The text could not be sent.",
+                        "note": "Tell the caller the text could not be sent and give them the details by voice instead.",
+                    }
+                )
+
+        async def set_recording_func(function_call_params: FunctionCallParams) -> None:
+            wanted = str((function_call_params.arguments or {}).get("recording") or "").lower()
+            if wanted not in ("on", "off"):
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "say 'on' or 'off'"}
+                )
+                return
+            await self.set_recording(wanted == "on")
+            await function_call_params.result_callback(
+                {"status": "recording" if wanted == "on" else "paused"}
+            )
+
+        async def send_payment_link_func(function_call_params: FunctionCallParams) -> None:
+            wanted = str((function_call_params.arguments or {}).get("link") or "").strip().lower()
+            link = next((l for l in self._payment_links if str(l["title"]).strip().lower() == wanted), None)
+            if link is None:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "choose one of the listed payment links"}
+                )
+                return
+            if self._texts_sent >= builtin.MAX_TEXTS_PER_CALL:
+                await function_call_params.result_callback(
+                    {"status": "not_sent", "reason": "the most texts allowed on one call were already sent"}
+                )
+                return
+            self._texts_sent += 1
+            result = await builtin.send_payment_link(
+                workflow_id=self._phone_tool_workflow_id,
+                workflow_run_id=self._workflow_run_id,
+                to=self._phone_tool_caller_number or "",
+                slug=str(link["slug"]),
+            )
+            sent = result["status"] in ("sent", "queued")
+            await self.log_phone_tool_event(
+                "payment_link", outcome="sent" if sent else (result.get("reason") or result["status"]),
+                link=str(link["title"]),
+            )
+            await function_call_params.result_callback(
+                {"status": "sent", "note": "The payment link is on its way; tell the caller."}
+                if sent else
+                {
+                    "status": "not_sent",
+                    "reason": result.get("readable_reason") or "The link could not be sent.",
+                    "note": "Tell the caller the link could not be sent. Do not take card details by voice.",
+                }
+            )
+
+        if builtin.SEND_PAYMENT_LINK in names:
+            self.llm.register_function(builtin.SEND_PAYMENT_LINK, send_payment_link_func)
+        if builtin.SEND_TEXT in names:
+            self.llm.register_function(builtin.SEND_TEXT, send_text_func)
+        if builtin.SET_RECORDING in names:
+            self.llm.register_function(builtin.SET_RECORDING, set_recording_func)
+
+    async def set_recording(self, on: bool) -> None:
+        """Pause or resume the call recording. Pausing flushes what was recorded so far;
+        the finished recording simply leaves out the paused part."""
+        if self._audio_buffer is None or on != self._recording_paused:
+            return  # nothing to record with, or already in that state
+        if on:
+            await self._audio_buffer.start_recording()
+        else:
+            await self._audio_buffer.stop_recording()
+        self._recording_paused = not on
+        logger.info(f"Call recording {'resumed' if on else 'paused'} for run {self._workflow_run_id}")
+        await self.log_phone_tool_event("recording", outcome="resumed" if on else "paused")
 
     async def inject_caller_key(self, key: str) -> None:
         """A caller key press reported outside the media stream (Asterisk ARI)."""

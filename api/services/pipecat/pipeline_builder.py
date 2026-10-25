@@ -40,6 +40,7 @@ def build_pipeline(
     input_guardrail_processor=None,
     output_guardrail_processor=None,
     caller_keypad=None,
+    companion_input=None,
 ):
     """Build the main pipeline with all components.
 
@@ -58,6 +59,7 @@ def build_pipeline(
     processors = [
         transport.input(),  # Transport user input
         *([caller_keypad] if caller_keypad else []),
+        *([companion_input] if companion_input else []),
         stt,
     ]
 
@@ -114,6 +116,7 @@ def build_realtime_pipeline(
     input_guardrail_processor=None,
     output_guardrail_processor=None,
     caller_keypad=None,
+    companion_input=None,
 ):
     """Build a pipeline for realtime (speech-to-speech) LLM services.
 
@@ -143,6 +146,7 @@ def build_realtime_pipeline(
     processors = [
         transport.input(),
         *([caller_keypad] if caller_keypad else []),
+        *([companion_input] if companion_input else []),
         user_context_aggregator,
         realtime_llm,
     ]

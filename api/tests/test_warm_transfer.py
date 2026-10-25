@@ -32,6 +32,9 @@ class FakeTransfers:
     async def remove_transfer_context(self, transfer_id):
         self.contexts.pop(transfer_id, None)
 
+    async def store_transfer_channel_mapping(self, channel_id, transfer_id):
+        self.channels = {**getattr(self, "channels", {}), channel_id: transfer_id}
+
     async def publish_transfer_event(self, event):
         self.events.append(event)
 
@@ -263,6 +266,7 @@ def _provider(warm=True):
     return Mock(
         supports_transfers=lambda: True, validate_config=lambda: True,
         supports_warm_transfer=lambda: warm,
+        supports_three_way=lambda: False, supports_companion=lambda: False,
         transfer_call=AsyncMock(return_value={"call_sid": "CA-dest"}),
     )
 

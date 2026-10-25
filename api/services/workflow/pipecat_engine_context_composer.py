@@ -141,6 +141,8 @@ async def compose_functions_for_node(
     kb_document_uuids: Optional[list[str]] = None,
     dialer_callback_tz: Optional[str] = None,
     phone_tools_policy: Optional["PhoneToolsPolicy"] = None,
+    builtin_phone_tools: Optional[set[str]] = None,
+    payment_links: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -201,6 +203,35 @@ async def compose_functions_for_node(
                 required=["digits"],
             )
         )
+
+    # Built-in phone tools this call can offer (texting the caller, pausing the
+    # recording); the engine decides availability, the organization the wording.
+    if builtin_phone_tools:
+        from api.services.phone_tools import builtin
+
+        for name, tool_id, description, properties, required in (
+            (builtin.SEND_TEXT, "sms", builtin.SEND_TEXT_DESCRIPTION, builtin.SEND_TEXT_PROPERTIES, ["message"]),
+            (builtin.SET_RECORDING, "recording", builtin.SET_RECORDING_DESCRIPTION, builtin.SET_RECORDING_PROPERTIES, ["recording"]),
+        ):
+            if name in builtin_phone_tools:
+                functions.append(
+                    get_function_schema(
+                        name,
+                        phone_tools_policy.describe(tool_id, description),
+                        properties=properties,
+                        required=required,
+                    )
+                )
+        if builtin.SEND_PAYMENT_LINK in builtin_phone_tools and payment_links:
+            description, properties = builtin.payment_link_schema(payment_links)
+            functions.append(
+                get_function_schema(
+                    builtin.SEND_PAYMENT_LINK,
+                    phone_tools_policy.describe("payments", description),
+                    properties=properties,
+                    required=["link"],
+                )
+            )
 
     # Dialer extra answers: the agent books the callback time it agreed.
     if dialer_callback_tz is not None:

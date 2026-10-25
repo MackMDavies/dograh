@@ -1345,13 +1345,14 @@ async def delete_api_key(key_id: int, user: UserModel = Depends(get_user)):
 class PhoneToolRuleModel(BaseModel):
     mode: str = "on"
     rule: str = ""
+    start_paused: Optional[bool] = None  # recording only
 
 
 class PhoneToolsPolicyModel(BaseModel):
     tools: dict[str, PhoneToolRuleModel] = {}
 
 
-@router.get("/phone-tools", response_model=PhoneToolsPolicyModel)
+@router.get("/phone-tools", response_model=PhoneToolsPolicyModel, response_model_exclude_none=True)
 async def get_phone_tools_policy(user: UserModel = Depends(get_user)):
     """When this organization's agents may use the built-in phone tools."""
     if not user.selected_organization_id:
@@ -1362,7 +1363,7 @@ async def get_phone_tools_policy(user: UserModel = Depends(get_user)):
     return policy.to_dict()
 
 
-@router.put("/phone-tools", response_model=PhoneToolsPolicyModel)
+@router.put("/phone-tools", response_model=PhoneToolsPolicyModel, response_model_exclude_none=True)
 async def save_phone_tools_policy(
     request: PhoneToolsPolicyModel,
     user: UserModel = Depends(get_user),

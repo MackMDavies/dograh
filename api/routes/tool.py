@@ -136,9 +136,12 @@ class TransferCallConfig(BaseModel):
         le=120,
         description="Maximum time in seconds to wait for destination to answer (5-120 seconds)",
     )
-    transfer_mode: Literal["cold", "warm"] = Field(
+    transfer_mode: Literal["cold", "warm", "three_way"] = Field(
         default="cold",
-        description="warm: the agent introduces the caller and the colleague presses 1 to take the call",
+        description=(
+            "warm: the agent introduces the caller and the colleague presses 1 to take the call; "
+            "three_way: the colleague joins the caller and the agent on the line"
+        ),
     )
     fallback_destination: Optional[str] = Field(
         default=None,

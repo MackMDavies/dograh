@@ -360,7 +360,7 @@ class CustomToolManager:
                     for fs in mcp_schemas:
                         self._engine.llm.register_function(
                             fs.name,
-                            self._create_mcp_handler(session, fs.name),
+                            self._with_hold_music(self._create_mcp_handler(session, fs.name)),
                             timeout_secs=session.call_timeout_secs,
                         )
                     logger.debug(
@@ -410,9 +410,52 @@ class CustomToolManager:
                 "timeout_ms", 5000
             )
             timeout_secs = float(timeout_ms) / 1000
-            handler = self._create_http_tool_handler(tool, function_name)
+            handler = self._with_hold_music(self._create_http_tool_handler(tool, function_name))
 
         return handler, timeout_secs
+
+    def _with_hold_music(self, handler):
+        """Phone tools "hold": a lookup still running after a moment plays hold music
+        to the caller until it returns, instead of dead air."""
+        from api.services.phone_tools.builtin import HOLD_AFTER_SECONDS
+
+        engine = self._engine
+
+        async def held(function_call_params: FunctionCallParams) -> None:
+            if not engine.hold_music_allowed():
+                await handler(function_call_params)
+                return
+            finished = asyncio.Event()
+            stop_music = asyncio.Event()
+
+            async def hold() -> None:
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=HOLD_AFTER_SECONDS)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                await engine.log_phone_tool_event("hold", outcome="started")
+                sample_rate = (
+                    engine._audio_config.transport_out_sample_rate if engine._audio_config else 8000
+                )
+                await play_audio_loop(
+                    stop_event=stop_music,
+                    sample_rate=sample_rate,
+                    queue_frame=engine._transport_output.queue_frame,
+                )
+
+            music = asyncio.create_task(hold())
+            try:
+                await handler(function_call_params)
+            finally:
+                finished.set()
+                stop_music.set()
+                try:
+                    await music
+                except Exception as e:  # noqa: BLE001 -- the music must never fail the lookup
+                    logger.warning(f"hold music failed: {e}")
+
+        return held
 
     def _register_calculator_handler(self) -> None:
         """Register the built-in calculator function with the LLM."""
@@ -746,7 +789,22 @@ class CustomToolManager:
                 # Warm transfer: the colleague hears the agent's introduction and must
                 # press 1. Carriers that can't read it to them keep the cold transfer.
                 introduction = None
-                if config.get("transfer_mode") == "warm":
+                mode = config.get("transfer_mode")
+                # SIP lines join the colleague in the call's own bridge; stream carriers
+                # dial them as a second media stream that Dograh mixes in.
+                companion = (
+                    mode == "three_way"
+                    and not provider.supports_three_way()
+                    and provider.supports_companion()
+                    and self._engine.companion_available()
+                )
+                three_way = mode == "three_way" and (provider.supports_three_way() or companion)
+                if mode == "three_way" and not three_way:
+                    logger.info(
+                        f"{type(provider).__name__} cannot hold a three-way call; transferring warm"
+                    )
+                    mode = "warm"
+                if mode == "warm":
                     if provider.supports_warm_transfer():
                         introduction = clean_introduction(
                             (function_call_params.arguments or {}).get("introduction")
@@ -801,13 +859,22 @@ class CustomToolManager:
                             conference_name=conference_name,
                             timeout_seconds=timeout_seconds,
                             introduction=introduction,
+                            three_way=three_way,
+                            companion=companion,
                         )
+                        if (
+                            companion
+                            and transfer_event
+                            and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
+                            and not await self._engine.start_companion(transfer_event.transfer_id)
+                        ):
+                            transfer_event, reason = None, "join_failed"
                         connected = bool(
                             transfer_event
                             and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
                         )
                         await self._engine.log_phone_tool_event(
-                            "transfer",
+                            "conference" if three_way else "transfer",
                             destination=masked_destination(target),
                             warm=bool(introduction),
                             outcome="connected" if connected else reason,
@@ -833,7 +900,19 @@ class CustomToolManager:
                     self._engine.set_mute_pipeline(False)
 
                 # Handle result (after cleanup)
-                if transfer_event:
+                if transfer_event and three_way:
+                    # Nobody is handed off: the agent carries on with both of them.
+                    await function_call_params.result_callback(
+                        {
+                            "status": "colleague_joined",
+                            "note": (
+                                "Your colleague is now on the line with you and the caller. "
+                                "Introduce them to each other and carry on as a three-way "
+                                "conversation."
+                            ),
+                        }
+                    )
+                elif transfer_event:
                     final_result = transfer_event.to_result_dict()
                     await self._handle_transfer_result(
                         final_result, function_call_params, properties
@@ -888,6 +967,8 @@ class CustomToolManager:
         conference_name: str,
         timeout_seconds: int,
         introduction: Optional[str],
+        three_way: bool = False,
+        companion: bool = False,
     ) -> tuple[Optional[Any], str]:
         """Ring one destination and wait for the outcome.
 
@@ -907,11 +988,14 @@ class CustomToolManager:
             workflow_run_id=self._engine._workflow_run_id,
             warm=bool(introduction),
             introduction=introduction,
+            three_way=three_way,
         )
         await call_transfer_manager.store_transfer_context(transfer_context)
 
         try:
             warm_kwargs = {"introduction": introduction} if introduction else {}
+            if companion:
+                warm_kwargs["three_way"] = True
             transfer_result = await provider.transfer_call(
                 destination=destination,
                 transfer_id=transfer_id,

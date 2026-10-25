@@ -11,6 +11,7 @@ from api.services.pipecat.transport_params import realtime_param_overrides
 from api.services.telephony.factory import load_credentials_for_transport
 
 from .serializers import VonageFrameSerializer
+from .strategies import VonageConversationStrategy
 
 
 async def create_transport(
@@ -41,6 +42,7 @@ async def create_transport(
         call_uuid=call_uuid,
         application_id=application_id,
         private_key=private_key,
+        transfer_strategy=VonageConversationStrategy(),
         params=VonageFrameSerializer.InputParams(
             vonage_sample_rate=audio_config.transport_in_sample_rate,
             sample_rate=audio_config.pipeline_sample_rate,

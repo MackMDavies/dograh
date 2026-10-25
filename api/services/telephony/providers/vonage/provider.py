@@ -599,21 +599,83 @@ class VonageProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        """
-        Vonage provider does not support call transfers.
+        """Ring the destination with an inline NCCO that joins the named conversation.
 
-        Raises:
-            NotImplementedError: call transfers are yet to be implemented
+        Three-way: the NCCO streams their audio to /telephony/companion/{transfer_id}
+        instead, and Dograh mixes them into the call.
+
+        Warm: the NCCO reads them the introduction and waits for one key;
+        /telephony/vonage/transfer-accept/{id} answers with the conversation (1) or
+        nothing (hang up). Status events go to /telephony/vonage/transfer-result/{id}.
+        VonageConversationStrategy moves the caller into the conversation at hand-off.
+        https://developer.vonage.com/en/api/voice#createCall
         """
-        raise NotImplementedError("Vonage provider does not support call transfers")
+        from api.services.telephony.warm_transfer import (
+            ACCEPT_TIMEOUT_SECONDS,
+            briefing_speech,
+            vonage_conversation_ncco,
+        )
+
+        if not self.validate_config():
+            raise ValueError("Vonage provider not properly configured")
+        backend_endpoint, _ = await get_backend_endpoints()
+        if introduction:
+            ncco = [
+                {"action": "talk", "text": briefing_speech(introduction), "bargeIn": True},
+                {
+                    "action": "input",
+                    "type": ["dtmf"],
+                    "dtmf": {"maxDigits": 1, "timeOut": ACCEPT_TIMEOUT_SECONDS},
+                    "eventUrl": [f"{backend_endpoint}/api/v1/telephony/vonage/transfer-accept/{transfer_id}"],
+                    "eventMethod": "POST",
+                },
+            ]
+        else:
+            ncco = [
+                {"action": "talk", "text": "You have answered a transfer call. Connecting you now."},
+                *vonage_conversation_ncco(conference_name),
+            ]
+        if three_way:
+            from api.services.telephony.warm_transfer import companion_socket_url
+
+            ncco = [
+                {
+                    "action": "connect",
+                    "endpoint": [
+                        {
+                            "type": "websocket",
+                            "uri": await companion_socket_url(transfer_id),
+                            "content-type": "audio/l16;rate=16000",
+                        }
+                    ],
+                }
+            ]
+        data = {
+            "to": [{"type": "phone", "number": destination.replace("+", "")}],
+            "from": {"type": "phone", "number": random.choice(self.from_numbers).replace("+", "")},
+            "ncco": ncco,
+            "event_url": [f"{backend_endpoint}/api/v1/telephony/vonage/transfer-result/{transfer_id}"],
+            "event_method": "POST",
+            "ringing_timer": int(timeout),
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{self.base_url}/v1/calls", json=data, headers=self._get_auth_headers()
+            ) as response:
+                body = await response.json(content_type=None)
+                if response.status != 201:
+                    raise Exception(f"Vonage transfer call failed ({response.status}): {body}")
+        return {"call_sid": body["uuid"], "status": body.get("status", "started"), "provider": self.PROVIDER_NAME}
+
+    def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
+        return True
 
     def supports_transfers(self) -> bool:
-        """
-        Vonage does not support call transfers.
-
-        Returns:
-            False - Vonage provider does not support call transfers
-        """
-        return False
+        return True

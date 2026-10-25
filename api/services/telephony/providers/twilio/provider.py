@@ -18,7 +18,11 @@ from api.services.telephony.base import (
     ProviderSyncResult,
     TelephonyProvider,
 )
-from api.services.telephony.warm_transfer import twilio_transfer_twiml
+from api.services.telephony.warm_transfer import (
+    companion_socket_url,
+    companion_stream_twiml,
+    twilio_transfer_twiml,
+)
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_address import normalize_telephony_address
 
@@ -560,10 +564,14 @@ class TwilioProvider(TelephonyProvider):
         conference_name: str,
         timeout: int = 30,
         introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Initiate a call transfer via Twilio.
+
+        Three-way: the colleague's call streams to /telephony/companion/{transfer_id}
+        and Dograh mixes them into the call (services/pipecat/companion.py).
 
         With an introduction (warm transfer) the destination hears it and must press
         1; /telephony/transfer-accept/{transfer_id} then joins them to the conference.
@@ -607,6 +615,8 @@ class TwilioProvider(TelephonyProvider):
             if introduction
             else None,
         )
+        if three_way:
+            twiml = companion_stream_twiml(await companion_socket_url(transfer_id))
 
         # Prepare Twilio API call data
         endpoint = f"{self.base_url}/Calls.json"
@@ -674,6 +684,9 @@ class TwilioProvider(TelephonyProvider):
             raise
 
     def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
         return True
 
     def supports_transfers(self) -> bool:

@@ -23,7 +23,12 @@ from api.enums import OrganizationConfigurationKey
 
 # keypad: the agent presses keys on the call (switchboards, phone menus).
 # caller_keypad: the agent hears the keys the caller presses.
-PHONE_TOOL_IDS = ("keypad", "caller_keypad")
+# sms: the agent texts the caller during the call (builtin.py).
+# recording: the agent pauses/resumes the recording when the caller asks; with
+#   start_paused, every call starts unrecorded until the caller agrees.
+# hold: music while a lookup tool (HTTP / MCP) takes more than a moment.
+# payments: text the caller one of the business's own payment links (builtin.py).
+PHONE_TOOL_IDS = ("keypad", "caller_keypad", "sms", "recording", "hold", "payments")
 
 MODES = ("on", "rule", "off")
 MAX_RULE_CHARS = 300
@@ -33,6 +38,7 @@ MAX_RULE_CHARS = 300
 class ToolRule:
     mode: str = "on"
     rule: str = ""
+    start_paused: bool = False  # recording only
 
 
 class PhoneToolsPolicy:
@@ -46,6 +52,9 @@ class PhoneToolsPolicy:
         entry = self._tools.get(tool_id, ToolRule())
         return entry.rule if entry.mode == "rule" and entry.rule else None
 
+    def recording_starts_paused(self) -> bool:
+        return self.enabled("recording") and self._tools["recording"].start_paused
+
     def describe(self, tool_id: str, description: str) -> str:
         rule = self.rule(tool_id)
         if not rule:
@@ -53,12 +62,12 @@ class PhoneToolsPolicy:
         return f"{description} Your organization only allows this tool when: {rule}"
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "tools": {
-                tool_id: {"mode": entry.mode, "rule": entry.rule}
-                for tool_id, entry in self._tools.items()
-            }
-        }
+        tools: dict[str, Any] = {}
+        for tool_id, entry in self._tools.items():
+            tools[tool_id] = {"mode": entry.mode, "rule": entry.rule}
+            if tool_id == "recording":
+                tools[tool_id]["start_paused"] = entry.start_paused
+        return {"tools": tools}
 
 
 def _clean_rule(value: Any) -> str:
@@ -80,7 +89,11 @@ def normalize_policy(raw: Any) -> PhoneToolsPolicy:
         rule = _clean_rule(entry.get("rule"))
         if mode == "rule" and not rule:
             mode = "on"
-        tools[tool_id] = ToolRule(mode=mode, rule=rule if mode == "rule" else "")
+        tools[tool_id] = ToolRule(
+            mode=mode,
+            rule=rule if mode == "rule" else "",
+            start_paused=tool_id == "recording" and entry.get("start_paused") is True,
+        )
     return PhoneToolsPolicy(tools)
 
 
