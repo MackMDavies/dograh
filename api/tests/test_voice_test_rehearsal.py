@@ -9,6 +9,8 @@ from pipecat.frames.frames import (
     EndFrame,
     ErrorFrame,
     InputAudioRawFrame,
+    InterruptionFrame,
+    StartFrame,
     TTSAudioRawFrame,
     TTSStoppedFrame,
 )
@@ -248,6 +250,31 @@ class FixtureResponder(FrameProcessor):
                 # Native output uses 40 ms chunks; keep this transport proof
                 # aligned so the test does not depend on trailing TTS padding.
                 await self.push_frame(TTSAudioRawFrame(b"\x01\x00" * 1280, 16000, 1))
+                await self.push_frame(TTSStoppedFrame())
+        else:
+            await self.push_frame(frame, direction)
+
+
+class FixtureInterruptResponder(FrameProcessor):
+    """Synthetic speaker/VAD stand-in, using actual SDK output cancellation."""
+
+    def __init__(self):
+        super().__init__()
+        self.receiving = False
+
+    async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)
+        if isinstance(frame, StartFrame):
+            await self.push_frame(frame, direction)
+            await self.push_frame(TTSAudioRawFrame(b"\x01\x00" * 16000, 16000, 1))
+            await self.push_frame(TTSStoppedFrame())
+        elif isinstance(frame, InputAudioRawFrame):
+            if any(frame.audio) and not self.receiving:
+                self.receiving = True
+                await self.push_frame(InterruptionFrame())
+            elif not any(frame.audio) and self.receiving:
+                self.receiving = False
+                await self.push_frame(TTSAudioRawFrame(b"\x02\x00" * 1280, 16000, 1))
                 await self.push_frame(TTSStoppedFrame())
         else:
             await self.push_frame(frame, direction)

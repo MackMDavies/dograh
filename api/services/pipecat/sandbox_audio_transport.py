@@ -176,13 +176,20 @@ class _FixtureInput(BaseInputTransport):
                 else bytes(CHUNK_BYTES)
             )
             audio = audio.ljust(CHUNK_BYTES, b"\0")
-            await self.push_audio_frame(InputAudioRawFrame(audio, SAMPLE_RATE, 1))
+            evidence = self.owner.voice_observer.timing_evidence if active and self.owner.voice_observer is not None else None
+            # Submitting can yield to downstream VAD/provider signals. Record
+            # the active caller before that handoff; failed submission can
+            # never certify a completed input or timing snapshot.
+            if evidence is not None:
+                evidence.record_input(self.active_evidence, frame_started_at, self.cursor,
+                    min(CHUNK_BYTES, len(active[0]) - self.cursor), len(audio))
+            try:
+                await self.push_audio_frame(InputAudioRawFrame(audio, SAMPLE_RATE, 1))
+            except BaseException:
+                if evidence is not None:
+                    evidence.invalid = True
+                raise
             if active:
-                if self.owner.voice_observer is not None:
-                    self.owner.voice_observer.timing_evidence.record_input(
-                        self.active_evidence, frame_started_at, self.cursor,
-                        min(CHUNK_BYTES, len(active[0]) - self.cursor), len(audio),
-                    )
                 self.cursor += CHUNK_BYTES
             await asyncio.sleep(max(0, frame_started_at + CHUNK_SECONDS - loop.time()))
             if active and self.cursor >= len(active[0]) and not active[1].done():
@@ -237,14 +244,21 @@ class _CapturedOutput(BaseOutputTransport):
             at = asyncio.get_running_loop().time()
             pcm_start_byte = len(self.owner.capture.pcm)
             self.owner.capture.append(frame, at)
+            sequence = None
             if self.owner.voice_observer is not None:
-                self.owner.voice_observer.record_audio(at, len(frame.audio), pcm_start_byte=pcm_start_byte)
+                sequence = self.owner.voice_observer.record_audio(at, len(frame.audio), pcm_start_byte=pcm_start_byte)
         except ValueError as exc:
             self.owner.failure = str(exc)
             return False
         # Native MediaSender must experience the same PCM playback pacing as
         # a live transport; collecting bytes instantly would falsify timing.
-        await asyncio.sleep(len(frame.audio) / (SAMPLE_RATE * 2))
+        try:
+            await asyncio.sleep(len(frame.audio) / (SAMPLE_RATE * 2))
+        except asyncio.CancelledError:
+            if frame.audio and self.owner.voice_observer is not None:
+                self.owner.voice_observer.timing_evidence.record_cancelled_output(
+                    asyncio.get_running_loop().time(), sequence, pcm_start_byte, len(frame.audio))
+            raise
         return True
 
 

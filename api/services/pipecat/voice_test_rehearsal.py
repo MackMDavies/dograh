@@ -17,6 +17,7 @@ from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
     ErrorFrame,
+    InterruptionFrame,
 )
 from pipecat.observers.base_observer import BaseObserver
 from pipecat.processors.frame_processor import FrameDirection
@@ -72,6 +73,9 @@ class VoiceTurnObserver(BaseObserver):
         elif isinstance(frame, BotStoppedSpeakingFrame):
             if current is not None and current.stopped_at is None:
                 current.stopped_at = now
+        elif isinstance(frame, InterruptionFrame):
+            self.timing_evidence.record_interruption(now,
+                current.sequence if current is not None and current.stopped_at is None else None)
         elif isinstance(frame, ErrorFrame):
             self.failure = "voice_pipeline_failed"
         elif isinstance(frame, (EndFrame, CancelFrame)):
@@ -85,8 +89,8 @@ class VoiceTurnObserver(BaseObserver):
         current = self.current
         self.audio_evidence.record(pcm_start_byte, size,
                                    current.sequence if current is not None and current.stopped_at is None else None)
-        self.timing_evidence.record_output(at, size,
-                                          current.sequence if current is not None and current.stopped_at is None else None)
+        sequence = current.sequence if current is not None and current.stopped_at is None else None
+        self.timing_evidence.record_output(at, size, sequence, pcm_start_byte=pcm_start_byte)
         if (
             size
             and current is not None
@@ -95,6 +99,7 @@ class VoiceTurnObserver(BaseObserver):
         ):
             current.first_audio_at = at
             self.changed.set()
+        return sequence
 
     async def wait_for(self, predicate, deadline: float):
         while True:

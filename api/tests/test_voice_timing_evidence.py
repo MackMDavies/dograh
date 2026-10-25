@@ -35,6 +35,60 @@ async def test_actual_writer_preserves_a_delivery_gap_missing_from_the_wav():
 
 
 @pytest.mark.asyncio
+async def test_actual_sdk_interruption_can_seal_the_packet_cancelled_during_pacing():
+    """The whole packet was submitted; cancellation need not wait its nominal end."""
+    import hashlib
+    from pipecat.frames.frames import InterruptionFrame
+    from pipecat.pipeline.pipeline import Pipeline
+    from pipecat.pipeline.runner import PipelineRunner
+    from pipecat.pipeline.task import PipelineParams, PipelineTask
+    from pipecat.processors.frame_processor import FrameDirection
+    from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+    from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
+    from api.services.workflow.voice_test_timing_evidence import validate_voice_timing_evidence
+    from api.tests.test_sandbox_audio_transport import wav_fixture
+    from api.tests.test_voice_test_rehearsal import FixtureResponder
+
+    transport = SandboxAudioTransport(duration_limit=5)
+    observer = VoiceTurnObserver(transport.output())
+    transport.set_voice_observer(observer)
+    submitted = asyncio.Event()
+    original = observer.record_audio
+
+    def record(*args, **kwargs):
+        sequence = original(*args, **kwargs)
+        submitted.set()
+        return sequence
+
+    observer.record_audio = record
+    task = PipelineTask(Pipeline([transport.input(), FixtureResponder(), transport.output()]),
+        params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000), observers=[observer])
+    running = asyncio.create_task(PipelineRunner(handle_sigint=False).run(task))
+    encoded, _ = wav_fixture()
+    try:
+        await transport.play_wav(encoded, fixture_id="caller-001.wav")
+        await asyncio.wait_for(submitted.wait(), timeout=2)
+        # Run the pinned SDK's real sender interruption path, including cancellation.
+        await transport.output().process_frame(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+        assert observer.current.stopped_at is not None
+        timing = observer.timing_evidence.snapshot(pipeline_stopped=True)
+        segment = timing["responses"][0]
+        assert segment["stopped_ms"] < segment["last_pcm_end_ms"]
+        spans = observer.audio_evidence.snapshot(pcm_bytes=len(transport.capture.pcm),
+            responses=observer.responses, pipeline_stopped=True)["spans"]
+        fixtures = [SimpleNamespace(file_name="caller-001.wav", sha256=hashlib.sha256(encoded).hexdigest(), duration_ms=80)]
+        assert validate_voice_timing_evidence(timing, duration_ms=5000, fixtures=fixtures, spans=spans) is timing
+        assert timing["version"] == 2
+        assert segment["cancelled_write"]["pcm_end_byte"] == spans[0]["pcm_end_byte"]
+        assert segment["cancelled_write"]["cancelled_ms"] <= segment["stopped_ms"]
+        assert timing["interruptions"][0]["response_sequence"] == 1
+        assert timing["complete"] is True
+    finally:
+        await task.cancel()
+        await asyncio.wait_for(running, timeout=5)
+
+
+@pytest.mark.asyncio
 async def test_actual_input_records_verified_fixture_identity_and_padded_playback():
     import hashlib
     from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
@@ -66,6 +120,77 @@ async def test_actual_input_records_verified_fixture_identity_and_padded_playbac
     finally:
         input_.closed = True
         await stream
+
+
+@pytest.mark.asyncio
+async def test_input_submission_marks_active_caller_before_a_downstream_signal_can_run():
+    from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+    from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
+    from api.tests.test_sandbox_audio_transport import wav_fixture
+    from pipecat.frames.frames import BotStartedSpeakingFrame, BotStoppedSpeakingFrame, InterruptionFrame
+    from pipecat.processors.frame_processor import FrameDirection
+
+    transport = SandboxAudioTransport(duration_limit=5)
+    observer = VoiceTurnObserver(transport.output())
+    transport.set_voice_observer(observer)
+    input_ = transport.input()
+    input_.started.set()
+    input_.deadline = asyncio.get_running_loop().time() + 5
+    observer.observe_output(BotStartedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+    observer.record_audio(asyncio.get_running_loop().time(), 640, pcm_start_byte=0)
+
+    async def submit(frame):
+        if any(frame.audio):
+            # Accepted input can yield to downstream processing before its
+            # submitting coroutine resumes after the await.
+            observer.observe_output(InterruptionFrame(), FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0)
+
+    input_.push_audio_frame = submit
+    stream = asyncio.create_task(input_._stream())
+    try:
+        await transport.play_wav(wav_fixture(seconds=0.02)[0], fixture_id="caller-001.wav")
+        observer.observe_output(BotStoppedSpeakingFrame(), FrameDirection.DOWNSTREAM)
+        timing = observer.timing_evidence.snapshot(pipeline_stopped=True)
+        event = timing["interruptions"][0]
+        caller = timing["caller_steps"][0]
+        assert caller["first_frame_ms"] <= event["at_ms"] <= caller["playback_finished_ms"]
+        assert event["caller_step"] == 1
+        assert event["caller_active"] is True
+    finally:
+        input_.closed = True
+        await stream
+
+
+@pytest.mark.asyncio
+async def test_failed_input_submission_cannot_certify_the_prepared_frame():
+    from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+    from api.services.pipecat.voice_test_rehearsal import VoiceTurnObserver
+    from api.tests.test_sandbox_audio_transport import wav_fixture
+
+    transport = SandboxAudioTransport(duration_limit=5)
+    observer = VoiceTurnObserver(transport.output())
+    transport.set_voice_observer(observer)
+    input_ = transport.input()
+    input_.started.set()
+    input_.deadline = asyncio.get_running_loop().time() + 5
+    async def reject(frame):
+        if any(frame.audio):
+            raise RuntimeError("synthetic input submission rejected")
+    input_.push_audio_frame = reject
+    playing = asyncio.create_task(transport.play_wav(wav_fixture(seconds=0.02)[0], fixture_id="caller-001.wav"))
+    stream = asyncio.create_task(input_._stream())
+    try:
+        with pytest.raises(RuntimeError, match="synthetic input submission rejected"):
+            await stream
+    finally:
+        await input_._close()
+        with pytest.raises(RuntimeError, match="ended during fixture playback"):
+            await playing
+    assert observer.timing_evidence.invalid is True
+    timing = observer.timing_evidence.snapshot(pipeline_stopped=True)
+    assert timing["complete"] is False
+    assert timing["caller_steps"] == []
 
 
 def protocol():
@@ -150,7 +275,8 @@ def test_unfinished_input_or_response_cannot_make_a_complete_timing_claim():
 
 
 @pytest.mark.asyncio
-async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio():
+@pytest.mark.parametrize("interrupt", [False, True])
+async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio(interrupt, monkeypatch):
     import hashlib
     from dataclasses import replace
     from pipecat.pipeline.pipeline import Pipeline
@@ -158,22 +284,34 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
     from pipecat.pipeline.task import PipelineParams, PipelineTask
     from api.tests.test_sandbox_audio_transport import wav_fixture
     from api.tests.test_voice_test_job import setup
-    from api.tests.test_voice_test_rehearsal import FixtureResponder
+    from api.tests.test_voice_test_rehearsal import FixtureResponder, FixtureInterruptResponder
     from api.tests.test_voice_test_control import SECRET
     from api.services.workflow.voice_test_control import VoiceFixture
     from api.services.workflow.voice_test_job import execute_voice_job, read_voice_job_audio_evidence
+    from api.services.workflow import voice_test_audio_evidence
+
+    rejected = []
+    original = voice_test_audio_evidence.validate_voice_timing_evidence
+    def validate_timing(value, **kwargs):
+        try:
+            return original(value, **kwargs)
+        except Exception:
+            rejected.append(copy.deepcopy(value))
+            raise
+    monkeypatch.setattr(voice_test_audio_evidence, "validate_voice_timing_evidence", validate_timing)
 
     encoded, _ = wav_fixture()
     context, db, control, run, _, _, _ = setup()
     session = control.get.return_value
     session = replace(session, duration_seconds=5,
         fixtures=(VoiceFixture("caller-001.wav", hashlib.sha256(encoded).hexdigest(), 80),),
-        script=replace(session.script, steps=(replace(session.script.steps[0], response_timeout_ms=2000),)))
+        script=replace(session.script, start_mode="agent_first" if interrupt else "caller_first",
+            steps=(replace(session.script.steps[0], response_timeout_ms=2000, delivery="interrupt" if interrupt else "after_response"),)))
     control.get.return_value = session
     control.fixture.return_value = encoded
 
     async def actual_transport(transport, *_):
-        responder = FixtureResponder()
+        responder = FixtureInterruptResponder() if interrupt else FixtureResponder()
         task = PipelineTask(
             Pipeline([transport.input(), responder, transport.output()]),
             params=PipelineParams(audio_in_sample_rate=16000, audio_out_sample_rate=16000),
@@ -183,7 +321,7 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
         await PipelineRunner(handle_sigint=False).run(task)
 
     result = await execute_voice_job(db, control, context, SECRET, pipeline_runner=actual_transport)
-    assert result["status"] == "completed"
+    assert result["status"] == "completed", dict(result=result, rejected_timing=rejected)
     report = run.annotations["agent_test_voice_result"]
     control.get.return_value = replace(session, status="completed", runtime_workflow_run_id=123,
         actual_duration_ms=report["actual_duration_ms"], audio_bytes=report["audio_bytes"], audio_sha256=report["audio_sha256"])
@@ -191,6 +329,14 @@ async def test_job_saves_and_reads_actual_transport_timing_with_the_sealed_audio
     assert value["evidence"]["complete"] is True
     assert value["evidence"]["timing"]["complete"] is True
     assert value["evidence"]["timing"]["caller_steps"][0]["sha256"] == session.fixtures[0].sha256
+    if interrupt:
+        timing = value["evidence"]["timing"]
+        assert timing["version"] == 2
+        assert timing["interruptions"][0]["response_sequence"] == 1
+        assert timing["interruptions"][0]["caller_step"] == 1
+        assert timing["interruptions"][0]["caller_active"] is True
+        assert report["rehearsal"]["turns"][0]["response_sequence"] == 2
+        assert report["rehearsal"]["turns"][0]["delivery"] == "interrupt"
     assert value["audio_sha256"] == hashlib.sha256(control.upload.await_args.args[3]).hexdigest()
     # Native status v1 still says quality_evaluated=false; timing cannot certify speech.
     assert report["rehearsal"]["quality_evaluated"] is False
