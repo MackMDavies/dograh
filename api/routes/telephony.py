@@ -1186,6 +1186,19 @@ async def complete_transfer_function_call(transfer_id: str, request: Request):
     return {"status": "completed", "result": result}
 
 
+@router.get("/ari/transfer-intro/{transfer_id}.wav", include_in_schema=False)
+async def ari_transfer_introduction(transfer_id: str):
+    """The warm-transfer introduction Asterisk plays to the colleague (warm_transfer.py)."""
+    from fastapi import Response
+
+    from api.services.telephony.warm_transfer import ari_introduction_audio
+
+    audio = await ari_introduction_audio(transfer_id)
+    if not audio:
+        raise HTTPException(status_code=404, detail="Not found")
+    return Response(content=audio, media_type="audio/wav")
+
+
 @router.post("/transfer-accept/{transfer_id}")
 async def accept_warm_transfer(transfer_id: str, request: Request):
     """Twilio <Gather> action for a warm transfer: the colleague heard the

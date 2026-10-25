@@ -402,6 +402,11 @@ class ARIConnection:
                 f"[ARI org={self.organization_id}] DTMF: "
                 f"channel={channel_id}, digit={digit}"
             )
+            # A warm-transfer colleague answering the introduction's "press 1".
+            transfer_id = await self._get_transfer_id_for_channel(channel_id)
+            if transfer_id and digit:
+                asyncio.create_task(self._warm_transfer_key(transfer_id, channel_id, digit))
+                return
             # Hand the caller's key press to the pipeline running their call.
             workflow_run_id = await self._get_channel_run(channel_id)
             if workflow_run_id and digit:
@@ -957,6 +962,10 @@ class ARIConnection:
                 )
                 return
 
+            if context.warm and context.introduction and not context.resolved:
+                await self._play_warm_introduction(transfer_id, destination_channel_id)
+                return
+
             logger.info(
                 f"[ARI Transfer org={self.organization_id}] Transfer {transfer_id} success: "
                 f"caller={context.original_call_sid} -> destination={destination_channel_id}"
@@ -984,6 +993,75 @@ class ARIConnection:
                 transfer_id, destination_channel_id, f"Transfer processing error: {e}"
             )
 
+    async def _play_warm_introduction(self, transfer_id: str, channel_id: str) -> None:
+        """Warm transfer: the colleague hears the introduction and must press 1
+        (_warm_transfer_key). Silence for the whole window is a decline."""
+        from api.services.telephony.warm_transfer import ARI_ACCEPT_WINDOW_SECONDS
+        from api.utils.common import get_backend_endpoints
+
+        transfer_manager = await self._get_transfer_manager()
+        context = await transfer_manager.get_transfer_context(transfer_id)
+        if context is None:
+            return
+        context.answered = True
+        await transfer_manager.store_transfer_context(context)
+
+        backend, _ = await get_backend_endpoints()
+        media = f"sound:{backend}/api/v1/telephony/ari/transfer-intro/{transfer_id}.wav"
+        playback = await self._ari_request("POST", f"/channels/{channel_id}/play", params={"media": media})
+        if not playback:
+            # The introduction could not be played: connect them rather than lose the caller.
+            logger.warning(f"[ARI Transfer] introduction did not play for {transfer_id}; connecting cold")
+            context.warm = False
+            await transfer_manager.store_transfer_context(context)
+            await self._handle_destination_answered(transfer_id, channel_id)
+            return
+
+        async def decline_when_silent() -> None:
+            await asyncio.sleep(ARI_ACCEPT_WINDOW_SECONDS)
+            await self._warm_transfer_key(transfer_id, channel_id, "")
+
+        asyncio.create_task(decline_when_silent())
+
+    async def _warm_transfer_key(self, transfer_id: str, channel_id: str, digit: str) -> None:
+        from api.services.telephony.warm_transfer import ACCEPT_KEY
+
+        transfer_manager = await self._get_transfer_manager()
+        context = await transfer_manager.get_transfer_context(transfer_id)
+        if context is None or not context.warm or context.resolved:
+            return
+        context.resolved = True
+        context.accepted = digit == ACCEPT_KEY
+        await transfer_manager.store_transfer_context(context)
+        if context.accepted:
+            await self._ari_request("POST", f"/channels/{channel_id}/play", params={"media": "sound:beep"})
+            await transfer_manager.publish_transfer_event(
+                TransferEvent(
+                    type=TransferEventType.DESTINATION_ANSWERED,
+                    transfer_id=transfer_id,
+                    original_call_sid=context.original_call_sid,
+                    transfer_call_sid=channel_id,
+                    conference_name=context.conference_name,
+                    message="The person took the call.",
+                    status="success",
+                    action="destination_answered",
+                )
+            )
+            return
+        await transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.TRANSFER_FAILED,
+                transfer_id=transfer_id,
+                original_call_sid=context.original_call_sid,
+                transfer_call_sid=channel_id,
+                message="The person answered but did not take the call.",
+                status="failed",
+                action="transfer_failed",
+                reason="declined",
+            )
+        )
+        await self._delete_channel(channel_id)
+
     async def _handle_transfer_failed(
         self, transfer_id: str, channel_id: str, reason: str
     ):
@@ -993,6 +1071,13 @@ class ARIConnection:
 
             transfer_manager = await self._get_transfer_manager()
             context = await transfer_manager.get_transfer_context(transfer_id)
+            if context is not None and context.warm:
+                if context.resolved:
+                    return  # already reported (accepted and bridged, or declined)
+                context.resolved = True
+                await transfer_manager.store_transfer_context(context)
+                if context.answered:
+                    reason = "declined"  # hung up during the introduction
 
             # Publish failure event
             failure_event = TransferEvent(
