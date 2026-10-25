@@ -419,3 +419,9 @@ async def handle_vobiz_hangup_callback_by_workflow(
             f"[run {workflow_run_id}] Error processing Vobiz hangup callback: {e}"
         )
         return {"status": "error", "message": str(e)}
+
+
+# Transfers (Keypad & Native Phone Tools): see xml_conference_transfer.py.
+from api.services.telephony.xml_conference_transfer import build_router as _build_transfer_router  # noqa: E402
+
+router.include_router(_build_transfer_router("vobiz"))

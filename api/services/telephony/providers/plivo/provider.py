@@ -542,9 +542,23 @@ class PlivoProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
         **kwargs: Any,
     ) -> Dict[str, Any]:
-        raise NotImplementedError("Plivo provider does not support call transfers")
+        """Ring the destination; their answer_url joins them to the conference (warm:
+        after the introduction and a press of 1). See xml_conference_transfer.py."""
+        from api.services.telephony.xml_conference_transfer import dial_colleague
+
+        if not self.validate_config():
+            raise ValueError("plivo provider not properly configured")
+        return await dial_colleague(
+            "plivo", auth_id=self.auth_id, auth_token=self.auth_token,
+            from_numbers=self.from_numbers, destination=destination,
+            transfer_id=transfer_id, timeout=timeout,
+        )
+
+    def supports_warm_transfer(self) -> bool:
+        return True
 
     def supports_transfers(self) -> bool:
-        return False
+        return True
