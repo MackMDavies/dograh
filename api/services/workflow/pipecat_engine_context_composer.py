@@ -142,6 +142,7 @@ async def compose_functions_for_node(
     dialer_callback_tz: Optional[str] = None,
     phone_tools_policy: Optional["PhoneToolsPolicy"] = None,
     builtin_phone_tools: Optional[set[str]] = None,
+    payment_links: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -221,6 +222,16 @@ async def compose_functions_for_node(
                         required=required,
                     )
                 )
+        if builtin.SEND_PAYMENT_LINK in builtin_phone_tools and payment_links:
+            description, properties = builtin.payment_link_schema(payment_links)
+            functions.append(
+                get_function_schema(
+                    builtin.SEND_PAYMENT_LINK,
+                    phone_tools_policy.describe("payments", description),
+                    properties=properties,
+                    required=["link"],
+                )
+            )
 
     # Dialer extra answers: the agent books the callback time it agreed.
     if dialer_callback_tz is not None:

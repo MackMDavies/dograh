@@ -450,3 +450,51 @@ async def handle_vonage_events(
 
     # Return 204 No Content as expected by Vonage
     return {"status": "ok"}
+
+
+# ── Transfers (Keypad & Native Phone Tools) ───────────────────────────────────────
+# Status events for the colleague's leg dialled by VonageProvider.transfer_call, and
+# the key they press on a warm transfer. transfer_id is an unguessable uuid4 known
+# only to Vonage and Redis, matching the Twilio transfer-result route.
+
+_VONAGE_LEG_OUTCOMES = {
+    "answered": "answered",
+    "busy": "busy",
+    "timeout": "no_answer",
+    "unanswered": "no_answer",
+    "cancelled": "no_answer",
+    "rejected": "failed",
+    "failed": "failed",
+    "completed": "completed",
+}
+
+
+@router.post("/vonage/transfer-result/{transfer_id}", include_in_schema=False)
+async def vonage_transfer_result(transfer_id: str, request: Request):
+    from api.services.telephony.warm_transfer import report_transfer_leg
+
+    event = await request.json()
+    outcome = _VONAGE_LEG_OUTCOMES.get(str(event.get("status") or ""))
+    if not outcome:
+        return {"status": "ignored"}
+    done = await report_transfer_leg(transfer_id, outcome, str(event.get("uuid") or ""))
+    return {"status": done}
+
+
+@router.post("/vonage/transfer-accept/{transfer_id}", include_in_schema=False)
+async def vonage_transfer_accept(transfer_id: str, request: Request):
+    from api.services.telephony.warm_transfer import (
+        DECLINED_GOODBYE,
+        report_transfer_accept,
+        vonage_conversation_ncco,
+    )
+
+    event = await request.json()
+    digits = str(((event.get("dtmf") or {}).get("digits")) or "")
+    conference = await report_transfer_accept(transfer_id, digits, str(event.get("uuid") or ""))
+    ncco = (
+        [{"action": "talk", "text": "Connecting you now."}, *vonage_conversation_ncco(conference)]
+        if conference
+        else [{"action": "talk", "text": DECLINED_GOODBYE}]
+    )
+    return Response(content=json.dumps(ncco), media_type="application/json")

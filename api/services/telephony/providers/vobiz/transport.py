@@ -17,6 +17,8 @@ from api.services.pipecat.audio_mixer import build_audio_out_mixer
 from api.services.pipecat.transport_params import realtime_param_overrides
 from api.services.telephony.factory import load_credentials_for_transport
 
+from api.services.telephony.xml_conference_transfer import XmlConferenceStrategy
+
 from .serializers import VobizFrameSerializer
 
 
@@ -55,6 +57,7 @@ async def create_transport(
         call_id=call_id,
         auth_id=auth_id,
         auth_token=auth_token,
+        transfer_strategy=XmlConferenceStrategy("vobiz"),
         params=VobizFrameSerializer.InputParams(
             vobiz_sample_rate=8000,
             sample_rate=audio_config.pipeline_sample_rate,

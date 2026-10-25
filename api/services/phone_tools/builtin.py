@@ -16,6 +16,10 @@ from loguru import logger
 
 SEND_TEXT = "send_text"
 SET_RECORDING = "set_recording"
+SEND_PAYMENT_LINK = "send_payment_link"
+
+# A lookup that takes longer than this puts the caller on hold music.
+HOLD_AFTER_SECONDS = 2.0
 
 MAX_TEXT_CHARS = 600
 # A caller asking for "the link and the address" is two texts; more is a loop.
@@ -55,6 +59,72 @@ def sms_hook_url() -> Optional[str]:
     from api.services.sysevo_functions import sysevo_function_url
 
     return sysevo_function_url("dograh-agent-sms", "SYSEVO_AGENT_SMS_URL")
+
+
+def payment_link_schema(links: list[dict]) -> tuple[str, dict]:
+    """Description and properties for send_payment_link: the agent can only pick one
+    of the business's own links, so it can never invent a price."""
+    def price(link: dict) -> str:
+        amount = link.get("amount")
+        if amount is None:
+            return "amount chosen by the payer"
+        return f"{amount / 100:.2f} {str(link.get('currency') or '').upper()}".strip()
+
+    listing = "; ".join(f"{link['title']} ({price(link)})" for link in links)
+    description = (
+        "Text the caller a secure payment link while you are talking, so they can pay "
+        "by card on their phone. Never ask for or accept card numbers out loud or on "
+        f"the keypad; send a link instead. Only these links exist: {listing}. Only "
+        "send one after the caller agrees, then tell them it is on its way."
+    )
+    properties = {
+        "link": {
+            "type": "string",
+            "enum": [link["title"] for link in links],
+            "description": "Which payment link to send.",
+        }
+    }
+    return description, properties
+
+
+async def _call_hook(payload: dict[str, Any]) -> Optional[dict[str, Any]]:
+    url = sms_hook_url()
+    secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not url or not secret:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
+            response = await client.post(url, json=payload, headers={"X-Sysevo-Secret": secret})
+        return response.json() if response.content else {}
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(f"[phone tools] SMS hook call failed: {exc}")
+        return None
+
+
+async def list_payment_links(workflow_id: Optional[int]) -> list[dict]:
+    """The account's active payment links; [] on any failure (the tool is then not offered)."""
+    data = await _call_hook({"action": "list_payment_links", "workflow_id": workflow_id})
+    links = (data or {}).get("links") if isinstance(data, dict) else None
+    return [
+        link for link in (links or [])
+        if isinstance(link, dict) and link.get("slug") and link.get("title")
+    ][:20]
+
+
+async def send_payment_link(
+    *, workflow_id: Optional[int], workflow_run_id: Optional[int], to: str, slug: str
+) -> dict[str, Any]:
+    data = await _call_hook({
+        "action": "send_payment_link", "workflow_id": workflow_id,
+        "workflow_run_id": workflow_run_id, "to": to, "slug": slug,
+    })
+    if data is None:
+        return {"status": "failed", "reason": "send_error", "readable_reason": "The link could not be sent."}
+    return {
+        "status": str(data.get("status") or "failed"),
+        "reason": data.get("reason"),
+        "readable_reason": data.get("readableReason"),
+    }
 
 
 def clean_text(message: Any) -> str:

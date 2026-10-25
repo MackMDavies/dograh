@@ -26,7 +26,9 @@ from api.enums import OrganizationConfigurationKey
 # sms: the agent texts the caller during the call (builtin.py).
 # recording: the agent pauses/resumes the recording when the caller asks; with
 #   start_paused, every call starts unrecorded until the caller agrees.
-PHONE_TOOL_IDS = ("keypad", "caller_keypad", "sms", "recording")
+# hold: music while a lookup tool (HTTP / MCP) takes more than a moment.
+# payments: text the caller one of the business's own payment links (builtin.py).
+PHONE_TOOL_IDS = ("keypad", "caller_keypad", "sms", "recording", "hold", "payments")
 
 MODES = ("on", "rule", "off")
 MAX_RULE_CHARS = 300
