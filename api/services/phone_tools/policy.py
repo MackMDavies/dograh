@@ -91,7 +91,8 @@ def normalize_policy(raw: Any) -> PhoneToolsPolicy:
             mode = "on"
         tools[tool_id] = ToolRule(
             mode=mode,
-            rule=rule if mode == "rule" else "",
+            # Retain a disabled condition for the editor; rule()/enabled() keep it inactive.
+            rule=rule if mode in ("rule", "off") else "",
             start_paused=tool_id == "recording" and entry.get("start_paused") is True,
         )
     return PhoneToolsPolicy(tools)

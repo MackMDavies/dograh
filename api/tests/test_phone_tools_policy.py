@@ -81,3 +81,28 @@ async def test_load_never_breaks_a_call():
         policy = await phone_tools.load_policy(7)
     assert policy.enabled("keypad") and policy.enabled("caller_keypad")
     assert (await phone_tools.load_policy(None)).enabled("keypad")
+
+
+@pytest.mark.parametrize('tool_id', phone_tools.PHONE_TOOL_IDS)
+def test_disabling_a_tool_keeps_its_condition_for_reenabling_without_activating_it(tool_id):
+    policy = phone_tools.normalize_policy({'tools': {
+        tool_id: {'mode': 'off', 'rule': '  Only when the caller agrees  ', 'start_paused': True},
+    }})
+    stored = policy.to_dict()['tools'][tool_id]
+    assert stored['rule'] == 'Only when the caller agrees'
+    assert not policy.enabled(tool_id)
+    assert policy.rule(tool_id) is None
+    assert policy.describe(tool_id, 'Tool description.') == 'Tool description.'
+    assert phone_tools.normalize_policy(policy.to_dict()).to_dict() == policy.to_dict()
+    if tool_id == 'recording':
+        assert stored['start_paused'] is True
+        assert not policy.recording_starts_paused()
+    stored['mode'] = 'rule'
+    enabled = phone_tools.normalize_policy({'tools': {tool_id: stored}})
+    assert enabled.enabled(tool_id)
+    assert enabled.rule(tool_id) == 'Only when the caller agrees'
+
+
+def test_always_available_explicitly_clears_the_old_condition():
+    policy = phone_tools.normalize_policy({'tools': {'sms': {'mode': 'on', 'rule': 'Old condition'}}})
+    assert policy.to_dict()['tools']['sms'] == {'mode': 'on', 'rule': ''}
