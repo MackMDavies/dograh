@@ -1016,6 +1016,11 @@ class LangfuseCredentialsRequest(BaseModel):
     host: str
     public_key: str
     secret_key: str
+    # "What to send" (Developers → Telemetry). Omitted = keep the saved options
+    # (or the defaults for a new configuration).
+    options: Optional[dict] = None
+    # Verify the keys against Langfuse before saving; nothing is saved if they fail.
+    test: bool = False
 
 
 class LangfuseCredentialsResponse(BaseModel):
@@ -1023,6 +1028,16 @@ class LangfuseCredentialsResponse(BaseModel):
     public_key: str = ""
     secret_key: str = ""
     configured: bool = False
+    options: Optional[dict] = None
+
+
+async def _load_langfuse(org_id: int):
+    from api.services.telemetry.langfuse_config import decode_langfuse_config
+
+    config = await db_client.get_configuration(
+        org_id, OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value
+    )
+    return decode_langfuse_config(config.value) if config and config.value else None
 
 
 @router.get("/langfuse-credentials", response_model=LangfuseCredentialsResponse)
@@ -1031,19 +1046,18 @@ async def get_langfuse_credentials(user: UserModel = Depends(get_user)):
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    config = await db_client.get_configuration(
-        user.selected_organization_id,
-        OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
-    )
+    cfg = await _load_langfuse(user.selected_organization_id)
+    if not cfg:
+        from api.services.telemetry.langfuse_config import DEFAULT_OPTIONS
 
-    if not config or not config.value:
-        return LangfuseCredentialsResponse()
+        return LangfuseCredentialsResponse(options=dict(DEFAULT_OPTIONS))
 
     return LangfuseCredentialsResponse(
-        host=config.value.get("host", ""),
-        public_key=mask_key(config.value.get("public_key", "")),
-        secret_key=mask_key(config.value.get("secret_key", "")),
+        host=cfg["host"],
+        public_key=mask_key(cfg["public_key"]),
+        secret_key=mask_key(cfg["secret_key"]),
         configured=True,
+        options=cfg["options"],
     )
 
 
@@ -1052,32 +1066,52 @@ async def save_langfuse_credentials(
     request: LangfuseCredentialsRequest,
     user: UserModel = Depends(get_user),
 ):
-    """Save Langfuse credentials for the user's organization."""
+    """Save Langfuse credentials (secret encrypted at rest), optionally testing them first."""
+    from api.services.telemetry.langfuse_config import (
+        DEFAULT_OPTIONS,
+        encode_langfuse_config,
+        normalize_options,
+        validate_host,
+        verify_langfuse,
+    )
+
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    existing_config = await db_client.get_configuration(
-        user.selected_organization_id,
-        OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
+    existing = await _load_langfuse(user.selected_organization_id)
+    host = request.host.strip().rstrip("/")
+    public_key = request.public_key.strip()
+    secret_key = request.secret_key.strip()
+
+    # Preserve masked fields (the GET returns masks; re-saving them keeps the originals)
+    if existing:
+        if is_mask_of(public_key, existing["public_key"]):
+            public_key = existing["public_key"]
+        if is_mask_of(secret_key, existing["secret_key"]):
+            secret_key = existing["secret_key"]
+
+    if not host or not public_key or not secret_key:
+        raise HTTPException(status_code=422, detail="Host, public key and secret key are required")
+    reason = validate_host(host)
+    if reason:
+        raise HTTPException(status_code=422, detail=reason)
+
+    options = normalize_options(
+        request.options
+        if request.options is not None
+        else (existing["options"] if existing else DEFAULT_OPTIONS)
     )
 
-    config_value = {
-        "host": request.host,
-        "public_key": request.public_key,
-        "secret_key": request.secret_key,
-    }
-
-    # Preserve masked fields
-    if existing_config and existing_config.value:
-        if is_mask_of(request.public_key, existing_config.value.get("public_key", "")):
-            config_value["public_key"] = existing_config.value["public_key"]
-        if is_mask_of(request.secret_key, existing_config.value.get("secret_key", "")):
-            config_value["secret_key"] = existing_config.value["secret_key"]
+    traces_today = None
+    if request.test:
+        ok, traces_today, error = await verify_langfuse(host, public_key, secret_key)
+        if not ok:
+            raise HTTPException(status_code=400, detail=error or "Langfuse rejected these keys")
 
     await db_client.upsert_configuration(
         user.selected_organization_id,
         OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
-        config_value,
+        encode_langfuse_config(host, public_key, secret_key, options),
     )
 
     # Broadcast to all workers so every process updates its in-memory exporter
@@ -1087,7 +1121,26 @@ async def save_langfuse_credentials(
         org_id=user.selected_organization_id,
     )
 
-    return {"message": "Langfuse credentials saved successfully"}
+    return {
+        "message": "Langfuse credentials saved successfully",
+        "tested": request.test,
+        "traces_today": traces_today,
+        "options": options,
+    }
+
+
+@router.post("/langfuse-credentials/test")
+async def test_langfuse_credentials(user: UserModel = Depends(get_user)):
+    """Check the saved credentials against Langfuse; returns today's trace count."""
+    from api.services.telemetry.langfuse_config import verify_langfuse
+
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    cfg = await _load_langfuse(user.selected_organization_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="No Langfuse credentials found")
+    ok, traces_today, error = await verify_langfuse(cfg["host"], cfg["public_key"], cfg["secret_key"])
+    return {"ok": ok, "traces_today": traces_today, "error": error}
 
 
 @router.delete("/langfuse-credentials")

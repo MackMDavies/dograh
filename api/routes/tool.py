@@ -16,6 +16,10 @@ from api.sdk_expose import sdk_expose
 from api.services.auth.depends import get_user
 from api.services.posthog_client import capture_event
 from api.services.workflow.mcp_tool_session import discover_mcp_tools
+from api.services.workflow.tools.preview_security import (
+    mask_preview_headers as _masked_headers,
+    validate_preview_target,
+)
 from api.services.workflow.tools.mcp_tool import (
     McpDefinitionError,
     validate_mcp_definition,
@@ -42,6 +46,10 @@ class ToolParameter(BaseModel):
     description: str = Field(description="Description of what this parameter is for")
     required: bool = Field(
         default=True, description="Whether this parameter is required"
+    )
+    ui_type: Optional[str] = Field(
+        default=None,
+        description="Display type chosen in the Voice AI tool editor (text, email, phone, date, ...)",
     )
 
 
@@ -88,6 +96,14 @@ class HttpApiConfig(BaseModel):
     )
     customMessageRecordingId: Optional[str] = Field(
         default=None, description="Recording ID for audio custom message"
+    )
+    failureMessage: Optional[str] = Field(
+        default=None,
+        description="What the agent says if the request fails or times out",
+    )
+    runAsync: Optional[bool] = Field(
+        default=None,
+        description="Keep talking while the request runs instead of waiting in silence",
     )
 
 
@@ -505,6 +521,106 @@ async def get_tool(
         raise HTTPException(status_code=404, detail="Tool not found")
 
     return build_tool_response(tool, include_created_by=True)
+
+
+class ToolTestRequest(BaseModel):
+    """A one-off run of an HTTP tool from the tool editor's "Try it" panel."""
+
+    arguments: Dict[str, Any] = Field(default_factory=dict)
+    # Unsaved edits from the editor; the saved credential always comes from the tool.
+    method: Optional[str] = None
+    url: Optional[str] = None
+    timeout_ms: Optional[int] = Field(default=None, ge=500, le=30000)
+
+
+@router.post("/{tool_uuid}/test")
+async def test_tool(
+    tool_uuid: str,
+    request: ToolTestRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Send one real request with a saved HTTP tool (its credential applied server side).
+
+    Returns the request as sent (secret headers masked), the response, and the time it
+    took. Used by the Voice AI tool editor; nothing is stored.
+    """
+    import time
+
+    import httpx
+
+    from api.utils.credential_auth import build_auth_header
+
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected for the user")
+    tool = await db_client.get_tool_by_uuid(
+        tool_uuid, user.selected_organization_id, include_archived=True
+    )
+    if not tool:
+        raise HTTPException(status_code=404, detail="Tool not found")
+    if tool.category != ToolCategory.HTTP_API.value:
+        raise HTTPException(status_code=400, detail="Only HTTP tools can be sent from here")
+
+    config = (tool.definition or {}).get("config", {}) or {}
+    method = (request.method or config.get("method") or "POST").upper()
+    url = request.url or config.get("url") or ""
+    if not re.match(r"^https://", url):
+        raise HTTPException(status_code=400, detail="The tool needs an https:// address")
+    args = dict(request.arguments or {})
+    # {name} placeholders in the address take the matching value.
+    for k in list(args.keys()):
+        token = "{" + k + "}"
+        if token in url:
+            url = url.replace(token, str(args.pop(k)))
+
+    credential_uuid = config.get("credential_uuid")
+    try:
+        validate_preview_target(
+            config.get("url") or "", url,
+            has_credentials=bool(credential_uuid or config.get("headers")),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if method not in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+        raise HTTPException(status_code=400, detail="Unsupported request method")
+    headers = dict(config.get("headers") or {})
+    credential_headers = {}
+    if credential_uuid:
+        credential = await db_client.get_credential_by_uuid(
+            credential_uuid, user.selected_organization_id
+        )
+        if credential:
+            credential_headers = build_auth_header(credential)
+            headers.update(credential_headers)
+    timeout_ms = request.timeout_ms or config.get("timeout_ms") or 10000
+
+    body = args if method in ("POST", "PUT", "PATCH") else None
+    params = args if method in ("GET", "DELETE") and args else None
+    sent = {"method": method, "url": url, "headers": _masked_headers(headers, credential_headers), "body": body, "params": params}
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=timeout_ms / 1000, follow_redirects=False) as client:
+            res = await client.request(method=method, url=url, headers=headers, json=body, params=params)
+        ms = int((time.monotonic() - started) * 1000)
+        try:
+            data = res.json()
+        except Exception:
+            data = {"raw_response": res.text[:4000]}
+        return {
+            "status": "success" if res.status_code < 400 else "error",
+            "status_code": res.status_code,
+            "ms": ms,
+            "request": sent,
+            "response": data,
+        }
+    except httpx.TimeoutException:
+        return {"status": "timeout", "ms": int(timeout_ms), "request": sent, "error": "timeout"}
+    except httpx.RequestError as e:
+        return {
+            "status": "error",
+            "ms": int((time.monotonic() - started) * 1000),
+            "request": sent,
+            "error": f"Request failed: {e}",
+        }
 
 
 @router.post("/{tool_uuid}/mcp/refresh")

@@ -184,7 +184,7 @@ def _resolve_preset_parameters(
     return resolved
 
 
-async def execute_http_tool(
+async def _execute_http_tool(
     tool: Any,
     arguments: Dict[str, Any],
     call_context_vars: Optional[Dict[str, Any]] = None,
@@ -307,3 +307,26 @@ async def execute_http_tool(
             "status": "error",
             "error": f"Tool execution failed: {str(e)}",
         }
+
+
+async def execute_http_tool(
+    tool: Any,
+    arguments: Dict[str, Any],
+    call_context_vars: Optional[Dict[str, Any]] = None,
+    gathered_context_vars: Optional[Dict[str, Any]] = None,
+    organization_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run the tool; when it fails, hand the LLM the line the owner wants said.
+
+    `failureMessage` is set in the Voice AI tool editor ("If it fails, the agent says").
+    """
+    result = await _execute_http_tool(
+        tool, arguments, call_context_vars, gathered_context_vars, organization_id
+    )
+    failure_message = ((tool.definition or {}).get("config", {}) or {}).get("failureMessage")
+    failed = result.get("status") == "error" or (
+        isinstance(result.get("status_code"), int) and result["status_code"] >= 400
+    )
+    if failed and failure_message:
+        result = {**result, "say_to_caller": failure_message}
+    return result

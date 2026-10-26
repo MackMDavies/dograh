@@ -97,6 +97,40 @@ class ManagedProvisioner:
             logger.error(f"[managed_provisioner] Number search failed: {exc}")
             return []
 
+    def search_available_numbers_detailed(
+        self,
+        country: str,
+        number_type: str = "local",
+        area_code: Optional[str] = None,
+        contains: Optional[str] = None,
+        in_locality: Optional[str] = None,
+        limit: int = 6,
+    ) -> List[Dict[str, Any]]:
+        """Purchasable numbers with place and capabilities (Voice AI "Buy a number")."""
+        try:
+            kwargs: Dict[str, Any] = {"limit": limit}
+            if area_code:
+                kwargs["area_code"] = area_code
+            if contains:
+                kwargs["contains"] = contains
+            if in_locality:
+                kwargs["in_locality"] = in_locality
+            listing = self._client.available_phone_numbers(country)
+            source = {"toll_free": listing.toll_free, "mobile": listing.mobile}.get(number_type, listing.local)
+            out = []
+            for n in source.list(**kwargs):
+                caps = getattr(n, "capabilities", None) or {}
+                out.append({
+                    "phone_number": n.phone_number,
+                    "locality": getattr(n, "locality", None),
+                    "region": getattr(n, "region", None),
+                    "capabilities": [k.upper() if k == "sms" else k.capitalize() for k in ("voice", "sms", "mms") if caps.get(k)],
+                })
+            return out
+        except TwilioRestException as exc:
+            logger.error(f"[managed_provisioner] Detailed number search failed: {exc}")
+            return []
+
     # ── Provisioning ──────────────────────────────────────────────────────────
 
     def provision_number(

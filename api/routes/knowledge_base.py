@@ -6,6 +6,7 @@ import uuid
 from typing import Annotated, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 from loguru import logger
 
 from api.db import db_client
@@ -858,3 +859,99 @@ async def unassign_document_from_workflow(
         raise HTTPException(
             status_code=500, detail="Failed to unassign document"
         ) from exc
+
+
+# ── Voice AI knowledge base page: rename, kind, read mode, sections ─────────────
+
+
+class UpdateDocumentDetailsRequest(BaseModel):
+    title: Optional[str] = Field(default=None, max_length=200)
+    kind: Optional[str] = Field(default=None, pattern="^(md|pdf|web|text|qa|csv)$")
+    source_url: Optional[str] = Field(default=None, max_length=2000)
+    retrieval_mode: Optional[str] = Field(default=None, pattern="^(chunked|full_document)$")
+
+
+def _doc_response(document) -> DocumentResponseSchema:
+    return DocumentResponseSchema(
+        id=document.id,
+        document_uuid=document.document_uuid,
+        filename=document.filename,
+        file_size_bytes=document.file_size_bytes,
+        file_hash=document.file_hash,
+        mime_type=document.mime_type,
+        processing_status=document.processing_status,
+        processing_error=document.processing_error,
+        total_chunks=document.total_chunks,
+        retrieval_mode=document.retrieval_mode,
+        custom_metadata=document.custom_metadata,
+        docling_metadata=document.docling_metadata,
+        source_url=document.source_url,
+        created_at=document.created_at,
+        updated_at=document.updated_at,
+        organization_id=document.organization_id,
+        created_by=document.created_by,
+        is_active=document.is_active,
+        is_global=document.is_global,
+    )
+
+
+@router.patch(
+    "/documents/{document_uuid}",
+    response_model=DocumentResponseSchema,
+    summary="Rename a document, tag its source, or change how agents read it",
+)
+async def update_document_details(
+    document_uuid: str,
+    request: UpdateDocumentDetailsRequest,
+    user=Depends(get_user),
+):
+    """Changing `retrieval_mode` re-processes the document with the new mode."""
+    before = await db_client.get_document_by_uuid(document_uuid, user.selected_organization_id)
+    if not before or not before.is_active:
+        raise HTTPException(status_code=404, detail="Document not found")
+    document = await db_client.update_document_details(
+        document_uuid=document_uuid,
+        organization_id=user.selected_organization_id,
+        title=request.title.strip() if request.title is not None else None,
+        kind=request.kind,
+        source_url=request.source_url,
+        retrieval_mode=request.retrieval_mode,
+    )
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    if request.retrieval_mode and request.retrieval_mode != (before.retrieval_mode or "chunked"):
+        s3_key = (document.custom_metadata or {}).get("s3_key", "")
+        if s3_key:
+            await db_client.delete_document_chunks(document.id)
+            await db_client.reset_document_for_retry(document.id)
+            await enqueue_job(
+                FunctionNames.PROCESS_KNOWLEDGE_BASE_DOCUMENT,
+                document.id,
+                s3_key,
+                user.selected_organization_id,
+                str(user.provider_id),
+                128,
+                request.retrieval_mode,
+            )
+            document = await db_client.get_document_by_uuid(document_uuid, user.selected_organization_id)
+    return _doc_response(document)
+
+
+@router.get(
+    "/documents/{document_uuid}/chunks",
+    summary="The sections an agent can retrieve from a document",
+)
+async def get_document_chunks(document_uuid: str, user=Depends(get_user)):
+    document = await db_client.get_document_by_uuid(document_uuid, user.selected_organization_id)
+    if not document or not document.is_active:
+        raise HTTPException(status_code=404, detail="Document not found")
+    chunks = await db_client.get_chunks_for_document(document.id, user.selected_organization_id)
+    return {
+        "document_uuid": document_uuid,
+        "retrieval_mode": document.retrieval_mode,
+        "full_text": document.full_text if (document.retrieval_mode == "full_document") else None,
+        "chunks": [
+            {"chunk_index": c.chunk_index, "chunk_text": c.chunk_text}
+            for c in chunks
+        ],
+    }

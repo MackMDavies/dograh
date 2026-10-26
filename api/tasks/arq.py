@@ -62,6 +62,7 @@ from api.tasks.dial_suppression_sync import sync_dial_suppression
 from api.tasks.dialer_overflow_reconciliation import reconcile_dialer_overflow
 from api.tasks.dialer_agent_history_reconciliation import reconcile_dialer_agent_history
 from api.services.api_usage_counter import flush_api_request_usage
+from api.services.api_request_logging import purge_api_request_logs
 
 
 class WorkerSettings:
@@ -86,6 +87,8 @@ class WorkerSettings:
         cron(reconcile_dialer_overflow, second=set(range(0,60,2)), run_at_startup=True),
         # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
         cron(flush_api_request_usage, minute=0),
+        # Daily: enforce the Developers request-log retention window (default 30 days).
+        cron(purge_api_request_logs, hour={3}, minute={17}),
         # Every 10 min: re-fire post-call wallet debits that never settled (crash / lost
         # job / transient webhook failure). Idempotent on workflow_run_id, so safe to retry.
         cron(reconcile_wallet_debits, minute=set(range(0, 60, 10))),

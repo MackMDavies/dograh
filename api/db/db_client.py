@@ -1,5 +1,6 @@
 from api.db.agent_trigger_client import AgentTriggerClient
 from api.db.api_key_client import APIKeyClient
+from api.db.api_request_log_client import ApiRequestLogClient
 from api.db.compliance_client import ComplianceDBClient
 from api.db.campaign_client import CampaignClient
 from api.db.embed_token_client import EmbedTokenClient
@@ -38,6 +39,7 @@ class DBClient(
     CampaignClient,
     ReportsClient,
     APIKeyClient,
+    ApiRequestLogClient,
     EmbedTokenClient,
     AgentTriggerClient,
     WebhookCredentialClient,

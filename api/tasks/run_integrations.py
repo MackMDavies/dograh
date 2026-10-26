@@ -217,11 +217,15 @@ async def run_integrations_post_workflow_run(_ctx, workflow_run_id: int):
             OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
         )
         if langfuse_config:
+            from api.services.telemetry.langfuse_config import decode_langfuse_config
+
+            decoded = decode_langfuse_config(langfuse_config)
             register_org_langfuse_credentials(
                 org_id=organization_id,
-                host=langfuse_config.get("host"),
-                public_key=langfuse_config.get("public_key"),
-                secret_key=langfuse_config.get("secret_key"),
+                host=decoded["host"],
+                public_key=decoded["public_key"],
+                secret_key=decoded["secret_key"],
+                options=decoded["options"],
             )
 
         # Step 2: Get workflow definition from the run's pinned version

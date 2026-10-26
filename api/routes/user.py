@@ -198,10 +198,14 @@ class APIKeyResponse(BaseModel):
     created_at: datetime
     last_used_at: Optional[datetime] = None
     archived_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
 
 
 class CreateAPIKeyRequest(BaseModel):
     name: str
+    # Optional: days until the key stops working (Developers page: 90 / 365). Omitted or
+    # null = never expires, which is the previous behaviour.
+    expires_in_days: Optional[int] = None
 
 
 class CreateAPIKeyResponse(BaseModel):
@@ -210,6 +214,7 @@ class CreateAPIKeyResponse(BaseModel):
     key_prefix: str
     api_key: str  # Only returned when creating a new key
     created_at: datetime
+    expires_at: Optional[datetime] = None
 
 
 @router.get("/api-keys")
@@ -234,6 +239,7 @@ async def get_api_keys(
             created_at=key.created_at,
             last_used_at=key.last_used_at,
             archived_at=key.archived_at,
+            expires_at=key.expires_at,
         )
         for key in api_keys
     ]
@@ -249,10 +255,19 @@ async def create_api_key(
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
+    expires_at = None
+    if request.expires_in_days is not None:
+        if not 1 <= request.expires_in_days <= 3650:
+            raise HTTPException(status_code=422, detail="expires_in_days must be 1–3650")
+        from datetime import timezone
+
+        expires_at = datetime.now(timezone.utc) + timedelta(days=request.expires_in_days)
+
     api_key, raw_key = await db_client.create_api_key(
         organization_id=user.selected_organization_id,
         name=request.name,
         created_by=user.id,
+        expires_at=expires_at,
     )
 
     # Record the payer link (dograh_api_key_id -> client_account) server-side, after the
@@ -267,6 +282,7 @@ async def create_api_key(
         key_prefix=api_key.key_prefix,
         api_key=raw_key,
         created_at=api_key.created_at,
+        expires_at=api_key.expires_at,
     )
 
 

@@ -101,8 +101,17 @@ class CarrierLookupResponse(BaseModel):
     line_type: str
 
 
+class AvailableNumberItem(BaseModel):
+    phone_number: str
+    locality: Optional[str] = None
+    region: Optional[str] = None
+    capabilities: list[str] = []
+
+
 class AvailableNumbersResponse(BaseModel):
     numbers: list[str]
+    # Filled when number_type / contains / in_locality / detailed is asked for.
+    items: Optional[list[AvailableNumberItem]] = None
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────────
@@ -158,6 +167,10 @@ async def available_numbers(
     country: str = Query(..., description="ISO 3166-1 alpha-2 country code"),
     area_code: Optional[str] = Query(None),
     platform_account_id: Optional[int] = Query(None),
+    number_type: Optional[Literal["local", "toll_free", "mobile"]] = Query(None),
+    contains: Optional[str] = Query(None, max_length=16),
+    in_locality: Optional[str] = Query(None, max_length=64),
+    detailed: bool = Query(False),
     user: UserModel = Depends(get_user),
 ):
     """List purchasable numbers from the platform Twilio account."""
@@ -166,6 +179,12 @@ async def available_numbers(
     )
     if provisioner is None:
         raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+    if detailed or number_type or contains or in_locality:
+        items = await asyncio.to_thread(
+            provisioner.search_available_numbers_detailed,
+            country, number_type or "local", area_code, contains, in_locality,
+        )
+        return AvailableNumbersResponse(numbers=[i["phone_number"] for i in items], items=items)
     numbers = await asyncio.to_thread(provisioner.search_available_numbers, country, area_code)
     return AvailableNumbersResponse(numbers=numbers)
 

@@ -1,6 +1,7 @@
+from datetime import datetime, timezone
 from typing import List, Optional
 
-from sqlalchemy import and_
+from sqlalchemy import and_, or_
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
@@ -10,7 +11,11 @@ from api.utils.api_key import generate_api_key, hash_api_key
 
 class APIKeyClient(BaseDBClient):
     async def create_api_key(
-        self, organization_id: int, name: str, created_by: Optional[int] = None
+        self,
+        organization_id: int,
+        name: str,
+        created_by: Optional[int] = None,
+        expires_at: Optional[datetime] = None,
     ) -> tuple[APIKeyModel, str]:
         """Create a new API key for an organization.
 
@@ -28,6 +33,7 @@ class APIKeyClient(BaseDBClient):
                 key_prefix=key_prefix,
                 created_by=created_by,
                 is_active=True,
+                expires_at=expires_at,
             )
             session.add(api_key)
             await session.commit()
@@ -59,10 +65,32 @@ class APIKeyClient(BaseDBClient):
                         APIKeyModel.key_hash == key_hash,
                         APIKeyModel.is_active == True,
                         APIKeyModel.archived_at.is_(None),
+                        # Keys created with an expiry stop validating after it.
+                        or_(
+                            APIKeyModel.expires_at.is_(None),
+                            APIKeyModel.expires_at > datetime.now(timezone.utc),
+                        ),
                     )
                 )
             )
             return result.scalars().first()
+
+    async def get_api_key_identity_by_hash(
+        self, key_hash: str
+    ) -> Optional[tuple[int, int]]:
+        """(api_key_id, organization_id) for a key hash, archived/expired included.
+
+        Used only to attribute request-log rows; never for authentication and never
+        touches last_used_at.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(APIKeyModel.id, APIKeyModel.organization_id).where(
+                    APIKeyModel.key_hash == key_hash
+                )
+            )
+            row = result.first()
+            return (row[0], row[1]) if row else None
 
     async def validate_api_key(self, raw_api_key: str) -> Optional[APIKeyModel]:
         """Validate an API key and return the associated model if valid."""
