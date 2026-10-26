@@ -115,10 +115,10 @@ class ApiRequestLogClient(BaseDBClient):
         minutes = await self.execute_raw_query(
             """
             SELECT
-              COALESCE(sum((cost_info->>'call_duration_seconds')::float)
-                FILTER (WHERE created_at >= :month), 0) / 60.0 AS this_month,
-              COALESCE(sum((cost_info->>'call_duration_seconds')::float)
-                FILTER (WHERE created_at >= :last_month AND created_at < :month), 0) / 60.0 AS last_month
+              COALESCE(sum((wr.cost_info->>'call_duration_seconds')::float)
+                FILTER (WHERE wr.created_at >= :month), 0) / 60.0 AS this_month,
+              COALESCE(sum((wr.cost_info->>'call_duration_seconds')::float)
+                FILTER (WHERE wr.created_at >= :last_month AND wr.created_at < :month), 0) / 60.0 AS last_month
               FROM workflow_runs wr
               JOIN api_keys k ON k.id = wr.api_key_id
              WHERE k.organization_id = :org AND wr.created_at >= :last_month
