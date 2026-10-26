@@ -20,53 +20,55 @@ from api.db.models import (
     PlatformDialerTwilioCredentialsModel,
     PlatformTelnyxDialerCredentialsModel,
     PlatformTelnyxUserCredentialModel,
+    PlatformSignalWireDialerCredentialsModel,
     PlatformTwilioCredentialsModel,
+    PlatformTwilioDialerCredentialsModel,
     PlatformVonageDialerCredentialsModel,
 )
 from api.services.crypto import decrypt_secret, encrypt_secret
 
 
 class PlatformSettingsClient(BaseDBClient):
+    async def get_platform_signalwire_dialer_credentials(self) -> Optional[dict]:
+        async with self.async_session() as session:
+            row = await session.get(PlatformSignalWireDialerCredentialsModel, 1)
+        if not row:
+            return None
+        return {**(row.credentials or {}), "updated_at": row.updated_at}
+
+    async def save_platform_signalwire_dialer_credentials(self, credentials: dict) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformSignalWireDialerCredentialsModel, 1)
+            if row is None:
+                session.add(PlatformSignalWireDialerCredentialsModel(id=1, credentials=credentials))
+            else:
+                row.credentials = credentials
+            await session.commit()
+
     async def get_platform_vonage_dialer_credentials(self) -> Optional[dict]:
         async with self.async_session() as session:
             row = await session.get(PlatformVonageDialerCredentialsModel, 1)
         if not row:
             return None
-        credentials = row.credentials or {}
-        return {
-            "application_id": credentials.get("application_id"),
-            "api_key": credentials.get("api_key"),
-            "api_secret": credentials.get("api_secret"),
-            "private_key": credentials.get("private_key"),
-            "signature_secret": credentials.get("signature_secret"),
-            "updated_at": row.updated_at,
-        }
+        return {**(row.credentials or {}), "updated_at": row.updated_at}
 
     async def save_platform_vonage_dialer_credentials(
-        self, *, application_id: str, api_key: str, api_secret: str | None, private_key: str, signature_secret: str
+        self, credentials: dict | None = None, *, application_id: str | None = None,
+        api_key: str | None = None, api_secret: str | None = None,
+        private_key: str | None = None, signature_secret: str | None = None,
     ) -> None:
+        # Accept the deployed admin's dictionary and the canonical admin's keywords.
+        if credentials is None:
+            credentials = dict(application_id=application_id, api_key=api_key,
+                               api_secret=api_secret, private_key=private_key,
+                               signature_secret=signature_secret)
         async with self.async_session() as session:
             row = await session.get(PlatformVonageDialerCredentialsModel, 1)
             if row is None:
-                row = PlatformVonageDialerCredentialsModel(
-                    id=1,
-                    credentials={
-                        "application_id": application_id,
-                        "api_key": api_key,
-                        "api_secret": api_secret,
-                        "private_key": private_key,
-                        "signature_secret": signature_secret,
-                    },
-                )
+                row = PlatformVonageDialerCredentialsModel(id=1, credentials=credentials)
                 session.add(row)
             else:
-                row.credentials = {
-                    "application_id": application_id,
-                    "api_key": api_key,
-                    "api_secret": api_secret,
-                    "private_key": private_key,
-                    "signature_secret": signature_secret,
-                }
+                row.credentials = credentials
             await session.commit()
 
     async def get_platform_telnyx_user_credential(self, user_id: int) -> Optional[dict]:
@@ -188,9 +190,15 @@ class PlatformSettingsClient(BaseDBClient):
             return result.scalars().first()
 
     async def get_platform_dialer_credentials(self) -> Optional[dict]:
-        """Return the dedicated sales dialer Twilio record, separate from AI Voice."""
+        """
+        Return ``{"account_sid", "api_key_sid", "api_key_secret",
+        "twiml_app_sid", "default_caller_id"}`` for the active account, or
+        ``None`` if no account is active, the active account has no dialer
+        fields configured, or decryption fails. Callers should fall back to
+        env vars on ``None`` (see ``voice_sdk.py``).
+        """
         async with self.async_session() as session:
-            row = await session.get(PlatformDialerTwilioCredentialsModel, 1)
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
         if not row:
             return None
         try:
@@ -208,14 +216,14 @@ class PlatformSettingsClient(BaseDBClient):
             "last_validated_at": row.last_validated_at,
         }
 
-    async def save_platform_dialer_twilio_credentials(
+    async def save_platform_dialer_credentials(
         self, *, account_sid: str, auth_token: str, api_key_sid: str,
-        api_key_secret: str, twiml_app_sid: str, default_caller_id: Optional[str],
+        api_key_secret: str, twiml_app_sid: str, default_caller_id: str | None,
     ) -> None:
         async with self.async_session() as session:
-            row = await session.get(PlatformDialerTwilioCredentialsModel, 1)
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
             if row is None:
-                row = PlatformDialerTwilioCredentialsModel(id=1)
+                row = PlatformTwilioDialerCredentialsModel(id=1)
                 session.add(row)
             row.account_sid = account_sid
             row.auth_token_encrypted = encrypt_secret(auth_token)
@@ -224,8 +232,21 @@ class PlatformSettingsClient(BaseDBClient):
             row.twiml_app_sid = twiml_app_sid
             row.default_caller_id = default_caller_id
             row.last_validated_at = datetime.now(UTC)
-            row.updated_at = datetime.now(UTC)
             await session.commit()
+
+    async def get_platform_dialer_connection_status(self) -> dict:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
+        if not row:
+            return {"configured": False, "account_sid": None, "api_key_sid": None, "twiml_app_sid": None, "default_caller_id": None, "last_validated_at": None}
+        return {
+            "configured": bool(row.account_sid and row.auth_token_encrypted and row.api_key_sid and row.api_key_secret_encrypted and row.twiml_app_sid),
+            "account_sid": row.account_sid,
+            "api_key_sid": row.api_key_sid,
+            "twiml_app_sid": row.twiml_app_sid,
+            "default_caller_id": row.default_caller_id,
+            "last_validated_at": row.last_validated_at,
+        }
 
     async def get_platform_dialer_twilio_connection(self) -> Optional[dict]:
         creds = await self.get_platform_dialer_credentials()
@@ -240,6 +261,10 @@ class PlatformSettingsClient(BaseDBClient):
             "default_caller_id": creds.get("default_caller_id"),
             "last_validated_at": creds.get("last_validated_at"),
         }
+
+    async def save_platform_dialer_twilio_credentials(self, **credentials) -> None:
+        """Compatibility name used by the canonical admin route."""
+        await self.save_platform_dialer_credentials(**credentials)
 
     async def get_platform_dialer_auth_token(self) -> Optional[str]:
         """
@@ -266,15 +291,11 @@ class PlatformSettingsClient(BaseDBClient):
                 "is_active": r.is_active,
                 "last_validated_at": r.last_validated_at,
                 "created_at": r.created_at,
-                "dialer_configured": bool(
-                    r.dialer_api_key_sid and r.dialer_api_key_secret_encrypted
-                ),
-                # Identifiers, not secrets — safe to show in full so the edit
-                # form can pre-fill them. Only auth_token / dialer_api_key_secret
-                # are ever masked/withheld.
-                "dialer_api_key_sid": r.dialer_api_key_sid,
-                "dialer_twiml_app_sid": r.dialer_twiml_app_sid,
-                "dialer_default_caller_id": r.dialer_default_caller_id,
+                # Legacy response keys remain available; the dialer has its own settings.
+                "dialer_configured": False,
+                "dialer_api_key_sid": None,
+                "dialer_twiml_app_sid": None,
+                "dialer_default_caller_id": None,
             }
             for r in rows
         ]
@@ -288,12 +309,7 @@ class PlatformSettingsClient(BaseDBClient):
         pass only fields the client actually submitted, e.g. via
         ``BaseModel.model_dump(exclude_unset=True)``).
 
-        Recognised keys: label, account_sid, auth_token, dialer_api_key_sid,
-        dialer_api_key_secret, dialer_twiml_app_sid, dialer_default_caller_id.
-        Empty string clears a nullable field; ``auth_token``/
-        ``dialer_api_key_secret`` are re-encrypted when present and non-empty,
-        left alone when absent, and only cleared (along with the paired SID)
-        by explicitly clearing ``dialer_api_key_sid`` to "".
+        Recognised keys: label, account_sid, auth_token.
 
         Returns None on success, or an error string if the account doesn't exist.
         """
@@ -308,22 +324,6 @@ class PlatformSettingsClient(BaseDBClient):
                 row.account_sid = updates["account_sid"]
             if "auth_token" in updates and updates["auth_token"]:
                 row.auth_token_encrypted = encrypt_secret(updates["auth_token"])
-            if "dialer_api_key_sid" in updates:
-                new_sid = updates["dialer_api_key_sid"] or None
-                row.dialer_api_key_sid = new_sid
-                if new_sid is None:
-                    row.dialer_api_key_secret_encrypted = None
-            if updates.get("dialer_api_key_secret"):
-                row.dialer_api_key_secret_encrypted = encrypt_secret(
-                    updates["dialer_api_key_secret"]
-                )
-            if "dialer_twiml_app_sid" in updates:
-                row.dialer_twiml_app_sid = updates["dialer_twiml_app_sid"] or None
-            if "dialer_default_caller_id" in updates:
-                row.dialer_default_caller_id = (
-                    updates["dialer_default_caller_id"] or None
-                )
-
             await session.commit()
             return None
 
@@ -345,9 +345,6 @@ class PlatformSettingsClient(BaseDBClient):
         remains active. Returns the new row's id.
         """
         encrypted = encrypt_secret(auth_token)
-        dialer_secret_encrypted = (
-            encrypt_secret(dialer_api_key_secret) if dialer_api_key_secret else None
-        )
         now = datetime.now(UTC)
         async with self.async_session() as session:
             if make_active:
@@ -362,10 +359,6 @@ class PlatformSettingsClient(BaseDBClient):
                 label=label,
                 account_sid=account_sid,
                 auth_token_encrypted=encrypted,
-                dialer_api_key_sid=dialer_api_key_sid,
-                dialer_api_key_secret_encrypted=dialer_secret_encrypted,
-                dialer_twiml_app_sid=dialer_twiml_app_sid,
-                dialer_default_caller_id=dialer_default_caller_id,
                 is_active=make_active,
                 last_validated_at=now,
             )

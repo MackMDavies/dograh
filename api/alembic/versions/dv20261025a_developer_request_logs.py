@@ -1,7 +1,7 @@
 """Developers console: API key expiry + per-request API log.
 
 Revision ID: dv20261025a
-Revises: ef20261016
+Revises: vr20261026a
 
 * ``api_keys.expires_at`` (nullable): keys created with an expiry stop validating
   after that instant. Existing keys stay NULL = never expire.
@@ -16,7 +16,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "dv20261025a"
-down_revision: Union[str, Sequence[str], None] = "ef20261016"
+down_revision: Union[str, Sequence[str], None] = "vr20261026a"
 branch_labels = None
 depends_on = None
 
