@@ -56,7 +56,16 @@ router = APIRouter(prefix="/telephony")
 @router.get('/number-preferences/capabilities')
 async def number_preference_capabilities(_user: UserModel = Depends(get_user)):
     """Advertise only number preferences consumed by this running server."""
-    return {'daily_call_cap': True, 'local_presence': True}
+    from api.services.telephony import registry
+
+    return {
+        'daily_call_cap': True,
+        'local_presence': True,
+        'inbound_number_routing_providers': [
+            spec.name for spec in registry.all_specs()
+            if getattr(spec.provider_cls, 'SUPPORTS_INBOUND_NUMBER_POLICIES', False)
+        ],
+    }
 
 
 class InitiateCallRequest(BaseModel):
@@ -561,6 +570,79 @@ async def _create_inbound_workflow_run(
     return workflow_run.id
 
 
+async def _create_inbound_voicemail_run(
+    *, workflow, organization_id: int, provider: str, normalized_data,
+    configuration_id: int, phone_number_id: int,
+) -> int:
+    """Create an idempotent, non-billable run that owns an inbound voicemail."""
+    suffix = int(str(uuid.uuid4()).replace("-", "")[:8], 16) % 100000000
+    run = await db_client.create_workflow_run(
+        f"WR-VM-IN-{suffix:08d}", workflow.id, provider,
+        user_id=workflow.user_id,
+        call_type=CallType.INBOUND,
+        initial_context={
+            "caller_number": normalized_data.from_number,
+            "called_number": normalized_data.to_number,
+            "direction": "inbound",
+            "provider": provider,
+            "telephony_configuration_id": configuration_id,
+            "from_phone_number_id": phone_number_id,
+            "number_policy_voicemail": True,
+        },
+        gathered_context={"call_id": normalized_data.call_id},
+        annotations={"voice_number_voicemail": {"enabled": True, "organization_id": organization_id}},
+        idempotency_key=f"voice-number-voicemail:{normalized_data.call_id}",
+        organization_id=organization_id,
+    )
+    return run.id
+
+
+async def _start_number_policy_fallback(
+    *, provider_instance, policy, action: str, workflow, organization_id: int,
+    provider_name: str, normalized_data, configuration_id: int, phone_number_id: int,
+):
+    """Start a provider-native fallback only when that provider implements it."""
+    if not getattr(provider_instance, "SUPPORTS_INBOUND_NUMBER_POLICIES", False):
+        return None
+    backend_endpoint, _ = await get_backend_endpoints()
+    voicemail_run_id = None
+    if action == "vm":
+        voicemail_run_id = await _create_inbound_voicemail_run(
+            workflow=workflow,
+            organization_id=organization_id,
+            provider=provider_name,
+            normalized_data=normalized_data,
+            configuration_id=configuration_id,
+            phone_number_id=phone_number_id,
+        )
+    destination = policy.forward_to if policy else None
+    if action == "fwd" and destination:
+        from api.utils.telephony_address import normalize_telephony_address
+        try:
+            normalized_destination = normalize_telephony_address(
+                destination, country_hint=normalized_data.to_country
+            )
+            destination = normalized_destination.canonical if normalized_destination.address_type == "pstn" else None
+        except ValueError:
+            destination = None
+    resolved_action = action if action == "vm" or destination else "vm"
+    if resolved_action == "vm" and voicemail_run_id is None:
+        voicemail_run_id = await _create_inbound_voicemail_run(
+            workflow=workflow,
+            organization_id=organization_id,
+            provider=provider_name,
+            normalized_data=normalized_data,
+            configuration_id=configuration_id,
+            phone_number_id=phone_number_id,
+        )
+    return await provider_instance.inbound_number_policy_response(
+        action=resolved_action,
+        forward_to=destination,
+        voicemail_run_id=voicemail_run_id,
+        backend_endpoint=backend_endpoint,
+    )
+
+
 async def _resolve_inbound_telephony_config(
     organization_id: int, provider_class, account_id: str
 ) -> tuple[TelephonyError, Optional[int]]:
@@ -821,16 +903,6 @@ async def handle_inbound_run(request: Request):
                 TelephonyError.WORKFLOW_NOT_FOUND
             )
 
-        # Agent activation gate — deactivated agents cannot receive calls.
-        from api.services.workflow_active_check import check_workflow_active
-        allowed, reason = await check_workflow_active(workflow_id)
-        if not allowed:
-            logger.warning(
-                f"Inbound rejected: workflow {workflow_id} not active ({reason})"
-            )
-            return provider_class.generate_validation_error_response(
-                TelephonyError.WORKFLOW_DEACTIVATED
-            )
         user_id = workflow.user_id
 
         # 3. Verify webhook signature against the matched config's credentials.
@@ -849,6 +921,62 @@ async def handle_inbound_run(request: Request):
                 TelephonyError.SIGNATURE_VALIDATION_FAILED
             )
 
+        # Number-level routing runs only after provider authentication and an
+        # exact tenant-owned (configuration, number) match. A cache miss or
+        # storage read error leaves the established inbound path unchanged.
+        from api.services.telephony.number_policy import (
+            inbound_hours_action,
+            load_inbound_number_policy,
+        )
+        number_policy = await load_inbound_number_policy(
+            config.organization_id,
+            telephony_configuration_id,
+            phone_row.id,
+            phone_row.address_normalized,
+        )
+        supports_number_policy = getattr(
+            provider_instance, "SUPPORTS_INBOUND_NUMBER_POLICIES", False
+        )
+
+        async def policy_fallback(action: str):
+            if not supports_number_policy or not number_policy:
+                return None
+            return await _start_number_policy_fallback(
+                provider_instance=provider_instance,
+                policy=number_policy,
+                action=action,
+                workflow=workflow,
+                organization_id=config.organization_id,
+                provider_name=provider_class.PROVIDER_NAME,
+                normalized_data=normalized_data,
+                configuration_id=telephony_configuration_id,
+                phone_number_id=phone_row.id,
+            )
+
+        if supports_number_policy and number_policy:
+            hours_action = inbound_hours_action(number_policy)
+            if hours_action in ("vm", "fwd"):
+                fallback = await policy_fallback(hours_action)
+                if fallback is not None:
+                    return fallback
+                return provider_class.generate_validation_error_response(
+                    TelephonyError.GENERAL_AUTH_FAILED
+                )
+
+        # Agent activation gate — deactivated agents cannot receive calls.
+        from api.services.workflow_active_check import check_workflow_active
+        allowed, reason = await check_workflow_active(workflow_id)
+        if not allowed:
+            logger.warning(
+                f"Inbound rejected: workflow {workflow_id} not active ({reason})"
+            )
+            fallback = await policy_fallback(number_policy.on_fail if number_policy else "vm")
+            if fallback is not None:
+                return fallback
+            return provider_class.generate_validation_error_response(
+                TelephonyError.WORKFLOW_DEACTIVATED
+            )
+
         # 4. Quota check (use the workflow's model_overrides if set).
         quota_result = await check_dograh_quota_by_user_id(
             user_id, workflow_id=workflow_id
@@ -857,6 +985,9 @@ async def handle_inbound_run(request: Request):
             logger.warning(
                 f"User {user_id} has exceeded quota: {quota_result.error_message}"
             )
+            fallback = await policy_fallback(number_policy.on_fail if number_policy else "vm")
+            if fallback is not None:
+                return fallback
             return provider_class.generate_validation_error_response(
                 TelephonyError.QUOTA_EXCEEDED
             )
@@ -868,6 +999,9 @@ async def handle_inbound_run(request: Request):
             logger.warning(
                 f"Inbound call blocked for workflow {workflow_id}: {wallet_block_reason}"
             )
+            fallback = await policy_fallback(number_policy.on_fail if number_policy else "vm")
+            if fallback is not None:
+                return fallback
             return provider_class.generate_validation_error_response(
                 TelephonyError.QUOTA_EXCEEDED
             )
@@ -879,6 +1013,9 @@ async def handle_inbound_run(request: Request):
             logger.warning(
                 f"Inbound call blocked for workflow {workflow_id}: concurrent-call limit reached"
             )
+            fallback = await policy_fallback(number_policy.on_fail if number_policy else "vm")
+            if fallback is not None:
+                return fallback
             return provider_class.generate_validation_error_response(
                 TelephonyError.QUOTA_EXCEEDED
             )

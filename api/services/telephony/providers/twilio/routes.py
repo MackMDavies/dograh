@@ -8,6 +8,7 @@ import json
 import os
 import re
 import asyncio
+import tempfile
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
@@ -50,7 +51,10 @@ from api.services.telephony.dialer.provider import (
     resolve_active_dialer_provider,
     resolve_configured_dialer_provider,
 )
-from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.factory import (
+    get_telephony_provider_by_id,
+    get_telephony_provider_for_run,
+)
 from api.services.telephony.providers.twilio.floor_monitor import (
     claim_floor_monitor,
     change_floor_monitor_mode,
@@ -117,6 +121,7 @@ from api.services.telephony.status_processor import (
     _process_status_update,
 )
 from api.utils.common import get_backend_endpoints
+from api.utils.telephony_helper import numbers_match
 
 router = APIRouter()
 
@@ -3401,6 +3406,100 @@ async def handle_twilio_status_callback(
     await _process_status_update(workflow_run_id, status_update)
 
     return {"status": "success"}
+
+
+@router.post("/twilio/inbound-voicemail/{workflow_run_id}", include_in_schema=False)
+async def handle_inbound_voicemail_recording(workflow_run_id: int, request: Request):
+    """Verify, store, and finalize an owner's inbound voicemail recording."""
+    from fastapi import Response
+    from api.enums import WorkflowRunState
+    from api.services.storage import get_storage_for_backend
+
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    if not run or not (run.annotations or {}).get("voice_number_voicemail", {}).get("enabled"):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+    workflow = await db_client.get_workflow_by_id(run.workflow_id)
+    if not workflow or workflow.organization_id != (run.annotations or {}).get("voice_number_voicemail", {}).get("organization_id"):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+
+    callback_data = dict(await request.form())
+    provider = await get_telephony_provider_by_id(
+        int((run.initial_context or {}).get("telephony_configuration_id") or 0),
+        workflow.organization_id,
+    )
+    valid = await provider.verify_inbound_signature(
+        str(request.url), callback_data, dict(request.headers)
+    )
+    if not valid:
+        return Response(content=hangup, media_type="application/xml", status_code=401)
+
+    call_sid = callback_data.get("CallSid", "")
+    if (
+        callback_data.get("AccountSid") != getattr(provider, "account_sid", None)
+        or call_sid != (run.gathered_context or {}).get("call_id")
+        or not numbers_match(callback_data.get("From", ""), (run.initial_context or {}).get("caller_number", ""))
+        or not numbers_match(callback_data.get("To", ""), (run.initial_context or {}).get("called_number", ""))
+    ):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+
+    recording_sid = callback_data.get("RecordingSid", "")
+    duration_raw = callback_data.get("RecordingDuration", "0")
+    try:
+        duration = max(0, min(180, int(duration_raw)))
+    except (TypeError, ValueError):
+        duration = 0
+    recording_key = None
+    if re.fullmatch(r"RE[a-zA-Z0-9]{32}", recording_sid):
+        recording_url = f"{provider.base_url}/Recordings/{recording_sid}.wav"
+        temp_path = None
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                media = await client.get(
+                    recording_url,
+                    auth=(provider.account_sid, provider.auth_token),
+                )
+            if media.status_code == 200 and 44 < len(media.content) <= 25 * 1024 * 1024:
+                fd, temp_path = tempfile.mkstemp(suffix=".wav")
+                with os.fdopen(fd, "wb") as output:
+                    output.write(media.content)
+                storage = get_storage_for_backend(run.storage_backend)
+                candidate_key = f"recordings/{workflow_run_id}.wav"
+                if await storage.aupload_file(temp_path, candidate_key):
+                    recording_key = candidate_key
+        except Exception as exc:
+            logger.error(f"Could not store inbound voicemail for run {workflow_run_id}: {type(exc).__name__}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    logger.warning(f"Could not remove temporary inbound voicemail for run {workflow_run_id}")
+
+    disposition = "voicemail" if recording_key else "no_answer"
+    await db_client.update_workflow_run(
+        run_id=workflow_run_id,
+        is_completed=True,
+        recording_url=recording_key,
+        storage_backend=run.storage_backend,
+        cost_info={"dograh_token_usage": 0, "call_duration_seconds": duration, "charge_usd": 0},
+        gathered_context={
+            "mapped_call_disposition": disposition,
+            "inbound_voicemail_recording_sid": recording_sid if recording_key else None,
+            "inbound_voicemail_recording_duration_seconds": duration,
+        },
+        state=WorkflowRunState.COMPLETED.value,
+        annotations={"voice_number_voicemail": {
+            "enabled": True,
+            "organization_id": workflow.organization_id,
+            "recording_saved": bool(recording_key),
+        }},
+    )
+    # These calls never enter the AI pipeline, so make both post-call ledgers
+    # terminal and keep reconcilers from treating the voicemail as unprocessed.
+    await db_client.mark_wallet_debit_settled(workflow_run_id)
+    await db_client.mark_memory_settled(workflow_run_id)
+    return Response(content=hangup, media_type="application/xml")
 
 
 # In-call controls (hold, recording, keypad tones, transfer, add call) live in their

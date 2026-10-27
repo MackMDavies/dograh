@@ -64,6 +64,7 @@ class TelephonyProvider(ABC):
 
     PROVIDER_NAME = None
     WEBHOOK_ENDPOINT = None
+    SUPPORTS_INBOUND_NUMBER_POLICIES = False
 
     @abstractmethod
     async def initiate_call(
@@ -322,6 +323,22 @@ class TelephonyProvider(ABC):
             FastAPI Response object (or dict/JSON-serializable value)
         """
         pass
+
+    async def inbound_number_policy_response(
+        self,
+        *,
+        action: str,
+        forward_to: str | None = None,
+        voicemail_run_id: int | None = None,
+        backend_endpoint: str | None = None,
+    ) -> Any | None:
+        """Return a provider-native response for saved number-level fallback.
+
+        Providers that do not implement voicemail/forwarding leave this unset;
+        the dispatcher keeps their existing call path and does not claim the
+        saved preference is active for that provider.
+        """
+        return None
 
     async def handle_external_websocket(
         self,

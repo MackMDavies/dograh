@@ -4,6 +4,7 @@ Twilio implementation of the TelephonyProvider interface.
 
 import json
 import random
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import aiohttp
@@ -38,6 +39,7 @@ class TwilioProvider(TelephonyProvider):
 
     PROVIDER_NAME = WorkflowRunMode.TWILIO.value
     WEBHOOK_ENDPOINT = "twiml"
+    SUPPORTS_INBOUND_NUMBER_POLICIES = True
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -518,6 +520,38 @@ class TwilioProvider(TelephonyProvider):
 </Response>"""
 
         return Response(content=twiml_content, media_type="application/xml")
+
+    async def inbound_number_policy_response(
+        self,
+        *,
+        action: str,
+        forward_to: str | None = None,
+        voicemail_run_id: int | None = None,
+        backend_endpoint: str | None = None,
+    ):
+        """Build a Twilio response for an owner's verified number policy."""
+        from fastapi import Response
+        from xml.sax.saxutils import escape, quoteattr
+
+        if action == "fwd" and forward_to and re.fullmatch(r"\+[1-9][0-9]{6,14}", forward_to):
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?><Response><Dial timeout="30">'
+                f"<Number>{escape(forward_to)}</Number></Dial><Hangup/></Response>"
+            )
+        elif action == "vm" and voicemail_run_id and backend_endpoint:
+            voicemail_callback_url = (
+                f"{backend_endpoint}/api/v1/telephony/twilio/inbound-voicemail/{voicemail_run_id}"
+            )
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Say voice="alice">Please leave a message after the tone. Press the pound key when finished.</Say>'
+                f"<Record action={quoteattr(voicemail_callback_url)} method=\"POST\" maxLength=\"180\" "
+                'playBeep="true" finishOnKey="#" timeout="8" trim="trim-silence"/>'
+                '<Say voice="alice">We did not receive a message. Goodbye.</Say><Hangup/></Response>'
+            )
+        else:
+            return None
+        return Response(content=content, media_type="application/xml")
 
     @staticmethod
     def generate_error_response(error_type: str, message: str) -> tuple:
