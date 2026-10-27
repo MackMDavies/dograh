@@ -117,12 +117,25 @@ async def append_text_chat_user_message(
     text_session: WorkflowRunTextSessionModel,
     user_text: str,
     expected_revision: int | None,
+    source_event_id: str | None = None,
 ) -> WorkflowRunTextSessionModel:
     session_data = normalize_text_chat_session_data(text_session.session_data)
     checkpoint = normalize_text_chat_checkpoint(text_session.checkpoint)
 
+    # Webhook and worker retries use the provider event ID to avoid adding the
+    # same user turn twice. The id lives with its turn in the existing JSONB
+    # session; no new table or public API contract is needed.
+    if source_event_id and any(
+        turn.get("source_event_id") == source_event_id
+        for turn in session_data["turns"]
+    ):
+        return text_session
+
     active_turns, discarded_future = truncate_text_chat_future_turns(session_data)
-    active_turns.append(build_pending_text_chat_turn(user_text=user_text))
+    turn = build_pending_text_chat_turn(user_text=user_text)
+    if source_event_id:
+        turn["source_event_id"] = source_event_id
+    active_turns.append(turn)
 
     session_data["turns"] = active_turns
     session_data["discarded_future"] = discarded_future

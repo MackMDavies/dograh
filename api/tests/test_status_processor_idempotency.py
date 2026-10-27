@@ -16,8 +16,10 @@ import pytest
 
 from api.services.telephony.status_processor import (
     StatusCallbackRequest,
+    _enqueue_missed_call_text_if_eligible,
     _process_status_update,
 )
+from api.tasks.function_names import FunctionNames
 
 
 def _workflow_run(*, state="initialized", campaign_id=7, queued_run_id=99):
@@ -149,3 +151,55 @@ class TestCompletedBranchIdempotency:
 
             mock_dispatcher.release_call_slot.assert_awaited_once_with(1)
             mock_cb.record_and_evaluate.assert_awaited_once_with(7, is_failure=False)
+
+
+class TestMissedCallTextQueueing:
+    @pytest.mark.asyncio
+    async def test_queues_only_an_unanswered_inbound_run_with_trusted_number_context(self):
+        run = _workflow_run(campaign_id=None)
+        run.call_type = "inbound"
+        run.workflow_id = 42
+        run.initial_context = {
+            "direction": "inbound", "caller_number": "+15550001111",
+            "called_number": "+15550003333",
+        }
+        run.gathered_context = {"call_id": "CA0123"}
+        run.logs = {"inbound_webhook": {"from_phone_number_id": 20}}
+        redis = MagicMock(enqueue_job=AsyncMock())
+        with patch("api.tasks.arq.get_arq_redis", new=AsyncMock(return_value=redis)):
+            queued = await _enqueue_missed_call_text_if_eligible(
+                run, StatusCallbackRequest(call_id="CA0123", status="no-answer")
+            )
+
+        assert queued is True
+        redis.enqueue_job.assert_awaited_once_with(
+            FunctionNames.PROCESS_MISSED_CALL_TEXT, 42, 1, 20,
+            "+15550001111", "+15550003333", _job_id="missed-call-text:1",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["completed", "failed", "canceled", "answered"])
+    async def test_does_not_text_for_non_missed_terminal_statuses(self, status):
+        run = _workflow_run(campaign_id=None)
+        run.call_type = "inbound"
+        run.workflow_id = 42
+        run.initial_context = {"direction": "inbound", "caller_number": "+15550001111", "called_number": "+15550003333"}
+        run.logs = {"inbound_webhook": {"from_phone_number_id": 20}}
+        with patch("api.tasks.arq.get_arq_redis", new=AsyncMock()) as redis:
+            assert not await _enqueue_missed_call_text_if_eligible(
+                run, StatusCallbackRequest(call_id="CA0123", status=status)
+            )
+        redis.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_does_not_text_outbound_or_mismatched_provider_run(self):
+        run = _workflow_run(campaign_id=None)
+        run.call_type = "outbound"
+        run.workflow_id = 42
+        run.initial_context = {"direction": "outbound", "caller_number": "+15550001111", "called_number": "+15550003333"}
+        run.logs = {"inbound_webhook": {"from_phone_number_id": 20}}
+        with patch("api.tasks.arq.get_arq_redis", new=AsyncMock()) as redis:
+            assert not await _enqueue_missed_call_text_if_eligible(
+                run, StatusCallbackRequest(call_id="CA-other", status="busy")
+            )
+        redis.assert_not_awaited()

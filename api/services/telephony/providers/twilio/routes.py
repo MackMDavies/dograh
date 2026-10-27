@@ -8,6 +8,7 @@ import json
 import os
 import re
 import asyncio
+import tempfile
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from urllib.parse import urlencode
@@ -50,7 +51,10 @@ from api.services.telephony.dialer.provider import (
     resolve_active_dialer_provider,
     resolve_configured_dialer_provider,
 )
-from api.services.telephony.factory import get_telephony_provider_for_run
+from api.services.telephony.factory import (
+    get_telephony_provider_by_id,
+    get_telephony_provider_for_run,
+)
 from api.services.telephony.providers.twilio.floor_monitor import (
     claim_floor_monitor,
     change_floor_monitor_mode,
@@ -116,9 +120,171 @@ from api.services.telephony.status_processor import (
     StatusCallbackRequest,
     _process_status_update,
 )
+from api.tasks.arq import get_arq_redis
+from api.tasks.function_names import FunctionNames
 from api.utils.common import get_backend_endpoints
+from api.utils.telephony_helper import numbers_match, parse_webhook_request
 
 router = APIRouter()
+
+
+def _voice_sms_twiml(message: str | None = None) -> HTMLResponse:
+    content = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response>"
+    if message:
+        content += f"<Message>{escape(message)}</Message>"
+    content += "</Response>"
+    return HTMLResponse(content=content, media_type="application/xml")
+
+
+@router.post("/twilio/inbound/sms", include_in_schema=False)
+async def handle_voice_number_inbound_sms(request: Request):
+    """Store an inbound text and queue an opted-in voice agent's text turn."""
+    try:
+        webhook_data, raw_body = await parse_webhook_request(request)
+        account_sid = str(webhook_data.get("AccountSid") or "")
+        message_sid = str(webhook_data.get("MessageSid") or webhook_data.get("SmsSid") or "")
+        to_number = str(webhook_data.get("To") or "")
+        from_number = str(webhook_data.get("From") or "")
+        body = str(webhook_data.get("Body") or "").strip()
+        if (
+            not re.fullmatch(r"AC[a-fA-F0-9]{32}", account_sid)
+            or not re.fullmatch(r"SM[a-fA-F0-9]{32}", message_sid)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", to_number)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", from_number)
+            or not body
+            or len(body) > 1600
+        ):
+            return _voice_sms_twiml()
+
+        match = await db_client.find_inbound_route_by_account(
+            provider="twilio",
+            account_id_field="account_sid",
+            account_id=account_sid,
+            to_number=to_number,
+        )
+        if not match:
+            return _voice_sms_twiml()
+        config, phone_number = match
+
+        provider = await get_telephony_provider_by_id(config.id, config.organization_id)
+        valid = await provider.verify_inbound_signature(
+            str(request.url), webhook_data, dict(request.headers), raw_body
+        )
+        if not valid:
+            return HTMLResponse("Invalid Twilio signature", status_code=403)
+
+        workflow_id = phone_number.inbound_workflow_id
+        if not workflow_id:
+            return _voice_sms_twiml()
+
+        from api.services.phone_tools.builtin import ingest_inbound_voice_text
+
+        result = await ingest_inbound_voice_text(
+            workflow_id=workflow_id,
+            phone_number_id=phone_number.id,
+            message_sid=message_sid,
+            to=to_number,
+            from_number=from_number,
+            body=body,
+        )
+        if not result or result.get("status") != "received":
+            logger.warning("Twilio voice-number SMS ingest was unavailable")
+            return HTMLResponse("SMS ingest unavailable", status_code=503)
+
+        # Opt-out, help, and existing calendar replies are returned as TwiML.
+        # Normal agent answers run through the durable worker and central SMS
+        # sender, inbox, opt-out and credit controls.
+        reply = result.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            return _voice_sms_twiml(reply[:600])
+        if result.get("should_reply") is not True:
+            return _voice_sms_twiml()
+
+        redis = await get_arq_redis()
+        await redis.enqueue_job(
+            FunctionNames.PROCESS_INBOUND_VOICE_SMS,
+            int(workflow_id),
+            int(config.organization_id),
+            int(phone_number.id),
+            to_number,
+            from_number,
+            body,
+            message_sid,
+            _job_id=f"voice-sms:{message_sid}",
+        )
+        return _voice_sms_twiml()
+    except Exception as exc:
+        # Deliberately omit the caller, destination and message body.
+        logger.error("Twilio inbound voice SMS could not be accepted: %s", type(exc).__name__)
+        return HTMLResponse("SMS processing unavailable", status_code=503)
+
+
+@router.post("/twilio/inbound/status-callback", include_in_schema=False)
+async def handle_voice_number_inbound_status(request: Request):
+    """Process the signed final call status for a configured voice number."""
+    try:
+        webhook_data, raw_body = await parse_webhook_request(request)
+        account_sid = str(webhook_data.get("AccountSid") or "")
+        call_sid = str(webhook_data.get("CallSid") or "")
+        to_number = str(webhook_data.get("To") or "")
+        from_number = str(webhook_data.get("From") or "")
+        call_direction = str(webhook_data.get("Direction") or "").lower()
+        call_status = str(webhook_data.get("CallStatus") or "").lower()
+        if (
+            not re.fullmatch(r"AC[a-fA-F0-9]{32}", account_sid)
+            or not re.fullmatch(r"CA[a-fA-F0-9]{32}", call_sid)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", to_number)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", from_number)
+            or call_direction != "inbound"
+        ):
+            return {"status": "ignored"}
+
+        match = await db_client.find_inbound_route_by_account(
+            provider="twilio", account_id_field="account_sid",
+            account_id=account_sid, to_number=to_number,
+        )
+        if not match:
+            return {"status": "ignored"}
+        config, phone_number = match
+        provider = await get_telephony_provider_by_id(config.id, config.organization_id)
+        valid = await provider.verify_inbound_signature(
+            str(request.url), webhook_data, dict(request.headers), raw_body
+        )
+        if not valid:
+            return HTMLResponse("Invalid Twilio signature", status_code=403)
+
+        workflow_id = phone_number.inbound_workflow_id
+        if not workflow_id or call_status not in {"busy", "no-answer", "failed", "canceled", "completed"}:
+            return {"status": "ignored"}
+
+        status_update = StatusCallbackRequest.from_twilio(webhook_data)
+        workflow_run = await db_client.get_workflow_run_by_call_id(call_sid)
+        if workflow_run:
+            context = workflow_run.initial_context or {}
+            if (
+                workflow_run.workflow_id != workflow_id
+                or context.get("direction") != "inbound"
+                or not numbers_match(context.get("caller_number", ""), from_number)
+                or not numbers_match(context.get("called_number", ""), to_number)
+            ):
+                return {"status": "ignored"}
+            await _process_status_update(workflow_run.id, status_update)
+        elif call_status in {"busy", "no-answer"}:
+            # A call can fail before Dograh has created a run. The callback's
+            # signature and exact account-owned called number still establish
+            # the workflow and number identity. Use the provider SID as the
+            # stable idempotency seed in the downstream SMS request.
+            redis = await get_arq_redis()
+            await redis.enqueue_job(
+                FunctionNames.PROCESS_MISSED_CALL_TEXT,
+                int(workflow_id), str(call_sid), int(phone_number.id),
+                from_number, to_number,
+                _job_id=f"missed-call-text:{call_sid}",
+            )
+        return {"status": "success"}
+    except Exception as exc:  # noqa: BLE001 - let provider retry if durable queueing failed
+        logger.error(f"Twilio inbound call status processing failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail="Call status could not be processed") from exc
 
 
 def _twilio_event_time(value: str | None) -> str | None:
@@ -3401,6 +3567,100 @@ async def handle_twilio_status_callback(
     await _process_status_update(workflow_run_id, status_update)
 
     return {"status": "success"}
+
+
+@router.post("/twilio/inbound-voicemail/{workflow_run_id}", include_in_schema=False)
+async def handle_inbound_voicemail_recording(workflow_run_id: int, request: Request):
+    """Verify, store, and finalize an owner's inbound voicemail recording."""
+    from fastapi import Response
+    from api.enums import WorkflowRunState
+    from api.services.storage import get_storage_for_backend
+
+    hangup = '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+    run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    if not run or not (run.annotations or {}).get("voice_number_voicemail", {}).get("enabled"):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+    workflow = await db_client.get_workflow_by_id(run.workflow_id)
+    if not workflow or workflow.organization_id != (run.annotations or {}).get("voice_number_voicemail", {}).get("organization_id"):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+
+    callback_data = dict(await request.form())
+    provider = await get_telephony_provider_by_id(
+        int((run.initial_context or {}).get("telephony_configuration_id") or 0),
+        workflow.organization_id,
+    )
+    valid = await provider.verify_inbound_signature(
+        str(request.url), callback_data, dict(request.headers)
+    )
+    if not valid:
+        return Response(content=hangup, media_type="application/xml", status_code=401)
+
+    call_sid = callback_data.get("CallSid", "")
+    if (
+        callback_data.get("AccountSid") != getattr(provider, "account_sid", None)
+        or call_sid != (run.gathered_context or {}).get("call_id")
+        or not numbers_match(callback_data.get("From", ""), (run.initial_context or {}).get("caller_number", ""))
+        or not numbers_match(callback_data.get("To", ""), (run.initial_context or {}).get("called_number", ""))
+    ):
+        return Response(content=hangup, media_type="application/xml", status_code=404)
+
+    recording_sid = callback_data.get("RecordingSid", "")
+    duration_raw = callback_data.get("RecordingDuration", "0")
+    try:
+        duration = max(0, min(180, int(duration_raw)))
+    except (TypeError, ValueError):
+        duration = 0
+    recording_key = None
+    if re.fullmatch(r"RE[a-zA-Z0-9]{32}", recording_sid):
+        recording_url = f"{provider.base_url}/Recordings/{recording_sid}.wav"
+        temp_path = None
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                media = await client.get(
+                    recording_url,
+                    auth=(provider.account_sid, provider.auth_token),
+                )
+            if media.status_code == 200 and 44 < len(media.content) <= 25 * 1024 * 1024:
+                fd, temp_path = tempfile.mkstemp(suffix=".wav")
+                with os.fdopen(fd, "wb") as output:
+                    output.write(media.content)
+                storage = get_storage_for_backend(run.storage_backend)
+                candidate_key = f"recordings/{workflow_run_id}.wav"
+                if await storage.aupload_file(temp_path, candidate_key):
+                    recording_key = candidate_key
+        except Exception as exc:
+            logger.error(f"Could not store inbound voicemail for run {workflow_run_id}: {type(exc).__name__}")
+        finally:
+            if temp_path and os.path.exists(temp_path):
+                try:
+                    os.remove(temp_path)
+                except OSError:
+                    logger.warning(f"Could not remove temporary inbound voicemail for run {workflow_run_id}")
+
+    disposition = "voicemail" if recording_key else "no_answer"
+    await db_client.update_workflow_run(
+        run_id=workflow_run_id,
+        is_completed=True,
+        recording_url=recording_key,
+        storage_backend=run.storage_backend,
+        cost_info={"dograh_token_usage": 0, "call_duration_seconds": duration, "charge_usd": 0},
+        gathered_context={
+            "mapped_call_disposition": disposition,
+            "inbound_voicemail_recording_sid": recording_sid if recording_key else None,
+            "inbound_voicemail_recording_duration_seconds": duration,
+        },
+        state=WorkflowRunState.COMPLETED.value,
+        annotations={"voice_number_voicemail": {
+            "enabled": True,
+            "organization_id": workflow.organization_id,
+            "recording_saved": bool(recording_key),
+        }},
+    )
+    # These calls never enter the AI pipeline, so make both post-call ledgers
+    # terminal and keep reconcilers from treating the voicemail as unprocessed.
+    await db_client.mark_wallet_debit_settled(workflow_run_id)
+    await db_client.mark_memory_settled(workflow_run_id)
+    return Response(content=hangup, media_type="application/xml")
 
 
 # In-call controls (hold, recording, keypad tones, transfer, add call) live in their

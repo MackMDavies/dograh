@@ -6,3 +6,5 @@ class FunctionNames:
     SYNC_CAMPAIGN_SOURCE = "sync_campaign_source"
     PROCESS_CAMPAIGN_BATCH = "process_campaign_batch"
     PROCESS_KNOWLEDGE_BASE_DOCUMENT = "process_knowledge_base_document"
+    PROCESS_INBOUND_VOICE_SMS = "process_inbound_voice_sms"
+    PROCESS_MISSED_CALL_TEXT = "process_missed_call_text"

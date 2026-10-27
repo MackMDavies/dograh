@@ -36,6 +36,41 @@ def test_local_calendar_day_survives_dst_and_does_not_mix_tenants():
     assert policy.NumberPolicy(10, 20, NY, 50, timezone='unknown').day_key(datetime(2026, 1, 1, tzinfo=UTC)).endswith('2026-01-01')
 
 
+def test_business_hours_follow_number_timezone_and_dst():
+    p = policy.NumberPolicy(10, 20, NY, 50, timezone='America/New_York',
+                            business_hours_enabled=True, business_days=('Mon',),
+                            open_time='09:00', close_time='17:00')
+    assert p.is_business_open(datetime(2026, 3, 9, 13, 0, tzinfo=UTC))  # Monday 09:00 EDT
+    assert not p.is_business_open(datetime(2026, 3, 9, 12, 59, tzinfo=UTC))
+    assert not p.is_business_open(datetime(2026, 3, 10, 14, 0, tzinfo=UTC))
+
+
+def test_overnight_hours_are_anchored_to_the_selected_opening_day():
+    p = policy.NumberPolicy(10, 20, NY, 50, timezone='UTC',
+                            business_hours_enabled=True, business_days=('Fri',),
+                            open_time='22:00', close_time='02:00')
+    assert p.is_business_open(datetime(2026, 10, 30, 23, 0, tzinfo=UTC))
+    assert p.is_business_open(datetime(2026, 10, 31, 1, 59, tzinfo=UTC))
+    assert not p.is_business_open(datetime(2026, 10, 31, 2, 0, tzinfo=UTC))
+
+
+def test_empty_days_close_all_week_and_invalid_saved_hours_fail_open():
+    p = policy.NumberPolicy(10, 20, NY, 50, timezone='UTC',
+                            business_hours_enabled=True, business_days=())
+    assert not p.is_business_open(datetime(2026, 10, 27, 12, 0, tzinfo=UTC))
+    malformed = policy.NumberPolicy(10, 20, NY, 50, timezone='UTC',
+                                    business_hours_enabled=True, business_days=('Mon',),
+                                    open_time='25:00')
+    assert malformed.is_business_open(datetime(2026, 10, 27, 12, 0, tzinfo=UTC))
+
+
+def test_inbound_hours_action_preserves_24_hour_default_and_saved_mode():
+    assert policy.inbound_hours_action(None, datetime(2026, 10, 27, 12, 0, tzinfo=UTC)) == 'agent'
+    closed = policy.NumberPolicy(10, 20, NY, 50, timezone='UTC', business_hours_enabled=True,
+                                 business_days=('Mon',), open_time='09:00', close_time='17:00', after_hours='fwd')
+    assert policy.inbound_hours_action(closed, datetime(2026, 10, 27, 12, 0, tzinfo=UTC)) == 'fwd'
+
+
 def test_geographic_presence_matches_real_area_codes_and_ignores_mobile_prefixes():
     assert policy.geographic_area(NY) == policy.geographic_area('+12125550102')
     assert policy.geographic_area(NY) != policy.geographic_area(LA)
@@ -54,7 +89,10 @@ def loader(monkeypatch):
             SimpleNamespace(id=21, organization_id=99, is_active=True, address_normalized=LA)]
     monkeypatch.setattr(policy.db_client, 'list_phone_numbers_for_config', AsyncMock(return_value=rows))
     calls = []
-    settings = [{'dograh_phone_number_id': 20, 'e164': NY, 'daily_call_cap': 100, 'local_presence': True, 'timezone': 'America/New_York'},
+    settings = [{'dograh_phone_number_id': 20, 'e164': NY, 'daily_call_cap': 100, 'local_presence': True, 'timezone': 'America/New_York',
+                 'business_hours_enabled': True, 'business_days': ['Mon', 'Tue'], 'open_time': '08:00', 'close_time': '16:00',
+                 'after_hours': 'fwd', 'on_fail': 'vm', 'forward_to': '+12125550199',
+                 'agent_sms_replies': True, 'missed_call_text': True},
                 {'dograh_phone_number_id': 21, 'e164': LA, 'daily_call_cap': 100}]
     original = httpx.AsyncClient
     def reply(request):
@@ -69,10 +107,23 @@ async def test_load_is_scoped_to_actual_config_owner_and_full_number(loader):
     result = await policy.load_number_policies(10, 3)
     assert list(result) == [NY]
     assert result[NY].daily_limit == 100
+    assert result[NY].business_hours_enabled is True
+    assert result[NY].business_days == ('Mon', 'Tue')
+    assert result[NY].after_hours == 'fwd'
+    assert result[NY].forward_to == '+12125550199'
+    assert result[NY].agent_sms_replies is True
+    assert result[NY].missed_call_text is True
     assert calls[0].url.params['client_account_id'] == 'eq.' + ACCOUNT
     assert calls[0].url.params['dograh_phone_number_id'] == 'in.(20)'
     assert await policy.load_number_policies(10, 3) == result
     assert len(calls) == 1
+
+
+async def test_inbound_policy_requires_exact_owned_id_and_address(loader):
+    loaded = await policy.load_inbound_number_policy(10, 3, 20, NY)
+    assert loaded is not None and loaded.number_id == 20
+    assert await policy.load_inbound_number_policy(10, 3, 21, NY) is None
+    assert await policy.load_inbound_number_policy(10, 3, 20, LA) is None
 
 
 async def test_wrong_phone_and_invalid_limits_are_never_applied(loader):

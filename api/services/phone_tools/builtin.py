@@ -166,3 +166,75 @@ async def send_caller_text(
         "reason": data.get("reason"),
         "readable_reason": data.get("readableReason"),
     }
+
+
+async def send_inbound_sms_reply(
+    *, workflow_id: int, workflow_run_id: int, to: str, body: str, message_sid: str
+) -> dict[str, Any]:
+    """Send one generated reply for an inbound Twilio message.
+
+    The provider message SID is part of the Sysevo idempotency key, so worker
+    retries can safely hand the same reply to the central SMS ledger again.
+    """
+    data = await _call_hook({
+        "action": "send_inbound_reply",
+        "workflow_id": workflow_id,
+        "workflow_run_id": workflow_run_id,
+        "message_sid": message_sid,
+        "to": to,
+        "body": clean_text(body),
+    })
+    if data is None:
+        return {"status": "failed", "reason": "send_error"}
+    return {
+        "status": str(data.get("status") or "failed"),
+        "reason": data.get("reason"),
+        "readable_reason": data.get("readableReason"),
+    }
+
+
+async def send_missed_call_booking_text(
+    *, workflow_id: int, workflow_run_id: int | str, phone_number_id: int,
+    caller_number: str, called_number: str,
+) -> dict[str, Any]:
+    """Ask Sysevo to send the saved account booking link after a missed inbound call.
+
+    Sysevo rechecks the owning account, number, opt-out, link publication and
+    idempotency before sending; Dograh never chooses or constructs the URL.
+    """
+    data = await _call_hook({
+        "action": "send_missed_call",
+        "workflow_id": workflow_id,
+        "workflow_run_id": workflow_run_id,
+        "dograh_phone_number_id": phone_number_id,
+        "to": caller_number,
+        "called_number": called_number,
+    })
+    if data is None:
+        return {"status": "failed", "reason": "send_error"}
+    return {
+        "status": str(data.get("status") or "failed"),
+        "reason": data.get("reason"),
+        "readable_reason": data.get("readableReason"),
+    }
+
+
+async def ingest_inbound_voice_text(
+    *,
+    workflow_id: int,
+    phone_number_id: int,
+    message_sid: str,
+    to: str,
+    from_number: str,
+    body: str,
+) -> dict[str, Any] | None:
+    """Record a signed Twilio voice-number SMS and resolve reply eligibility."""
+    return await _call_hook({
+        "action": "ingest_inbound",
+        "workflow_id": workflow_id,
+        "dograh_phone_number_id": phone_number_id,
+        "message_sid": message_sid,
+        "to": to,
+        "from": from_number,
+        "body": body,
+    })

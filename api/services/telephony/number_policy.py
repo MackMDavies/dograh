@@ -9,7 +9,7 @@ from __future__ import annotations
 import random
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time as datetime_time
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -30,6 +30,15 @@ class NumberPolicy:
     daily_limit: int
     local_presence: bool = False
     timezone: str = 'UTC'
+    business_hours_enabled: bool = False
+    business_days: tuple[str, ...] = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri')
+    open_time: str = '09:00'
+    close_time: str = '18:00'
+    after_hours: str = 'vm'
+    on_fail: str = 'vm'
+    forward_to: str | None = None
+    agent_sms_replies: bool = False
+    missed_call_text: bool = False
 
     def day_key(self, now: datetime | None = None) -> str:
         try:
@@ -38,6 +47,51 @@ class NumberPolicy:
             zone = ZoneInfo('UTC')
         day = (now or datetime.now(UTC)).astimezone(zone).date().isoformat()
         return f'voice-number-day:{self.organization_id}:{self.number_id}:{day}'
+
+    @staticmethod
+    def _clock(value: str) -> datetime_time | None:
+        try:
+            hour, minute = value.split(':', 1)
+            result = datetime_time(int(hour), int(minute))
+            if len(hour) != 2 or len(minute) != 2:
+                return None
+            return result
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+    def is_business_open(self, now: datetime | None = None) -> bool:
+        """Evaluate saved hours in the number's IANA timezone, including DST.
+
+        For overnight hours, the selected day is the day on which the window
+        opens (e.g. Friday 22:00–02:00 also includes Saturday 01:00).
+        Invalid saved configuration is treated as open so a bad preference
+        cannot silently block calls.
+        """
+        if not self.business_hours_enabled:
+            return True
+        try:
+            zone = ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError, TypeError):
+            zone = ZoneInfo('UTC')
+        local_now = (now or datetime.now(UTC)).astimezone(zone)
+        opening = self._clock(self.open_time)
+        closing = self._clock(self.close_time)
+        days = set(self.business_days)
+        weekday = ('Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun')
+        if opening is None or closing is None or not days.issubset(weekday):
+            return True
+        if not days:
+            return False
+        if opening == closing:
+            return weekday[local_now.weekday()] in days
+        current = local_now.timetz().replace(tzinfo=None)
+        today = weekday[local_now.weekday()]
+        if opening < closing:
+            return today in days and opening <= current < closing
+        if current >= opening:
+            return today in days
+        previous_day = weekday[(local_now.weekday() - 1) % 7]
+        return current < closing and previous_day in days
 
 
 _cache: dict[tuple[int, int | None], tuple[float, dict[str, NumberPolicy]]] = {}
@@ -76,7 +130,9 @@ async def load_number_policies(organization_id: int, configuration_id: int | Non
             return {}
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(SUPABASE_URL + '/rest/v1/voice_number_settings', params={
-                'select': 'dograh_phone_number_id,e164,daily_call_cap,local_presence,timezone',
+                'select': ('dograh_phone_number_id,e164,daily_call_cap,local_presence,timezone,'
+                           'business_hours_enabled,business_days,open_time,close_time,after_hours,on_fail,forward_to,'
+                           'agent_sms_replies,missed_call_text'),
                 'client_account_id': 'eq.' + account,
                 'dograh_phone_number_id': 'in.(' + ','.join(str(n) for n in owned) + ')',
             }, headers={'apikey': SUPABASE_SERVICE_ROLE_KEY, 'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY})
@@ -90,7 +146,15 @@ async def load_number_policies(organization_id: int, configuration_id: int | Non
                 continue
             policies[number.address_normalized] = NumberPolicy(config.organization_id, number.id,
                 number.address_normalized, limit, row.get('local_presence') is True,
-                row.get('timezone') or 'UTC')
+                row.get('timezone') or 'UTC',
+                row.get('business_hours_enabled') is True,
+                tuple(row.get('business_days') or ()),
+                row.get('open_time') or '09:00', row.get('close_time') or '18:00',
+                row.get('after_hours') if row.get('after_hours') in ('agent', 'vm', 'fwd') else 'vm',
+                row.get('on_fail') if row.get('on_fail') in ('vm', 'fwd') else 'vm',
+                row.get('forward_to') if isinstance(row.get('forward_to'), str) else None,
+                row.get('agent_sms_replies') is True,
+                row.get('missed_call_text') is True)
         if len(_cache) >= 128:
             _cache.pop(next(iter(_cache)))
         _cache[key] = (time.monotonic() + _CACHE_SECONDS, policies)
@@ -100,6 +164,32 @@ async def load_number_policies(organization_id: int, configuration_id: int | Non
         # unconfigured deployments keep their current call path on a cold miss.
         logger.warning('Number preferences unavailable; retaining last known policy')
         return cached[1] if cached else {}
+
+
+async def load_inbound_number_policy(
+    organization_id: int,
+    configuration_id: int,
+    number_id: int,
+    e164: str,
+) -> NumberPolicy | None:
+    """Return preferences only when both Dograh number identity fields match.
+
+    Inbound dispatch already resolved and signature-validated this number.
+    Rechecking its numeric ID and exact canonical address prevents settings
+    for a recycled or foreign number from changing call handling.
+    """
+    policies = await load_number_policies(organization_id, configuration_id)
+    policy = policies.get(e164)
+    if policy and policy.number_id == number_id and policy.number == e164:
+        return policy
+    return None
+
+
+def inbound_hours_action(policy: NumberPolicy | None, now: datetime | None = None) -> str:
+    """Resolve the post-signature inbound action for a matched phone number."""
+    if policy is None or policy.is_business_open(now):
+        return 'agent'
+    return policy.after_hours if policy.after_hours in ('agent', 'vm', 'fwd') else 'vm'
 
 
 def geographic_area(number: str) -> tuple[int, str] | None:
