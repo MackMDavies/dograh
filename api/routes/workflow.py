@@ -318,6 +318,7 @@ class UpdateWorkflowStatusRequest(BaseModel):
 class CreateWorkflowRunRequest(BaseModel):
     mode: str
     name: str
+    start_node_id: str | None = Field(default=None, min_length=1, max_length=200)
 
 
 class CreateWorkflowRunResponse(BaseModel):
@@ -1468,6 +1469,7 @@ async def create_workflow_run(
                 request.mode,
                 user.id,
                 use_draft=True,
+                **({"test_start_node_id": request.start_node_id} if request.start_node_id is not None else {}),
                 organization_id=effective_org_id,
                 bypass_user_check=True,
                 api_key_id=getattr(user, "api_key_id", None),
@@ -1495,12 +1497,16 @@ async def create_workflow_run(
                 request.mode,
                 user.id,
                 use_draft=True,
+                **({"test_start_node_id": request.start_node_id} if request.start_node_id is not None else {}),
                 organization_id=effective_org_id,
                 bypass_user_check=effective_org_id is not None,
                 api_key_id=getattr(user, "api_key_id", None),
             )
-    except Exception:
+    except Exception as exc:
         await release_slot_for_failed_start(effective_org_id, _cc_slot)
+        from api.services.workflow.studio_test_entry import StudioTestEntryError
+        if isinstance(exc, StudioTestEntryError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         raise
 
     if _cc_gated:

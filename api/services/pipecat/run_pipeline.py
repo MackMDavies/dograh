@@ -816,6 +816,11 @@ async def _run_pipeline(
     guardrail_config = run_configs.get("voice_guardrails")
     guardrail_instruction = build_guardrail_prompt_instruction(guardrail_config)
 
+    # Keep normal pre-call fetching and saved start flags intact; only this
+    # authenticated browser test's in-memory graph changes its entry point.
+    from api.services.workflow.studio_test_entry import apply_test_entry
+    apply_test_entry(workflow_graph, workflow_run.mode, workflow_run.annotations)
+
     engine = PipecatEngine(
         llm=llm,
         inference_llm=inference_llm,

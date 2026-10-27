@@ -19,6 +19,7 @@ from api.db.models import (
 from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.enums import CallType, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
+from api.services.workflow.studio_test_entry import test_entry_annotations
 from api.services.workflow.variable_resolution import sanitize_context_variables
 
 
@@ -96,6 +97,7 @@ class WorkflowRunClient(BaseDBClient):
         definition_id: int | None = None,
         idempotency_key: str | None = None,
         annotations: dict | None = None,
+        test_start_node_id: str | None = None,
     ) -> WorkflowRunModel:
         async with self.async_session() as session:
             workflow_query = select(WorkflowModel).options(joinedload(WorkflowModel.user)).where(
@@ -223,7 +225,7 @@ class WorkflowRunClient(BaseDBClient):
                 storage_backend=current_backend.value,
                 call_type=call_type.value,
                 api_key_id=api_key_id,
-                annotations=annotations or {},
+                annotations=test_entry_annotations(mode, test_start_node_id, target_def.workflow_json if target_def else workflow.workflow_definition, annotations),
             )
             session.add(new_run)
             try:
