@@ -73,6 +73,31 @@ async def test_list_voices_regular_user_sees_own_voices():
 
 
 @pytest.mark.asyncio
+async def test_list_voices_applies_pagination_and_search_before_fetching():
+    client = VoiceLibraryClient()
+    voice = _make_voice()
+    mock_result = MagicMock()
+    mock_result.scalars.return_value.all.return_value = [voice]
+    mock_session = AsyncMock()
+    mock_session.execute = AsyncMock(return_value=mock_result)
+    mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+    mock_session.__aexit__ = AsyncMock(return_value=None)
+
+    with patch.object(client, "async_session", return_value=mock_session):
+        results = await client.list_voices(
+            organization_id=11, user_id=5, is_superuser=False,
+            q="British", accent="British", limit=60, offset=120,
+        )
+
+    statement = str(mock_session.execute.await_args.args[0]).lower()
+    assert results == [voice]
+    assert " limit " in statement
+    assert " offset " in statement
+    assert "like" in statement
+    assert "voice_library.id desc" in statement
+
+
+@pytest.mark.asyncio
 async def test_delete_voice_returns_false_for_other_users_voice():
     """Non-owner, non-superuser cannot delete another user's voice."""
     client = VoiceLibraryClient()

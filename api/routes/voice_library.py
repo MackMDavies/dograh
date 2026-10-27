@@ -65,6 +65,10 @@ async def list_voices(
     use_case: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, max_length=120),
+    accent: Optional[str] = Query(None, max_length=80),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     user: UserModel = Depends(get_user),
 ) -> list[VoiceLibraryResponseSchema]:
     # Non-superuser clients share the platform admin's voice library
@@ -79,11 +83,15 @@ async def list_voices(
         user_id=user.id,
         is_superuser=user.is_superuser,
         language=language,
-        gender=gender,
+        gender=gender.lower() if gender else None,
         age=age,
         use_case=use_case,
         provider=provider,
         status=status,
+        q=q,
+        accent=accent,
+        limit=limit,
+        offset=offset,
     )
     return [_serialize(v) for v in voices]
 

@@ -50,6 +50,7 @@ def test_list_voices_returns_200():
     mock_voice = _make_voice()
 
     with patch("api.routes.voice_library.db_client") as mock_db:
+        mock_db.get_platform_organization_id = AsyncMock(return_value=11)
         mock_db.list_voices = AsyncMock(return_value=[mock_voice])
         response = client.get("/voice-library")
 
@@ -57,6 +58,35 @@ def test_list_voices_returns_200():
     data = response.json()
     assert isinstance(data, list)
     assert data[0]["uuid"] == "v-abc"
+
+
+def test_list_voices_supports_paged_search_and_filters():
+    app = _make_app(is_superuser=True)
+    client = TestClient(app)
+
+    with patch("api.routes.voice_library.db_client") as mock_db:
+        mock_db.list_voices = AsyncMock(return_value=[_make_voice()])
+        response = client.get(
+            "/voice-library",
+            params={"limit": 60, "offset": 120, "q": "British", "gender": "Female", "accent": "British", "provider": "elevenlabs"},
+        )
+
+    assert response.status_code == 200
+    mock_db.list_voices.assert_awaited_once_with(
+        organization_id=11,
+        user_id=1,
+        is_superuser=True,
+        language=None,
+        gender="female",
+        age=None,
+        use_case=None,
+        provider="elevenlabs",
+        status=None,
+        q="British",
+        accent="British",
+        limit=60,
+        offset=120,
+    )
 
 
 def test_delete_voice_returns_204():
