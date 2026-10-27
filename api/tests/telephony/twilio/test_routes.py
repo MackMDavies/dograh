@@ -9,11 +9,13 @@ from twilio.request_validator import RequestValidator
 
 from api.services.telephony.providers.twilio.provider import TwilioProvider
 from api.services.telephony.providers.twilio.routes import (
+    handle_voice_number_inbound_status,
     handle_voice_number_inbound_sms,
     handle_inbound_voicemail_recording,
     handle_twilio_status_callback,
     handle_twiml_webhook,
 )
+from api.tasks.function_names import FunctionNames
 import api.services.telephony.providers.twilio.provider as twilio_provider_module
 
 
@@ -89,19 +91,24 @@ def test_twilio_number_sms_callback_is_derived_from_voice_callback():
         "https://api.example.test/api/v1/telephony/twilio/inbound/sms"
     )
     assert not TwilioProvider._is_voice_sms_callback("https://custom.test/inbound/sms")
+    assert TwilioProvider._inbound_status_callback(voice_url) == (
+        "https://api.example.test/api/v1/telephony/twilio/inbound/status-callback"
+    )
+    assert TwilioProvider._inbound_status_callback("https://custom.test/voice") is None
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("existing_sms_url", "should_update_sms"),
+    ("existing_sms_url", "should_update_sms", "existing_status_callback", "should_update_status"),
     [
-        ("", True),
-        ("https://customer.example/sms-hook", False),
-        ("https://old.example/api/v1/telephony/twilio/inbound/sms", True),
+        ("", True, "", True),
+        ("https://customer.example/sms-hook", False, "https://customer.example/status", False),
+        ("https://old.example/api/v1/telephony/twilio/inbound/sms", True,
+         "https://old.example/api/v1/telephony/twilio/inbound/status-callback", True),
     ],
 )
 async def test_configure_inbound_preserves_custom_sms_urls(
-    monkeypatch, existing_sms_url, should_update_sms
+    monkeypatch, existing_sms_url, should_update_sms, existing_status_callback, should_update_status
 ):
     provider = _provider()
     monkeypatch.setattr(provider, "_lookup_incoming_number_sid", AsyncMock(return_value="PN123"))
@@ -117,7 +124,7 @@ async def test_configure_inbound_preserves_custom_sms_urls(
             return None
 
         async def json(self):
-            return {"sms_url": existing_sms_url}
+            return {"sms_url": existing_sms_url, "status_callback": existing_status_callback}
 
         async def text(self):
             return ""
@@ -146,6 +153,66 @@ async def test_configure_inbound_preserves_custom_sms_urls(
     assert ("SmsUrl" in posted) is should_update_sms
     if should_update_sms:
         assert posted["SmsUrl"] == "https://api.example.test/api/v1/telephony/twilio/inbound/sms"
+    assert ("StatusCallback" in posted) is should_update_status
+    if should_update_status:
+        assert posted["StatusCallback"] == "https://api.example.test/api/v1/telephony/twilio/inbound/status-callback"
+        assert posted["StatusCallbackMethod"] == "POST"
+
+
+@pytest.mark.asyncio
+async def test_inbound_status_callback_requires_signed_tenant_number_match():
+    provider = _provider()
+    provider.verify_inbound_signature = AsyncMock(return_value=True)
+    config = SimpleNamespace(id=1, organization_id=77)
+    phone = SimpleNamespace(id=88, inbound_workflow_id=99)
+    run = SimpleNamespace(
+        id=123, workflow_id=99,
+        initial_context={"direction": "inbound", "caller_number": "+15551230001", "called_number": "+15551230002"},
+    )
+    payload = {
+        "AccountSid": "AC" + "1" * 32, "CallSid": "CA" + "2" * 32,
+        "To": "+15551230002", "From": "+15551230001", "Direction": "inbound", "CallStatus": "no-answer",
+    }
+    request = _request(path="/api/v1/telephony/twilio/inbound/status-callback", query={}, form_data=payload)
+    with (
+        patch("api.services.telephony.providers.twilio.routes.parse_webhook_request", new_callable=AsyncMock, return_value=(payload, "raw")),
+        patch("api.services.telephony.providers.twilio.routes.db_client.find_inbound_route_by_account", new_callable=AsyncMock, return_value=(config, phone)) as route,
+        patch("api.services.telephony.providers.twilio.routes.db_client.get_workflow_run_by_call_id", new_callable=AsyncMock, return_value=run),
+        patch("api.services.telephony.providers.twilio.routes.get_telephony_provider_by_id", new_callable=AsyncMock, return_value=provider),
+        patch("api.services.telephony.providers.twilio.routes._process_status_update", new_callable=AsyncMock) as process,
+    ):
+        response = await handle_voice_number_inbound_status(request)
+    assert response == {"status": "success"}
+    route.assert_awaited_once_with(provider="twilio", account_id_field="account_sid", account_id=payload["AccountSid"], to_number=payload["To"])
+    provider.verify_inbound_signature.assert_awaited_once()
+    process.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_inbound_status_without_a_run_queues_a_stable_missed_call_job():
+    provider = _provider()
+    provider.verify_inbound_signature = AsyncMock(return_value=True)
+    config = SimpleNamespace(id=1, organization_id=77)
+    phone = SimpleNamespace(id=88, inbound_workflow_id=99)
+    payload = {
+        "AccountSid": "AC" + "1" * 32, "CallSid": "CA" + "2" * 32,
+        "To": "+15551230002", "From": "+15551230001", "Direction": "inbound", "CallStatus": "no-answer",
+    }
+    request = _request(path="/api/v1/telephony/twilio/inbound/status-callback", query={}, form_data=payload)
+    redis = SimpleNamespace(enqueue_job=AsyncMock())
+    with (
+        patch("api.services.telephony.providers.twilio.routes.parse_webhook_request", new_callable=AsyncMock, return_value=(payload, "raw")),
+        patch("api.services.telephony.providers.twilio.routes.db_client.find_inbound_route_by_account", new_callable=AsyncMock, return_value=(config, phone)),
+        patch("api.services.telephony.providers.twilio.routes.db_client.get_workflow_run_by_call_id", new_callable=AsyncMock, return_value=None),
+        patch("api.services.telephony.providers.twilio.routes.get_telephony_provider_by_id", new_callable=AsyncMock, return_value=provider),
+        patch("api.services.telephony.providers.twilio.routes.get_arq_redis", new_callable=AsyncMock, return_value=redis),
+    ):
+        response = await handle_voice_number_inbound_status(request)
+    assert response == {"status": "success"}
+    redis.enqueue_job.assert_awaited_once_with(
+        FunctionNames.PROCESS_MISSED_CALL_TEXT, 99, payload["CallSid"], 88,
+        payload["From"], payload["To"], _job_id=f"missed-call-text:{payload['CallSid']}",
+    )
 
 
 @pytest.mark.asyncio

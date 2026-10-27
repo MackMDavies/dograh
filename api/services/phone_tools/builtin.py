@@ -193,6 +193,32 @@ async def send_inbound_sms_reply(
     }
 
 
+async def send_missed_call_booking_text(
+    *, workflow_id: int, workflow_run_id: int | str, phone_number_id: int,
+    caller_number: str, called_number: str,
+) -> dict[str, Any]:
+    """Ask Sysevo to send the saved account booking link after a missed inbound call.
+
+    Sysevo rechecks the owning account, number, opt-out, link publication and
+    idempotency before sending; Dograh never chooses or constructs the URL.
+    """
+    data = await _call_hook({
+        "action": "send_missed_call",
+        "workflow_id": workflow_id,
+        "workflow_run_id": workflow_run_id,
+        "dograh_phone_number_id": phone_number_id,
+        "to": caller_number,
+        "called_number": called_number,
+    })
+    if data is None:
+        return {"status": "failed", "reason": "send_error"}
+    return {
+        "status": str(data.get("status") or "failed"),
+        "reason": data.get("reason"),
+        "readable_reason": data.get("readableReason"),
+    }
+
+
 async def ingest_inbound_voice_text(
     *,
     workflow_id: int,

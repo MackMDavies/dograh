@@ -54,11 +54,31 @@ class TwilioProvider(TelephonyProvider):
         return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
 
     @staticmethod
+    def _inbound_status_callback(voice_webhook_url: str | None) -> str | None:
+        if not voice_webhook_url:
+            return None
+        parsed = urlsplit(voice_webhook_url)
+        suffix = "/api/v1/telephony/inbound/run"
+        if not parsed.path.endswith(suffix):
+            return None
+        path = parsed.path[: -len("/inbound/run")] + "/twilio/inbound/status-callback"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+    @staticmethod
     def _is_voice_sms_callback(value: str | None) -> bool:
         return bool(
             value
             and urlsplit(value).path.endswith(
                 "/api/v1/telephony/twilio/inbound/sms"
+            )
+        )
+
+    @staticmethod
+    def _is_voice_status_callback(value: str | None) -> bool:
+        return bool(
+            value
+            and urlsplit(value).path.endswith(
+                "/api/v1/telephony/twilio/inbound/status-callback"
             )
         )
 
@@ -429,7 +449,7 @@ class TwilioProvider(TelephonyProvider):
     async def configure_inbound(
         self, address: str, webhook_url: Optional[str]
     ) -> ProviderSyncResult:
-        """Set (or clear) inbound VoiceUrl and the owned voice-SMS callback.
+        """Set (or clear) inbound VoiceUrl and Sysevo-owned callbacks.
 
         Looks up the number's SID by E.164 then POSTs the update. Non-PSTN
         addresses (SIP URIs, extensions) are skipped — Twilio's
@@ -463,14 +483,18 @@ class TwilioProvider(TelephonyProvider):
 
         endpoint = f"{self.base_url}/IncomingPhoneNumbers/{sid}.json"
         sms_callback = self._inbound_sms_callback(webhook_url)
+        status_callback = self._inbound_status_callback(webhook_url)
         current_sms_url = None
+        current_status_callback = None
         sms_settings_read = False
         try:
             async with aiohttp.ClientSession() as session:
                 auth = aiohttp.BasicAuth(self.account_sid, self.auth_token)
                 async with session.get(endpoint, auth=auth) as response:
                     if response.status == 200:
-                        current_sms_url = (await response.json()).get("sms_url") or ""
+                        number_data = await response.json()
+                        current_sms_url = number_data.get("sms_url") or ""
+                        current_status_callback = number_data.get("status_callback") or ""
                         sms_settings_read = True
                     else:
                         logger.warning(
@@ -500,6 +524,17 @@ class TwilioProvider(TelephonyProvider):
             data["SmsMethod"] = "POST"
         elif sms_settings_read and not webhook_url and self._is_voice_sms_callback(current_sms_url):
             data["SmsUrl"] = ""
+
+        # A TwiML <Stream> callback only reports stream lifecycle events. The
+        # number-level callback reports final CallStatus, which is needed to
+        # detect unanswered inbound calls. Preserve independently configured
+        # customer callbacks; claim this slot only when blank or already ours.
+        if (sms_settings_read and status_callback
+                and (not current_status_callback or self._is_voice_status_callback(current_status_callback))):
+            data["StatusCallback"] = status_callback
+            data["StatusCallbackMethod"] = "POST"
+        elif sms_settings_read and not webhook_url and self._is_voice_status_callback(current_status_callback):
+            data["StatusCallback"] = ""
 
         try:
             async with aiohttp.ClientSession() as session:

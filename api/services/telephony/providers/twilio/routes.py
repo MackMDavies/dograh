@@ -219,6 +219,74 @@ async def handle_voice_number_inbound_sms(request: Request):
         return HTMLResponse("SMS processing unavailable", status_code=503)
 
 
+@router.post("/twilio/inbound/status-callback", include_in_schema=False)
+async def handle_voice_number_inbound_status(request: Request):
+    """Process the signed final call status for a configured voice number."""
+    try:
+        webhook_data, raw_body = await parse_webhook_request(request)
+        account_sid = str(webhook_data.get("AccountSid") or "")
+        call_sid = str(webhook_data.get("CallSid") or "")
+        to_number = str(webhook_data.get("To") or "")
+        from_number = str(webhook_data.get("From") or "")
+        call_direction = str(webhook_data.get("Direction") or "").lower()
+        call_status = str(webhook_data.get("CallStatus") or "").lower()
+        if (
+            not re.fullmatch(r"AC[a-fA-F0-9]{32}", account_sid)
+            or not re.fullmatch(r"CA[a-fA-F0-9]{32}", call_sid)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", to_number)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", from_number)
+            or call_direction != "inbound"
+        ):
+            return {"status": "ignored"}
+
+        match = await db_client.find_inbound_route_by_account(
+            provider="twilio", account_id_field="account_sid",
+            account_id=account_sid, to_number=to_number,
+        )
+        if not match:
+            return {"status": "ignored"}
+        config, phone_number = match
+        provider = await get_telephony_provider_by_id(config.id, config.organization_id)
+        valid = await provider.verify_inbound_signature(
+            str(request.url), webhook_data, dict(request.headers), raw_body
+        )
+        if not valid:
+            return HTMLResponse("Invalid Twilio signature", status_code=403)
+
+        workflow_id = phone_number.inbound_workflow_id
+        if not workflow_id or call_status not in {"busy", "no-answer", "failed", "canceled", "completed"}:
+            return {"status": "ignored"}
+
+        status_update = StatusCallbackRequest.from_twilio(webhook_data)
+        workflow_run = await db_client.get_workflow_run_by_call_id(call_sid)
+        if workflow_run:
+            context = workflow_run.initial_context or {}
+            if (
+                workflow_run.workflow_id != workflow_id
+                or context.get("direction") != "inbound"
+                or not numbers_match(context.get("caller_number", ""), from_number)
+                or not numbers_match(context.get("called_number", ""), to_number)
+            ):
+                return {"status": "ignored"}
+            await _process_status_update(workflow_run.id, status_update)
+        elif call_status in {"busy", "no-answer"}:
+            # A call can fail before Dograh has created a run. The callback's
+            # signature and exact account-owned called number still establish
+            # the workflow and number identity. Use the provider SID as the
+            # stable idempotency seed in the downstream SMS request.
+            redis = await get_arq_redis()
+            await redis.enqueue_job(
+                FunctionNames.PROCESS_MISSED_CALL_TEXT,
+                int(workflow_id), str(call_sid), int(phone_number.id),
+                from_number, to_number,
+                _job_id=f"missed-call-text:{call_sid}",
+            )
+        return {"status": "success"}
+    except Exception as exc:  # noqa: BLE001 - let provider retry if durable queueing failed
+        logger.error(f"Twilio inbound call status processing failed: {type(exc).__name__}")
+        raise HTTPException(status_code=503, detail="Call status could not be processed") from exc
+
+
 def _twilio_event_time(value: str | None) -> str | None:
     """Parse Twilio's signed RFC 2822 event timestamp as a UTC ISO value."""
     if not value:

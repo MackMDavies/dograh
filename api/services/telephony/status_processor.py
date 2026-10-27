@@ -7,6 +7,7 @@ introducing a circular import on the routes module.
 
 from datetime import UTC, datetime
 import os
+import re
 from typing import Optional
 
 import httpx
@@ -21,6 +22,52 @@ from api.services.campaign.campaign_event_publisher import (
     get_campaign_event_publisher,
 )
 from api.services.campaign.circuit_breaker import circuit_breaker
+from api.tasks.function_names import FunctionNames
+
+
+_E164 = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+async def _enqueue_missed_call_text_if_eligible(workflow_run, status: "StatusCallbackRequest") -> bool:
+    """Queue a configured text only for a verified inbound run that rang out.
+
+    The signed provider callback identifies the run; its persisted inbound
+    context supplies caller/called numbers and the owning Dograh number ID.
+    Sysevo performs a second tenant, setting, publication and opt-out check.
+    """
+    if status.status.lower() not in {"busy", "no-answer"}:
+        return False
+    call_type = getattr(workflow_run.call_type, "value", workflow_run.call_type)
+    initial = workflow_run.initial_context or {}
+    if call_type != "inbound" or initial.get("direction") != "inbound":
+        return False
+    gathered = workflow_run.gathered_context or {}
+    if status.call_id and gathered.get("call_id") and status.call_id != gathered.get("call_id"):
+        return False
+    logs = workflow_run.logs or {}
+    inbound = logs.get("inbound_webhook") or {}
+    phone_number_id = inbound.get("from_phone_number_id")
+    caller_number = initial.get("caller_number")
+    called_number = initial.get("called_number")
+    workflow_id = workflow_run.workflow_id
+    if (type(phone_number_id) is not int or phone_number_id <= 0 or type(workflow_id) is not int
+            or not isinstance(caller_number, str) or not _E164.fullmatch(caller_number)
+            or not isinstance(called_number, str) or not _E164.fullmatch(called_number)):
+        return False
+
+    from api.tasks.arq import get_arq_redis
+
+    redis = await get_arq_redis()
+    await redis.enqueue_job(
+        FunctionNames.PROCESS_MISSED_CALL_TEXT,
+        workflow_id,
+        workflow_run.id,
+        phone_number_id,
+        caller_number,
+        called_number,
+        _job_id=f"missed-call-text:{workflow_run.id}",
+    )
+    return True
 
 
 class StatusCallbackRequest(BaseModel):
@@ -219,6 +266,10 @@ async def _process_status_update(workflow_run_id: int, status: StatusCallbackReq
         # every time it's invoked — so a duplicate webhook meant a duplicate
         # dial of the same number.
         if workflow_run.state != WorkflowRunState.COMPLETED.value:
+            # Queue before terminalizing the run. If Redis is temporarily
+            # unavailable the provider can retry this status callback; the
+            # stable ARQ job ID and Sysevo request key prevent duplicate texts.
+            await _enqueue_missed_call_text_if_eligible(workflow_run, status)
             if workflow_run.campaign_id:
                 await campaign_call_dispatcher.release_call_slot(workflow_run_id)
                 is_failure = status.status in ("error", "failed")

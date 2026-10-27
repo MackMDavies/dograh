@@ -62,6 +62,7 @@ from api.tasks.dial_suppression_sync import sync_dial_suppression
 from api.tasks.dialer_overflow_reconciliation import reconcile_dialer_overflow
 from api.tasks.dialer_agent_history_reconciliation import reconcile_dialer_agent_history
 from api.tasks.inbound_voice_sms import process_inbound_voice_sms
+from api.tasks.missed_call_text import process_missed_call_text
 from api.services.api_usage_counter import flush_api_request_usage
 from api.services.api_request_logging import purge_api_request_logs
 
@@ -79,6 +80,13 @@ class WorkerSettings:
             process_inbound_voice_sms,
             name=FunctionNames.PROCESS_INBOUND_VOICE_SMS,
             timeout=100,
+            max_tries=3,
+            keep_result=600,
+        ),
+        func(
+            process_missed_call_text,
+            name=FunctionNames.PROCESS_MISSED_CALL_TEXT,
+            timeout=35,
             max_tries=3,
             keep_result=600,
         ),
