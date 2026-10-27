@@ -110,3 +110,21 @@ def test_create_workflow_rejects_unknown_initial_status():
 
     assert response.status_code == 422
     assert mock_db.mock_calls == []
+
+
+async def test_initial_lifecycle_status_is_persisted_and_blocks_phone_activation(db_session, async_session):
+    from uuid import uuid4
+    from api.db.models import OrganizationModel, UserModel
+    from api.services.workflow_active_check import check_workflow_active
+    marker = uuid4().hex
+    org = OrganizationModel(provider_id='lifecycle-'+marker)
+    async_session.add(org); await async_session.flush()
+    user = UserModel(provider_id='lifecycle-user-'+marker, selected_organization_id=org.id)
+    async_session.add(user); await async_session.flush()
+    candidate = await db_session.create_workflow('Candidate', {'nodes': [], 'edges': []}, user.id, org.id, status='deactivated')
+    default = await db_session.create_workflow('Default', {'nodes': [], 'edges': []}, user.id, org.id)
+    assert candidate.status == 'deactivated'
+    assert default.status == 'active'
+    with patch('api.services.workflow_active_check.db_client', db_session):
+        assert await check_workflow_active(candidate.id) == (False, 'workflow_deactivated')
+        assert await check_workflow_active(default.id) == (True, None)
