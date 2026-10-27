@@ -9,10 +9,12 @@ from twilio.request_validator import RequestValidator
 
 from api.services.telephony.providers.twilio.provider import TwilioProvider
 from api.services.telephony.providers.twilio.routes import (
+    handle_voice_number_inbound_sms,
     handle_inbound_voicemail_recording,
     handle_twilio_status_callback,
     handle_twiml_webhook,
 )
+import api.services.telephony.providers.twilio.provider as twilio_provider_module
 
 
 def _provider() -> TwilioProvider:
@@ -75,6 +77,145 @@ def _signature(
         url = f"{url}?{urlencode(query)}"
     validator = RequestValidator(provider.auth_token)
     return validator.compute_signature(url, form_data)
+
+
+def test_twilio_number_sms_callback_is_derived_from_voice_callback():
+    voice_url = "https://api.example.test/api/v1/telephony/inbound/run"
+    assert TwilioProvider._inbound_sms_callback(voice_url) == (
+        "https://api.example.test/api/v1/telephony/twilio/inbound/sms"
+    )
+    assert TwilioProvider._inbound_sms_callback("https://custom.test/voice") is None
+    assert TwilioProvider._is_voice_sms_callback(
+        "https://api.example.test/api/v1/telephony/twilio/inbound/sms"
+    )
+    assert not TwilioProvider._is_voice_sms_callback("https://custom.test/inbound/sms")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_sms_url", "should_update_sms"),
+    [
+        ("", True),
+        ("https://customer.example/sms-hook", False),
+        ("https://old.example/api/v1/telephony/twilio/inbound/sms", True),
+    ],
+)
+async def test_configure_inbound_preserves_custom_sms_urls(
+    monkeypatch, existing_sms_url, should_update_sms
+):
+    provider = _provider()
+    monkeypatch.setattr(provider, "_lookup_incoming_number_sid", AsyncMock(return_value="PN123"))
+    posted = {}
+
+    class Response:
+        status = 200
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def json(self):
+            return {"sms_url": existing_sms_url}
+
+        async def text(self):
+            return ""
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        def get(self, *_args, **_kwargs):
+            return Response()
+
+        def post(self, _url, data, **_kwargs):
+            posted.update(data)
+            return Response()
+
+    monkeypatch.setattr(twilio_provider_module.aiohttp, "ClientSession", Session)
+    result = await provider.configure_inbound(
+        "+15551230002",
+        "https://api.example.test/api/v1/telephony/inbound/run",
+    )
+
+    assert result.ok
+    assert ("SmsUrl" in posted) is should_update_sms
+    if should_update_sms:
+        assert posted["SmsUrl"] == "https://api.example.test/api/v1/telephony/twilio/inbound/sms"
+
+
+@pytest.mark.asyncio
+async def test_voice_number_sms_signature_and_tenant_route_gate_before_ingest():
+    provider = _provider()
+    provider.verify_inbound_signature = AsyncMock(return_value=False)
+    config = SimpleNamespace(id=1, organization_id=77)
+    phone = SimpleNamespace(id=88, inbound_workflow_id=99)
+    payload = {
+        "AccountSid": "AC" + "1" * 32,
+        "MessageSid": "SM" + "2" * 32,
+        "To": "+15551230002",
+        "From": "+15551230001",
+        "Body": "Hello",
+    }
+    request = _request(
+        path="/api/v1/telephony/twilio/inbound/sms",
+        query={},
+        form_data=payload,
+    )
+    with (
+        patch("api.services.telephony.providers.twilio.routes.parse_webhook_request", new_callable=AsyncMock, return_value=(payload, "raw")),
+        patch("api.services.telephony.providers.twilio.routes.db_client.find_inbound_route_by_account", new_callable=AsyncMock, return_value=(config, phone)),
+        patch("api.services.telephony.providers.twilio.routes.get_telephony_provider_by_id", new_callable=AsyncMock, return_value=provider),
+        patch("api.services.phone_tools.builtin.ingest_inbound_voice_text", new_callable=AsyncMock) as ingest,
+    ):
+        response = await handle_voice_number_inbound_sms(request)
+
+    assert response.status_code == 403
+    ingest.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_voice_number_sms_enqueues_only_the_verified_tenant_agent_reply():
+    provider = _provider()
+    provider.verify_inbound_signature = AsyncMock(return_value=True)
+    config = SimpleNamespace(id=1, organization_id=77)
+    phone = SimpleNamespace(id=88, inbound_workflow_id=99)
+    payload = {
+        "AccountSid": "AC" + "1" * 32,
+        "MessageSid": "SM" + "2" * 32,
+        "To": "+15551230002",
+        "From": "+15551230001",
+        "Body": "Hello",
+    }
+    request = _request(
+        path="/api/v1/telephony/twilio/inbound/sms",
+        query={},
+        form_data=payload,
+    )
+    redis = SimpleNamespace(enqueue_job=AsyncMock())
+    with (
+        patch("api.services.telephony.providers.twilio.routes.parse_webhook_request", new_callable=AsyncMock, return_value=(payload, "raw")),
+        patch("api.services.telephony.providers.twilio.routes.db_client.find_inbound_route_by_account", new_callable=AsyncMock, return_value=(config, phone)) as route,
+        patch("api.services.telephony.providers.twilio.routes.get_telephony_provider_by_id", new_callable=AsyncMock, return_value=provider),
+        patch("api.services.phone_tools.builtin.ingest_inbound_voice_text", new_callable=AsyncMock, return_value={"status": "received", "should_reply": True, "reply": None}),
+        patch("api.services.telephony.providers.twilio.routes.get_arq_redis", new_callable=AsyncMock, return_value=redis),
+    ):
+        response = await handle_voice_number_inbound_sms(request)
+
+    assert response.status_code == 200
+    route.assert_awaited_once_with(
+        provider="twilio", account_id_field="account_sid",
+        account_id=payload["AccountSid"], to_number=payload["To"],
+    )
+    redis.enqueue_job.assert_awaited_once_with(
+        "process_inbound_voice_sms", 99, 77, 88, payload["To"], payload["From"],
+        payload["Body"], payload["MessageSid"],
+        _job_id=f"voice-sms:{payload['MessageSid']}",
+    )
 
 
 @pytest.mark.asyncio

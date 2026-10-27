@@ -120,10 +120,103 @@ from api.services.telephony.status_processor import (
     StatusCallbackRequest,
     _process_status_update,
 )
+from api.tasks.arq import get_arq_redis
+from api.tasks.function_names import FunctionNames
 from api.utils.common import get_backend_endpoints
-from api.utils.telephony_helper import numbers_match
+from api.utils.telephony_helper import numbers_match, parse_webhook_request
 
 router = APIRouter()
+
+
+def _voice_sms_twiml(message: str | None = None) -> HTMLResponse:
+    content = "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Response>"
+    if message:
+        content += f"<Message>{escape(message)}</Message>"
+    content += "</Response>"
+    return HTMLResponse(content=content, media_type="application/xml")
+
+
+@router.post("/twilio/inbound/sms", include_in_schema=False)
+async def handle_voice_number_inbound_sms(request: Request):
+    """Store an inbound text and queue an opted-in voice agent's text turn."""
+    try:
+        webhook_data, raw_body = await parse_webhook_request(request)
+        account_sid = str(webhook_data.get("AccountSid") or "")
+        message_sid = str(webhook_data.get("MessageSid") or webhook_data.get("SmsSid") or "")
+        to_number = str(webhook_data.get("To") or "")
+        from_number = str(webhook_data.get("From") or "")
+        body = str(webhook_data.get("Body") or "").strip()
+        if (
+            not re.fullmatch(r"AC[a-fA-F0-9]{32}", account_sid)
+            or not re.fullmatch(r"SM[a-fA-F0-9]{32}", message_sid)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", to_number)
+            or not re.fullmatch(r"\+[1-9]\d{7,14}", from_number)
+            or not body
+            or len(body) > 1600
+        ):
+            return _voice_sms_twiml()
+
+        match = await db_client.find_inbound_route_by_account(
+            provider="twilio",
+            account_id_field="account_sid",
+            account_id=account_sid,
+            to_number=to_number,
+        )
+        if not match:
+            return _voice_sms_twiml()
+        config, phone_number = match
+
+        provider = await get_telephony_provider_by_id(config.id, config.organization_id)
+        valid = await provider.verify_inbound_signature(
+            str(request.url), webhook_data, dict(request.headers), raw_body
+        )
+        if not valid:
+            return HTMLResponse("Invalid Twilio signature", status_code=403)
+
+        workflow_id = phone_number.inbound_workflow_id
+        if not workflow_id:
+            return _voice_sms_twiml()
+
+        from api.services.phone_tools.builtin import ingest_inbound_voice_text
+
+        result = await ingest_inbound_voice_text(
+            workflow_id=workflow_id,
+            phone_number_id=phone_number.id,
+            message_sid=message_sid,
+            to=to_number,
+            from_number=from_number,
+            body=body,
+        )
+        if not result or result.get("status") != "received":
+            logger.warning("Twilio voice-number SMS ingest was unavailable")
+            return HTMLResponse("SMS ingest unavailable", status_code=503)
+
+        # Opt-out, help, and existing calendar replies are returned as TwiML.
+        # Normal agent answers run through the durable worker and central SMS
+        # sender, inbox, opt-out and credit controls.
+        reply = result.get("reply")
+        if isinstance(reply, str) and reply.strip():
+            return _voice_sms_twiml(reply[:600])
+        if result.get("should_reply") is not True:
+            return _voice_sms_twiml()
+
+        redis = await get_arq_redis()
+        await redis.enqueue_job(
+            FunctionNames.PROCESS_INBOUND_VOICE_SMS,
+            int(workflow_id),
+            int(config.organization_id),
+            int(phone_number.id),
+            to_number,
+            from_number,
+            body,
+            message_sid,
+            _job_id=f"voice-sms:{message_sid}",
+        )
+        return _voice_sms_twiml()
+    except Exception as exc:
+        # Deliberately omit the caller, destination and message body.
+        logger.error("Twilio inbound voice SMS could not be accepted: %s", type(exc).__name__)
+        return HTMLResponse("SMS processing unavailable", status_code=503)
 
 
 def _twilio_event_time(value: str | None) -> str | None:

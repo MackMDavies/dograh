@@ -91,7 +91,8 @@ def loader(monkeypatch):
     calls = []
     settings = [{'dograh_phone_number_id': 20, 'e164': NY, 'daily_call_cap': 100, 'local_presence': True, 'timezone': 'America/New_York',
                  'business_hours_enabled': True, 'business_days': ['Mon', 'Tue'], 'open_time': '08:00', 'close_time': '16:00',
-                 'after_hours': 'fwd', 'on_fail': 'vm', 'forward_to': '+12125550199'},
+                 'after_hours': 'fwd', 'on_fail': 'vm', 'forward_to': '+12125550199',
+                 'agent_sms_replies': True, 'missed_call_text': True},
                 {'dograh_phone_number_id': 21, 'e164': LA, 'daily_call_cap': 100}]
     original = httpx.AsyncClient
     def reply(request):
@@ -110,6 +111,8 @@ async def test_load_is_scoped_to_actual_config_owner_and_full_number(loader):
     assert result[NY].business_days == ('Mon', 'Tue')
     assert result[NY].after_hours == 'fwd'
     assert result[NY].forward_to == '+12125550199'
+    assert result[NY].agent_sms_replies is True
+    assert result[NY].missed_call_text is True
     assert calls[0].url.params['client_account_id'] == 'eq.' + ACCOUNT
     assert calls[0].url.params['dograh_phone_number_id'] == 'in.(20)'
     assert await policy.load_number_policies(10, 3) == result

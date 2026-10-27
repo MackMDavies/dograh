@@ -37,6 +37,8 @@ class NumberPolicy:
     after_hours: str = 'vm'
     on_fail: str = 'vm'
     forward_to: str | None = None
+    agent_sms_replies: bool = False
+    missed_call_text: bool = False
 
     def day_key(self, now: datetime | None = None) -> str:
         try:
@@ -129,7 +131,8 @@ async def load_number_policies(organization_id: int, configuration_id: int | Non
         async with httpx.AsyncClient(timeout=3) as client:
             response = await client.get(SUPABASE_URL + '/rest/v1/voice_number_settings', params={
                 'select': ('dograh_phone_number_id,e164,daily_call_cap,local_presence,timezone,'
-                           'business_hours_enabled,business_days,open_time,close_time,after_hours,on_fail,forward_to'),
+                           'business_hours_enabled,business_days,open_time,close_time,after_hours,on_fail,forward_to,'
+                           'agent_sms_replies,missed_call_text'),
                 'client_account_id': 'eq.' + account,
                 'dograh_phone_number_id': 'in.(' + ','.join(str(n) for n in owned) + ')',
             }, headers={'apikey': SUPABASE_SERVICE_ROLE_KEY, 'Authorization': 'Bearer ' + SUPABASE_SERVICE_ROLE_KEY})
@@ -149,7 +152,9 @@ async def load_number_policies(organization_id: int, configuration_id: int | Non
                 row.get('open_time') or '09:00', row.get('close_time') or '18:00',
                 row.get('after_hours') if row.get('after_hours') in ('agent', 'vm', 'fwd') else 'vm',
                 row.get('on_fail') if row.get('on_fail') in ('vm', 'fwd') else 'vm',
-                row.get('forward_to') if isinstance(row.get('forward_to'), str) else None)
+                row.get('forward_to') if isinstance(row.get('forward_to'), str) else None,
+                row.get('agent_sms_replies') is True,
+                row.get('missed_call_text') is True)
         if len(_cache) >= 128:
             _cache.pop(next(iter(_cache)))
         _cache[key] = (time.monotonic() + _CACHE_SECONDS, policies)

@@ -6,6 +6,7 @@ import json
 import random
 import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from fastapi import HTTPException
@@ -40,6 +41,26 @@ class TwilioProvider(TelephonyProvider):
     PROVIDER_NAME = WorkflowRunMode.TWILIO.value
     WEBHOOK_ENDPOINT = "twiml"
     SUPPORTS_INBOUND_NUMBER_POLICIES = True
+
+    @staticmethod
+    def _inbound_sms_callback(voice_webhook_url: str | None) -> str | None:
+        if not voice_webhook_url:
+            return None
+        parsed = urlsplit(voice_webhook_url)
+        suffix = "/api/v1/telephony/inbound/run"
+        if not parsed.path.endswith(suffix):
+            return None
+        path = parsed.path[: -len("/inbound/run")] + "/twilio/inbound/sms"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+    @staticmethod
+    def _is_voice_sms_callback(value: str | None) -> bool:
+        return bool(
+            value
+            and urlsplit(value).path.endswith(
+                "/api/v1/telephony/twilio/inbound/sms"
+            )
+        )
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -408,7 +429,7 @@ class TwilioProvider(TelephonyProvider):
     async def configure_inbound(
         self, address: str, webhook_url: Optional[str]
     ) -> ProviderSyncResult:
-        """Set (or clear) the VoiceUrl on Twilio's IncomingPhoneNumber for ``address``.
+        """Set (or clear) inbound VoiceUrl and the owned voice-SMS callback.
 
         Looks up the number's SID by E.164 then POSTs the update. Non-PSTN
         addresses (SIP URIs, extensions) are skipped — Twilio's
@@ -441,6 +462,26 @@ class TwilioProvider(TelephonyProvider):
             )
 
         endpoint = f"{self.base_url}/IncomingPhoneNumbers/{sid}.json"
+        sms_callback = self._inbound_sms_callback(webhook_url)
+        current_sms_url = None
+        sms_settings_read = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                auth = aiohttp.BasicAuth(self.account_sid, self.auth_token)
+                async with session.get(endpoint, auth=auth) as response:
+                    if response.status == 200:
+                        current_sms_url = (await response.json()).get("sms_url") or ""
+                        sms_settings_read = True
+                    else:
+                        logger.warning(
+                            "Twilio SMS callback was left unchanged because its current URL could not be read"
+                        )
+        except Exception as e:
+            logger.warning(
+                "Twilio SMS callback was left unchanged because its current URL could not be read: {}",
+                type(e).__name__,
+            )
+
         if webhook_url:
             data = {
                 "VoiceUrl": webhook_url,
@@ -451,6 +492,14 @@ class TwilioProvider(TelephonyProvider):
             data = {
                 "VoiceUrl": "",
             }
+
+        # Preserve a customer's existing SMS integration. Only bind or clear
+        # the voice endpoint when the current SmsUrl is blank or already ours.
+        if sms_settings_read and sms_callback and (not current_sms_url or self._is_voice_sms_callback(current_sms_url)):
+            data["SmsUrl"] = sms_callback
+            data["SmsMethod"] = "POST"
+        elif sms_settings_read and not webhook_url and self._is_voice_sms_callback(current_sms_url):
+            data["SmsUrl"] = ""
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -471,7 +520,7 @@ class TwilioProvider(TelephonyProvider):
             return ProviderSyncResult(ok=False, message=f"Twilio update failed: {e}")
 
         action = "set" if webhook_url else "cleared"
-        logger.info(f"Twilio VoiceUrl {action} for {e164} (sid={sid})")
+        logger.info(f"Twilio inbound voice routing {action} for {e164} (sid={sid})")
         return ProviderSyncResult(ok=True)
 
     async def _lookup_incoming_number_sid(self, e164: str) -> Optional[str]:
