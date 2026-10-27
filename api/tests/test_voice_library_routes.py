@@ -100,11 +100,38 @@ def test_delete_voice_returns_204():
     assert response.status_code == 204
 
 
-def test_elevenlabs_catalog_requires_superuser():
+def test_elevenlabs_catalog_uses_platform_key_for_regular_user_without_own_key():
     app = _make_app(is_superuser=False)
     client = TestClient(app)
-    response = client.get("/voice-library/elevenlabs/voices")
-    assert response.status_code == 403
+
+    with patch("api.routes.voice_library.db_client") as mock_db:
+        mock_db.get_connection_by_provider = AsyncMock(return_value=None)
+        mock_db.list_all_connections_superuser = AsyncMock(return_value=[])
+        with patch(
+            "api.routes.voice_library.get_caller_elevenlabs_api_key",
+            new=AsyncMock(return_value=None),
+        ):
+            with patch(
+                "api.routes.voice_library.get_system_elevenlabs_api_key",
+                new=AsyncMock(return_value="platform-key"),
+            ):
+                with patch(
+                    "api.routes.voice_library.fetch_elevenlabs_catalog",
+                    new=AsyncMock(return_value=[
+                        {
+                            "voice_id": "v1",
+                            "name": "Rachel",
+                            "preview_url": None,
+                            "labels": {},
+                            "category": "premade",
+                        }
+                    ]),
+                ) as fetch_catalog:
+                    response = client.get("/voice-library/elevenlabs/voices")
+
+    assert response.status_code == 200
+    fetch_catalog.assert_awaited_once_with("platform-key")
+    mock_db.list_all_connections_superuser.assert_not_awaited()
 
 
 def test_elevenlabs_catalog_allowed_for_superuser():
