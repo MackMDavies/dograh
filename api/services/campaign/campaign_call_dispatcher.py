@@ -14,6 +14,7 @@ from api.services.campaign.dial_suppression import is_number_suppressed
 from api.services.campaign.errors import (
     ConcurrentSlotAcquisitionError,
     PhoneNumberPoolExhaustedError,
+    PhoneNumberDailyLimitError,
     SuppressedNumberError,
 )
 from api.services.campaign.caller_id_capacity import get_calls_per_number
@@ -533,10 +534,20 @@ class CampaignCallDispatcher:
         # Acquire a unique from_number from the pool scoped to this campaign's
         # telephony configuration so orgs with multiple configs don't leak
         # caller IDs across configs.
-        lease = await self.acquire_from_number(
-            campaign.organization_id,
-            telephony_configuration_id=campaign.telephony_configuration_id,
+        from api.services.telephony.number_policy import (
+            load_number_policies, pool_preferences, reserve_daily_attempt,
         )
+        number_policies = await load_number_policies(campaign.organization_id, campaign.telephony_configuration_id)
+        preferences = pool_preferences(number_policies, phone_number)
+        try:
+            lease = await self.acquire_from_number(
+                campaign.organization_id,
+                telephony_configuration_id=campaign.telephony_configuration_id,
+                **({'number_preferences': preferences} if preferences else {}),
+            )
+        except PhoneNumberPoolExhaustedError:
+            await rate_limiter.release_concurrent_slot(campaign.organization_id, slot_id)
+            raise
         if lease is None:
             # Release concurrent slot before raising
             await rate_limiter.release_concurrent_slot(
@@ -546,6 +557,21 @@ class CampaignCallDispatcher:
                 organization_id=campaign.organization_id
             )
         from_number = lease.number
+
+        # Reserve the daily attempt atomically AFTER taking this caller-ID's
+        # lease, and BEFORE making a run or a provider request. A limit race is
+        # deferred through the existing pool path; it must never lose a lead.
+        number_policy = number_policies.get(from_number)
+        if number_policy:
+            try:
+                allowed = await reserve_daily_attempt(number_policy)
+            except Exception:
+                allowed = False
+            if not allowed:
+                await rate_limiter.release_from_number(campaign.organization_id, from_number,
+                    telephony_configuration_id=campaign.telephony_configuration_id, lease_id=lease.lease_id)
+                await rate_limiter.release_concurrent_slot(campaign.organization_id, slot_id)
+                raise PhoneNumberDailyLimitError(campaign.organization_id)
 
         logger.info(f"Provider name: {provider.PROVIDER_NAME}")
         logger.info(f"Queued run context: {queued_run.context_variables}")
@@ -823,6 +849,7 @@ class CampaignCallDispatcher:
         organization_id: int,
         telephony_configuration_id: int | None,
         timeout: float = 600,
+        number_preferences: dict | None = None,
     ) -> Optional["FromNumberLease"]:
         """
         Take a caller-ID lease from the (org, telephony config) pool with retry.
@@ -842,6 +869,7 @@ class CampaignCallDispatcher:
                 organization_id,
                 telephony_configuration_id,
                 calls_per_number=calls_per_number,
+                **({'number_preferences': number_preferences} if number_preferences else {}),
             )
             if lease:
                 return lease

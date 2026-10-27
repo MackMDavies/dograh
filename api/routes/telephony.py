@@ -53,6 +53,12 @@ from api.utils.telephony_helper import (
 router = APIRouter(prefix="/telephony")
 
 
+@router.get('/number-preferences/capabilities')
+async def number_preference_capabilities(_user: UserModel = Depends(get_user)):
+    """Advertise only number preferences consumed by this running server."""
+    return {'daily_call_cap': True, 'local_presence': True}
+
+
 class InitiateCallRequest(BaseModel):
     workflow_id: int
     workflow_run_id: int | None = None
@@ -163,6 +169,25 @@ async def initiate_call(
     if not wallet_allowed:
         raise HTTPException(status_code=402, detail=wallet_block_reason or "insufficient_balance")
 
+    # Resolve optional caller-ID. The config has already been validated against
+    # the user's organization, so filtering by config_id is sufficient for
+    # tenant isolation.
+    from_number: str | None = None
+    if request.from_phone_number_id is not None:
+        if telephony_configuration_id is None:
+            raise HTTPException(
+                status_code=400,
+                detail="from_phone_number_id_requires_telephony_configuration",
+            )
+        phone_row = await db_client.get_phone_number_for_config(
+            request.from_phone_number_id, telephony_configuration_id
+        )
+        if not phone_row or not phone_row.is_active:
+            raise HTTPException(status_code=400, detail="from_phone_number_not_found")
+        from_number = phone_row.address_normalized
+
+    from api.services.telephony.number_policy import reserve_outbound_number
+
     # Determine the workflow run mode based on provider type
     workflow_run_mode = provider.PROVIDER_NAME
 
@@ -182,6 +207,8 @@ async def initiate_call(
         numeric_suffix = int(str(uuid.uuid4()).replace("-", "")[:8], 16) % 100000000
         workflow_run_name = f"WR-TEL-OUT-{numeric_suffix:08d}"
         try:
+            from_number = await reserve_outbound_number(effective_org_id, telephony_configuration_id,
+                phone_number, getattr(provider, 'from_numbers', []), from_number)
             workflow_run = await db_client.create_workflow_run(
                 workflow_run_name,
                 workflow.id,
@@ -214,6 +241,8 @@ async def initiate_call(
                 detail="workflow_run_workflow_mismatch",
             )
         workflow_run_name = workflow_run.name
+        from_number = await reserve_outbound_number(effective_org_id, telephony_configuration_id,
+            phone_number, getattr(provider, 'from_numbers', []), from_number)
 
     # Construct webhook URL based on provider type
     backend_endpoint, _ = await get_backend_endpoints()
@@ -229,23 +258,6 @@ async def initiate_call(
     )
 
     keywords = {"workflow_id": workflow.id, "user_id": execution_user_id}
-
-    # Resolve optional caller-ID. The config has already been validated against
-    # the user's organization, so filtering by config_id is sufficient for
-    # tenant isolation.
-    from_number: str | None = None
-    if request.from_phone_number_id is not None:
-        if telephony_configuration_id is None:
-            raise HTTPException(
-                status_code=400,
-                detail="from_phone_number_id_requires_telephony_configuration",
-            )
-        phone_row = await db_client.get_phone_number_for_config(
-            request.from_phone_number_id, telephony_configuration_id
-        )
-        if not phone_row or not phone_row.is_active:
-            raise HTTPException(status_code=400, detail="from_phone_number_not_found")
-        from_number = phone_row.address_normalized
 
     # Initiate call via provider
     result = await provider.initiate_call(
