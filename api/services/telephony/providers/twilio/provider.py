@@ -41,6 +41,7 @@ class TwilioProvider(TelephonyProvider):
     PROVIDER_NAME = WorkflowRunMode.TWILIO.value
     WEBHOOK_ENDPOINT = "twiml"
     SUPPORTS_INBOUND_NUMBER_POLICIES = True
+    SUPPORTS_INBOUND_SMS = True
 
     @staticmethod
     def _inbound_sms_callback(voice_webhook_url: str | None) -> str | None:

@@ -85,4 +85,10 @@ def test_capability_endpoint_advertises_only_implemented_preferences():
     from api.services.auth.depends import get_user
     app = FastAPI(); app.include_router(router)
     app.dependency_overrides[get_user] = lambda: SimpleNamespace(id=7)
-    assert TestClient(app).get('/telephony/number-preferences/capabilities').json() == {'daily_call_cap': True, 'local_presence': True}
+    result = TestClient(app).get('/telephony/number-preferences/capabilities').json()
+    assert result == {
+        'daily_call_cap': True,
+        'local_presence': True,
+        'inbound_number_routing_providers': ['twilio'],
+        'inbound_sms_providers': ['twilio'],
+    }

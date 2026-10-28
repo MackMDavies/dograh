@@ -65,6 +65,10 @@ async def number_preference_capabilities(_user: UserModel = Depends(get_user)):
             spec.name for spec in registry.all_specs()
             if getattr(spec.provider_cls, 'SUPPORTS_INBOUND_NUMBER_POLICIES', False)
         ],
+        'inbound_sms_providers': [
+            spec.name for spec in registry.all_specs()
+            if getattr(spec.provider_cls, 'SUPPORTS_INBOUND_SMS', False)
+        ],
     }
 
 
