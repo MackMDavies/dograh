@@ -18,6 +18,7 @@ from loguru import logger
 
 from api.db import db_client
 from api.services.telephony.call_concurrency import release_call_slot
+from api.services.workflow.test_sandbox_mode import sandbox_post_call_policy
 
 _TIMEOUT = 15.0
 
@@ -69,6 +70,12 @@ async def fire_post_call_wallet_debit(
         if not workflow_run:
             logger.warning(f"[wallet-debit] run {workflow_run_id} not found")
             return True  # nothing we can ever bill for a missing run
+
+        if sandbox_post_call_policy(workflow_run):
+            logger.info(
+                f"[wallet-debit] sandbox run {workflow_run_id}; debit is disabled"
+            )
+            return True
 
         usage: dict[str, Any] = workflow_run.usage_info or {}
         duration_secs: float | None = (

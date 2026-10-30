@@ -15,6 +15,7 @@ def _make_test_app() -> FastAPI:
     app.dependency_overrides[get_user] = lambda: SimpleNamespace(
         id=1,
         selected_organization_id=11,
+        is_superuser=False,
     )
     return app
 
@@ -35,6 +36,7 @@ def test_workflow_fetch_list_includes_workflow_uuid():
     with patch("api.routes.workflow.db_client") as mock_db:
         mock_db.get_all_workflows_for_listing = AsyncMock(return_value=[workflow])
         mock_db.get_workflow_run_counts = AsyncMock(return_value={workflow.id: 9})
+        mock_db.list_phone_numbers_for_workflows = AsyncMock(return_value=[])
 
         response = client.get("/workflow/fetch")
 
@@ -48,5 +50,6 @@ def test_workflow_fetch_list_includes_workflow_uuid():
             "total_runs": 9,
             "folder_id": workflow.folder_id,
             "workflow_uuid": workflow.workflow_uuid,
+            "phone_numbers": [],
         }
     ]

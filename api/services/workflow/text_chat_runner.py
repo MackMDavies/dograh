@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -34,6 +35,7 @@ from pipecat.utils.run_context import set_current_org_id
 from api.db import db_client
 from api.enums import WorkflowRunMode, WorkflowRunState
 from api.services.configuration.resolve import resolve_effective_config
+from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.audio_config import create_audio_config
 from api.services.pipecat.pipeline_builder import create_pipeline_task
 from api.services.pipecat.pipeline_metrics_aggregator import (
@@ -45,9 +47,11 @@ from api.services.pipecat.tracing_config import (
     build_remote_parent_context,
     get_trace_url,
 )
-from api.services.gen_ai import resolve_embeddings_config
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.test_sandbox_binding import (
+    validate_sandbox_execution_binding,
+)
 from api.services.workflow.variable_resolution import build_call_context
 from api.services.workflow.workflow_graph import WorkflowGraph
 
@@ -407,6 +411,9 @@ async def execute_text_chat_pending_turn(
     set_current_org_id(workflow.organization_id)
 
     run_definition = workflow_run.definition
+    validate_sandbox_execution_binding(
+        workflow_run, run_definition, os.getenv("SYSEVO_MEMORY_SECRET", "")
+    )
     run_configs = run_definition.workflow_configurations or {}
 
     user_config = await db_client.get_user_configurations(workflow_run.workflow.user.id)
@@ -414,6 +421,7 @@ async def execute_text_chat_pending_turn(
         enrich_overrides_with_org_api_keys,
         resolve_org_provider_config,
     )
+
     org_id = workflow.organization_id
     if org_id:
         user_config = await resolve_org_provider_config(org_id, user_config)
@@ -475,7 +483,11 @@ async def execute_text_chat_pending_turn(
             }
         )
 
-    embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
+    (
+        embeddings_api_key,
+        embeddings_model,
+        embeddings_base_url,
+    ) = await resolve_embeddings_config(
         organization_id=workflow.organization_id,
         user_config=user_config,
     )

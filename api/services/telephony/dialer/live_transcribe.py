@@ -18,6 +18,7 @@ relaying audio, and the real transcript is produced afterwards regardless.
 import asyncio
 import json
 import os
+import re
 from contextlib import suppress
 from typing import Awaitable, Callable
 
@@ -29,13 +30,70 @@ from loguru import logger
 _DEEPGRAM_URL = (
     "wss://api.deepgram.com/v1/listen"
     "?encoding=mulaw&sample_rate=8000&channels=1"
-    "&model=nova-2&punctuate=true&smart_format=true"
+    "&model=nova-3&punctuate=true&smart_format=true"
     # Interim results are what make this feel live rather than arriving in paragraphs,
     # and endpointing closes a sentence on a natural pause rather than a fixed timer.
     "&interim_results=true&endpointing=300"
+    # Our own name is not a word. nova-3 keyterm prompting tells the model to expect
+    # it (nova-2's keyword boost still gave Sysco, Cecebo, Sasivo on 22 Oct); what it
+    # still mis-hears is corrected below.
+    "&keyterm=Sysevo&keyterm=calling%20from%20Sysevo&keyterm=Sysevo%20AI"
 )
 
+# How "Sysevo" has been mis-heard (Sysavo, Sasebo, Saseo, Sasivo, Siveo, Cecebo, "Sai sevo"…),
+# kept in step with supabase/functions/_shared/brandVocabulary.ts. Whole words only.
+_BRAND_MISHEARINGS = re.compile(
+    r"\b(?:"
+    r"[scz][aeiouy]{1,2}[scz]{1,2}[aeiouy]{0,2}[vb][aeiouy]{0,2}[oa]"
+    r"|s[aiy][sc][aeiy]{1,2}o"
+    r"|s[iy][vb][aeiy]?[oa]"
+    r"|(?:s[aiy]{1,2}e?|sigh|sci|cy)[\s-]+[scz][aeiy]{1,2}[vb][oa]"
+    r"|s[iy]s[\s-]+[ae]v[oa]"
+    r")\b",
+    re.IGNORECASE,
+)
+# Real names a model reaches for; only replaced where a rep says where they are calling from.
+_BRAND_SOUNDALIKE_AFTER_FROM = re.compile(
+    r"(\b(?:calling|call|ringing|here|it's|it is|this is \w+)\s+(?:you\s+)?from\s+)"
+    r"(?:sysco|cisco|sisco|syscoe|sysco's|seesaw|sicko|psycho)\b",
+    re.IGNORECASE,
+)
+
+
+def correct_brand_spelling(text: str) -> str:
+    """Every mis-heard spelling of our name, written as "Sysevo"."""
+    if not text:
+        return text
+    text = _BRAND_SOUNDALIKE_AFTER_FROM.sub(lambda m: f"{m.group(1)}Sysevo", text)
+    return _BRAND_MISHEARINGS.sub(lambda m: m.group(0) if m.group(0) == "SYSEVO" else "Sysevo", text)
+
 _CONNECT_TIMEOUT_SECONDS = 8.0
+
+
+def caption_payload(
+    deepgram_result: dict, text: str, speaker: str | None, source: str | None
+) -> dict:
+    """One caption in the shape every listener reads (contract C1).
+
+    Old clients read only type/text/is_final/start and ignore the rest, so the extra
+    keys are additive. `start`/`duration` are seconds from the start of this
+    transcription stream, which opens with the call's audio.
+    """
+    def _seconds(value) -> float | None:
+        try:
+            return round(float(value), 3) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "type": "transcript",
+        "text": text,
+        "is_final": bool(deepgram_result.get("is_final")),
+        "start": _seconds(deepgram_result.get("start")),
+        "duration": _seconds(deepgram_result.get("duration")),
+        "speaker": speaker,
+        "source": source,
+    }
 
 
 class LiveTranscriber:
@@ -46,9 +104,21 @@ class LiveTranscriber:
     "transcription is not available".
     """
 
-    def __init__(self, call_id: str, on_text: Callable[[dict], Awaitable[None]]):
+    def __init__(
+        self,
+        call_id: str,
+        on_text: Callable[[dict], Awaitable[None]],
+        *,
+        speaker: str | None = None,
+        source: str | None = None,
+    ):
+        """`speaker` is who this stream carries ("rep"/"prospect"), or None when the
+        audio is a mixed mono stream and nobody can honestly be named. `source` says
+        where the audio came from, so a client can tell attributed from mixed text."""
         self._call_id = call_id
         self._on_text = on_text
+        self._speaker = speaker if speaker in ("rep", "prospect") else None
+        self._source = source
         self._socket: websockets.ClientConnection | None = None
         self._reader: asyncio.Task | None = None
 
@@ -122,19 +192,12 @@ class LiveTranscriber:
                 except Exception:  # noqa: BLE001
                     continue
                 alternatives = (payload.get("channel") or {}).get("alternatives") or []
-                text = (alternatives[0].get("transcript") if alternatives else "") or ""
+                text = correct_brand_spelling((alternatives[0].get("transcript") if alternatives else "") or "")
                 if not text.strip():
                     # Deepgram emits empty results constantly during silence. Publishing
                     # them would clear the caption every time nobody is speaking.
                     continue
-                await self._on_text(
-                    {
-                        "type": "transcript",
-                        "text": text,
-                        "is_final": bool(payload.get("is_final")),
-                        "start": payload.get("start"),
-                    }
-                )
+                await self._on_text(caption_payload(payload, text, self._speaker, self._source))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001

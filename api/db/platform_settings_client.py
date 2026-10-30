@@ -17,6 +17,7 @@ from sqlalchemy.dialects.postgresql import insert
 
 from api.db.base_client import BaseDBClient
 from api.db.models import (
+    PlatformDialerTwilioCredentialsModel,
     PlatformTelnyxDialerCredentialsModel,
     PlatformTelnyxUserCredentialModel,
     PlatformSignalWireDialerCredentialsModel,
@@ -51,7 +52,16 @@ class PlatformSettingsClient(BaseDBClient):
             return None
         return {**(row.credentials or {}), "updated_at": row.updated_at}
 
-    async def save_platform_vonage_dialer_credentials(self, credentials: dict) -> None:
+    async def save_platform_vonage_dialer_credentials(
+        self, credentials: dict | None = None, *, application_id: str | None = None,
+        api_key: str | None = None, api_secret: str | None = None,
+        private_key: str | None = None, signature_secret: str | None = None,
+    ) -> None:
+        # Accept the deployed admin's dictionary and the canonical admin's keywords.
+        if credentials is None:
+            credentials = dict(application_id=application_id, api_key=api_key,
+                               api_secret=api_secret, private_key=private_key,
+                               signature_secret=signature_secret)
         async with self.async_session() as session:
             row = await session.get(PlatformVonageDialerCredentialsModel, 1)
             if row is None:
@@ -238,6 +248,24 @@ class PlatformSettingsClient(BaseDBClient):
             "last_validated_at": row.last_validated_at,
         }
 
+    async def get_platform_dialer_twilio_connection(self) -> Optional[dict]:
+        creds = await self.get_platform_dialer_credentials()
+        if not creds:
+            return None
+        return {
+            "configured": True,
+            "account_sid": creds["account_sid"],
+            "account_sid_preview": f'{creds["account_sid"][:7]}…{creds["account_sid"][-4:]}',
+            "api_key_sid": creds["api_key_sid"],
+            "twiml_app_sid": creds["twiml_app_sid"],
+            "default_caller_id": creds.get("default_caller_id"),
+            "last_validated_at": creds.get("last_validated_at"),
+        }
+
+    async def save_platform_dialer_twilio_credentials(self, **credentials) -> None:
+        """Compatibility name used by the canonical admin route."""
+        await self.save_platform_dialer_credentials(**credentials)
+
     async def get_platform_dialer_auth_token(self) -> Optional[str]:
         """
         Return the active account's decrypted auth token, for verifying
@@ -263,6 +291,11 @@ class PlatformSettingsClient(BaseDBClient):
                 "is_active": r.is_active,
                 "last_validated_at": r.last_validated_at,
                 "created_at": r.created_at,
+                # Legacy response keys remain available; the dialer has its own settings.
+                "dialer_configured": False,
+                "dialer_api_key_sid": None,
+                "dialer_twiml_app_sid": None,
+                "dialer_default_caller_id": None,
             }
             for r in rows
         ]
@@ -300,6 +333,10 @@ class PlatformSettingsClient(BaseDBClient):
         auth_token: str,
         label: Optional[str] = None,
         make_active: bool = False,
+        dialer_api_key_sid: Optional[str] = None,
+        dialer_api_key_secret: Optional[str] = None,
+        dialer_twiml_app_sid: Optional[str] = None,
+        dialer_default_caller_id: Optional[str] = None,
     ) -> int:
         """
         Insert a new platform Twilio account. Existing accounts (and their

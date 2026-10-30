@@ -859,6 +859,238 @@ class TestCustomToolManagerUnit:
     """Unit tests for CustomToolManager class."""
 
     @pytest.mark.asyncio
+    async def test_internal_test_sandbox_blocks_http_tool_side_effects(self):
+        from api.db import db_client
+        from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
+
+        manager = CustomToolManager(Mock(_workflow_run_id=987))
+        manager._play_config_message = AsyncMock(return_value=False)
+        run = Mock(annotations={"sysevo_test_sandbox": {"enabled": True}})
+        tool_executor = AsyncMock(return_value={"status": "success"})
+        results = []
+
+        class Params:
+            arguments = {"email": "client@example.com"}
+
+            async def result_callback(self, result, **_kwargs):
+                results.append(result)
+
+        tool = MockToolModel(
+            tool_uuid="sandbox-http-tool",
+            name="Send Email",
+            description="Send an email",
+            category="http_api",
+            definition={"type": "http_api", "config": {"url": "https://client.example.com/send"}},
+        )
+        with (
+            patch.object(db_client, "get_workflow_run_by_id", new=AsyncMock(return_value=run)),
+            patch("api.services.workflow.pipecat_engine_custom_tools.execute_http_tool", new=tool_executor),
+        ):
+            handler = manager._create_http_tool_handler(tool, "send_email")
+            await handler(Params())
+
+        tool_executor.assert_not_awaited()
+        assert results[0]["status"] == "blocked"
+        assert results[0]["code"] == "sandbox_adapter_unavailable"
+
+    @pytest.mark.asyncio
+    async def test_sandbox_booking_tool_routes_only_to_sysevo_adapter(self):
+        from api.db import db_client
+        from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
+
+        manager = CustomToolManager(Mock(_workflow_run_id=987))
+        run = Mock(
+            annotations={"sysevo_test_sandbox": {
+                "enabled": True,
+                "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+                "scenario_id": "sandbox_calendar_booking",
+            }},
+            workflow_id=56,
+        )
+        tool = MockToolModel(
+            tool_uuid="sandbox-booking-tool",
+            name="Book appointment",
+            description="Book an appointment",
+            category="http_api",
+            definition={"type": "http_api", "config": {
+                "method": "POST",
+                "url": "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-memory-lookup?action=book_appointment",
+            }},
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "success", "provider": "google_calendar"}
+        post = AsyncMock(return_value=response)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *args, **kwargs):
+                return await post(*args, **kwargs)
+
+        with (
+            patch.object(db_client, "get_workflow_run_by_id", new=AsyncMock(return_value=run)),
+            patch("api.services.workflow.pipecat_engine_custom_tools.os.getenv", return_value="internal-test-secret"),
+            patch("api.services.workflow.pipecat_engine_custom_tools.httpx.AsyncClient", return_value=FakeClient()),
+        ):
+            result = await manager._execute_sandbox_action(
+                tool,
+                {"date": "2026-10-13", "time": "10:00", "customer_email": "client@example.com"},
+            )
+
+        assert result["status"] == "success"
+        assert post.await_args.args[0] == "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
+        assert post.await_args.kwargs["headers"] == {"x-sysevo-secret": "internal-test-secret"}
+        assert post.await_args.kwargs["json"]["action"] == "book_appointment"
+        assert post.await_args.kwargs["json"]["scenario_id"] == "sandbox_calendar_booking"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("url", "method", "expected_action"),
+        [
+            ("https://api.resend.com/emails", "POST", "send_test_email"),
+            (
+                "https://api.twilio.com/2010-04-01/Accounts/__ACCOUNT_SID__/Messages.json",
+                "POST",
+                "send_test_sms",
+            ),
+        ],
+    )
+    async def test_sandbox_provider_actions_route_to_syservo_adapter_only(
+        self, url, method, expected_action
+    ):
+        from api.db import db_client
+        from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
+
+        manager = CustomToolManager(Mock(_workflow_run_id=987))
+        url = url.replace("__ACCOUNT_SID__", "AC" + "a" * 32)
+        run = Mock(
+            annotations={"sysevo_test_sandbox": {
+                "enabled": True,
+                "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+                "scenario_id": "sandbox_provider_action",
+            }},
+            workflow_id=56,
+        )
+        tool = MockToolModel(
+            tool_uuid="sandbox-provider-tool",
+            name="Send test message",
+            description="Send a message",
+            category="http_api",
+            definition={"type": "http_api", "config": {"url": url, "method": method}},
+        )
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "success", "provider": expected_action}
+        post = AsyncMock(return_value=response)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *args, **kwargs):
+                return await post(*args, **kwargs)
+
+        with (
+            patch.object(db_client, "get_workflow_run_by_id", new=AsyncMock(return_value=run)),
+            patch("api.services.workflow.pipecat_engine_custom_tools.os.getenv", return_value="internal-test-secret"),
+            patch("api.services.workflow.pipecat_engine_custom_tools.httpx.AsyncClient", return_value=FakeClient()),
+        ):
+            result = await manager._execute_sandbox_action(
+                tool, {"to": "+442079460000", "email": "client@example.com", "body": "customer data"}
+            )
+
+        assert result["status"] == "success"
+        assert post.await_args.args[0] == "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
+        payload = post.await_args.kwargs["json"]
+        assert payload["action"] == expected_action
+        assert payload["arguments"] == {}
+
+    @pytest.mark.asyncio
+    async def test_sandbox_custom_webhook_routes_to_internal_sink_only(self):
+        from api.db import db_client
+        from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
+
+        manager = CustomToolManager(Mock(_workflow_run_id=987))
+        tool = MockToolModel(
+            tool_uuid="sandbox-custom-webhook",
+            name="Send lead",
+            description="Send a lead",
+            category="http_api",
+            definition={"type": "http_api", "config": {
+                "url": "https://client.example.com/leads",
+                "method": "POST",
+                "parameters": [
+                    {"name": "name", "required": True},
+                    {"name": "email", "required": True},
+                ],
+            }},
+        )
+        run = Mock(workflow_id=174, annotations={"sysevo_test_sandbox": {
+            "enabled": True,
+            "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+            "scenario_id": "sandbox_calendar_booking",
+        }})
+        response = Mock(status_code=200)
+        response.json.return_value = {"status": "success", "action": "send_test_webhook"}
+        post = AsyncMock(return_value=response)
+
+        class FakeClient:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return None
+
+            async def post(self, *args, **kwargs):
+                return await post(*args, **kwargs)
+
+        with (
+            patch.object(db_client, "get_workflow_run_by_id", new=AsyncMock(return_value=run)),
+            patch("api.services.workflow.pipecat_engine_custom_tools.os.getenv", return_value="internal-test-secret"),
+            patch("api.services.workflow.pipecat_engine_custom_tools.httpx.AsyncClient", return_value=FakeClient()),
+        ):
+            result = await manager._execute_sandbox_action(
+                tool, {"name": "Sysevo QA Contact", "email": "qa@sysevo.io"}
+            )
+
+        assert result["status"] == "success"
+        assert post.await_args.args[0] == "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
+        payload = post.await_args.kwargs["json"]
+        assert payload["action"] == "send_test_webhook"
+        assert payload["arguments"] == {"name": "Sysevo QA Contact", "email": "qa@sysevo.io"}
+        assert payload["required_fields"] == ["name", "email"]
+
+    @pytest.mark.asyncio
+    async def test_sandbox_custom_webhook_rejects_non_https_and_read_only_tools(self):
+        from api.db import db_client
+        from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
+
+        manager = CustomToolManager(Mock(_workflow_run_id=987))
+        run = Mock(annotations={"sysevo_test_sandbox": {
+            "enabled": True,
+            "agent_test_run_id": "12345678-1234-4234-8234-123456789abc",
+            "scenario_id": "sandbox_custom_webhook",
+        }})
+        with patch.object(db_client, "get_workflow_run_by_id", new=AsyncMock(return_value=run)):
+            for url, method in [("http://client.example.com/leads", "POST"), ("https://client.example.com/leads", "GET")]:
+                tool = MockToolModel(
+                    tool_uuid="sandbox-custom-webhook",
+                    name="Send lead",
+                    description="Send a lead",
+                    category="http_api",
+                    definition={"type": "http_api", "config": {"url": url, "method": method}},
+                )
+                result = await manager._execute_sandbox_action(tool, {"name": "QA"})
+                assert result["status"] == "blocked"
+                assert result["code"] == "sandbox_adapter_unavailable"
+
+    @pytest.mark.asyncio
     async def test_get_tool_schemas_returns_correct_format(self):
         """Test that get_tool_schemas returns FunctionSchema objects."""
         # Create a mock engine
@@ -1005,7 +1237,10 @@ class TestCustomToolManagerUnit:
 
         with patch(
             "api.services.workflow.pipecat_engine_custom_tools.execute_http_tool"
-        ) as mock_execute:
+        ) as mock_execute, patch(
+            "api.services.workflow.pipecat_engine_custom_tools.db_client.get_workflow_run_by_id",
+            new=AsyncMock(return_value=Mock(annotations={})),
+        ):
             mock_execute.return_value = {
                 "status": "success",
                 "data": {"response": "ok"},

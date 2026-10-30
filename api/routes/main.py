@@ -6,6 +6,7 @@ from api.routes.agent_stream import router as agent_stream_router
 from api.routes.auth import router as auth_router
 from api.routes.campaign import router as campaign_router
 from api.routes.credentials import router as credentials_router
+from api.routes.developer_console import router as developer_console_router
 from api.routes.folder import router as folder_router
 from api.routes.knowledge_base import router as knowledge_base_router
 from api.routes.node_types import router as node_types_router
@@ -30,9 +31,11 @@ from api.routes.workflow_embed import router as workflow_embed_router
 from api.routes.workflow_recording import router as workflow_recording_router
 from api.routes.voice_library import router as voice_library_router
 from api.routes.workflow_text_chat import router as workflow_text_chat_router
+from api.routes.workflow_voice_test import router as workflow_voice_test_router
 from api.routes.ai_providers import router as ai_providers_router
 from api.routes.memory_tools import router as memory_tools_router
 from api.routes.admin_telephony import router as admin_telephony_router
+from api.routes.dialer_agent_history import router as dialer_agent_history_router
 from api.services.integrations import all_routers
 
 router = APIRouter(
@@ -46,11 +49,13 @@ router.include_router(superuser_router)
 router.include_router(supervisor_router)
 router.include_router(workflow_router)
 router.include_router(workflow_text_chat_router)
+router.include_router(workflow_voice_test_router)
 router.include_router(user_router)
 router.include_router(campaign_router)
 router.include_router(credentials_router)
 router.include_router(tool_router)
 router.include_router(organization_router)
+router.include_router(developer_console_router)
 router.include_router(s3_router)
 router.include_router(service_keys_router)
 router.include_router(organization_usage_router)
@@ -71,6 +76,7 @@ router.include_router(voice_library_router)
 router.include_router(ai_providers_router)
 router.include_router(memory_tools_router)
 router.include_router(admin_telephony_router)
+router.include_router(dialer_agent_history_router)
 
 for _integration_router in all_routers():
     router.include_router(_integration_router)

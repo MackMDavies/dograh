@@ -16,6 +16,7 @@ setup_logging()
 # Now import ARQ and task dependencies
 from arq import create_pool, cron
 from arq.connections import ArqRedis, RedisSettings
+from arq.worker import func
 
 parsed_url = urlparse(REDIS_URL)
 
@@ -45,6 +46,9 @@ from api.tasks.campaign_tasks import (
     process_campaign_batch,
     sync_campaign_source,
 )
+from api.tasks.agent_test_voice import run_agent_test_voice
+from api.services.workflow.voice_test_capacity import publish_voice_worker_protocol
+from api.services.workflow.voice_test_job import JOB_NAME as AGENT_TEST_VOICE_JOB_NAME
 from api.tasks.knowledge_base_processing import process_knowledge_base_document
 from api.tasks.run_integrations import run_integrations_post_workflow_run
 from api.tasks.s3_upload import (
@@ -55,11 +59,37 @@ from api.tasks.wallet_reconciliation import reconcile_wallet_debits
 from api.tasks.memory_reconciliation import reconcile_memory
 from api.tasks.telephony_cost_reconciliation import reconcile_telephony_cost
 from api.tasks.dial_suppression_sync import sync_dial_suppression
+from api.tasks.dialer_overflow_reconciliation import reconcile_dialer_overflow
+from api.tasks.dialer_agent_history_reconciliation import reconcile_dialer_agent_history
+from api.tasks.inbound_voice_sms import process_inbound_voice_sms
+from api.tasks.missed_call_text import process_missed_call_text
 from api.services.api_usage_counter import flush_api_request_usage
+from api.services.api_request_logging import purge_api_request_logs
 
 
 class WorkerSettings:
     functions = [
+        func(
+            run_agent_test_voice,
+            name=AGENT_TEST_VOICE_JOB_NAME,
+            timeout=270,
+            max_tries=3,
+            keep_result=600,
+        ),
+        func(
+            process_inbound_voice_sms,
+            name=FunctionNames.PROCESS_INBOUND_VOICE_SMS,
+            timeout=100,
+            max_tries=3,
+            keep_result=600,
+        ),
+        func(
+            process_missed_call_text,
+            name=FunctionNames.PROCESS_MISSED_CALL_TEXT,
+            timeout=35,
+            max_tries=3,
+            keep_result=600,
+        ),
         run_integrations_post_workflow_run,
         upload_voicemail_audio_to_s3,
         process_workflow_completion,
@@ -68,8 +98,13 @@ class WorkerSettings:
         process_knowledge_base_document,
     ]
     cron_jobs = [
+        cron(publish_voice_worker_protocol, second={5,35}),
+        cron(reconcile_dialer_agent_history, second={10,40}, run_at_startup=True),
+        cron(reconcile_dialer_overflow, second=set(range(0,60,2)), run_at_startup=True),
         # Hourly: flush per-key API request counters to the Sysevo api-usage-report fn.
         cron(flush_api_request_usage, minute=0),
+        # Daily: enforce the Developers request-log retention window (default 30 days).
+        cron(purge_api_request_logs, hour={3}, minute={17}),
         # Every 10 min: re-fire post-call wallet debits that never settled (crash / lost
         # job / transient webhook failure). Idempotent on workflow_run_id, so safe to retry.
         cron(reconcile_wallet_debits, minute=set(range(0, 60, 10))),
@@ -103,6 +138,8 @@ class WorkerSettings:
         what it sees. The hard alarm is the ARTIFACT LOST error in s3_upload.py;
         this is the early warning at boot.
         """
+        await publish_voice_worker_protocol(_ctx)
+
         import os
         import tempfile
 

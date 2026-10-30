@@ -548,6 +548,43 @@ class KnowledgeBaseClient(BaseDBClient):
             )
             return True
 
+    async def update_document_details(
+        self,
+        document_uuid: str,
+        organization_id: int,
+        title: Optional[str] = None,
+        kind: Optional[str] = None,
+        source_url: Optional[str] = None,
+        retrieval_mode: Optional[str] = None,
+    ) -> Optional[KnowledgeBaseDocumentModel]:
+        """Display title / source kind (custom_metadata), source URL and read mode.
+
+        The stored filename is left alone: it drives the MIME type and the S3 key.
+        """
+        async with self.async_session() as session:
+            query = select(KnowledgeBaseDocumentModel).where(
+                KnowledgeBaseDocumentModel.document_uuid == document_uuid,
+                KnowledgeBaseDocumentModel.organization_id == organization_id,
+                KnowledgeBaseDocumentModel.is_active == True,
+            )
+            result = await session.execute(query)
+            document = result.scalar_one_or_none()
+            if not document:
+                return None
+            meta = dict(document.custom_metadata or {})
+            if title is not None:
+                meta["title"] = title
+            if kind is not None:
+                meta["kind"] = kind
+            document.custom_metadata = meta
+            if source_url is not None:
+                document.source_url = source_url
+            if retrieval_mode is not None:
+                document.retrieval_mode = retrieval_mode
+            await session.commit()
+            await session.refresh(document)
+            return document
+
     async def set_document_global(
         self,
         document_uuid: str,

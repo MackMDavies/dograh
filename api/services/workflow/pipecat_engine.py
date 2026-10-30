@@ -18,6 +18,7 @@ from pipecat.utils.enums import EndTaskReason
 
 from api.db import db_client
 from api.enums import ToolCategory
+from api.services.phone_tools.policy import PhoneToolsPolicy, normalize_policy
 from api.services.pipecat.audio_playback import play_audio
 from api.services.workflow.disposition_mapper import apply_disposition_mapping
 from api.services.workflow.workflow_graph import Node, WorkflowGraph
@@ -33,6 +34,7 @@ if TYPE_CHECKING:
 
 import asyncio
 import time
+from contextlib import suppress
 
 from loguru import logger
 
@@ -125,6 +127,9 @@ class PipecatEngine:
         has_recordings: bool = False,
         context_compaction_enabled: bool = False,
         transition_filler_enabled: bool = False,
+        voice_expression_instruction: Optional[str] = None,
+        guardrail_instruction: Optional[str] = None,
+        is_realtime: bool = False,
     ):
         self.task = task
         self.llm = llm
@@ -159,6 +164,10 @@ class PipecatEngine:
 
         # Controls whether user input should be muted
         self._mute_pipeline: bool = False
+        # Enabled only for the isolated voice-test transport; the observing
+        # strategy wrapper reads this fixed reason after the callback returns.
+        self._voice_test_mute_observation_enabled = False
+        self._voice_test_mute_reason = None
 
         # Mute state for queued TTSSpeakFrames (transition speech, custom tool messages)
         # "idle" = not muting, "waiting" = speech queued, "playing" = bot speaking it
@@ -188,6 +197,10 @@ class PipecatEngine:
         self._embeddings_api_key: Optional[str] = embeddings_api_key
         self._embeddings_model: Optional[str] = embeddings_model
         self._embeddings_base_url: Optional[str] = embeddings_base_url
+        self._voice_expression_instruction = voice_expression_instruction
+        self._guardrail_instruction = guardrail_instruction
+        self._is_realtime = is_realtime
+        self._agent_test_sandbox: Optional[dict] = None
 
         # Audio configuration (set via set_audio_config from _run_pipeline)
         self._audio_config = None
@@ -221,6 +234,22 @@ class PipecatEngine:
         self._context_summarization_manager: Optional[ContextSummarizationManager] = (
             None
         )
+        # Built-in phone tools and the organization's rules for them
+        # (set via set_phone_tools from _run_pipeline; defaults = every tool on).
+        self._phone_tools: PhoneToolsPolicy = normalize_policy(None)
+        self._caller_keypad = None
+        self._logs_buffer = None
+        self._audio_buffer = None
+        self._recording_paused = False
+        self._phone_tool_caller_number: Optional[str] = None
+        self._phone_tool_workflow_id: Optional[int] = None
+        self._phone_tools_sandbox = False
+        self._texts_sent = 0
+        self._payment_links: list[dict] = []
+        self._companion_mixer = None
+        self._companion_input = None
+        self._companion_bridge = None
+        self._payment_links_task: Optional[asyncio.Task] = None
 
     async def _get_organization_id(self) -> Optional[int]:
         """Get and cache the organization ID from workflow run."""
@@ -255,6 +284,26 @@ class PipecatEngine:
             return None
         return tracing_ctx.get_turn_context() or tracing_ctx.get_conversation_context()
 
+    def configure_test_sandbox(self, workflow_run) -> None:
+        """Bind tool isolation only from the server-owned run annotations.
+
+        An incomplete enabled marker remains truthy, so restricted tool paths
+        fail closed rather than falling through to live customer actions.
+        """
+        from api.services.workflow.test_sandbox_mode import (
+            is_sandbox_test_run,
+            sandbox_test_run_context,
+        )
+        if not is_sandbox_test_run(workflow_run):
+            self._agent_test_sandbox = None
+            return
+        context = sandbox_test_run_context(workflow_run) or {}
+        self._agent_test_sandbox = {
+            "test_run_id": context.get("agent_test_run_id"),
+            "scenario_id": context.get("scenario_id"),
+            "workflow_id": getattr(workflow_run, "workflow_id", None),
+        }
+
     async def initialize(self):
         # TODO: May be set_node in a separate task so that we return from initialize immediately
         if self._initialized:
@@ -288,9 +337,12 @@ class PipecatEngine:
             tools_schema = ToolsSchema(standard_tools=functions)
             self.context.set_tools(tools_schema)
 
-        # For Gemini Live, set context on the LLM before _update_settings so that
-        # _connect (triggered by reconnect) can read tools from it.
-        if hasattr(self.llm, "_context") and not self.llm._context and self.context:
+        # Realtime adapters hold their own context reference and receive an
+        # opening TTSSpeakFrame before the first LLMContextFrame. Always point
+        # that reference at the engine's live context: the service may have
+        # initialized an empty LLMContext already, which is truthy but is not
+        # the context the engine populates for this workflow.
+        if hasattr(self.llm, "_context") and self.context:
             self.llm._context = self.context
 
         await self.llm._update_settings(LLMSettings(system_instruction=system_prompt))
@@ -600,6 +652,7 @@ class PipecatEngine:
                     raise RuntimeError("no pipeline task available")
                 await self.task.queue_frame(OutputDTMFFrame.from_string(digits))
                 self._gathered_context.setdefault("dtmf_pressed", []).append(digits)
+                await self.log_phone_tool_event("keypad", keys=digits)
                 await function_call_params.result_callback(
                     {
                         "status": "pressed",
@@ -614,6 +667,29 @@ class PipecatEngine:
                 )
 
         self.llm.register_function("press_keys", press_keys_func)
+
+    def _dialer_callback_enabled(self) -> bool:
+        """Dialer extra-answer agent runs may book the agreed callback time."""
+        context = self._call_context_vars or {}
+        return bool(context.get("dialer_extra_answer_id") and context.get("dialer_original_call_id"))
+
+    async def _register_dialer_callback_function(self) -> None:
+        """book_callback: store the callback time agreed with the person (Phase 1b gap)."""
+        from api.services.telephony.dialer import agent_callback
+
+        async def book_callback_func(function_call_params: FunctionCallParams) -> None:
+            try:
+                result = await agent_callback.handle_tool_call(
+                    dict(function_call_params.arguments or {}), dict(self._call_context_vars or {}),
+                )
+                if result.get("status") == "booked":
+                    self._gathered_context["dialer_callback_due_at"] = result.get("due_at")
+            except Exception as e:  # noqa: BLE001
+                logger.error(f"book_callback failed: {e}")
+                result = {"status": "error", "reason": "the callback could not be saved"}
+            await function_call_params.result_callback(result)
+
+        self.llm.register_function(agent_callback.TOOL_NAME, book_callback_func)
 
     async def _perform_variable_extraction_if_needed(
         self, node: Optional[Node], run_in_background: bool = True
@@ -858,8 +934,17 @@ class PipecatEngine:
             await self._register_knowledge_base_function(kb_doc_uuids)
 
         # SYSEVO_DTMF: available on every node — an IVR or call-control gate can
-        # appear at any point, not just when the call is answered.
-        await self._register_dtmf_function()
+        # appear at any point, not just when the call is answered — unless the
+        # organization switched the keypad tool off.
+        if self._phone_tools.enabled("keypad"):
+            await self._register_dtmf_function()
+        await self._collect_payment_links()
+        builtin_phone_tools = self._builtin_phone_tools()
+        if builtin_phone_tools:
+            await self._register_builtin_phone_tools(builtin_phone_tools)
+        dialer_callback = self._dialer_callback_enabled()
+        if dialer_callback:
+            await self._register_dialer_callback_function()
 
         # Compose prompt and functions via the context composer module
         system_prompt = compose_system_prompt_for_node(
@@ -869,10 +954,29 @@ class PipecatEngine:
             has_recordings=self._has_recordings,
             call_context_vars=self._call_context_vars,
         )
+        # Agent-wide voice and policy instructions apply to every workflow node,
+        # including the initial greeting and all later transitions.
+        system_prompt = "\n\n".join(
+            part for part in (
+                system_prompt,
+                self._voice_expression_instruction,
+                self._guardrail_instruction,
+            ) if part
+        )
+        # Only dialer extra-answer runs pass the callback tool's timezone; every other
+        # call composes its tools exactly as before.
+        dialer_kwargs = (
+            {"dialer_callback_tz": str((self._call_context_vars or {}).get("phone_timezone") or "UTC")}
+            if dialer_callback else {}
+        )
         functions = await compose_functions_for_node(
             node=node,
             custom_tool_manager=self._custom_tool_manager,
             kb_document_uuids=kb_doc_uuids,
+            phone_tools_policy=self._phone_tools,
+            builtin_phone_tools=builtin_phone_tools,
+            payment_links=self._payment_links,
+            **dialer_kwargs,
         )
         await self._update_llm_context(system_prompt, functions)
 
@@ -1228,6 +1332,16 @@ class PipecatEngine:
             and not self._current_node.allow_interrupt
         )
 
+        if self._voice_test_mute_observation_enabled:
+            if self._mute_pipeline:
+                self._voice_test_mute_reason = "pipeline_shutdown"
+            elif self._queued_speech_mute_state != "idle":
+                self._voice_test_mute_reason = "queued_speech"
+            elif self._bot_is_speaking and self._current_node is not None and not self._current_node.allow_interrupt:
+                self._voice_test_mute_reason = "node_forbids_interruption"
+            else:
+                self._voice_test_mute_reason = "unmuted"
+
         if muted:
             now = time.monotonic()
             if self._mute_active_since is None:
@@ -1244,6 +1358,8 @@ class PipecatEngine:
                 self._bot_is_speaking = False
                 self._queued_speech_mute_state = "idle"
                 self._mute_active_since = None
+                if self._voice_test_mute_observation_enabled:
+                    self._voice_test_mute_reason = "self_heal_release"
                 return False
             return True
 
@@ -1307,6 +1423,292 @@ class PipecatEngine:
     def set_fetch_recording_audio(self, fetch_fn) -> None:
         """Set the recording audio fetcher callback."""
         self._fetch_recording_audio = fetch_fn
+
+    def set_phone_tools(
+        self,
+        policy: PhoneToolsPolicy,
+        caller_keypad=None,
+        logs_buffer=None,
+        *,
+        audio_buffer=None,
+        caller_number: Optional[str] = None,
+        workflow_id: Optional[int] = None,
+        sandbox: bool = False,
+    ) -> None:
+        """Install the organization's phone tool rules (Voice AI -> Tools).
+
+        caller_keypad is the pipeline's CallerKeypadProcessor; it only passes key
+        presses on when the organization allows the caller keypad tool.
+        audio_buffer (the call recorder) enables pausing the recording;
+        caller_number (the other party) enables texting them. Agent test
+        sandboxes never send texts.
+        """
+        self._phone_tools = policy
+        self._logs_buffer = logs_buffer
+        self._audio_buffer = audio_buffer
+        self._phone_tool_caller_number = caller_number or None
+        self._phone_tool_workflow_id = workflow_id
+        self._phone_tools_sandbox = sandbox
+        self._recording_paused = audio_buffer is not None and policy.recording_starts_paused()
+        self._caller_keypad = caller_keypad
+        if self._can_text_caller() and policy.enabled("payments"):
+            # Fetched while the call connects; the tool is offered once they arrive.
+            from api.services.phone_tools import builtin
+
+            try:
+                self._payment_links_task = asyncio.get_running_loop().create_task(
+                    builtin.list_payment_links(workflow_id)
+                )
+            except RuntimeError:
+                self._payment_links_task = None
+        if caller_keypad is not None:
+            if policy.enabled("caller_keypad"):
+                caller_keypad.set_handler(self._on_caller_keys, self._caller_keys_accepted)
+            else:
+                caller_keypad.set_handler(None)
+
+    def set_companion(self, mixer, input_processor) -> None:
+        """Where a three-way colleague is mixed in (services/pipecat/companion.py)."""
+        self._companion_mixer = mixer
+        self._companion_input = input_processor
+
+    def companion_available(self) -> bool:
+        return self._companion_mixer is not None and self._companion_input is not None
+
+    async def start_companion(self, transfer_id: str) -> bool:
+        """The colleague answered: mix them in. The agent stays on the call."""
+        from api.constants import REDIS_URL
+        from api.services.pipecat.companion import CompanionBridge
+
+        if not self.companion_available() or self._audio_config is None:
+            return False
+        await self.stop_companion()
+
+        async def colleague_left() -> None:
+            from pipecat.frames.frames import LLMMessagesAppendFrame
+
+            await self.log_phone_tool_event("conference", outcome="colleague_left")
+            note = LLMMessagesAppendFrame(
+                [{"role": "user", "content": "[Your colleague has left the call. Carry on with the caller.]"}],
+                run_llm=False,
+            )
+            with suppress(Exception):
+                await (self.llm.queue_frame(note) if self._is_realtime else self.task.queue_frame(note))
+
+        bridge = CompanionBridge(
+            transfer_id, self._audio_config.transport_out_sample_rate, REDIS_URL, on_left=colleague_left
+        )
+        await bridge.start()
+        self._companion_bridge = bridge
+        self._companion_mixer.bridge = bridge
+        self._companion_input.bridge = bridge
+        return True
+
+    async def stop_companion(self) -> None:
+        bridge, self._companion_bridge = self._companion_bridge, None
+        if bridge is None:
+            return
+        if self._companion_mixer is not None:
+            self._companion_mixer.bridge = None
+        if self._companion_input is not None:
+            self._companion_input.bridge = None
+        await bridge.stop()
+
+    def recording_should_start(self) -> bool:
+        """False when the organization starts every call with the recording paused."""
+        return not self._recording_paused
+
+    def _can_text_caller(self) -> bool:
+        from api.services.phone_tools import builtin
+
+        return bool(
+            self._phone_tool_caller_number
+            and not self._phone_tools_sandbox
+            and builtin.sms_hook_url()
+        )
+
+    def hold_music_allowed(self) -> bool:
+        return self._phone_tools.enabled("hold") and self._transport_output is not None
+
+    async def _collect_payment_links(self) -> None:
+        task, self._payment_links_task = self._payment_links_task, None
+        if task is None:
+            return
+        try:
+            self._payment_links = await asyncio.wait_for(task, timeout=2.0)
+        except Exception as e:  # noqa: BLE001 -- no links, no tool; the call goes on
+            logger.info(f"payment links unavailable for this call: {e}")
+            self._payment_links = []
+
+    def _builtin_phone_tools(self) -> set[str]:
+        """The built-in phone tools this call can offer (besides press_keys)."""
+        from api.services.phone_tools import builtin
+
+        tools: set[str] = set()
+        if self._phone_tools.enabled("sms") and self._can_text_caller():
+            tools.add(builtin.SEND_TEXT)
+        if self._phone_tools.enabled("payments") and self._can_text_caller() and self._payment_links:
+            tools.add(builtin.SEND_PAYMENT_LINK)
+        if self._phone_tools.enabled("recording") and self._audio_buffer is not None:
+            tools.add(builtin.SET_RECORDING)
+        return tools
+
+    async def _register_builtin_phone_tools(self, names: set[str]) -> None:
+        from api.services.phone_tools import builtin
+
+        async def send_text_func(function_call_params: FunctionCallParams) -> None:
+            body = builtin.clean_text((function_call_params.arguments or {}).get("message"))
+            if not body:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "write the text to send first"}
+                )
+                return
+            if self._texts_sent >= builtin.MAX_TEXTS_PER_CALL:
+                await function_call_params.result_callback(
+                    {"status": "not_sent", "reason": "the most texts allowed on one call were already sent"}
+                )
+                return
+            self._texts_sent += 1
+            result = await builtin.send_caller_text(
+                workflow_id=self._phone_tool_workflow_id,
+                workflow_run_id=self._workflow_run_id,
+                to=self._phone_tool_caller_number or "",
+                body=body,
+            )
+            sent = result["status"] in ("sent", "queued")
+            await self.log_phone_tool_event(
+                "sms", outcome="sent" if sent else (result.get("reason") or result["status"]),
+                characters=len(body),
+            )
+            if sent:
+                await function_call_params.result_callback(
+                    {"status": "sent", "note": "The text is on its way; tell the caller."}
+                )
+            else:
+                await function_call_params.result_callback(
+                    {
+                        "status": "not_sent",
+                        "reason": result.get("readable_reason") or "The text could not be sent.",
+                        "note": "Tell the caller the text could not be sent and give them the details by voice instead.",
+                    }
+                )
+
+        async def set_recording_func(function_call_params: FunctionCallParams) -> None:
+            wanted = str((function_call_params.arguments or {}).get("recording") or "").lower()
+            if wanted not in ("on", "off"):
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "say 'on' or 'off'"}
+                )
+                return
+            await self.set_recording(wanted == "on")
+            await function_call_params.result_callback(
+                {"status": "recording" if wanted == "on" else "paused"}
+            )
+
+        async def send_payment_link_func(function_call_params: FunctionCallParams) -> None:
+            wanted = str((function_call_params.arguments or {}).get("link") or "").strip().lower()
+            link = next((l for l in self._payment_links if str(l["title"]).strip().lower() == wanted), None)
+            if link is None:
+                await function_call_params.result_callback(
+                    {"status": "error", "reason": "choose one of the listed payment links"}
+                )
+                return
+            if self._texts_sent >= builtin.MAX_TEXTS_PER_CALL:
+                await function_call_params.result_callback(
+                    {"status": "not_sent", "reason": "the most texts allowed on one call were already sent"}
+                )
+                return
+            self._texts_sent += 1
+            result = await builtin.send_payment_link(
+                workflow_id=self._phone_tool_workflow_id,
+                workflow_run_id=self._workflow_run_id,
+                to=self._phone_tool_caller_number or "",
+                slug=str(link["slug"]),
+            )
+            sent = result["status"] in ("sent", "queued")
+            await self.log_phone_tool_event(
+                "payment_link", outcome="sent" if sent else (result.get("reason") or result["status"]),
+                link=str(link["title"]),
+            )
+            await function_call_params.result_callback(
+                {"status": "sent", "note": "The payment link is on its way; tell the caller."}
+                if sent else
+                {
+                    "status": "not_sent",
+                    "reason": result.get("readable_reason") or "The link could not be sent.",
+                    "note": "Tell the caller the link could not be sent. Do not take card details by voice.",
+                }
+            )
+
+        if builtin.SEND_PAYMENT_LINK in names:
+            self.llm.register_function(builtin.SEND_PAYMENT_LINK, send_payment_link_func)
+        if builtin.SEND_TEXT in names:
+            self.llm.register_function(builtin.SEND_TEXT, send_text_func)
+        if builtin.SET_RECORDING in names:
+            self.llm.register_function(builtin.SET_RECORDING, set_recording_func)
+
+    async def set_recording(self, on: bool) -> None:
+        """Pause or resume the call recording. Pausing flushes what was recorded so far;
+        the finished recording simply leaves out the paused part."""
+        if self._audio_buffer is None or on != self._recording_paused:
+            return  # nothing to record with, or already in that state
+        if on:
+            await self._audio_buffer.start_recording()
+        else:
+            await self._audio_buffer.stop_recording()
+        self._recording_paused = not on
+        logger.info(f"Call recording {'resumed' if on else 'paused'} for run {self._workflow_run_id}")
+        await self.log_phone_tool_event("recording", outcome="resumed" if on else "paused")
+
+    async def inject_caller_key(self, key: str) -> None:
+        """A caller key press reported outside the media stream (Asterisk ARI)."""
+        if self._caller_keypad is not None:
+            await self._caller_keypad.inject_key(key)
+
+    def _caller_keys_accepted(self) -> bool:
+        """Key presses follow the same rule as speech: none while the line is held for a
+        transfer, and none over speech the agent must finish (allow_interrupt=False)."""
+        if self._mute_pipeline or self._queued_speech_mute_state != "idle":
+            return False
+        return not (
+            self._bot_is_speaking
+            and self._current_node is not None
+            and not self._current_node.allow_interrupt
+        )
+
+    async def log_phone_tool_event(self, tool: str, **details: Any) -> None:
+        """Record a phone tool use in the call's history (logs.realtime_feedback_events)."""
+        if self._logs_buffer is None:
+            return
+        try:
+            await self._logs_buffer.append(
+                {"type": "phone_tool", "payload": {"tool": tool, **details}}
+            )
+        except Exception as e:  # noqa: BLE001 -- history is best effort, the call is not
+            logger.warning(f"could not record phone tool event {tool}: {e}")
+
+    async def _on_caller_keys(self, keys: str) -> Optional["Frame"]:
+        """The caller finished pressing keys: tell the model, and record it."""
+        from pipecat.frames.frames import LLMMessagesAppendFrame
+
+        logger.info(f"Caller pressed keypad keys ({len(keys)} keys)")
+        self._gathered_context.setdefault("caller_keys_pressed", []).append(keys)
+        await self.log_phone_tool_event("caller_keypad", keys=keys)
+
+        content = f"[The caller pressed these keys on their phone keypad: {keys}]"
+        rule = self._phone_tools.rule("caller_keypad")
+        if rule:
+            content += (
+                f"\n[Only act on key presses when: {rule}. Otherwise carry on "
+                "with the conversation as if no key was pressed.]"
+            )
+        frame = LLMMessagesAppendFrame([{"role": "user", "content": content}], run_llm=True)
+        if self._is_realtime:
+            # The realtime model sits after the user aggregator, which would swallow
+            # the message into the local context without the model ever hearing it.
+            await self.llm.queue_frame(frame)
+            return None
+        return frame
 
     def set_mute_pipeline(self, mute: bool) -> None:
         """Set the pipeline mute state.

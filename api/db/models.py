@@ -4,6 +4,7 @@ from datetime import UTC, datetime
 from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
+    BigInteger,
     Boolean,
     CheckConstraint,
     Column,
@@ -141,6 +142,8 @@ class APIKeyModel(Base):
     last_used_at = Column(DateTime(timezone=True), nullable=True)
     created_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC))
     archived_at = Column(DateTime(timezone=True), nullable=True)
+    # NULL = never expires. Set at creation from the Developers page (90 days / 1 year).
+    expires_at = Column(DateTime(timezone=True), nullable=True)
 
     # Relationships
     organization = relationship("OrganizationModel", back_populates="api_keys")
@@ -151,6 +154,30 @@ class APIKeyModel(Base):
         Index("ix_api_keys_organization_id", "organization_id"),
         Index("ix_api_keys_key_hash", "key_hash"),
         Index("ix_api_keys_active", "is_active"),
+    )
+
+
+class ApiRequestLogModel(Base):
+    """One request authenticated with an organisation API key (see dv20261025a)."""
+
+    __tablename__ = "api_request_logs"
+
+    id = Column(BigInteger, primary_key=True)
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False
+    )
+    api_key_id = Column(
+        Integer, ForeignKey("api_keys.id", ondelete="SET NULL"), nullable=True
+    )
+    surface = Column(String(16), nullable=False)
+    method = Column(String(8), nullable=False)
+    path = Column(String(512), nullable=False)
+    mcp_method = Column(String(160), nullable=True)
+    status = Column(Integer, nullable=False)
+    latency_ms = Column(Integer, nullable=False)
+    user_agent = Column(String(160), nullable=True)
+    created_at = Column(
+        DateTime(timezone=True), nullable=False, server_default=text("now()")
     )
 
 
@@ -363,6 +390,10 @@ class PlatformTwilioDialerCredentialsModel(Base):
     default_caller_id = Column(String(32), nullable=True)
     last_validated_at = Column(DateTime(timezone=True), nullable=True)
     updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
+
+
+# Compatibility name for canonical callers; both names address the live dialer table.
+PlatformDialerTwilioCredentialsModel = PlatformTwilioDialerCredentialsModel
 
 
 class PlatformTelnyxDialerCredentialsModel(Base):

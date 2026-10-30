@@ -24,7 +24,9 @@ def _headers() -> dict:
     }
 
 
-async def create_dialer_call_listener(*, parent_call_sid: str, manager_user_id: str) -> None:
+async def create_dialer_call_listener(
+    *, parent_call_sid: str, manager_user_id: str, mode: str = "listen"
+) -> None:
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         logger.warning("SUPABASE_SERVICE_ROLE_KEY not set - cannot create dialer_call_listeners row")
         return
@@ -32,7 +34,11 @@ async def create_dialer_call_listener(*, parent_call_sid: str, manager_user_id: 
         async with httpx.AsyncClient() as client:
             response = await client.post(
                 f"{SUPABASE_URL}{_LISTENERS_URL_SUFFIX}",
-                json={"parent_call_sid": parent_call_sid, "manager_user_id": manager_user_id},
+                json={
+                    "parent_call_sid": parent_call_sid,
+                    "manager_user_id": manager_user_id,
+                    "mode": mode,
+                },
                 headers=_headers(),
                 timeout=5.0,
             )

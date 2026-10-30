@@ -8,6 +8,7 @@ from api.services.workflow.text_chat_session_service import (
     TextChatSessionExecutionError,
     TextChatTurnNotFoundError,
     _reload_text_chat_session,
+    append_text_chat_user_message,
     build_pending_text_chat_turn,
     truncate_text_chat_future_turns,
     validate_text_chat_turn_cursor,
@@ -49,6 +50,35 @@ def test_validate_text_chat_turn_cursor_raises_for_missing_turn():
             {"turns": [{"id": "turn-1"}]},
             "turn-404",
         )
+
+
+@pytest.mark.asyncio
+async def test_append_text_chat_user_message_is_idempotent_for_source_event(monkeypatch):
+    session = WorkflowRunTextSessionModel(
+        workflow_run_id=123,
+        revision=4,
+        session_data={
+            "turns": [{"source_event_id": "SM" + "a" * 32, "status": "completed"}]
+        },
+        checkpoint={},
+    )
+    update = AsyncMock()
+    monkeypatch.setattr(
+        text_chat_session_service.db_client,
+        "update_workflow_run_text_session",
+        update,
+    )
+
+    result = await append_text_chat_user_message(
+        run_id=123,
+        text_session=session,
+        user_text="Hello again",
+        expected_revision=4,
+        source_event_id="SM" + "a" * 32,
+    )
+
+    assert result is session
+    update.assert_not_awaited()
 
 
 @pytest.mark.asyncio

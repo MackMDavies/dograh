@@ -11,6 +11,8 @@ assignment lookup failure or a stale client on another provider fails closed;
 it must never place a call with a caller ID from a different line/provider.
 """
 
+import re
+
 import httpx
 from loguru import logger
 
@@ -101,6 +103,113 @@ async def resolve_assigned_dialer_number(rep_id: int) -> dict | None:
         if isinstance(exc, DialerNumberAssignmentUnavailable):
             raise
         raise DialerNumberAssignmentUnavailable("Could not read the rep's dialer assignment") from exc
+
+
+def _nanp_area_code(phone: str) -> str | None:
+    digits = re.sub(r"\D", "", phone)
+    if phone.strip().startswith("+1") and len(digits) >= 11:
+        return digits[1:4]
+    return None
+
+
+def _normalise_e164(phone: str) -> str:
+    value = phone.strip()
+    digits = re.sub(r"\D", "", value)
+    if value.startswith("+") and 8 <= len(digits) <= 15:
+        return "+" + digits
+    return value
+
+
+def choose_parallel_caller_ids(
+    targets: list[dict], caller_numbers: list[str], fallback: str
+) -> dict[str, str]:
+    """Choose distinct rep-owned DIDs for a batch, preferring the lead's NPA.
+
+    Local presence only applies to North American area codes in this phase;
+    international destinations use the next unused assigned DID. Once the
+    rep's eligible number lineup is exhausted, the established caller ID is
+    reused rather than borrowing another rep's number.
+    """
+    numbers = list(dict.fromkeys(_normalise_e164(number) for number in caller_numbers if number))
+    fallback = _normalise_e164(fallback) if fallback else ""
+    if fallback and fallback not in numbers:
+        # Preserve the eligible DID lineup ahead of the fixed fallback. The
+        # fallback should be consumed only after local and other assigned
+        # numbers have been allocated to the selected parallel lines.
+        numbers.append(fallback)
+    available = list(numbers)
+    selected: dict[str, str] = {}
+    for target in targets:
+        entry_id = target.get("entry_id")
+        phone = target.get("phone")
+        if not isinstance(entry_id, str):
+            continue
+        lead_area = _nanp_area_code(phone) if isinstance(phone, str) else None
+        local_match = next(
+            (number for number in available if lead_area and _nanp_area_code(number) == lead_area),
+            None,
+        )
+        number = local_match or (available[0] if available else fallback)
+        if number:
+            selected[entry_id] = number
+            if number in available:
+                available.remove(number)
+    return selected
+
+
+async def parallel_caller_id_candidates(rep_id: int, fallback: str) -> list[str]:
+    """Read only this rep's active Twilio DIDs on the active platform account.
+
+    Legacy rows with no account SID are admitted only when they are already the
+    call's resolved caller ID. This prevents a parallel batch from mixing DIDs
+    belonging to another Twilio account.
+    """
+    try:
+        user = await db_client.get_user_by_id(rep_id)
+        if not user or not user.provider_id or not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+            return [fallback] if fallback else []
+        credentials = await db_client.get_platform_dialer_credentials()
+        account_sid = (credentials or {}).get("account_sid")
+        if not account_sid:
+            return [fallback] if fallback else []
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{SUPABASE_URL}/rest/v1/dialer_phone_numbers",
+                params={
+                    "select": "phone_number,twilio_account_sid,created_at",
+                    "assigned_user_id": f"eq.{user.provider_id}",
+                    "provider": "eq.twilio",
+                    "is_active": "eq.true",
+                    "dialer_available": "eq.true",
+                    "direction": "in.(outbound,both)",
+                    "order": "created_at.asc",
+                },
+                headers={
+                    "apikey": SUPABASE_ANON_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                },
+                timeout=5.0,
+            )
+            response.raise_for_status()
+            rows = response.json()
+        if not isinstance(rows, list):
+            return [fallback] if fallback else []
+        numbers = [
+            row["phone_number"]
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("phone_number"), str)
+            and (
+                row.get("twilio_account_sid") == account_sid
+                or (row.get("twilio_account_sid") is None and row["phone_number"] == fallback)
+            )
+        ]
+        if fallback and fallback not in numbers:
+            numbers.insert(0, fallback)
+        return list(dict.fromkeys(numbers))
+    except Exception as exc:  # noqa: BLE001 - retain the existing verified caller ID
+        logger.warning(f"Could not load local-presence DIDs for parallel dialing: {type(exc).__name__}")
+        return [fallback] if fallback else []
 
 
 async def user_owns_dialer_number(rep_id: int, phone_number: str, provider_name: str) -> bool:

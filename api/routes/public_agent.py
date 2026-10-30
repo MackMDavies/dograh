@@ -260,6 +260,10 @@ async def _execute_resolved_target(
         if not allowed:
             raise HTTPException(status_code=402, detail=reason)
 
+    from api.services.telephony.number_policy import reserve_outbound_number
+    selected_from_number = await reserve_outbound_number(target.organization_id, resolved_cfg_id,
+        request.phone_number, getattr(provider, 'from_numbers', []))
+
     workflow_run = await db_client.create_workflow_run(
         name=workflow_run_name,
         workflow_id=target.workflow.id,
@@ -301,6 +305,7 @@ async def _execute_resolved_target(
             to_number=request.phone_number,
             webhook_url=webhook_url,
             workflow_run_id=workflow_run.id,
+            **({'from_number': selected_from_number} if selected_from_number else {}),
             workflow_id=target.workflow.id,
             user_id=execution_user_id,
         )

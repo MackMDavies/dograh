@@ -8,6 +8,8 @@ from typing import Optional
 import aiohttp
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, File, Form, HTTPException, Query, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel, Field
 from loguru import logger
 
 from api.db import db_client
@@ -63,6 +65,10 @@ async def list_voices(
     use_case: Optional[str] = Query(None),
     provider: Optional[str] = Query(None),
     status: Optional[str] = Query(None),
+    q: Optional[str] = Query(None, max_length=120),
+    accent: Optional[str] = Query(None, max_length=80),
+    limit: Optional[int] = Query(None, ge=1, le=100),
+    offset: int = Query(0, ge=0),
     user: UserModel = Depends(get_user),
 ) -> list[VoiceLibraryResponseSchema]:
     # Non-superuser clients share the platform admin's voice library
@@ -77,11 +83,15 @@ async def list_voices(
         user_id=user.id,
         is_superuser=user.is_superuser,
         language=language,
-        gender=gender,
+        gender=gender.lower() if gender else None,
         age=age,
         use_case=use_case,
         provider=provider,
         status=status,
+        q=q,
+        accent=accent,
+        limit=limit,
+        offset=offset,
     )
     return [_serialize(v) for v in voices]
 
@@ -891,6 +901,119 @@ async def import_fish_public_voices(
     return created
 
 
+# ─── Agent Studio: speak a line, design a voice ──────────────────────────────
+# Used by the Sysevo Voice AI v2 Agent Studio ("Hear it in Sam's voice" and the
+# voice library's "Design from a description"). ElevenLabs only (incl. cloned
+# voices, which are ElevenLabs-backed); the key comes from the same cascade as
+# cloning/previews so client accounts can use the platform key.
+
+_EL_BASE = "https://api.elevenlabs.io/v1"
+
+
+class SpeakRequestSchema(BaseModel):
+    text: str = Field(..., min_length=1, max_length=600)
+    provider: Optional[str] = None
+    voice_id: Optional[str] = None
+    voice_uuid: Optional[str] = None
+
+
+class DesignPreviewRequestSchema(BaseModel):
+    description: str = Field(..., min_length=10, max_length=1000)
+
+
+class DesignCreateRequestSchema(BaseModel):
+    name: str = Field(..., min_length=1, max_length=120)
+    description: str = Field("", max_length=1000)
+    generated_voice_id: str = Field(..., min_length=1, max_length=200)
+
+
+@router.post("/speak")
+async def speak_line(body: SpeakRequestSchema, user: UserModel = Depends(get_user)) -> Response:
+    """Speak a short line in a voice and return the audio (audio/mpeg). Nothing is stored."""
+    voice_id = body.voice_id
+    provider = (body.provider or "").lower()
+    if body.voice_uuid:
+        voice = await db_client.get_voice_by_uuid(body.voice_uuid, user.selected_organization_id)
+        if voice:
+            voice_id = voice.provider_voice_id or voice_id
+            provider = "elevenlabs" if voice.provider == "dograh_clone" else voice.provider
+    if provider in ("elevenlabs_realtime", "dograh_clone"):
+        provider = "elevenlabs"
+    if provider != "elevenlabs" or not voice_id:
+        raise HTTPException(status_code=422, detail="Speaking a line is only available for ElevenLabs voices")
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No ElevenLabs API key available")
+    async with aiohttp.ClientSession() as http:
+        async with http.post(
+            f"{_EL_BASE}/text-to-speech/{voice_id}",
+            json={"text": body.text, "model_id": "eleven_flash_v2_5"},
+            headers={"xi-api-key": api_key, "Content-Type": "application/json", "Accept": "audio/mpeg"},
+        ) as resp:
+            if resp.status != 200:
+                logger.error(f"ElevenLabs speak error {resp.status}: {await resp.text()}")
+                raise HTTPException(status_code=502, detail=f"ElevenLabs returned {resp.status}")
+            audio = await resp.read()
+    return Response(content=audio, media_type="audio/mpeg")
+
+
+@router.post("/design/previews")
+async def design_voice_previews(body: DesignPreviewRequestSchema, user: UserModel = Depends(get_user)) -> dict:
+    """Generate three voice versions from a description (ElevenLabs text-to-voice)."""
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No ElevenLabs API key available to design a voice")
+    async with aiohttp.ClientSession() as http:
+        async with http.post(
+            f"{_EL_BASE}/text-to-voice/create-previews",
+            json={"voice_description": body.description, "auto_generate_text": True},
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                logger.error(f"ElevenLabs voice design error {resp.status}: {await resp.text()}")
+                raise HTTPException(status_code=502, detail=f"ElevenLabs returned {resp.status}")
+            data = await resp.json()
+    previews = [
+        {"generated_voice_id": p.get("generated_voice_id"), "audio_base64": p.get("audio_base_64")}
+        for p in (data.get("previews") or [])[:3]
+        if p.get("generated_voice_id")
+    ]
+    return {"previews": previews}
+
+
+@router.post("/design/create", response_model=VoiceLibraryResponseSchema, status_code=201)
+async def design_voice_create(body: DesignCreateRequestSchema, user: UserModel = Depends(get_user)) -> VoiceLibraryResponseSchema:
+    """Keep one designed version: save it to ElevenLabs and add it to this org's library."""
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="No ElevenLabs API key available")
+    async with aiohttp.ClientSession() as http:
+        async with http.post(
+            f"{_EL_BASE}/text-to-voice/create-voice-from-preview",
+            json={"voice_name": body.name, "voice_description": body.description or body.name, "generated_voice_id": body.generated_voice_id},
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+        ) as resp:
+            if resp.status != 200:
+                logger.error(f"ElevenLabs create-voice-from-preview error {resp.status}: {await resp.text()}")
+                raise HTTPException(status_code=502, detail=f"ElevenLabs returned {resp.status}")
+            data = await resp.json()
+    el_voice_id = data.get("voice_id")
+    if not el_voice_id:
+        raise HTTPException(status_code=502, detail="ElevenLabs did not return a voice")
+    voice = await db_client.create_voice(
+        user_id=user.id,
+        organization_id=user.selected_organization_id,
+        name=body.name,
+        description=body.description or None,
+        provider="elevenlabs",
+        provider_voice_id=el_voice_id,
+        audio_preview_url=data.get("preview_url"),
+        labels={"source": "voice_design"},
+        status="ready",
+    )
+    return _serialize(voice)
+
+
 @router.post("/clone", response_model=VoiceLibraryResponseSchema, status_code=201)
 async def clone_voice(
     background_tasks: BackgroundTasks,
@@ -1417,3 +1540,145 @@ async def delete_voice(
     )
     if not deleted:
         raise HTTPException(status_code=404, detail="Voice not found or access denied")
+
+
+# ── Voice AI voice library page: custom-text preview and voice design ──────────
+
+from pydantic import BaseModel as _BaseModel, Field as _Field  # noqa: E402
+
+ELEVEN_BASE = "https://api.elevenlabs.io/v1"
+
+
+class SpeakRequest(_BaseModel):
+    text: str = _Field(min_length=1, max_length=300)
+
+
+@router.post("/{voice_uuid}/speak")
+async def speak_with_voice(
+    voice_uuid: str,
+    body: SpeakRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Say a short line with an ElevenLabs (or cloned/designed) library voice.
+
+    Uses the same key cascade as cloning, so a voice made on the org's own ElevenLabs
+    account is spoken from that account. Returns base64 mp3; nothing is stored.
+    """
+    import base64
+
+    voice = await db_client.get_voice_by_uuid_any_org(voice_uuid)
+    if not voice or (not voice.is_public and voice.organization_id != user.selected_organization_id and not user.is_superuser):
+        raise HTTPException(status_code=404, detail="Voice not found")
+    if voice.provider not in ("elevenlabs", "dograh_clone") or not voice.provider_voice_id:
+        raise HTTPException(status_code=400, detail="This voice can only play its stored preview")
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
+    async with httpx.AsyncClient(timeout=30) as client:
+        res = await client.post(
+            f"{ELEVEN_BASE}/text-to-speech/{voice.provider_voice_id}?output_format=mp3_44100_128",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={"text": body.text.strip(), "model_id": "eleven_flash_v2_5"},
+        )
+    if res.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Voice provider could not speak that line")
+    return {"audio": base64.b64encode(res.content).decode(), "mime": "audio/mpeg"}
+
+
+class DesignPreviewRequest(_BaseModel):
+    description: str = _Field(min_length=20, max_length=1000)
+    text: Optional[str] = _Field(default=None, max_length=1000)
+
+
+@router.post("/design/previews")
+async def design_voice_previews(
+    body: DesignPreviewRequest,
+    user: UserModel = Depends(get_user),
+):
+    """ElevenLabs Voice Design: three candidate voices from a description."""
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
+    payload = {"voice_description": body.description}
+    if body.text and len(body.text) >= 100:
+        payload["text"] = body.text
+    else:
+        payload["auto_generate_text"] = True
+    async with httpx.AsyncClient(timeout=90) as client:
+        res = await client.post(
+            f"{ELEVEN_BASE}/text-to-voice/create-previews",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json=payload,
+        )
+    if res.status_code >= 400:
+        detail = "Voice design failed"
+        try:
+            detail = res.json().get("detail", {}).get("message") or detail
+        except Exception:
+            pass
+        raise HTTPException(status_code=502, detail=detail)
+    data = res.json()
+    return {
+        "text": data.get("text"),
+        "previews": [
+            {
+                "generated_voice_id": p.get("generated_voice_id"),
+                "audio_base_64": p.get("audio_base_64"),
+                "media_type": p.get("media_type", "audio/mpeg"),
+                "duration_secs": p.get("duration_secs"),
+            }
+            for p in (data.get("previews") or [])[:3]
+        ],
+    }
+
+
+class DesignSaveRequest(_BaseModel):
+    generated_voice_id: str
+    name: str = _Field(min_length=1, max_length=100)
+    description: str = _Field(min_length=1, max_length=1000)
+    gender: Optional[str] = None
+    age: Optional[str] = None
+    accent: Optional[str] = None
+
+
+@router.post("/design/save", response_model=VoiceLibraryResponseSchema, status_code=201)
+async def design_voice_save(
+    body: DesignSaveRequest,
+    user: UserModel = Depends(get_user),
+) -> VoiceLibraryResponseSchema:
+    """Keep a designed voice: create it on ElevenLabs and add it to this org's library."""
+    api_key = await _resolve_elevenlabs_api_key(user)
+    if not api_key:
+        raise HTTPException(status_code=400, detail="ElevenLabs API key not configured")
+    async with httpx.AsyncClient(timeout=60) as client:
+        res = await client.post(
+            f"{ELEVEN_BASE}/text-to-voice",
+            headers={"xi-api-key": api_key, "Content-Type": "application/json"},
+            json={
+                "voice_name": body.name,
+                "voice_description": body.description,
+                "generated_voice_id": body.generated_voice_id,
+            },
+        )
+    if res.status_code >= 400:
+        raise HTTPException(status_code=502, detail="Could not save the designed voice")
+    voice_id = res.json().get("voice_id")
+    if not voice_id:
+        raise HTTPException(status_code=502, detail="Could not save the designed voice")
+    labels = {"designed": True, "description": body.description}
+    voice = await db_client.create_voice(
+        user_id=user.id,
+        organization_id=user.selected_organization_id,
+        name=body.name,
+        provider="elevenlabs",
+        description=body.description[:500],
+        provider_voice_id=voice_id,
+        is_public=False,
+        gender=(body.gender or "").lower() or None,
+        age={"Young": "young", "Middle-aged": "middle_aged", "Older": "old"}.get(body.age or "", None),
+        accent=(body.accent or "").lower() or None,
+        use_case="conversation",
+        labels=labels,
+        status="ready",
+    )
+    return _serialize(voice)

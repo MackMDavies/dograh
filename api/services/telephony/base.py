@@ -64,6 +64,7 @@ class TelephonyProvider(ABC):
 
     PROVIDER_NAME = None
     WEBHOOK_ENDPOINT = None
+    SUPPORTS_INBOUND_NUMBER_POLICIES = False
 
     @abstractmethod
     async def initiate_call(
@@ -323,6 +324,22 @@ class TelephonyProvider(ABC):
         """
         pass
 
+    async def inbound_number_policy_response(
+        self,
+        *,
+        action: str,
+        forward_to: str | None = None,
+        voicemail_run_id: int | None = None,
+        backend_endpoint: str | None = None,
+    ) -> Any | None:
+        """Return a provider-native response for saved number-level fallback.
+
+        Providers that do not implement voicemail/forwarding leave this unset;
+        the dispatcher keeps their existing call path and does not claim the
+        saved preference is active for that provider.
+        """
+        return None
+
     async def handle_external_websocket(
         self,
         websocket: "WebSocket",
@@ -413,3 +430,18 @@ class TelephonyProvider(ABC):
             True if provider supports call transfers, False otherwise
         """
         pass
+
+    def supports_companion(self) -> bool:
+        """True when a three-way colleague can be dialled as a second media stream that
+        Dograh mixes into the call (transfer_call(..., three_way=True); companion.py)."""
+        return False
+
+    def supports_three_way(self) -> bool:
+        """True when a colleague can join the caller and the agent on one line
+        (transfer_mode three_way); other providers fall back to a warm transfer."""
+        return False
+
+    def supports_warm_transfer(self) -> bool:
+        """True when transfer_call accepts introduction= and only connects the
+        destination once they press 1 (services/telephony/warm_transfer.py)."""
+        return False

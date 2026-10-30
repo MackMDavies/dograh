@@ -4,7 +4,9 @@ Twilio implementation of the TelephonyProvider interface.
 
 import json
 import random
+import re
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
 from fastapi import HTTPException
@@ -17,6 +19,11 @@ from api.services.telephony.base import (
     NormalizedInboundData,
     ProviderSyncResult,
     TelephonyProvider,
+)
+from api.services.telephony.warm_transfer import (
+    companion_socket_url,
+    companion_stream_twiml,
+    twilio_transfer_twiml,
 )
 from api.utils.common import get_backend_endpoints
 from api.utils.telephony_address import normalize_telephony_address
@@ -33,6 +40,48 @@ class TwilioProvider(TelephonyProvider):
 
     PROVIDER_NAME = WorkflowRunMode.TWILIO.value
     WEBHOOK_ENDPOINT = "twiml"
+    SUPPORTS_INBOUND_NUMBER_POLICIES = True
+    SUPPORTS_INBOUND_SMS = True
+
+    @staticmethod
+    def _inbound_sms_callback(voice_webhook_url: str | None) -> str | None:
+        if not voice_webhook_url:
+            return None
+        parsed = urlsplit(voice_webhook_url)
+        suffix = "/api/v1/telephony/inbound/run"
+        if not parsed.path.endswith(suffix):
+            return None
+        path = parsed.path[: -len("/inbound/run")] + "/twilio/inbound/sms"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+    @staticmethod
+    def _inbound_status_callback(voice_webhook_url: str | None) -> str | None:
+        if not voice_webhook_url:
+            return None
+        parsed = urlsplit(voice_webhook_url)
+        suffix = "/api/v1/telephony/inbound/run"
+        if not parsed.path.endswith(suffix):
+            return None
+        path = parsed.path[: -len("/inbound/run")] + "/twilio/inbound/status-callback"
+        return urlunsplit((parsed.scheme, parsed.netloc, path, "", ""))
+
+    @staticmethod
+    def _is_voice_sms_callback(value: str | None) -> bool:
+        return bool(
+            value
+            and urlsplit(value).path.endswith(
+                "/api/v1/telephony/twilio/inbound/sms"
+            )
+        )
+
+    @staticmethod
+    def _is_voice_status_callback(value: str | None) -> bool:
+        return bool(
+            value
+            and urlsplit(value).path.endswith(
+                "/api/v1/telephony/twilio/inbound/status-callback"
+            )
+        )
 
     def __init__(self, config: Dict[str, Any]):
         """
@@ -401,7 +450,7 @@ class TwilioProvider(TelephonyProvider):
     async def configure_inbound(
         self, address: str, webhook_url: Optional[str]
     ) -> ProviderSyncResult:
-        """Set (or clear) the VoiceUrl on Twilio's IncomingPhoneNumber for ``address``.
+        """Set (or clear) inbound VoiceUrl and Sysevo-owned callbacks.
 
         Looks up the number's SID by E.164 then POSTs the update. Non-PSTN
         addresses (SIP URIs, extensions) are skipped — Twilio's
@@ -434,6 +483,30 @@ class TwilioProvider(TelephonyProvider):
             )
 
         endpoint = f"{self.base_url}/IncomingPhoneNumbers/{sid}.json"
+        sms_callback = self._inbound_sms_callback(webhook_url)
+        status_callback = self._inbound_status_callback(webhook_url)
+        current_sms_url = None
+        current_status_callback = None
+        sms_settings_read = False
+        try:
+            async with aiohttp.ClientSession() as session:
+                auth = aiohttp.BasicAuth(self.account_sid, self.auth_token)
+                async with session.get(endpoint, auth=auth) as response:
+                    if response.status == 200:
+                        number_data = await response.json()
+                        current_sms_url = number_data.get("sms_url") or ""
+                        current_status_callback = number_data.get("status_callback") or ""
+                        sms_settings_read = True
+                    else:
+                        logger.warning(
+                            "Twilio SMS callback was left unchanged because its current URL could not be read"
+                        )
+        except Exception as e:
+            logger.warning(
+                "Twilio SMS callback was left unchanged because its current URL could not be read: {}",
+                type(e).__name__,
+            )
+
         if webhook_url:
             data = {
                 "VoiceUrl": webhook_url,
@@ -444,6 +517,25 @@ class TwilioProvider(TelephonyProvider):
             data = {
                 "VoiceUrl": "",
             }
+
+        # Preserve a customer's existing SMS integration. Only bind or clear
+        # the voice endpoint when the current SmsUrl is blank or already ours.
+        if sms_settings_read and sms_callback and (not current_sms_url or self._is_voice_sms_callback(current_sms_url)):
+            data["SmsUrl"] = sms_callback
+            data["SmsMethod"] = "POST"
+        elif sms_settings_read and not webhook_url and self._is_voice_sms_callback(current_sms_url):
+            data["SmsUrl"] = ""
+
+        # A TwiML <Stream> callback only reports stream lifecycle events. The
+        # number-level callback reports final CallStatus, which is needed to
+        # detect unanswered inbound calls. Preserve independently configured
+        # customer callbacks; claim this slot only when blank or already ours.
+        if (sms_settings_read and status_callback
+                and (not current_status_callback or self._is_voice_status_callback(current_status_callback))):
+            data["StatusCallback"] = status_callback
+            data["StatusCallbackMethod"] = "POST"
+        elif sms_settings_read and not webhook_url and self._is_voice_status_callback(current_status_callback):
+            data["StatusCallback"] = ""
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -464,7 +556,7 @@ class TwilioProvider(TelephonyProvider):
             return ProviderSyncResult(ok=False, message=f"Twilio update failed: {e}")
 
         action = "set" if webhook_url else "cleared"
-        logger.info(f"Twilio VoiceUrl {action} for {e164} (sid={sid})")
+        logger.info(f"Twilio inbound voice routing {action} for {e164} (sid={sid})")
         return ProviderSyncResult(ok=True)
 
     async def _lookup_incoming_number_sid(self, e164: str) -> Optional[str]:
@@ -514,6 +606,38 @@ class TwilioProvider(TelephonyProvider):
 
         return Response(content=twiml_content, media_type="application/xml")
 
+    async def inbound_number_policy_response(
+        self,
+        *,
+        action: str,
+        forward_to: str | None = None,
+        voicemail_run_id: int | None = None,
+        backend_endpoint: str | None = None,
+    ):
+        """Build a Twilio response for an owner's verified number policy."""
+        from fastapi import Response
+        from xml.sax.saxutils import escape, quoteattr
+
+        if action == "fwd" and forward_to and re.fullmatch(r"\+[1-9][0-9]{6,14}", forward_to):
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?><Response><Dial timeout="30">'
+                f"<Number>{escape(forward_to)}</Number></Dial><Hangup/></Response>"
+            )
+        elif action == "vm" and voicemail_run_id and backend_endpoint:
+            voicemail_callback_url = (
+                f"{backend_endpoint}/api/v1/telephony/twilio/inbound-voicemail/{voicemail_run_id}"
+            )
+            content = (
+                '<?xml version="1.0" encoding="UTF-8"?><Response>'
+                '<Say voice="alice">Please leave a message after the tone. Press the pound key when finished.</Say>'
+                f"<Record action={quoteattr(voicemail_callback_url)} method=\"POST\" maxLength=\"180\" "
+                'playBeep="true" finishOnKey="#" timeout="8" trim="trim-silence"/>'
+                '<Say voice="alice">We did not receive a message. Goodbye.</Say><Hangup/></Response>'
+            )
+        else:
+            return None
+        return Response(content=content, media_type="application/xml")
+
     @staticmethod
     def generate_error_response(error_type: str, message: str) -> tuple:
         """
@@ -558,10 +682,18 @@ class TwilioProvider(TelephonyProvider):
         transfer_id: str,
         conference_name: str,
         timeout: int = 30,
+        introduction: Optional[str] = None,
+        three_way: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         """
         Initiate a call transfer via Twilio.
+
+        Three-way: the colleague's call streams to /telephony/companion/{transfer_id}
+        and Dograh mixes them into the call (services/pipecat/companion.py).
+
+        With an introduction (warm transfer) the destination hears it and must press
+        1; /telephony/transfer-accept/{transfer_id} then joins them to the conference.
 
         Uses inline TwiML to put the destination into a conference when they answer,
         and a status callback to track the transfer outcome.
@@ -594,13 +726,16 @@ class TwilioProvider(TelephonyProvider):
         )
 
         # Inline TwiML: when the destination answers, put them into the conference
-        twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-    <Say>You have answered a transfer call. Connecting you now.</Say>
-    <Dial>
-        <Conference endConferenceOnExit="true">{conference_name}</Conference>
-    </Dial>
-</Response>"""
+        # (warm: read them the introduction and wait for them to press 1 first).
+        twiml = twilio_transfer_twiml(
+            conference_name,
+            introduction,
+            f"{backend_endpoint}/api/v1/telephony/transfer-accept/{transfer_id}"
+            if introduction
+            else None,
+        )
+        if three_way:
+            twiml = companion_stream_twiml(await companion_socket_url(transfer_id))
 
         # Prepare Twilio API call data
         endpoint = f"{self.base_url}/Calls.json"
@@ -666,6 +801,12 @@ class TwilioProvider(TelephonyProvider):
         except Exception as e:
             logger.error(f"Exception during Twilio transfer call: {e}")
             raise
+
+    def supports_warm_transfer(self) -> bool:
+        return True
+
+    def supports_companion(self) -> bool:
+        return True
 
     def supports_transfers(self) -> bool:
         """

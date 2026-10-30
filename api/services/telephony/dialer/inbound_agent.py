@@ -17,6 +17,7 @@ from loguru import logger
 
 from api.constants import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
 from api.db import db_client
+from api.db.dialer_agent_routing_client import inbound_scope
 from api.services.telephony.dialer.inbound_agent_rules import (
     InboundAgent,
     choose_inbound_agent,
@@ -24,7 +25,7 @@ from api.services.telephony.dialer.inbound_agent_rules import (
 )
 
 _TTL_SECONDS = 30.0
-_cache: tuple[float, InboundAgent] | None = None
+_cache: dict[str, tuple[float, InboundAgent]] = {}
 
 
 async def _supabase_get(table: str, params: dict) -> list[dict] | None:
@@ -47,12 +48,8 @@ async def _supabase_get(table: str, params: dict) -> list[dict] | None:
         return None
 
 
-async def _resolve() -> InboundAgent:
-    rows = await _supabase_get(
-        "dialer_agent_assignments",
-        {"role": "eq.inbound", "select": "is_active,ring_first_seconds,demo_agent:demo_agents(workflow_uuid,is_active)"},
-    )
-    assignment = (rows or [None])[0]
+async def _resolve(scope: dict) -> InboundAgent:
+    assignment = scope.get("assignment")
     workflow_id: int | None = None
     numbers: list[str] = []
     picked = (assignment or {}).get("demo_agent")
@@ -69,20 +66,28 @@ async def _resolve() -> InboundAgent:
         assignment=assignment,
         workflow_id=workflow_id,
         numbers=numbers,
-        env_number=os.environ.get("SYSEVO_SAM_INBOUND_NUMBER"),
-        env_workflow_id=os.environ.get("SYSEVO_SAM_INBOUND_WORKFLOW_ID") or "214",
-        env_ring_first=os.environ.get("SYSEVO_SAM_RING_FIRST_SECONDS"),
+        env_number=os.environ.get("SYSEVO_SAM_INBOUND_NUMBER") if scope.get("platform") else None,
+        env_workflow_id=(os.environ.get("SYSEVO_SAM_INBOUND_WORKFLOW_ID") or "214") if scope.get("platform") else None,
+        env_ring_first=os.environ.get("SYSEVO_SAM_RING_FIRST_SECONDS") if scope.get("platform") else None,
     )
 
 
-async def current_inbound_agent(*, fresh: bool = False) -> InboundAgent:
+async def current_inbound_agent(*, fresh: bool = False, number: str | None = None,
+    user_id: str | None = None, call_id: str | None = None) -> InboundAgent:
     """The agent callers are handed to right now. `fresh` skips the cache (the status check)."""
-    global _cache
+    try:
+        scope = await inbound_scope(number=number,user_id=user_id,call_id=call_id)
+    except Exception:
+        scope = None
+    if not scope or not scope.get("client_account_id"):
+        return InboundAgent(None,"",0,"off","The inbound account could not be verified.")
+    account = str(scope["client_account_id"])
     now = time.monotonic()
-    if not fresh and _cache and now - _cache[0] < _TTL_SECONDS:
-        return _cache[1]
-    agent = await _resolve()
-    _cache = (now, agent)
+    cached = _cache.get(account)
+    if not fresh and cached and now - cached[0] < _TTL_SECONDS:
+        return cached[1]
+    agent = await _resolve(scope)
+    _cache[account] = (now, agent)
     return agent
 
 

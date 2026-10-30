@@ -1,3 +1,4 @@
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -7,6 +8,7 @@ import redis.asyncio as aioredis
 from loguru import logger
 
 from api.constants import REDIS_URL
+from api.services.campaign.errors import PhoneNumberDailyLimitError
 
 
 @dataclass(frozen=True)
@@ -320,6 +322,7 @@ class RateLimiter:
         organization_id: int,
         telephony_configuration_id: int | None,
         calls_per_number: int | None = None,
+        number_preferences: dict | None = None,
     ) -> Optional["FromNumberLease"]:
         """
         Atomically take a lease on a caller ID from the
@@ -361,6 +364,7 @@ class RateLimiter:
         local lease_id = ARGV[4]
         local tie_breaker = tonumber(ARGV[5])
         local lease_ttl = tonumber(ARGV[6])
+        local preferences = cjson.decode(ARGV[7] or '{}')
 
         -- Reclaim leases from calls that never released (crash, missed webhook)
         redis.call('ZREMRANGEBYSCORE', leases_key, 0, stale_cutoff)
@@ -388,20 +392,32 @@ class RateLimiter:
         -- Pick the least-loaded number that is still under capacity
         local best = {}
         local best_count = -1
+        local best_priority = -1
+        local daily_available = 0
         for i = 1, #numbers do
             local num = numbers[i]
             local in_use = counts[num] or 0
-            if capacity < 0 or in_use < capacity then
-                if best_count < 0 or in_use < best_count then
+            local rule = preferences[num]
+            local under_daily_limit = true
+            if rule and rule.key and rule.limit then
+                local used = tonumber(redis.call('GET', rule.key) or '0')
+                under_daily_limit = used and used < tonumber(rule.limit)
+            end
+            if under_daily_limit then daily_available = daily_available + 1 end
+            local priority = (rule and rule.preferred) and 1 or 0
+            if under_daily_limit and (capacity < 0 or in_use < capacity) then
+                if priority > best_priority or (priority == best_priority and (best_count < 0 or in_use < best_count)) then
+                    best_priority = priority
                     best_count = in_use
                     best = {num}
-                elseif in_use == best_count then
+                elseif priority == best_priority and in_use == best_count then
                     table.insert(best, num)
                 end
             end
         end
 
         if #best == 0 then
+            if daily_available == 0 then return '__daily_limit__' end
             return nil
         end
 
@@ -425,11 +441,16 @@ class RateLimiter:
                 lease_id,
                 tie_breaker,
                 self._lease_ttl,
+                *([json.dumps(number_preferences)] if number_preferences else []),
             )
+            if result == '__daily_limit__':
+                raise PhoneNumberDailyLimitError(organization_id)
             if not result:
                 return None
             logger.debug(f"Acquired from_number {result} for org {organization_id}")
             return FromNumberLease(number=result, lease_id=lease_id)
+        except PhoneNumberDailyLimitError:
+            raise
         except Exception as e:
             logger.error(f"Error acquiring from_number: {e}")
             return None

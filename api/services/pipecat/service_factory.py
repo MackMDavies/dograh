@@ -1134,6 +1134,19 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
     model = realtime_config.model
     api_key = realtime_config.api_key
     voice = getattr(realtime_config, "voice", None)
+    if provider == ServiceProviders.ELEVENLABS_REALTIME.value:
+        # The active Realtime picker is authoritative. Older agents used the
+        # placeholder "brian" while their selected voice lived only in TTS.
+        # Retain that fallback without letting a hidden TTS control override an
+        # explicitly selected Realtime voice.
+        tts_config = getattr(user_config, "tts", None)
+        tts_voice = getattr(tts_config, "voice", None)
+        if (
+            (not voice or voice == "brian")
+            and getattr(tts_config, "provider", None) == ServiceProviders.ELEVENLABS.value
+            and tts_voice
+        ):
+            voice = tts_voice
     language = getattr(realtime_config, "language", None)
 
     logger.info(
@@ -1164,6 +1177,33 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
                         output=AudioOutput(
                             voice=voice or "alloy",
                         ),
+                    ),
+                ),
+            ),
+        )
+    elif provider == ServiceProviders.ELEVENLABS_REALTIME.value:
+        from api.services.pipecat.realtime.elevenlabs_realtime import (
+            DograhElevenLabsRealtimeLLMService,
+        )
+        from pipecat.services.openai.realtime.events import (
+            AudioConfiguration,
+            AudioInput,
+            AudioOutput,
+            InputAudioTranscription,
+            SessionProperties,
+        )
+
+        return DograhElevenLabsRealtimeLLMService(
+            api_key=api_key,
+            base_url="wss://api.elevenlabs.io/v1/convai/realtime",
+            settings=DograhElevenLabsRealtimeLLMService.Settings(
+                model=model,
+                session_properties=SessionProperties(
+                    audio=AudioConfiguration(
+                        input=AudioInput(
+                            transcription=InputAudioTranscription(),
+                        ),
+                        output=AudioOutput(voice=voice or "brian"),
                     ),
                 ),
             ),

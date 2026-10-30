@@ -7,6 +7,7 @@ reusable functions. Defines recording response mode markers and instructions.
 from typing import TYPE_CHECKING, Callable, Optional
 
 if TYPE_CHECKING:
+    from api.services.phone_tools.policy import PhoneToolsPolicy
     from api.services.workflow.pipecat_engine_custom_tools import CustomToolManager
     from api.services.workflow.workflow_graph import Node, WorkflowGraph
 
@@ -138,6 +139,10 @@ async def compose_functions_for_node(
     node: "Node",
     custom_tool_manager: Optional["CustomToolManager"],
     kb_document_uuids: Optional[list[str]] = None,
+    dialer_callback_tz: Optional[str] = None,
+    phone_tools_policy: Optional["PhoneToolsPolicy"] = None,
+    builtin_phone_tools: Optional[set[str]] = None,
+    payment_links: Optional[list[dict]] = None,
 ) -> list[dict]:
     """Compose the function/tool schemas for a workflow node.
 
@@ -172,25 +177,76 @@ async def compose_functions_for_node(
 
     # SYSEVO_DTMF: keypad control. Advertised on every node — registering the
     # handler without telling the LLM the tool exists makes it silently useless.
-    functions.append(
-        get_function_schema(
-            "press_keys",
-            (
-                "Press digits on the phone keypad. Use this ONLY when an automated "
-                "system or recorded message asks you to press something to continue "
-                "— for example 'this number has call control, to get through press "
-                "nine', or 'press one for sales'. Never use it while talking to a "
-                "person. After pressing, stay quiet and wait to be connected."
-            ),
-            properties={
-                "digits": {
-                    "type": "string",
-                    "description": "Digits to press, e.g. '9' or '1'. 0-9, * and # only.",
-                }
-            },
-            required=["digits"],
+    # The organization can switch it off or limit it (Voice AI -> Tools).
+    if phone_tools_policy is None:
+        from api.services.phone_tools.policy import normalize_policy
+
+        phone_tools_policy = normalize_policy(None)
+    if phone_tools_policy.enabled("keypad"):
+        functions.append(
+            get_function_schema(
+                "press_keys",
+                phone_tools_policy.describe(
+                    "keypad",
+                    "Press digits on the phone keypad. Use this ONLY when an automated "
+                    "system or recorded message asks you to press something to continue "
+                    "— for example 'this number has call control, to get through press "
+                    "nine', or 'press one for sales'. Never use it while talking to a "
+                    "person. After pressing, stay quiet and wait to be connected.",
+                ),
+                properties={
+                    "digits": {
+                        "type": "string",
+                        "description": "Digits to press, e.g. '9' or '1'. 0-9, * and # only.",
+                    }
+                },
+                required=["digits"],
+            )
         )
-    )
+
+    # Built-in phone tools this call can offer (texting the caller, pausing the
+    # recording); the engine decides availability, the organization the wording.
+    if builtin_phone_tools:
+        from api.services.phone_tools import builtin
+
+        for name, tool_id, description, properties, required in (
+            (builtin.SEND_TEXT, "sms", builtin.SEND_TEXT_DESCRIPTION, builtin.SEND_TEXT_PROPERTIES, ["message"]),
+            (builtin.SET_RECORDING, "recording", builtin.SET_RECORDING_DESCRIPTION, builtin.SET_RECORDING_PROPERTIES, ["recording"]),
+        ):
+            if name in builtin_phone_tools:
+                functions.append(
+                    get_function_schema(
+                        name,
+                        phone_tools_policy.describe(tool_id, description),
+                        properties=properties,
+                        required=required,
+                    )
+                )
+        if builtin.SEND_PAYMENT_LINK in builtin_phone_tools and payment_links:
+            description, properties = builtin.payment_link_schema(payment_links)
+            functions.append(
+                get_function_schema(
+                    builtin.SEND_PAYMENT_LINK,
+                    phone_tools_policy.describe("payments", description),
+                    properties=properties,
+                    required=["link"],
+                )
+            )
+
+    # Dialer extra answers: the agent books the callback time it agreed.
+    if dialer_callback_tz is not None:
+        from datetime import UTC, datetime
+
+        from api.services.telephony.dialer import agent_callback
+
+        functions.append(
+            get_function_schema(
+                agent_callback.TOOL_NAME,
+                agent_callback.tool_description(datetime.now(UTC), dialer_callback_tz),
+                properties=agent_callback.tool_schema_properties(),
+                required=["when"],
+            )
+        )
 
     # Custom tools
     if node.tool_uuids and custom_tool_manager:

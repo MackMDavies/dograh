@@ -86,6 +86,19 @@ def tool_to_function_schema(tool: Any) -> Dict[str, Any]:
         }
         required.append("reason")
 
+    # A warm transfer tool asks the model for the introduction the colleague hears
+    # before taking the call (services/telephony/warm_transfer.py).
+    if definition.get("type") == "transfer_call" and config.get("transfer_mode") == "warm":
+        properties["introduction"] = {
+            "type": "string",
+            "description": (
+                "One or two sentences for the colleague before they are connected: "
+                "who is calling (their name if you know it) and what they need, so "
+                "the caller does not have to repeat themselves."
+            ),
+        }
+        required.append("introduction")
+
     # Sanitize tool name for function name (lowercase, underscores only)
     function_name = re.sub(r"[^a-z0-9_]", "_", tool.name.lower())
     # Remove consecutive underscores and trim
@@ -191,7 +204,7 @@ def _resolve_preset_parameters(
     return resolved
 
 
-async def execute_http_tool(
+async def _execute_http_tool(
     tool: Any,
     arguments: Dict[str, Any],
     call_context_vars: Optional[Dict[str, Any]] = None,
@@ -345,3 +358,26 @@ async def execute_http_tool(
             "status": "error",
             "error": f"Tool execution failed: {str(e)}",
         }
+
+
+async def execute_http_tool(
+    tool: Any,
+    arguments: Dict[str, Any],
+    call_context_vars: Optional[Dict[str, Any]] = None,
+    gathered_context_vars: Optional[Dict[str, Any]] = None,
+    organization_id: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Run the tool; when it fails, hand the LLM the line the owner wants said.
+
+    `failureMessage` is set in the Voice AI tool editor ("If it fails, the agent says").
+    """
+    result = await _execute_http_tool(
+        tool, arguments, call_context_vars, gathered_context_vars, organization_id
+    )
+    failure_message = ((tool.definition or {}).get("config", {}) or {}).get("failureMessage")
+    failed = result.get("status") == "error" or (
+        isinstance(result.get("status_code"), int) and result["status_code"] >= 400
+    )
+    if failed and failure_message:
+        result = {**result, "say_to_caller": failure_message}
+    return result

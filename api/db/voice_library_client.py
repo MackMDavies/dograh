@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select
 
 from api.db.base_client import BaseDBClient
 from api.db.models import VoiceLibraryModel
@@ -81,6 +81,25 @@ class VoiceLibraryClient(BaseDBClient):
             )
             return result.scalars().first()
 
+    async def get_voice_for_private_planning(
+        self, voice_uuid: str, organization_id: int
+    ) -> VoiceLibraryModel | None:
+        """Resolve an org voice or an explicitly public, ready library voice."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(VoiceLibraryModel).where(
+                    VoiceLibraryModel.uuid == voice_uuid,
+                    or_(
+                        VoiceLibraryModel.organization_id == organization_id,
+                        and_(
+                            VoiceLibraryModel.is_public == True,
+                            VoiceLibraryModel.status == "ready",
+                        ),
+                    ),
+                )
+            )
+            return result.scalars().first()
+
     async def get_voice_by_provider_id(
         self, provider_voice_id: str, organization_id: int
     ) -> Optional[VoiceLibraryModel]:
@@ -120,6 +139,10 @@ class VoiceLibraryClient(BaseDBClient):
         use_case: Optional[str] = None,
         provider: Optional[str] = None,
         status: Optional[str] = None,
+        q: Optional[str] = None,
+        accent: Optional[str] = None,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> list[VoiceLibraryModel]:
         async with self.async_session() as session:
             # Non-ready voices (pending/processing/failed) are always private to their
@@ -159,17 +182,37 @@ class VoiceLibraryClient(BaseDBClient):
                 filters.append(VoiceLibraryModel.provider == provider)
             if status:
                 filters.append(VoiceLibraryModel.status == status)
+            if accent:
+                filters.append(or_(
+                    VoiceLibraryModel.accent.ilike(accent),
+                    cast(VoiceLibraryModel.labels, String).ilike(f"%{accent}%"),
+                ))
+            if q and q.strip():
+                pattern = f"%{q.strip()}%"
+                filters.append(or_(
+                    VoiceLibraryModel.name.ilike(pattern),
+                    VoiceLibraryModel.description.ilike(pattern),
+                    VoiceLibraryModel.provider.ilike(pattern),
+                    cast(VoiceLibraryModel.labels, String).ilike(pattern),
+                ))
 
-            result = await session.execute(
-                select(VoiceLibraryModel)
-                .where(and_(*filters))
-                .order_by(VoiceLibraryModel.created_at.desc())
+            # Keep offset pages stable when several voices share a timestamp.
+            query = select(VoiceLibraryModel).where(and_(*filters)).order_by(
+                VoiceLibraryModel.created_at.desc(), VoiceLibraryModel.id.desc()
             )
+            if limit is not None:
+                # Pagination is opt-in so existing callers continue receiving the full,
+                # de-duplicated list. The browser de-duplicates across fetched pages.
+                query = query.offset(max(0, offset)).limit(min(100, max(1, limit)))
+            result = await session.execute(query)
+            rows = list(result.scalars().all())
+            if limit is not None:
+                return rows
             # Collapse duplicate rows for the same provider voice — the sync's
             # check-then-insert has no unique constraint behind it, and a
             # superuser's cross-org view can surface the same voice per org.
             # Either way the picker must list a voice once.
-            return dedupe_voices(list(result.scalars().all()))
+            return dedupe_voices(rows)
 
     async def update_voice(
         self,

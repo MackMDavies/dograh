@@ -34,6 +34,7 @@ from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from api.constants import REDIS_URL
 from api.mcp_server import mcp
+from api.services.api_request_logging import ApiRequestLogMiddleware
 from api.routes.main import router as main_router
 from api.services.pipecat.tracing_config import (
     handle_langfuse_sync,
@@ -109,6 +110,10 @@ else:
         )
     cors_origins = CORS_ALLOWED_ORIGINS
     cors_allow_credentials = True
+
+# Per-request log of organisation-API-key traffic (Developers → Logs). Innermost, so it
+# times the app itself; never touches bodies or responses. See services/api_request_logging.
+app.add_middleware(ApiRequestLogMiddleware)
 
 app.add_middleware(
     CORSMiddleware,

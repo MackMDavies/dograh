@@ -37,6 +37,10 @@ def build_pipeline(
     pipeline_metrics_aggregator,
     voicemail_detector=None,
     recording_router=None,
+    input_guardrail_processor=None,
+    output_guardrail_processor=None,
+    caller_keypad=None,
+    companion_input=None,
 ):
     """Build the main pipeline with all components.
 
@@ -48,10 +52,14 @@ def build_pipeline(
         recording_router: Optional RecordingRouterProcessor. When provided,
             inserts between callback processor and TTS to route between
             pre-recorded audio playback and dynamic TTS.
+        caller_keypad: Optional CallerKeypadProcessor, directly after the
+            transport input so the caller's key presses reach the agent.
     """
     # Build processors list with optional voicemail detection
     processors = [
         transport.input(),  # Transport user input
+        *([caller_keypad] if caller_keypad else []),
+        *([companion_input] if companion_input else []),
         stt,
     ]
 
@@ -67,10 +75,12 @@ def build_pipeline(
         processors.append(voicemail_detector.detector())
 
     # Continue with the rest of the pipeline
-    post_llm = [pipeline_engine_callback_processor]
+    post_llm = ([output_guardrail_processor] if output_guardrail_processor else []) + [pipeline_engine_callback_processor]
     if recording_router:
         post_llm.append(recording_router)
 
+    if input_guardrail_processor:
+        processors.append(input_guardrail_processor)
     processors.append(user_context_aggregator)
 
     # Insert LLM gate before the main LLM when voicemail detection is enabled.
@@ -103,6 +113,10 @@ def build_realtime_pipeline(
     pipeline_engine_callback_processor,
     pipeline_metrics_aggregator,
     voicemail_detector=None,
+    input_guardrail_processor=None,
+    output_guardrail_processor=None,
+    caller_keypad=None,
+    companion_input=None,
 ):
     """Build a pipeline for realtime (speech-to-speech) LLM services.
 
@@ -131,9 +145,16 @@ def build_realtime_pipeline(
     """
     processors = [
         transport.input(),
+        *([caller_keypad] if caller_keypad else []),
+        *([companion_input] if companion_input else []),
         user_context_aggregator,
         realtime_llm,
     ]
+
+    if input_guardrail_processor:
+        processors.append(input_guardrail_processor)
+    if output_guardrail_processor:
+        processors.append(output_guardrail_processor)
 
     if voicemail_detector:
         logger.info("Adding native voicemail detector to realtime pipeline")

@@ -134,6 +134,13 @@ async def test_telnyx_call_start_returns_server_selected_rotating_caller_id():
 
     with (
         patch(f"{_ROUTES}._get_assigned_dialer_number_or_503", new_callable=AsyncMock, return_value=assigned),
+        # Compliance lookups go to Supabase; unmocked they fail closed (403).
+        patch(f"{_ROUTES}.phone_block_reason", new_callable=AsyncMock, return_value=None),
+        patch(
+            f"{_ROUTES}.check_dialer_calling_hours_with_state",
+            new_callable=AsyncMock,
+            return_value=(True, None, None),
+        ),
         patch(f"{_ROUTES}.create_dialer_call", new_callable=AsyncMock, return_value=True) as create,
     ):
         result = await start_telnyx_dialer_call(body, user)

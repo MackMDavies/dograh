@@ -1,12 +1,19 @@
 from datetime import datetime
 from typing import List, Optional
 
+import httpx
+import re
 from fastapi import APIRouter, Depends, HTTPException
 from loguru import logger
 from pydantic import BaseModel
 from sqlalchemy.exc import IntegrityError
 
-from api.constants import DEFAULT_CAMPAIGN_RETRY_CONFIG, DEFAULT_ORG_CONCURRENCY_LIMIT
+from api.constants import (
+    DEFAULT_CAMPAIGN_RETRY_CONFIG,
+    DEFAULT_ORG_CONCURRENCY_LIMIT,
+    SUPABASE_SERVICE_ROLE_KEY,
+    SUPABASE_URL,
+)
 from api.db import db_client
 from api.db.models import UserModel
 from api.db.telephony_configuration_client import TelephonyConfigurationInUseError
@@ -43,6 +50,77 @@ from api.services.worker_sync.protocol import WorkerSyncEventType
 from api.utils.common import get_backend_endpoints
 
 router = APIRouter(prefix="/organizations", tags=["organizations"])
+
+
+async def _twilio_claim_account_sid(config_id: int) -> Optional[str]:
+    """Return the account SID only when this is the shared Sysevo Twilio account."""
+    config = await db_client.get_telephony_configuration(config_id)
+    if not config or str(config.provider).lower() != "twilio":
+        return None
+    spec = telephony_registry.get_optional(config.provider)
+    account_field = spec.account_id_credential_field if spec else None
+    account_sid = (config.credentials or {}).get(account_field) if account_field else None
+    active_sid = await db_client.get_platform_twilio_sid()
+    account_sid = str(account_sid).strip() if account_sid else ""
+    active_sid = str(active_sid).strip() if active_sid else ""
+    return account_sid if account_sid and account_sid == active_sid else None
+
+
+async def _set_shared_twilio_voice_claim(
+    *, config_id: int, phone_number: str, owner_ref: str, claim: bool
+) -> None:
+    """Atomically reserve/release a shared Twilio number in Supabase."""
+    account_sid = await _twilio_claim_account_sid(config_id)
+    if not account_sid:
+        return
+    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+        raise HTTPException(
+            status_code=503,
+            detail="Shared Twilio number ownership is unavailable; the Voice AI assignment was not changed.",
+        )
+    rpc = (
+        "twilio_claim_voice_agent_number"
+        if claim else "twilio_release_voice_agent_number"
+    )
+    payload = (
+        {
+            "p_account_sid": account_sid,
+            "p_twilio_sid": None,
+            "p_phone_number": phone_number,
+            "p_owner_ref": owner_ref,
+        }
+        if claim else {
+            "p_account_sid": account_sid,
+            "p_phone_number": phone_number,
+            "p_owner_ref": owner_ref,
+        }
+    )
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                f"{SUPABASE_URL.rstrip('/')}/rest/v1/rpc/{rpc}",
+                json=payload,
+                headers={
+                    "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    "Content-Type": "application/json",
+                },
+            )
+    except httpx.HTTPError as exc:
+        logger.error(f"Shared Twilio ownership check failed: {exc}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify shared Twilio number ownership; the Voice AI assignment was not changed.",
+        ) from exc
+    if not response.is_success:
+        detail = "This Twilio number is already claimed by the dialer." if claim and response.status_code == 409 else "Could not update shared Twilio number ownership."
+        logger.warning(f"Shared Twilio claim RPC {rpc} failed ({response.status_code}).")
+        raise HTTPException(status_code=409 if claim else 503, detail=detail)
+
+
+def _shared_twilio_owner_ref(config_id: int, phone_number: str) -> str:
+    phone_key = re.sub(r"\D", "", phone_number)
+    return f"config:{config_id}:phone:{phone_key}"
 
 
 def _sensitive_fields(provider_name: str) -> List[str]:
@@ -551,6 +629,20 @@ async def create_phone_number(
                 ),
             )
 
+    shared_owner_ref = _shared_twilio_owner_ref(config_id, request.address)
+    claimed_shared_number = request.inbound_workflow_id is not None
+    if request.inbound_workflow_id is not None and not user.is_superuser:
+        await _ensure_workflow_belongs_to_org(
+            request.inbound_workflow_id, user.selected_organization_id
+        )
+    if claimed_shared_number:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=request.address,
+            owner_ref=shared_owner_ref,
+            claim=True,
+        )
+
     try:
         row = await db_client.create_phone_number(
             organization_id=user.selected_organization_id,
@@ -564,12 +656,35 @@ async def create_phone_number(
             extra_metadata=request.extra_metadata,
         )
     except IntegrityError:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
         raise HTTPException(
             status_code=409,
             detail="A phone number with this address already exists in the org.",
         )
     except ValueError as e:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception:
+        if claimed_shared_number:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=request.address,
+                owner_ref=shared_owner_ref,
+                claim=False,
+            )
+        raise
 
     response = _phone_number_to_response(row)
     if request.inbound_workflow_id is not None:
@@ -614,6 +729,18 @@ async def update_phone_number(
     if not existing:
         raise HTTPException(status_code=404, detail="Phone number not found")
 
+    owner_ref = _shared_twilio_owner_ref(config_id, existing.address_normalized)
+    desired_inbound = (
+        None if request.clear_inbound_workflow
+        else request.inbound_workflow_id if request.inbound_workflow_id is not None
+        else existing.inbound_workflow_id
+    )
+    desired_outbound = (
+        None if request.clear_outbound_workflow
+        else request.outbound_workflow_id if request.outbound_workflow_id is not None
+        else existing.outbound_workflow_id
+    )
+    desired_voice_claim = desired_inbound is not None or desired_outbound is not None
     if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(
             request.inbound_workflow_id, effective_org_id
@@ -625,21 +752,53 @@ async def update_phone_number(
         await _ensure_workflow_belongs_to_org(
             request.outbound_workflow_id, effective_org_id
         )
+    if desired_voice_claim:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=existing.address_normalized,
+            owner_ref=owner_ref,
+            claim=True,
+        )
 
-    row = await db_client.update_phone_number(
-        phone_number_id=phone_number_id,
-        telephony_configuration_id=config_id,
-        label=request.label,
-        inbound_workflow_id=request.inbound_workflow_id,
-        outbound_workflow_id=request.outbound_workflow_id,
-        is_active=request.is_active,
-        country_code=request.country_code,
-        extra_metadata=request.extra_metadata,
-        clear_inbound_workflow=request.clear_inbound_workflow,
-        clear_outbound_workflow=request.clear_outbound_workflow,
-    )
+    try:
+        row = await db_client.update_phone_number(
+            phone_number_id=phone_number_id,
+            telephony_configuration_id=config_id,
+            label=request.label,
+            inbound_workflow_id=request.inbound_workflow_id,
+            outbound_workflow_id=request.outbound_workflow_id,
+            is_active=request.is_active,
+            country_code=request.country_code,
+            extra_metadata=request.extra_metadata,
+            clear_inbound_workflow=request.clear_inbound_workflow,
+            clear_outbound_workflow=request.clear_outbound_workflow,
+        )
+    except Exception:
+        if desired_voice_claim and existing.inbound_workflow_id is None and existing.outbound_workflow_id is None:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=existing.address_normalized,
+                owner_ref=owner_ref,
+                claim=False,
+            )
+        raise
     if not row:
+        if desired_voice_claim and existing.inbound_workflow_id is None and existing.outbound_workflow_id is None:
+            await _set_shared_twilio_voice_claim(
+                config_id=config_id,
+                phone_number=existing.address_normalized,
+                owner_ref=owner_ref,
+                claim=False,
+            )
         raise HTTPException(status_code=404, detail="Phone number not found")
+
+    if not desired_voice_claim:
+        await _set_shared_twilio_voice_claim(
+            config_id=config_id,
+            phone_number=existing.address_normalized,
+            owner_ref=owner_ref,
+            claim=False,
+        )
 
     response = _phone_number_to_response(row)
 
@@ -735,6 +894,17 @@ async def delete_phone_number(
     deleted = await db_client.delete_phone_number(phone_number_id, config_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Phone number not found")
+
+    # The Voice AI assignment has been removed from Dograh; release its
+    # shared-account claim only after the row deletion succeeds. A failed
+    # release is deliberately surfaced so the stale claim can be reconciled
+    # instead of making the number appear free while still assigned.
+    await _set_shared_twilio_voice_claim(
+        config_id=config_id,
+        phone_number=existing.address_normalized,
+        owner_ref=_shared_twilio_owner_ref(config_id, existing.address_normalized),
+        claim=False,
+    )
 
     return {"message": "Phone number deleted"}
 
@@ -846,6 +1016,11 @@ class LangfuseCredentialsRequest(BaseModel):
     host: str
     public_key: str
     secret_key: str
+    # "What to send" (Developers → Telemetry). Omitted = keep the saved options
+    # (or the defaults for a new configuration).
+    options: Optional[dict] = None
+    # Verify the keys against Langfuse before saving; nothing is saved if they fail.
+    test: bool = False
 
 
 class LangfuseCredentialsResponse(BaseModel):
@@ -853,6 +1028,16 @@ class LangfuseCredentialsResponse(BaseModel):
     public_key: str = ""
     secret_key: str = ""
     configured: bool = False
+    options: Optional[dict] = None
+
+
+async def _load_langfuse(org_id: int):
+    from api.services.telemetry.langfuse_config import decode_langfuse_config
+
+    config = await db_client.get_configuration(
+        org_id, OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value
+    )
+    return decode_langfuse_config(config.value) if config and config.value else None
 
 
 @router.get("/langfuse-credentials", response_model=LangfuseCredentialsResponse)
@@ -861,19 +1046,18 @@ async def get_langfuse_credentials(user: UserModel = Depends(get_user)):
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    config = await db_client.get_configuration(
-        user.selected_organization_id,
-        OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
-    )
+    cfg = await _load_langfuse(user.selected_organization_id)
+    if not cfg:
+        from api.services.telemetry.langfuse_config import DEFAULT_OPTIONS
 
-    if not config or not config.value:
-        return LangfuseCredentialsResponse()
+        return LangfuseCredentialsResponse(options=dict(DEFAULT_OPTIONS))
 
     return LangfuseCredentialsResponse(
-        host=config.value.get("host", ""),
-        public_key=mask_key(config.value.get("public_key", "")),
-        secret_key=mask_key(config.value.get("secret_key", "")),
+        host=cfg["host"],
+        public_key=mask_key(cfg["public_key"]),
+        secret_key=mask_key(cfg["secret_key"]),
         configured=True,
+        options=cfg["options"],
     )
 
 
@@ -882,32 +1066,52 @@ async def save_langfuse_credentials(
     request: LangfuseCredentialsRequest,
     user: UserModel = Depends(get_user),
 ):
-    """Save Langfuse credentials for the user's organization."""
+    """Save Langfuse credentials (secret encrypted at rest), optionally testing them first."""
+    from api.services.telemetry.langfuse_config import (
+        DEFAULT_OPTIONS,
+        encode_langfuse_config,
+        normalize_options,
+        validate_host,
+        verify_langfuse,
+    )
+
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
 
-    existing_config = await db_client.get_configuration(
-        user.selected_organization_id,
-        OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
+    existing = await _load_langfuse(user.selected_organization_id)
+    host = request.host.strip().rstrip("/")
+    public_key = request.public_key.strip()
+    secret_key = request.secret_key.strip()
+
+    # Preserve masked fields (the GET returns masks; re-saving them keeps the originals)
+    if existing:
+        if is_mask_of(public_key, existing["public_key"]):
+            public_key = existing["public_key"]
+        if is_mask_of(secret_key, existing["secret_key"]):
+            secret_key = existing["secret_key"]
+
+    if not host or not public_key or not secret_key:
+        raise HTTPException(status_code=422, detail="Host, public key and secret key are required")
+    reason = validate_host(host)
+    if reason:
+        raise HTTPException(status_code=422, detail=reason)
+
+    options = normalize_options(
+        request.options
+        if request.options is not None
+        else (existing["options"] if existing else DEFAULT_OPTIONS)
     )
 
-    config_value = {
-        "host": request.host,
-        "public_key": request.public_key,
-        "secret_key": request.secret_key,
-    }
-
-    # Preserve masked fields
-    if existing_config and existing_config.value:
-        if is_mask_of(request.public_key, existing_config.value.get("public_key", "")):
-            config_value["public_key"] = existing_config.value["public_key"]
-        if is_mask_of(request.secret_key, existing_config.value.get("secret_key", "")):
-            config_value["secret_key"] = existing_config.value["secret_key"]
+    traces_today = None
+    if request.test:
+        ok, traces_today, error = await verify_langfuse(host, public_key, secret_key)
+        if not ok:
+            raise HTTPException(status_code=400, detail=error or "Langfuse rejected these keys")
 
     await db_client.upsert_configuration(
         user.selected_organization_id,
         OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value,
-        config_value,
+        encode_langfuse_config(host, public_key, secret_key, options),
     )
 
     # Broadcast to all workers so every process updates its in-memory exporter
@@ -917,7 +1121,26 @@ async def save_langfuse_credentials(
         org_id=user.selected_organization_id,
     )
 
-    return {"message": "Langfuse credentials saved successfully"}
+    return {
+        "message": "Langfuse credentials saved successfully",
+        "tested": request.test,
+        "traces_today": traces_today,
+        "options": options,
+    }
+
+
+@router.post("/langfuse-credentials/test")
+async def test_langfuse_credentials(user: UserModel = Depends(get_user)):
+    """Check the saved credentials against Langfuse; returns today's trace count."""
+    from api.services.telemetry.langfuse_config import verify_langfuse
+
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    cfg = await _load_langfuse(user.selected_organization_id)
+    if not cfg:
+        raise HTTPException(status_code=404, detail="No Langfuse credentials found")
+    ok, traces_today, error = await verify_langfuse(cfg["host"], cfg["public_key"], cfg["secret_key"])
+    return {"ok": ok, "traces_today": traces_today, "error": error}
 
 
 @router.delete("/langfuse-credentials")
@@ -1167,3 +1390,41 @@ async def delete_api_key(key_id: int, user: UserModel = Depends(get_user)):
         raise HTTPException(status_code=404, detail="API key not found")
 
     return {"message": "API key deleted"}
+
+
+# ======== PHONE TOOLS (Keypad & Native Phone Tools) ========
+
+
+class PhoneToolRuleModel(BaseModel):
+    mode: str = "on"
+    rule: str = ""
+    start_paused: Optional[bool] = None  # recording only
+
+
+class PhoneToolsPolicyModel(BaseModel):
+    tools: dict[str, PhoneToolRuleModel] = {}
+
+
+@router.get("/phone-tools", response_model=PhoneToolsPolicyModel, response_model_exclude_none=True)
+async def get_phone_tools_policy(user: UserModel = Depends(get_user)):
+    """When this organization's agents may use the built-in phone tools."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    from api.services.phone_tools.policy import load_policy
+
+    policy = await load_policy(user.selected_organization_id)
+    return policy.to_dict()
+
+
+@router.put("/phone-tools", response_model=PhoneToolsPolicyModel, response_model_exclude_none=True)
+async def save_phone_tools_policy(
+    request: PhoneToolsPolicyModel,
+    user: UserModel = Depends(get_user),
+):
+    """Save the rules. Unknown tools and modes are dropped; a rule with no words is "on"."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail="No organization selected")
+    from api.services.phone_tools.policy import save_policy
+
+    policy = await save_policy(user.selected_organization_id, request.model_dump())
+    return policy.to_dict()

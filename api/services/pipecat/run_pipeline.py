@@ -9,11 +9,16 @@ from loguru import logger
 from api.db import db_client
 from api.enums import WorkflowRunMode
 from api.services.configuration.registry import ServiceProviders
+from api.services.configuration.voice_expression import build_voice_expression_instruction
+from api.services.pipecat.voice_guardrails import build_guardrail_prompt_instruction
+from api.services.pipecat.guardrail_runtime import create_guardrail_processors
 from api.services.integrations import (
     IntegrationRuntimeContext,
     create_runtime_sessions,
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.caller_keypad import CallerKeypadProcessor
+from api.services.phone_tools.policy import load_policy as load_phone_tools_policy
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -48,6 +53,8 @@ from api.services.pipecat.recording_audio_cache import (
 )
 from api.services.gen_ai import resolve_embeddings_config
 from api.services.pipecat.recording_router_processor import RecordingRouterProcessor
+from api.services.pipecat.sandbox_audio_transport import SandboxAudioTransport
+from api.services.pipecat.observed_user_mute_strategy import ObservedUserMuteStrategy
 from api.services.pipecat.service_factory import (
     create_llm_service,
     create_llm_service_from_provider,
@@ -65,6 +72,7 @@ from api.services.pipecat.ws_sender_registry import get_ws_sender
 from api.services.telephony import registry as telephony_registry
 from api.services.workflow.dto import ReactFlowDTO
 from api.services.workflow.pipecat_engine import PipecatEngine
+from api.services.workflow.test_sandbox_binding import validate_sandbox_pipeline_binding
 from api.services.workflow.variable_resolution import (
     build_call_context,
     build_memory_attr_map,
@@ -124,8 +132,11 @@ def _create_realtime_user_turn_config(provider: str):
             SileroVADAnalyzer(params=VADParams(stop_secs=0.2)),
         )
 
-    if provider == ServiceProviders.OPENAI_REALTIME.value:
-        # OpenAI Realtime already emits speaking-state frames and interruption
+    if provider in {
+        ServiceProviders.OPENAI_REALTIME.value,
+        ServiceProviders.ELEVENLABS_REALTIME.value,
+    }:
+        # OpenAI-compatible realtime providers emit speaking-state frames and interruption
         # events from the provider, so the aggregator should follow those
         # external signals rather than run its own local VAD.
         return (
@@ -210,31 +221,19 @@ async def run_pipeline_telephony(
     # Resolve effective user config here so the transport can tune its
     # bot-stopped-speaking fallback based on is_realtime; pass the resolved
     # values into _run_pipeline so it doesn't fetch them again.
-    from api.services.configuration.resolve import resolve_effective_config
+    from api.services.configuration.pipeline import resolve_pipeline_configuration
 
-    user_config = await db_client.get_user_configurations(user_id)
     run_configs = (
         (workflow_run.definition.workflow_configurations or {}) if workflow_run else {}
-    )
-    from api.services.configuration.org_provider_resolver import (
-        enrich_config_from_org_connections,
-        enrich_overrides_with_org_api_keys,
-        resolve_org_provider_config,
     )
     effective_org_id = workflow.organization_id if workflow else None
     if not effective_org_id:
         _user = await db_client.get_user_by_id(user_id)
         if _user:
             effective_org_id = _user.selected_organization_id
-    if effective_org_id:
-        user_config = await resolve_org_provider_config(effective_org_id, user_config)
-        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
-    raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and effective_org_id:
-        raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, effective_org_id
-        )
-    user_config = resolve_effective_config(user_config, raw_overrides)
+    user_config = await resolve_pipeline_configuration(
+        db_client, user_id, effective_org_id, run_configs.get("model_overrides")
+    )
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     spec = telephony_registry.get(provider_name)
@@ -305,34 +304,22 @@ async def run_pipeline_smallwebrtc(
     # Resolve workflow_run + effective user_config here so the transport can
     # tune its bot-stopped-speaking fallback based on is_realtime. _run_pipeline
     # reuses these via kwargs so we don't fetch twice.
-    from api.services.configuration.resolve import resolve_effective_config
+    from api.services.configuration.pipeline import resolve_pipeline_configuration
 
     workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
-    user_config = await db_client.get_user_configurations(user_id)
     run_configs = (
         (workflow_run.definition.workflow_configurations or {})
         if (workflow_run and workflow_run.definition)
         else {}
-    )
-    from api.services.configuration.org_provider_resolver import (
-        enrich_config_from_org_connections,
-        enrich_overrides_with_org_api_keys,
-        resolve_org_provider_config,
     )
     effective_org_id = workflow.organization_id if workflow else None
     if not effective_org_id:
         _user = await db_client.get_user_by_id(user_id)
         if _user:
             effective_org_id = _user.selected_organization_id
-    if effective_org_id:
-        user_config = await resolve_org_provider_config(effective_org_id, user_config)
-        user_config = await enrich_config_from_org_connections(effective_org_id, user_config)
-    raw_overrides = run_configs.get("model_overrides")
-    if raw_overrides and effective_org_id:
-        raw_overrides = await enrich_overrides_with_org_api_keys(
-            raw_overrides, effective_org_id
-        )
-    user_config = resolve_effective_config(user_config, raw_overrides)
+    user_config = await resolve_pipeline_configuration(
+        db_client, user_id, effective_org_id, run_configs.get("model_overrides")
+    )
     is_realtime = bool(user_config.is_realtime and user_config.realtime is not None)
 
     transport = await create_webrtc_transport(
@@ -355,6 +342,18 @@ async def run_pipeline_smallwebrtc(
     )
 
 
+async def _resolve_pipeline_embeddings(user_config, organization_id, is_private_voice):
+    if is_private_voice:
+        from api.services.workflow.voice_test_providers import (
+            private_voice_embedding_configuration,
+        )
+
+        return private_voice_embedding_configuration(user_config)
+    return await resolve_embeddings_config(
+        organization_id=organization_id, user_config=user_config
+    )
+
+
 async def _run_pipeline(
     transport,
     workflow_id: int,
@@ -366,6 +365,8 @@ async def _run_pipeline(
     workflow_run=None,
     resolved_user_config=None,
     is_telephony: bool = False,
+    expected_organization_id: int | None = None,
+    private_voice_providers=None,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration
@@ -378,6 +379,8 @@ async def _run_pipeline(
         workflow_run: Pre-fetched workflow run row. Fetched here if None.
         resolved_user_config: User configuration with model_overrides already
             applied. Fetched and resolved here if None.
+        private_voice_providers: In-memory QA credential envelope bound to this
+            exact private run. Required for private voice; forbidden for live calls.
     """
     if workflow_run is None:
         workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
@@ -386,11 +389,72 @@ async def _run_pipeline(
     if workflow_run is None or workflow_run.is_completed:
         raise HTTPException(status_code=400, detail="Workflow run already completed")
 
-    # Get workflow for metadata (name, organization_id, call_disposition_codes) — unscoped:
-    # access is validated before the pipeline is invoked.
-    workflow = await db_client.get_workflow_by_id(workflow_id)
-    if not workflow:
-        raise HTTPException(status_code=404, detail="Workflow not found")
+    try:
+        is_agent_test_sandbox = validate_sandbox_pipeline_binding(
+            workflow_run,
+            workflow_id,
+            workflow_run_id,
+            os.getenv("SYSEVO_MEMORY_SECRET", ""),
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=409, detail="Sandbox audio configuration binding is invalid"
+        ) from exc
+    if isinstance(transport, SandboxAudioTransport) and not is_agent_test_sandbox:
+        raise HTTPException(
+            status_code=409, detail="Private test audio requires an attested sandbox run"
+        )
+
+    # A queued private voice job may outlive its admission request. Recheck the
+    # original organization and provider owner before reading configuration.
+    if expected_organization_id is not None:
+        workflow = await db_client.get_workflow(
+            workflow_id, organization_id=expected_organization_id
+        )
+        if workflow is None or workflow.user_id != user_id:
+            raise HTTPException(
+                status_code=409, detail="Private voice workflow scope changed"
+            )
+    else:
+        # Existing live-call entry points validate access before invoking us.
+        workflow = await db_client.get_workflow_by_id(workflow_id)
+        if not workflow:
+            raise HTTPException(status_code=404, detail="Workflow not found")
+
+    private_user_config = None
+    if is_agent_test_sandbox:
+        from api.services.workflow.test_sandbox_mode import SANDBOX_ANNOTATION
+        from api.services.workflow.voice_test_control import VoiceControlError
+        from api.services.workflow.voice_test_providers import (
+            validate_private_voice_provider_configuration,
+        )
+
+        marker = workflow_run.annotations.get(SANDBOX_ANNOTATION, {})
+        if (
+            resolved_user_config is not None
+            or expected_organization_id is None
+            or workflow.organization_id != expected_organization_id
+            or marker.get("organization_id") != expected_organization_id
+            or is_telephony
+        ):
+            raise HTTPException(
+                status_code=409, detail="Private voice provider scope is invalid"
+            )
+        try:
+            private_user_config = validate_private_voice_provider_configuration(
+                private_voice_providers,
+                workflow_run,
+                os.getenv("SYSEVO_MEMORY_SECRET", ""),
+            )
+        except VoiceControlError:
+            raise HTTPException(
+                status_code=409,
+                detail="Private voice test credentials are missing or invalid",
+            ) from None
+    elif private_voice_providers is not None:
+        raise HTTPException(
+            status_code=409, detail="Test credentials require a private voice run"
+        )
 
     # Use the run's pinned definition for graph + configs (not the workflow's current)
     run_definition = workflow_run.definition
@@ -469,23 +533,17 @@ async def _run_pipeline(
 
     # Resolve model overrides from the version onto global user config (skip
     # when the caller already resolved it).
-    if resolved_user_config is None:
-        from api.services.configuration.resolve import resolve_effective_config
-        from api.services.configuration.org_provider_resolver import (
-            enrich_config_from_org_connections,
-            enrich_overrides_with_org_api_keys,
-            resolve_org_provider_config,
-        )
+    if is_agent_test_sandbox:
+        # Only the sealed, run-bound QA configuration may reach provider SDKs.
+        # Never resolve owner, org, global or environment credentials here.
+        user_config = private_user_config
+    elif resolved_user_config is None:
+        from api.services.configuration.pipeline import resolve_pipeline_configuration
 
-        user_config = await db_client.get_user_configurations(user_id)
         org_id = workflow.organization_id if workflow else None
-        if org_id:
-            user_config = await resolve_org_provider_config(org_id, user_config)
-            user_config = await enrich_config_from_org_connections(org_id, user_config)
-        raw_overrides = run_configs.get("model_overrides")
-        if raw_overrides and org_id:
-            raw_overrides = await enrich_overrides_with_org_api_keys(raw_overrides, org_id)
-        user_config = resolve_effective_config(user_config, raw_overrides)
+        user_config = await resolve_pipeline_configuration(
+            db_client, user_id, org_id, run_configs.get("model_overrides")
+        )
     else:
         user_config = resolved_user_config
 
@@ -493,43 +551,21 @@ async def _run_pipeline(
     # forwarded in the voice session's initial context. Apply it only to the
     # Syra workflow and only for ElevenLabs; all other calls retain their saved
     # workflow/provider configuration.
-    if user_config.tts is not None:
-        from api.services.syra_voice import is_syra_voice_config, syra_speech_speed
+    from api.services.configuration.pipeline import apply_pipeline_call_configuration
 
-        if is_syra_voice_config(run_configs):
-            speed = syra_speech_speed(merged_call_context_vars.get("syra_speech_speed"))
-            provider = getattr(user_config.tts.provider, "value", user_config.tts.provider)
-            if speed is not None and provider == "elevenlabs":
-                user_config = user_config.model_copy(deep=True)
-                user_config.tts = user_config.tts.model_copy(update={"speed": speed})
+    user_config = apply_pipeline_call_configuration(user_config, run_configs, merged_call_context_vars)
 
     # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
-    if user_config.tts is not None:
-        tts_override = run_configs.get("model_overrides", {}).get("tts", {})
-        voice_uuid = tts_override.get("voice_uuid")
-        if voice_uuid:
-            from api.services.configuration.org_provider_resolver import resolve_voice_for_tts
-            # Use effective org: workflow org → user's selected org (same fallback as provider resolution)
-            _voice_org_id = workflow.organization_id if workflow else None
-            if not _voice_org_id:
-                _user = await db_client.get_user_by_id(user_id)
-                if _user:
-                    _voice_org_id = _user.selected_organization_id
-            resolved_voice = await resolve_voice_for_tts(voice_uuid, _voice_org_id)
-            logger.info(
-                f"[run {workflow_run_id}] Voice resolution: uuid={voice_uuid} "
-                f"org_id={_voice_org_id} → resolved={resolved_voice!r}"
-            )
-            if resolved_voice:
-                user_config = user_config.model_copy(deep=True)
-                user_config.tts = user_config.tts.model_copy(
-                    update={"voice": resolved_voice}
-                )
-            else:
-                logger.warning(
-                    f"[run {workflow_run_id}] Voice UUID {voice_uuid!r} not found — "
-                    f"using default voice: {user_config.tts.voice!r}"
-                )
+    if user_config.tts is not None and not is_agent_test_sandbox:
+        from api.services.configuration.pipeline import resolve_pipeline_voice
+
+        user_config = await resolve_pipeline_voice(
+            db_client,
+            user_config,
+            run_configs.get("model_overrides"),
+            workflow.organization_id if workflow else None,
+            user_id,
+        )
 
     # Detect realtime mode (speech-to-speech services like OpenAI Realtime, Gemini Live)
     is_realtime = user_config.is_realtime and user_config.realtime is not None
@@ -579,6 +615,11 @@ async def _run_pipeline(
         llm = create_llm_service(user_config)
         inference_llm = None
 
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        trace = transport.voice_observer.tool_trace
+        if trace is not None:
+            trace.attach(llm)
+
     # Stamp the providers/models actually resolved for this run onto
     # initial_context so they're available for post-call analytics
     # (model_overrides may have shifted them away from the org-level
@@ -616,7 +657,8 @@ async def _run_pipeline(
     pre_call_fetch_is_memory = False
     start_node = workflow_graph.nodes.get(workflow_graph.start_node_id)
     if (
-        start_node
+        not is_agent_test_sandbox
+        and start_node
         and start_node.pre_call_fetch_enabled
         and start_node.pre_call_fetch_url
     ):
@@ -639,7 +681,11 @@ async def _run_pipeline(
     # as SYSEVO_MEMORY_PRE_CALL_URL is configured on this server and the
     # workflow's start node hasn't already claimed the pre_call_fetch slot.
     # Never for Syra's voice: the person is her user, not a caller to look up.
-    _sysevo_memory_url = None if run_configs.get("syra_voice") else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    _sysevo_memory_url = (
+        None
+        if is_agent_test_sandbox or run_configs.get("syra_voice")
+        else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
+    )
     _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
     # Gate on the LEAD's number, not on caller_number. On an outbound run
     # caller_number is our own outbound caller ID, and 13 telephony runs carry
@@ -670,7 +716,11 @@ async def _run_pipeline(
     # concurrent calls (e.g. a campaign dialer) each get their own live row. The row
     # is removed by the matching "ended" signal at call completion. Non-fatal.
     # Not for Syra's voice: a person talking to their own assistant is not a live call.
-    if os.getenv("SYSEVO_CALL_LIVE_URL") and not run_configs.get("syra_voice"):
+    if (
+        os.getenv("SYSEVO_CALL_LIVE_URL")
+        and not run_configs.get("syra_voice")
+        and not is_agent_test_sandbox
+    ):
         asyncio.create_task(
             fire_call_live(
                 event="started",
@@ -719,16 +769,20 @@ async def _run_pipeline(
 
     node_transition_callback = send_node_transition
 
-    embeddings_api_key, embeddings_model, embeddings_base_url = await resolve_embeddings_config(
-        organization_id=workflow.organization_id,
-        user_config=user_config,
+    embeddings_api_key, embeddings_model, embeddings_base_url = await _resolve_pipeline_embeddings(
+        user_config, workflow.organization_id, is_agent_test_sandbox
     )
 
     # Check if the workflow has any active recordings so the engine can
     # include recording response mode instructions in all node prompts.
     has_recordings = await db_client.has_active_recordings(workflow.organization_id)
 
-    context_compaction_enabled = (workflow.workflow_configurations or {}).get(
+    # Sandbox candidates must use their pinned settings, rather than the
+    # workflow's current published/draft mirror.
+    voice_settings = (
+        run_configs if is_agent_test_sandbox else (workflow.workflow_configurations or {})
+    )
+    context_compaction_enabled = voice_settings.get(
         "context_compaction_enabled", False
     )
     # Context compaction doesn't apply in realtime mode: the speech-to-speech
@@ -740,7 +794,7 @@ async def _run_pipeline(
     # Bridge the silence on transitions whose edge has no authored
     # transition_speech. Opt-in per workflow: it changes what the agent says
     # out loud, so it must never switch on for an agent nobody asked.
-    transition_filler_enabled = (workflow.workflow_configurations or {}).get(
+    transition_filler_enabled = voice_settings.get(
         "transition_filler_enabled", False
     )
     # Realtime services own speech generation end-to-end; a TTSSpeakFrame has
@@ -748,6 +802,24 @@ async def _run_pipeline(
     if is_realtime and transition_filler_enabled:
         logger.info("Disabling transition_filler_enabled for realtime workflow run")
         transition_filler_enabled = False
+
+    voice_expression_instruction = build_voice_expression_instruction(
+        user_config.tts, user_config.realtime if is_realtime else None,
+        run_configs.get("voice_expression"),
+    )
+    # A callback run carries why the person asked and the earlier call's notes.
+    from api.services.callbacks.standing import callback_instruction
+
+    voice_expression_instruction = "\n\n".join(
+        part for part in (voice_expression_instruction, callback_instruction(merged_call_context_vars)) if part
+    ) or None
+    guardrail_config = run_configs.get("voice_guardrails")
+    guardrail_instruction = build_guardrail_prompt_instruction(guardrail_config)
+
+    # Keep normal pre-call fetching and saved start flags intact; only this
+    # authenticated browser test's in-memory graph changes its entry point.
+    from api.services.workflow.studio_test_entry import apply_test_entry
+    apply_test_entry(workflow_graph, workflow_run.mode, workflow_run.annotations)
 
     engine = PipecatEngine(
         llm=llm,
@@ -762,7 +834,16 @@ async def _run_pipeline(
         has_recordings=has_recordings,
         context_compaction_enabled=context_compaction_enabled,
         transition_filler_enabled=transition_filler_enabled,
+        voice_expression_instruction=voice_expression_instruction,
+        guardrail_instruction=guardrail_instruction,
+        is_realtime=is_realtime,
     )
+
+    engine.configure_test_sandbox(workflow_run)
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        # Observe the existing callback policy only in the isolated test path;
+        # this does not alter or bypass any user-mute strategy.
+        engine._voice_test_timing_evidence = transport.voice_observer.timing_evidence
 
     # Create pipeline components
     audio_buffer, context = create_pipeline_components(audio_config)
@@ -787,20 +868,36 @@ async def _run_pipeline(
         correct_aggregation_callback=engine.create_aggregation_correction_callback(),
     )
 
-    user_mute_strategies = [
-        MuteUntilFirstBotCompleteUserMuteStrategy(),
-        FunctionCallUserMuteStrategy(),
-        CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user),
-    ]
+    first_bot_mute = MuteUntilFirstBotCompleteUserMuteStrategy()
+    function_call_mute = FunctionCallUserMuteStrategy()
+    workflow_mute = CallbackUserMuteStrategy(should_mute_callback=engine.should_mute_user)
+    user_mute_strategies = [first_bot_mute, function_call_mute, workflow_mute]
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        timing_evidence = transport.voice_observer.timing_evidence
+        engine._voice_test_mute_observation_enabled = True
+        engine._voice_test_mute_reason = None
+        user_mute_strategies = [
+            ObservedUserMuteStrategy(first_bot_mute, "first_bot_complete", timing_evidence),
+            ObservedUserMuteStrategy(function_call_mute, "function_call", timing_evidence),
+            ObservedUserMuteStrategy(workflow_mute, "workflow_callback", timing_evidence,
+                reason=lambda: engine._voice_test_mute_reason,
+                node_allows_interrupt=lambda: getattr(engine._current_node, "allow_interrupt", None)),
+        ]
     user_vad_analyzer = SileroVADAnalyzer(params=VADParams(stop_secs=0.2))
 
     # Configure turn strategies based on STT provider, model, and workflow configuration
     if is_realtime:
         # Realtime services still need user-turn tracking even when the model
         # itself owns speech generation and interruption behavior.
-        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(
-            user_config.realtime.provider
-        )
+        realtime_provider = user_config.realtime.provider
+        user_turn_strategies, user_vad_analyzer = _create_realtime_user_turn_config(realtime_provider)
+        if realtime_provider in {ServiceProviders.GOOGLE_REALTIME.value, ServiceProviders.GOOGLE_VERTEX_REALTIME.value}:
+            turn_detection_source = "google_server_vad"
+        elif realtime_provider in {ServiceProviders.OPENAI_REALTIME.value, ServiceProviders.ELEVENLABS_REALTIME.value,
+                                    ServiceProviders.GROK_REALTIME.value}:
+            turn_detection_source = "realtime_external_events"
+        else:
+            turn_detection_source = "realtime_local_vad"
     else:
         # Deepgram Flux uses external turn detection (VAD + External start/stop)
         # Other models use configurable turn detection strategy
@@ -810,6 +907,7 @@ async def _run_pipeline(
         )
 
         if is_deepgram_flux:
+            turn_detection_source = "deepgram_flux_vad_external"
             user_turn_strategies = UserTurnStrategies(
                 start=[
                     VADUserTurnStartStrategy(),
@@ -818,6 +916,7 @@ async def _run_pipeline(
                 stop=[ExternalUserTurnStopStrategy()],
             )
         elif turn_stop_strategy == "turn_analyzer":
+            turn_detection_source = "vad_transcription_turn_analyzer"
             # Smart Turn Analyzer: best for longer responses with natural pauses
             smart_turn_params = SmartTurnParams(stop_secs=smart_turn_stop_secs)
             user_turn_strategies = UserTurnStrategies(
@@ -832,6 +931,7 @@ async def _run_pipeline(
                 ],
             )
         else:
+            turn_detection_source = "vad_transcription_speech_timeout"
             # Transcription-based (default): best for short 1-2 word responses
             user_turn_strategies = UserTurnStrategies(
                 start=[
@@ -840,6 +940,9 @@ async def _run_pipeline(
                 ],
                 stop=[SpeechTimeoutUserTurnStopStrategy()],
             )
+
+    if isinstance(transport, SandboxAudioTransport) and transport.voice_observer is not None:
+        transport.voice_observer.timing_evidence.set_turn_detection_source(turn_detection_source)
 
     user_params = LLMUserAggregatorParams(
         user_turn_strategies=user_turn_strategies,
@@ -887,7 +990,7 @@ async def _run_pipeline(
     )
     engine.set_fetch_recording_audio(fetch_audio)
 
-    voicemail_config = (workflow.workflow_configurations or {}).get(
+    voicemail_config = voice_settings.get(
         "voicemail_detection", {}
     )
     # SYSEVO_FIRST_TURN_LATENCY: the classifier sits in front of the main LLM
@@ -959,6 +1062,40 @@ async def _run_pipeline(
             )
         )
 
+    async def record_guardrail_event(event):
+        await in_memory_logs_buffer.append(event)
+        if ws_sender:
+            try:
+                await ws_sender(event)
+            except Exception:
+                logger.debug("Guardrail live monitor disconnected")
+
+    input_guardrail_processor, output_guardrail_processor = await create_guardrail_processors(
+        config=guardrail_config, engine=engine, llm=create_llm_service(user_config) if guardrail_instruction else inference_llm or llm,
+        organization_id=workflow.organization_id, db=db_client,
+        factory=create_llm_service_from_provider, on_event=record_guardrail_event,
+        realtime=is_realtime,
+    )
+
+    # Keypad & native phone tools: the organization's rules (Voice AI -> Tools) and
+    # the keys the caller presses, which every serializer reports as InputDTMFFrame.
+    caller_keypad = CallerKeypadProcessor()
+    # Three-way calls on stream carriers: the colleague is mixed in by Dograh.
+    from api.services.pipecat.companion import CompanionInputProcessor, install_companion_mixer
+
+    companion_mixer = install_companion_mixer(transport)
+    companion_input = CompanionInputProcessor() if companion_mixer else None
+    engine.set_companion(companion_mixer, companion_input)
+    engine.set_phone_tools(
+        await load_phone_tools_policy(workflow.organization_id if workflow else None),
+        caller_keypad=caller_keypad,
+        logs_buffer=in_memory_logs_buffer,
+        audio_buffer=audio_buffer,
+        caller_number=_lead_number,
+        workflow_id=workflow_id,
+        sandbox=bool(is_agent_test_sandbox),
+    )
+
     # Build the pipeline
     if is_realtime:
         pipeline = build_realtime_pipeline(
@@ -970,6 +1107,10 @@ async def _run_pipeline(
             pipeline_engine_callback_processor,
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
+            input_guardrail_processor=input_guardrail_processor,
+            output_guardrail_processor=output_guardrail_processor,
+            caller_keypad=caller_keypad,
+            companion_input=companion_input,
         )
     else:
         pipeline = build_pipeline(
@@ -983,11 +1124,21 @@ async def _run_pipeline(
             pipeline_engine_callback_processor,
             pipeline_metrics_aggregator,
             voicemail_detector=voicemail_detector,
+            input_guardrail_processor=input_guardrail_processor,
+            output_guardrail_processor=output_guardrail_processor,
             recording_router=recording_router,
+            caller_keypad=caller_keypad,
+            companion_input=companion_input,
         )
 
     # Create pipeline task with audio configuration
     task = create_pipeline_task(pipeline, workflow_run_id, audio_config)
+    if (
+        isinstance(transport, SandboxAudioTransport)
+        and transport.voice_observer is not None
+    ):
+        transport.pipeline_task = task
+        task.add_observer(transport.voice_observer)
 
     for runtime_session in integration_runtime_sessions:
         runtime_session.attach(task)
@@ -1009,6 +1160,7 @@ async def _run_pipeline(
     feedback_observer = RealtimeFeedbackObserver(
         ws_sender=ws_sender,
         logs_buffer=in_memory_logs_buffer,
+        redact_tool_values=is_agent_test_sandbox,
     )
     task.add_observer(feedback_observer)
 
@@ -1070,15 +1222,16 @@ async def _run_pipeline(
     # Whisper / Take over from the portal (services/supervisor/live_control.py). Best-effort:
     # if Redis is down the call runs exactly as before, just without supervisor controls.
     supervisor = None
-    try:
-        from api.services.supervisor.live_control import SupervisorControl
+    if not is_agent_test_sandbox:
+        try:
+            from api.services.supervisor.live_control import SupervisorControl
 
-        supervisor = SupervisorControl(
-            engine, workflow_run_id, workflow.organization_id if workflow else None
-        )
-        supervisor.start()
-    except Exception as e:  # noqa: BLE001
-        logger.warning(f"supervisor controls unavailable for run {workflow_run_id}: {e}")
+            supervisor = SupervisorControl(
+                engine, workflow_run_id, workflow.organization_id if workflow else None
+            )
+            supervisor.start()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"supervisor controls unavailable for run {workflow_run_id}: {e}")
 
     try:
         # Run the pipeline
@@ -1092,5 +1245,7 @@ async def _run_pipeline(
         if supervisor:
             with suppress(Exception):
                 await supervisor.stop()
+        with suppress(Exception):
+            await engine.stop_companion()
         await feedback_observer.cleanup()
         logger.debug(f"Cleaned up context providers for workflow run {workflow_run_id}")

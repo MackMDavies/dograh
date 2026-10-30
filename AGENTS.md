@@ -27,6 +27,15 @@ dograh/
 
 Contributor setup and service startup are documented in `docs/contribution/setup.mdx`.
 
+## Production voice-server releases
+
+**Always build each voice-server release FROM the image currently running in production.** Releases stack existing changes; using an older release or the repository's default base can silently overwrite live features.
+
+- Before building, inspect `dograh-api-1` and `dograh-worker-1` and record both `.Config.Image` and the immutable `.Image` ID. Base each changed service on its actual running image. A shared candidate requires matching service image IDs.
+- Ensure the Dockerfile's `FROM` resolves to that exact running image ID. If the builder needs a tag, create a unique local base tag for the inspected image ID; never hard-code a previous release tag or assume a mutable tag still identifies the running image.
+- Layer only the reviewed changed files onto that base. Verify the candidate's filesystem layers retain the running image's complete layer history, and preserve the effective Compose configuration apart from the intended release changes.
+- Immediately before applying, recheck the running image ID. If it changed while preparing the release, rebuild from the new running image before deploying. Never deploy a candidate prepared against an older live base.
+
 ## Environment Configuration
 
 - `api/.env` - Backend environment variables. Source this when running diagnostic scripts or one-off services against the dev DB (e.g. `python -m api.services.admin_utils.local_exec`).

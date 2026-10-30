@@ -17,6 +17,7 @@ from api.db.models import (
     WorkflowModel,
     WorkflowRunModel,
 )
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.schemas.user_configuration import UserConfiguration
 
 
@@ -255,7 +256,7 @@ class OrganizationUsageClient(BaseDBClient):
                 select(WorkflowRunModel)
                 .join(WorkflowModel, WorkflowRunModel.workflow_id == WorkflowModel.id)
                 .join(UserModel, WorkflowModel.user_id == UserModel.id)
-                .where(WorkflowRunModel.cost_info.isnot(None))
+                .where(WorkflowRunModel.cost_info.isnot(None), customer_visible_workflow_run())
                 .order_by(WorkflowRunModel.created_at.desc())
             )
             if organization_id is not None:
@@ -405,6 +406,7 @@ class OrganizationUsageClient(BaseDBClient):
                 .where(
                     UserModel.selected_organization_id == organization_id,
                     WorkflowRunModel.cost_info.isnot(None),
+                    customer_visible_workflow_run(),
                 )
                 .order_by(WorkflowRunModel.created_at.desc())
             )
@@ -491,7 +493,7 @@ class OrganizationUsageClient(BaseDBClient):
                     func.count(WorkflowRunModel.id).label("call_count"),
                 )
                 .join(WorkflowModel, WorkflowModel.id == WorkflowRunModel.workflow_id)
-                .where(*base_where)
+                .where(*base_where, customer_visible_workflow_run())
                 .group_by(date_expr)
                 .order_by(date_expr.asc())
             )
@@ -591,6 +593,7 @@ class OrganizationUsageClient(BaseDBClient):
                 .join(UserModel, UserModel.id == WorkflowModel.user_id)
                 .where(
                     WorkflowRunModel.usage_info.isnot(None),
+                    customer_visible_workflow_run(),
                     WorkflowRunModel.created_at >= cutoff,
                 )
             )

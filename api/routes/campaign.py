@@ -309,6 +309,10 @@ class UpdateCampaignRequest(BaseModel):
     calling_hours: Optional[CallingHoursConfigRequest] = None
     workflow_id: Optional[int] = None
     telephony_configuration_id: Optional[int] = None
+    # SYSEVO_CAMPAIGN_FROM_NUMBER: change the pinned caller ID after creation.
+    # Validated exactly as create_campaign does (org, outbound assignment to the
+    # campaign's agent, active); the number's own telephony config wins.
+    from_phone_number_id: Optional[int] = None
 
 
 class UpdateCampaignScheduleRequest(BaseModel):
@@ -371,6 +375,8 @@ class CampaignResponse(BaseModel):
     is_standing: bool = False
     telephony_configuration_id: Optional[int] = None
     telephony_configuration_name: Optional[str] = None
+    # SYSEVO_CAMPAIGN_FROM_NUMBER: the pinned caller ID (null = leases across the pool).
+    from_phone_number_id: Optional[int] = None
     logs: List[CampaignLogEntryResponse] = Field(default_factory=list)
 
 
@@ -488,6 +494,7 @@ def _build_campaign_response(
         is_standing=bool(getattr(campaign, "is_standing", False)),
         telephony_configuration_id=campaign.telephony_configuration_id,
         telephony_configuration_name=telephony_configuration_name,
+        from_phone_number_id=getattr(campaign, "from_phone_number_id", None),
         logs=[
             CampaignLogEntryResponse(**entry)
             for entry in (campaign.logs or [])
@@ -990,6 +997,7 @@ async def update_campaign(
         or request.schedule_config is not None
         or request.circuit_breaker is not None
         or request.calling_hours is not None
+        or request.from_phone_number_id is not None
     )
     if non_name_fields_requested and campaign.state == "completed":
         raise HTTPException(
@@ -1097,6 +1105,23 @@ async def update_campaign(
             f"campaign {campaign_id}: setting telephony_configuration_id="
             f"{request.telephony_configuration_id} (cfg={cfg.name!r})"
         )
+
+    if request.from_phone_number_id is not None:
+        # SYSEVO_CAMPAIGN_FROM_NUMBER — same checks as create_campaign.
+        target_workflow_id = request.workflow_id or campaign.workflow_id
+        pinned = await db_client.get_phone_number(request.from_phone_number_id)
+        if not pinned:
+            raise HTTPException(status_code=400, detail="phone_number_not_found")
+        if not user.is_superuser and pinned.organization_id != user.selected_organization_id:
+            raise HTTPException(status_code=404, detail="phone_number_not_found")
+        if pinned.outbound_workflow_id != target_workflow_id:
+            raise HTTPException(
+                status_code=400, detail="phone_number_not_assigned_to_agent_for_outbound"
+            )
+        if not pinned.is_active:
+            raise HTTPException(status_code=400, detail="phone_number_inactive")
+        update_kwargs["from_phone_number_id"] = request.from_phone_number_id
+        update_kwargs["telephony_configuration_id"] = pinned.telephony_configuration_id
 
     if update_kwargs:
         await db_client.update_campaign(campaign_id=campaign_id, **update_kwargs)
@@ -1524,6 +1549,31 @@ async def delete_campaign_post(
 ) -> dict:
     """Delete a campaign permanently (POST fallback for proxies that block DELETE)."""
     return await _do_delete_campaign(campaign_id, user)
+
+
+class StandingCampaignRequest(BaseModel):
+    workflow_id: int
+
+
+@router.post("/standing")
+async def ensure_standing_campaign_endpoint(
+    request: StandingCampaignRequest,
+    user: UserModel = Depends(get_user),
+):
+    """Get or create the agent's callback queue (a standing campaign)."""
+    from api.services.callbacks.standing import ensure_standing_campaign
+
+    workflow = await db_client.get_workflow_by_id(request.workflow_id)
+    if not workflow or (
+        not user.is_superuser and workflow.organization_id != user.selected_organization_id
+    ):
+        raise HTTPException(status_code=404, detail="Workflow not found")
+    campaign, created = await ensure_standing_campaign(workflow)
+    return {
+        "campaign_id": campaign.id,
+        "created": created,
+        "retry_config": campaign.retry_config,
+    }
 
 
 @router.post("/{campaign_id}/enqueue")

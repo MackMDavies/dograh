@@ -65,6 +65,13 @@ async def test_get_tool_schemas_and_handler_for_mcp(monkeypatch):
             )
 
             captured = {}
+            from api.db import db_client
+
+            monkeypatch.setattr(
+                db_client,
+                "get_workflow_run_by_id",
+                AsyncMock(return_value=MagicMock(annotations={})),
+            )
 
             class P:
                 function_name = "mcp__acme_mcp__echo"
@@ -105,6 +112,36 @@ async def test_unavailable_mcp_session_contributes_nothing(monkeypatch):
     schemas = await mgr.get_tool_schemas([tool.tool_uuid])
     assert schemas == []
     await mgr.register_handlers([tool.tool_uuid])  # must not raise
+
+
+@pytest.mark.asyncio
+async def test_internal_test_sandbox_blocks_mcp_side_effects(monkeypatch):
+    session = MagicMock()
+    session.call = AsyncMock(return_value={"status": "success"})
+    engine = MagicMock()
+    engine._workflow_run_id = 445
+    mgr = CustomToolManager(engine)
+    from api.db import db_client
+
+    monkeypatch.setattr(
+        db_client,
+        "get_workflow_run_by_id",
+        AsyncMock(return_value=MagicMock(annotations={"sysevo_test_sandbox": {"enabled": True}})),
+    )
+    results = []
+
+    class Params:
+        arguments = {"destination": "client-system"}
+
+        async def result_callback(self, result, **_kwargs):
+            results.append(result)
+
+    handler = mgr._create_mcp_handler(session, "mcp__acme__create_record")
+    await handler(Params())
+
+    session.call.assert_not_awaited()
+    assert results[0]["status"] == "blocked"
+    assert results[0]["code"] == "sandbox_adapter_unavailable"
 
 
 def test_call_timeout_secs_is_read_timeout_plus_buffer():

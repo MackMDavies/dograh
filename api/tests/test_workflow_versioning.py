@@ -19,6 +19,13 @@ from api.db.models import (
     OrganizationModel,
     UserModel,
 )
+from api.services.workflow.test_sandbox_binding import (
+    SandboxWorkflowNotFoundError,
+    make_sandbox_workflow_binding,
+    resolve_requested_sandbox_definition,
+    validate_sandbox_execution_binding,
+)
+from api.services.workflow.test_sandbox_mode import build_run_annotations
 
 # Sample workflow definitions (graph JSON)
 GRAPH_V1 = {
@@ -110,6 +117,22 @@ async def workflow_with_v1(db_session, org_and_user):
 
 
 class TestWorkflowCreation:
+    async def test_create_workflow_can_start_deactivated_for_provisioning(
+        self, db_session, org_and_user
+    ):
+        org, user = org_and_user
+        workflow = await db_session.create_workflow(
+            name="Unreleased Candidate",
+            workflow_definition=GRAPH_V1,
+            user_id=user.id,
+            organization_id=org.id,
+            status="deactivated",
+        )
+        assert workflow.status == "deactivated"
+        versions = await db_session.get_workflow_versions(workflow.id)
+        assert len(versions) == 1
+        assert versions[0].status == "published"
+
     async def test_create_workflow_produces_published_v1(
         self, db_session, org_and_user
     ):
@@ -606,3 +629,157 @@ class TestRunDefinitionBinding:
         )
 
         assert run.definition_id == draft.id
+
+    async def test_sandbox_run_can_pin_exact_published_version_with_draft_present(
+        self, db_session, workflow_with_v1
+    ):
+        """Agent QA must test the plan's published version, not an editor draft."""
+        workflow, user = workflow_with_v1
+        await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+        versions = await db_session.get_workflow_versions(workflow.id)
+        published = next(v for v in versions if v.status == "published")
+
+        run = await db_session.create_workflow_run(
+            name="Pinned Agent QA",
+            workflow_id=workflow.id,
+            mode="textchat",
+            user_id=user.id,
+            definition_version_number=published.version_number,
+        )
+
+        assert run.definition_id == published.id
+
+    async def test_sandbox_run_can_pin_exact_candidate_draft_for_regression(
+        self, db_session, workflow_with_v1
+    ):
+        """A repair regression binds to its exact draft without publishing it."""
+        workflow, user = workflow_with_v1
+        draft = await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+
+        run = await db_session.create_workflow_run(
+            name="Repair Candidate Regression",
+            workflow_id=workflow.id,
+            mode="textchat",
+            user_id=user.id,
+            definition_version_number=draft.version_number,
+            definition_version_status="draft",
+        )
+
+        assert run.definition_id == draft.id
+
+    async def test_sandbox_run_rejects_version_that_is_no_longer_published(
+        self, db_session, workflow_with_v1
+    ):
+        """A publish racing a queued test fails closed instead of testing a stale plan."""
+        workflow, user = workflow_with_v1
+        old_versions = await db_session.get_workflow_versions(workflow.id)
+        old_published = next(v for v in old_versions if v.status == "published")
+        await db_session.save_workflow_draft(
+            workflow_id=workflow.id,
+            workflow_definition=GRAPH_V2,
+        )
+        await db_session.publish_workflow_draft(workflow.id)
+
+        with pytest.raises(ValueError, match="no longer available"):
+            await db_session.create_workflow_run(
+                name="Stale Agent QA",
+                workflow_id=workflow.id,
+                mode="textchat",
+                user_id=user.id,
+                definition_version_number=old_published.version_number,
+            )
+
+
+class TestAttestedRepairLifecycle:
+    async def test_mutating_the_same_draft_row_blocks_execution_and_publication(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, user = workflow_with_v1
+        candidate, _, candidate_hash = await db_session.create_sandbox_repair_draft(
+            workflow.id, 1, "append_conciseness_guidance"
+        )
+        run = await db_session.create_workflow_run(
+            name="Isolated attestation regression",
+            workflow_id=workflow.id,
+            mode="textchat",
+            user_id=user.id,
+            definition_version_number=candidate.version_number,
+            definition_version_status="draft",
+            organization_id=workflow.organization_id,
+        )
+        annotations = build_run_annotations(
+            {},
+            {"agent_test_run_id": "11111111-1111-4111-8111-111111111111", "scenario_id": "qa"},
+            sandbox_authorized=True,
+        )
+        annotations["sysevo_test_sandbox"]["workflow_binding"] = make_sandbox_workflow_binding(
+            candidate,
+            workflow_id=workflow.id,
+            workflow_run_id=run.id,
+            run_id=annotations["agent_test_run_id"],
+            scenario_id="qa",
+            signing_secret="synthetic-test-secret",
+            expected_hash=candidate_hash,
+        )
+        await db_session.update_workflow_run(run.id, annotations=annotations)
+        bound = await db_session.get_workflow_run_by_id(run.id)
+        validate_sandbox_execution_binding(bound, bound.definition, "synthetic-test-secret")
+
+        edited = await db_session.save_workflow_draft(workflow.id, GRAPH_V3)
+        assert edited.id == candidate.id
+        assert edited.version_number == candidate.version_number
+        reloaded = await db_session.get_workflow_run_by_id(run.id)
+        with pytest.raises(ValueError, match="configuration changed"):
+            validate_sandbox_execution_binding(reloaded, reloaded.definition, "synthetic-test-secret")
+        with pytest.raises(ValueError, match="Candidate draft changed"):
+            await db_session.publish_sandbox_repair_draft(
+                workflow.id, 1, candidate.version_number, candidate_hash
+            )
+        published = next(v for v in await db_session.get_workflow_versions(workflow.id) if v.status == "published")
+        assert published.version_number == 1
+        assert published.workflow_json == GRAPH_V1
+
+    async def test_exact_candidate_publication_is_idempotent_and_keeps_test_routing_out(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, _ = workflow_with_v1
+        candidate, changed_paths, candidate_hash = await db_session.create_sandbox_repair_draft(
+            workflow.id, 1, "append_goal_completion_guidance"
+        )
+        assert changed_paths
+        first = await db_session.publish_sandbox_repair_draft(
+            workflow.id, 1, candidate.version_number, candidate_hash
+        )
+        recovered = await db_session.publish_sandbox_repair_draft(
+            workflow.id, 1, candidate.version_number, candidate_hash
+        )
+        assert first.id == recovered.id == candidate.id
+        assert recovered.status == "published"
+        assert "sysevo_test_sandbox" not in recovered.workflow_json
+        assert "agent_test_run_id" not in recovered.workflow_json
+        versions = await db_session.get_workflow_versions(workflow.id)
+        assert len([version for version in versions if version.status == "published"]) == 1
+        assert not any(version.status == "draft" for version in versions)
+
+    async def test_candidate_resolution_rejects_another_organization(
+        self, db_session, workflow_with_v1
+    ):
+        workflow, _ = workflow_with_v1
+        candidate, _, candidate_hash = await db_session.create_sandbox_repair_draft(
+            workflow.id, 1, "append_conciseness_guidance"
+        )
+        with pytest.raises(SandboxWorkflowNotFoundError):
+            await resolve_requested_sandbox_definition(
+                db_session,
+                workflow_id=workflow.id,
+                organization_id=workflow.organization_id + 1,
+                version_number=candidate.version_number,
+                version_kind="draft",
+                expected_hash=candidate_hash,
+            )

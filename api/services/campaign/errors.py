@@ -36,3 +36,11 @@ class SuppressedNumberError(Exception):
         super().__init__(
             f"Phone number is suppressed for workflow {workflow_id}; refusing to dial."
         )
+
+
+class PhoneNumberDailyLimitError(PhoneNumberPoolExhaustedError):
+    """Saved number limits exhausted; defer contacts instead of failing them."""
+
+    def __init__(self, organization_id: int):
+        super().__init__(organization_id)
+        self.args = ('Daily call limits reached for the available phone numbers',)

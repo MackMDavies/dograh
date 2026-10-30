@@ -64,6 +64,58 @@ def _redis_url() -> str:
     return os.environ.get("REDIS_URL") or "redis://redis:6379"
 
 
+# Internal (server-published) command: the dialer's extra-answer chain hands a person
+# the agent is talking to back to the rep who just joined their conference. It is never
+# accepted from the portal (validate_command does not know it) and only ever moves this
+# run's OWN call into that call's own room, call-<call SID>.
+DIALER_TRANSFER = "dialer_transfer"
+DIALER_TRANSFER_TOOL_ID = "dialer-extra-answer"
+
+
+# Internal (server-published): store the agent's summary for the rep's card before the
+# transfer-back offer is written. Only acted on by a dialer extra-answer run.
+DIALER_SUMMARY = "dialer_summary"
+
+
+# Internal (server-published): a key the caller pressed on an Asterisk (ARI) call. ARI
+# reports presses as events to the ari_manager process, not in the media stream, so
+# they reach the pipeline here. Never accepted from the portal.
+CALLER_KEYPAD = "caller_keypad"
+_CALLER_KEYS = frozenset("0123456789*#")
+
+
+def caller_keypad_command(key: str) -> dict[str, Any]:
+    return {"type": CALLER_KEYPAD, "key": key}
+
+
+def dialer_summary_command() -> dict[str, Any]:
+    return {"type": DIALER_SUMMARY}
+
+
+def dialer_transfer_command(*, conference_name: str, to_name: str, to_user_id: str) -> dict[str, Any]:
+    return {
+        "type": DIALER_TRANSFER, "conference_name": conference_name,
+        "to_name": to_name, "to_user_id": to_user_id,
+    }
+
+
+def conversation_summary(messages: Any, *, limit: int = 900) -> str:
+    """The last few spoken turns, for the rep's card when the agent hands over."""
+    lines: list[str] = []
+    for message in messages if isinstance(messages, list) else []:
+        if not isinstance(message, dict) or message.get("role") not in {"user", "assistant"}:
+            continue
+        content = message.get("content")
+        if isinstance(content, list):
+            content = " ".join(
+                str(part.get("text") or "") for part in content if isinstance(part, dict)
+            )
+        text = " ".join(str(content or "").split())
+        if not text or text.startswith("[Private instruction"):
+            continue
+        lines.append(("Them: " if message["role"] == "user" else "Agent: ") + text)
+    summary = "\n".join(lines[-6:])
+    return summary[-limit:]
 class SupervisorCommandError(ValueError):
     """A command that can never be carried out (bad input), as opposed to a failure."""
 
@@ -196,6 +248,24 @@ class SupervisorControl:
                 await client.aclose()
 
     async def _handle(self, command: dict[str, Any]) -> None:
+        if isinstance(command, dict) and command.get("type") == CALLER_KEYPAD:
+            key = str(command.get("key") or "")
+            if key in _CALLER_KEYS:
+                with suppress(Exception):
+                    await self._engine.inject_caller_key(key)
+            return
+        if isinstance(command, dict) and command.get("type") == DIALER_SUMMARY:
+            try:
+                await self.dialer_summary()
+            except Exception as exc:  # noqa: BLE001
+                logger.info(f"dialer summary failed for run {self._run_id}: {exc}")
+            return
+        if isinstance(command, dict) and command.get("type") == DIALER_TRANSFER:
+            try:
+                await self.dialer_transfer(command)
+            except Exception as exc:  # noqa: BLE001
+                logger.error(f"dialer transfer-back failed for run {self._run_id}: {exc}")
+            return
         try:
             command = validate_command(command)
         except SupervisorCommandError:
@@ -221,6 +291,88 @@ class SupervisorControl:
         )
         logger.info(f"supervisor whisper delivered to run {self._run_id}")
 
+    def _messages(self) -> Any:
+        engine = self._engine
+        if getattr(engine, "context", None) is not None:
+            with suppress(Exception):
+                return engine.context.get_messages()
+        return []
+
+    async def _dialer_call_id(self) -> str | None:
+        from api.db import db_client
+
+        run = await db_client.get_workflow_run_by_id(self._run_id)
+        context = (run.initial_context or {}) if run else {}
+        call_id = str(((run.gathered_context or {}) if run else {}).get("call_id") or "")
+        if not run or not context.get("dialer_extra_answer_id") or not call_id \
+                or context.get("dialer_original_call_id") != call_id:
+            return None
+        return call_id
+
+    async def dialer_summary(self) -> None:
+        """Store a short summary of this extra-answer call (key facts, or an LLM's)."""
+        from api.services.telephony.dialer import extra_answer
+
+        call_id = await self._dialer_call_id()
+        if not call_id:
+            return
+        summary = await extra_answer.agent_summary(self._messages())
+        if summary:
+            await extra_answer.set_summary(call_id, summary)
+
+    async def dialer_transfer(self, command: dict[str, Any]) -> None:
+        """Hand this agent call to the rep who joined call-<call SID> (extra answer)."""
+        from pipecat.frames.frames import TTSSpeakFrame
+        from pipecat.utils.enums import EndTaskReason
+
+        from api.db import db_client
+        from api.services.telephony.call_transfer_manager import get_call_transfer_manager
+        from api.services.telephony.dialer import extra_answer
+        from api.services.telephony.transfer_event_protocol import TransferContext
+
+        if self._takeover_running:
+            return
+        run = await db_client.get_workflow_run_by_id(self._run_id)
+        context = (run.initial_context or {}) if run else {}
+        call_id = str(((run.gathered_context or {}) if run else {}).get("call_id") or "")
+        conference_name = str(command.get("conference_name") or "")
+        if (
+            not run or not context.get("dialer_extra_answer_id") or not call_id
+            or context.get("dialer_original_call_id") != call_id
+            or conference_name != f"call-{call_id}"
+        ):
+            logger.warning(f"dialer transfer-back refused for run {self._run_id}")
+            return
+        self._takeover_running = True
+        engine = self._engine
+        try:
+            summary = await extra_answer.agent_summary(self._messages())
+            if summary:
+                await extra_answer.set_summary(call_id, summary)
+            manager = await get_call_transfer_manager()
+            await manager.store_transfer_context(TransferContext(
+                transfer_id=str(uuid.uuid4()), call_sid=None, target_number="",
+                tool_uuid=DIALER_TRANSFER_TOOL_ID, original_call_sid=call_id,
+                conference_name=conference_name, initiated_at=time.time(),
+                workflow_run_id=self._run_id,
+            ))
+            task = engine.task
+            if task:
+                await task.queue_frame(TTSSpeakFrame(
+                    extra_answer.transfer_line(str(command.get("to_name") or "")), append_to_context=False,
+                ))
+            # The serializer's transfer strategy moves the caller into the conference once
+            # the line above has been spoken; the rep is already in it. The transfer is only
+            # recorded when the person's leg joins that room (dialer_extra_answer
+            # .on_prospect_joined); if it never does, the worker recovers it.
+            await engine.end_call_with_reason(EndTaskReason.TRANSFER_CALL.value, abort_immediately=False)
+        except Exception:
+            # Nothing was handed over: let the worker try again rather than leave the rep
+            # waiting in the room.
+            self._takeover_running = False
+            await extra_answer.release_transfer(call_id)
+            raise
+        logger.info(f"dialer extra answer handover started from run {self._run_id}")
     async def take_over(self, destination: str) -> None:
         if self._takeover_running:
             return

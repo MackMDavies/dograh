@@ -2,7 +2,8 @@ import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import func, update
+from sqlalchemy import JSON, Text, cast, func, literal, or_, text, update
+from sqlalchemy.dialects.postgresql import JSONB, array
 from sqlalchemy.future import select
 from sqlalchemy.orm import joinedload, selectinload
 
@@ -15,12 +16,66 @@ from api.db.models import (
     WorkflowModel,
     WorkflowRunModel,
 )
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.enums import CallType, StorageBackend
 from api.schemas.workflow import WorkflowRunResponseSchema
+from api.services.workflow.studio_test_entry import test_entry_annotations
 from api.services.workflow.variable_resolution import sanitize_context_variables
 
 
 class WorkflowRunClient(BaseDBClient):
+    async def save_agent_test_voice_result(
+        self, run_id, workflow_id, organization_id, session_id, result, *, tool_trace=None, audio_evidence=None
+    ):
+        """Atomically add immutable private evidence without replacing annotations."""
+        async with self.async_session() as session:
+            annotations = cast(WorkflowRunModel.annotations, JSONB)
+            saved = annotations.op("->")("agent_test_voice_result")
+            updated_annotations = func.jsonb_set(
+                annotations, array(["agent_test_voice_result"], type_=Text), literal(result, JSONB), True,
+            )
+            trace_guards = []
+            if tool_trace is not None:
+                saved_trace = annotations.op("->")("agent_test_voice_tool_trace")
+                trace_guards.append(or_(saved_trace.is_(None), saved_trace == literal(tool_trace, JSONB)))
+                updated_annotations = func.jsonb_set(
+                    updated_annotations, array(["agent_test_voice_tool_trace"], type_=Text),
+                    literal(tool_trace, JSONB), True,
+                )
+            if audio_evidence is not None:
+                saved_audio = annotations.op("->")("agent_test_voice_audio_evidence")
+                trace_guards.append(or_(saved_audio.is_(None), saved_audio == literal(audio_evidence, JSONB)))
+                updated_annotations = func.jsonb_set(
+                    updated_annotations, array(["agent_test_voice_audio_evidence"], type_=Text),
+                    literal(audio_evidence, JSONB), True,
+                )
+            written = await session.execute(
+                update(WorkflowRunModel)
+                .where(
+                    WorkflowRunModel.id == run_id,
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    WorkflowRunModel.workflow_id.in_(
+                        select(WorkflowModel.id).where(
+                            WorkflowModel.organization_id == organization_id
+                        )
+                    ),
+                    annotations.contains({
+                        "sysevo_test_sandbox": {
+                            "enabled": True,
+                            "voice_session_id": session_id,
+                            "organization_id": organization_id,
+                        }
+                    }),
+                    or_(saved.is_(None), saved == literal(result, JSONB)),
+                    *trace_guards,
+                )
+                .values(annotations=cast(updated_annotations, JSON))
+                .returning(WorkflowRunModel.id)
+            )
+            exists = written.scalar_one_or_none() is not None
+            await session.commit()
+            return exists
+
     async def create_workflow_run(
         self,
         name: str,
@@ -34,10 +89,15 @@ class WorkflowRunClient(BaseDBClient):
         campaign_id: int = None,
         queued_run_id: int = None,
         use_draft: bool = False,
-        definition_id: int | None = None,
+        definition_version_number: int | None = None,
+        definition_version_status: str = "published",
         organization_id: int | None = None,
         bypass_user_check: bool = False,
         api_key_id: int | None = None,
+        definition_id: int | None = None,
+        idempotency_key: str | None = None,
+        annotations: dict | None = None,
+        test_start_node_id: str | None = None,
     ) -> WorkflowRunModel:
         async with self.async_session() as session:
             workflow_query = select(WorkflowModel).options(joinedload(WorkflowModel.user)).where(
@@ -55,19 +115,62 @@ class WorkflowRunClient(BaseDBClient):
             if not workflow:
                 raise ValueError(f"Workflow with ID {workflow_id} not found")
 
-            # Resolve which definition to bind to this run
+            if idempotency_key is not None:
+                if not organization_id or not idempotency_key or len(idempotency_key) > 200:
+                    raise ValueError("Idempotent workflow creation requires an organization and bounded key")
+                # Cross-worker serialization lives in Postgres. Holding a
+                # Python lock would not protect a retried webhook on another worker.
+                await session.execute(text("select pg_advisory_xact_lock(hashtextextended(:key, 610184))"), {
+                    "key": f"workflow-run:{organization_id}:{workflow_id}:{idempotency_key}",
+                })
+                existing = (await session.execute(select(WorkflowRunModel).where(
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    WorkflowRunModel.initial_context.op("->>")("execution_idempotency_key") == idempotency_key,
+                ))).scalars().first()
+                if existing:
+                    return existing
+                initial_context = {**(initial_context or {}), "execution_idempotency_key": idempotency_key}
+
+            # Resolve which definition to bind to this run. Internal sandbox
+            # rehearsals may pin an exact published or draft version; validate
+            # that the definition belongs to this workflow before binding it.
             target_def = None
 
+            if definition_id is not None and definition_version_number is not None:
+                raise ValueError("Specify a definition ID or version number, not both")
+
             if definition_id is not None:
-                exact_result = await session.execute(
+                if use_draft:
+                    raise ValueError("An exact workflow definition cannot be combined with draft selection")
+                definition_result = await session.execute(
                     select(WorkflowDefinitionModel).where(
                         WorkflowDefinitionModel.id == definition_id,
                         WorkflowDefinitionModel.workflow_id == workflow.id,
                     )
                 )
-                target_def = exact_result.scalars().first()
+                target_def = definition_result.scalars().first()
                 if target_def is None:
-                    raise ValueError("Pinned workflow definition not found")
+                    raise ValueError(
+                        f"Workflow definition {definition_id} not found for workflow {workflow_id}"
+                    )
+
+            elif definition_version_number is not None:
+                if use_draft:
+                    raise ValueError("An exact workflow version cannot be combined with draft selection")
+                if definition_version_status not in {"published", "draft"}:
+                    raise ValueError("An exact workflow version must be published or a candidate draft")
+                version_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.workflow_id == workflow.id,
+                        WorkflowDefinitionModel.version_number == definition_version_number,
+                        WorkflowDefinitionModel.status == definition_version_status,
+                    )
+                )
+                target_def = version_result.scalars().first()
+                if target_def is None:
+                    raise ValueError(
+                        f"{definition_version_status.title()} workflow version {definition_version_number} is no longer available"
+                    )
 
             if target_def is None and use_draft:
                 # For test calls: prefer draft if it exists, fall back to published
@@ -122,6 +225,7 @@ class WorkflowRunClient(BaseDBClient):
                 storage_backend=current_backend.value,
                 call_type=call_type.value,
                 api_key_id=api_key_id,
+                annotations=test_entry_annotations(mode, test_start_node_id, target_def.workflow_json if target_def else workflow.workflow_definition, annotations),
             )
             session.add(new_run)
             try:
@@ -131,6 +235,44 @@ class WorkflowRunClient(BaseDBClient):
                 raise e
             await session.refresh(new_run)
         return new_run
+
+    async def claim_dialer_agent_media(self, run_id: int, organization_id: int, call_id: str) -> bool:
+        """A call-scoped, authenticated media stream may start a run only once."""
+        async with self.async_session() as session:
+            result = await session.execute(update(WorkflowRunModel).where(
+                WorkflowRunModel.id == run_id,
+                WorkflowRunModel.workflow_id.in_(select(WorkflowModel.id).where(WorkflowModel.organization_id == organization_id)),
+                WorkflowRunModel.initial_context.op("->>")("dialer_original_call_id") == call_id,
+                WorkflowRunModel.state == "initialized",
+                WorkflowRunModel.is_completed.is_not(True),
+            ).values(
+                state="running",
+                gathered_context=cast(func.jsonb_set(
+                    func.coalesce(
+                        func.nullif(cast(WorkflowRunModel.gathered_context, JSONB), literal(None, JSONB)),
+                        literal({}, JSONB),
+                    ),
+                    array(["dialer_media_authenticated"], type_=Text),
+                    literal(True, JSONB),
+                    True,
+                ), JSON),
+            ).returning(WorkflowRunModel.id))
+            claimed = result.scalar_one_or_none() is not None
+            await session.commit()
+            return claimed
+
+    async def finish_unstarted_dialer_agent_run(self, run_id: int, organization_id: int, call_id: str) -> bool:
+        """Release a prepared execution when its existing call ended before media."""
+        async with self.async_session() as session:
+            result = await session.execute(update(WorkflowRunModel).where(
+                WorkflowRunModel.id == run_id,
+                WorkflowRunModel.workflow_id.in_(select(WorkflowModel.id).where(WorkflowModel.organization_id == organization_id)),
+                WorkflowRunModel.initial_context.op("->>")("dialer_original_call_id") == call_id,
+                WorkflowRunModel.state == "initialized",
+            ).values(state="completed",is_completed=True).returning(WorkflowRunModel.id))
+            finished = result.scalar_one_or_none() is not None
+            await session.commit()
+            return finished
 
     async def get_all_workflow_runs(self) -> list[WorkflowRunModel]:
         async with self.async_session() as session:
@@ -224,7 +366,11 @@ class WorkflowRunClient(BaseDBClient):
             return formatted_runs, total_count
 
     async def get_workflow_run(
-        self, run_id: int, user_id: int = None, organization_id: int = None
+        self,
+        run_id: int,
+        user_id: int = None,
+        organization_id: int = None,
+        include_sandbox: bool = False,
     ) -> WorkflowRunModel | None:
         async with self.async_session() as session:
             query = (
@@ -248,6 +394,8 @@ class WorkflowRunClient(BaseDBClient):
             else:
                 query = query.where(WorkflowRunModel.id == run_id)
 
+            if not include_sandbox:
+                query = query.where(customer_visible_workflow_run())
             result = await session.execute(query)
             return result.scalars().first()
 
@@ -401,7 +549,10 @@ class WorkflowRunClient(BaseDBClient):
             base_query = (
                 select(WorkflowRunModel)
                 .join(WorkflowModel, WorkflowRunModel.workflow_id == WorkflowModel.id)
-                .where(WorkflowRunModel.workflow_id == workflow_id)
+                .where(
+                    WorkflowRunModel.workflow_id == workflow_id,
+                    customer_visible_workflow_run(),
+                )
             )
 
             if organization_id:
@@ -571,7 +722,10 @@ class WorkflowRunClient(BaseDBClient):
         """
         async with self.async_session() as session:
             result = await session.execute(
-                select(WorkflowRunModel).where(WorkflowRunModel.id == workflow_run_id)
+                select(WorkflowRunModel).where(
+                    WorkflowRunModel.id == workflow_run_id,
+                    customer_visible_workflow_run(),
+                )
             )
             run = result.scalars().first()
             if not run:
@@ -608,7 +762,8 @@ class WorkflowRunClient(BaseDBClient):
         async with self.async_session() as session:
             result = await session.execute(
                 select(WorkflowRunModel).where(
-                    WorkflowRunModel.public_access_token == token
+                    WorkflowRunModel.public_access_token == token,
+                    customer_visible_workflow_run(),
                 )
             )
             return result.scalars().first()

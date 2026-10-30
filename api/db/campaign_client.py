@@ -9,6 +9,7 @@ from sqlalchemy.future import select
 from api.db.base_client import BaseDBClient
 from api.db.filters import apply_workflow_run_filters, get_workflow_run_order_clause
 from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
+from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.schemas.workflow import WorkflowRunResponseSchema
 
 
@@ -100,6 +101,21 @@ class CampaignClient(BaseDBClient):
                 raise e
             await session.refresh(campaign)
             return campaign
+
+    async def get_standing_campaign_for_workflow(self, workflow_id: int) -> Optional[CampaignModel]:
+        """The workflow's callback queue (services/callbacks/standing.py), if it has one."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(CampaignModel)
+                .where(
+                    CampaignModel.workflow_id == workflow_id,
+                    CampaignModel.is_standing.is_(True),
+                    CampaignModel.state == "running",
+                )
+                .order_by(CampaignModel.id)
+                .limit(1)
+            )
+            return result.scalar_one_or_none()
 
     async def get_campaigns(
         self,
@@ -896,6 +912,7 @@ class CampaignClient(BaseDBClient):
         async with self.async_session() as session:
             conditions = [
                 WorkflowRunModel.is_completed.is_(True),
+                customer_visible_workflow_run(),
                 WorkflowRunModel.cost_info["call_duration_seconds"]
                 .as_string()
                 .isnot(None),

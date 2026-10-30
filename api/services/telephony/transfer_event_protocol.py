@@ -5,7 +5,7 @@ across multiple API server instances.
 """
 
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 from enum import Enum
 from typing import Any, Dict, Optional
 
@@ -72,6 +72,16 @@ class TransferContext:
     # conference_id: set by providers that seed the conference on answer (Telnyx).
     workflow_run_id: Optional[int] = None
     conference_id: Optional[str] = None
+    # Warm transfer (services/telephony/warm_transfer.py): the colleague hears the
+    # introduction and must press 1; accepted/resolved stop late status callbacks
+    # from reporting a second outcome.
+    warm: bool = False
+    introduction: Optional[str] = None
+    answered: bool = False
+    accepted: bool = False
+    resolved: bool = False
+    # Three-way: the colleague joins the caller and the agent; nobody is handed off.
+    three_way: bool = False
 
     def to_json(self) -> str:
         """Convert context to JSON string."""
@@ -79,8 +89,9 @@ class TransferContext:
 
     @classmethod
     def from_json(cls, data: str) -> "TransferContext":
-        """Create context from JSON string."""
-        return cls(**json.loads(data))
+        """Create context from JSON string (ignoring fields this version doesn't know)."""
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in json.loads(data).items() if k in known})
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""

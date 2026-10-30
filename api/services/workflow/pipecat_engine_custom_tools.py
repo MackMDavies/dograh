@@ -7,11 +7,13 @@ during workflow execution.
 from __future__ import annotations
 
 import asyncio
+import os
 import re
 import time
 import uuid
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
+import httpx
 from loguru import logger
 from pipecat.adapters.schemas.function_schema import FunctionSchema
 from pipecat.frames.frames import (
@@ -26,7 +28,16 @@ from api.enums import ToolCategory, WorkflowRunMode
 from api.services.pipecat.audio_playback import play_audio, play_audio_loop
 from api.services.telephony.call_transfer_manager import get_call_transfer_manager
 from api.services.telephony.factory import get_telephony_provider_for_run
-from api.services.telephony.transfer_event_protocol import TransferContext
+from api.services.telephony.transfer_event_protocol import (
+    TransferContext,
+    TransferEventType,
+)
+from api.services.telephony.warm_transfer import clean_introduction, masked_destination
+from api.services.workflow.test_sandbox_mode import (
+    is_sandbox_test_run,
+    resolve_sandbox_http_action,
+    sandbox_test_run_context,
+)
 from api.services.workflow.tools.calculator import get_calculator_tools, safe_calculator
 from api.services.workflow.tools.custom_tool import (
     execute_http_tool,
@@ -37,6 +48,17 @@ from api.services.workflow.tools.custom_tool import (
 if TYPE_CHECKING:
     from api.services.workflow.mcp_tool_session import McpToolSession
     from api.services.workflow.pipecat_engine import PipecatEngine
+
+
+_E164 = re.compile(r"^\+[1-9]\d{1,14}$")
+_SIP_ENDPOINT = re.compile(r"^(PJSIP|SIP)\/[\w\-\.@]+$")
+
+
+def _valid_transfer_destination(destination: str, mode: str) -> bool:
+    """E.164 everywhere; Asterisk (ARI) lines also accept SIP endpoints."""
+    if _E164.match(destination):
+        return True
+    return mode == WorkflowRunMode.ARI.value and bool(_SIP_ENDPOINT.match(destination))
 
 
 def get_function_schema(
@@ -74,6 +96,93 @@ class CustomToolManager:
 
     def __init__(self, engine: "PipecatEngine") -> None:
         self._engine = engine
+        self._sandbox_mode: bool | None = None
+
+    async def _is_sandbox_test_run(self) -> bool:
+        """Read the server-owned run marker before any tool can cause side effects."""
+        if self._sandbox_mode is not None:
+            return self._sandbox_mode
+        run_id = getattr(self._engine, "_workflow_run_id", None)
+        if not run_id:
+            return False
+        workflow_run = await db_client.get_workflow_run_by_id(run_id)
+        if workflow_run is None:
+            raise RuntimeError("Cannot verify test sandbox mode for this workflow run")
+        self._sandbox_mode = is_sandbox_test_run(workflow_run)
+        return self._sandbox_mode
+
+    async def _execute_sandbox_action(
+        self, tool: Any, arguments: dict[str, Any] | None
+    ) -> dict[str, Any]:
+        """Route only allowlisted provider actions to Sysevo's isolated adapters."""
+        workflow_run_id = getattr(self._engine, "_workflow_run_id", None)
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+        context = sandbox_test_run_context(workflow_run) if workflow_run else None
+        if not context:
+            return self._sandbox_action_blocked("missing_test_context")
+
+        config = (getattr(tool, "definition", None) or {}).get("config", {})
+        method = str(config.get("method", "GET")).upper()
+        action = resolve_sandbox_http_action(str(config.get("url", "")), method)
+        # Generic mutating HTTP tools go to the internal field-mapping ledger;
+        # the configured client URL is never contacted in a sandbox session.
+        if action is None:
+            return self._sandbox_action_blocked("unsupported_sandbox_adapter")
+
+        endpoint = "https://rdiwzxtibglitvtextzs.supabase.co/functions/v1/agent-test-sandbox-execute"
+        secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+        if not secret:
+            return self._sandbox_action_blocked("sandbox_service_auth_unavailable")
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    endpoint,
+                    headers={"x-sysevo-secret": secret},
+                    json={
+                        "test_run_id": context["agent_test_run_id"],
+                        "scenario_id": context["scenario_id"],
+                        "workflow_id": int(
+                            getattr(workflow_run, "workflow_id", 0) or 0
+                        ),
+                        "workflow_run_id": int(workflow_run_id),
+                        "action": action,
+                        "arguments": {}
+                        if action in {"send_test_email", "send_test_sms"}
+                        else (arguments or {}),
+                        "required_fields": [
+                            str(parameter.get("name"))
+                            for parameter in (config.get("parameters", []) or [])
+                            if isinstance(parameter, dict)
+                            and parameter.get("required") is True
+                            and isinstance(parameter.get("name"), str)
+                        ]
+                        if action == "send_test_webhook"
+                        else [],
+                    },
+                )
+            result = response.json()
+            if response.status_code >= 400:
+                return {
+                    "status": result.get("status", "blocked"),
+                    "code": result.get("code", "sandbox_action_rejected"),
+                    "message": result.get(
+                        "message", "The isolated provider action could not be verified."
+                    ),
+                    "client_integration_called": False,
+                }
+            return result
+        except Exception as error:
+            logger.warning("Isolated provider action failed: {}", type(error).__name__)
+            return self._sandbox_action_blocked("sandbox_adapter_unavailable")
+
+    @staticmethod
+    def _sandbox_action_blocked(action: str) -> dict[str, str]:
+        return {
+            "status": "blocked",
+            "code": "sandbox_adapter_unavailable",
+            "action": action,
+            "message": "No isolated action adapter is connected. The client integration was not called.",
+        }
 
     async def _play_config_message(
         self, config: dict, *, append_to_context: bool = False
@@ -269,7 +378,7 @@ class CustomToolManager:
                     for fs in mcp_schemas:
                         self._engine.llm.register_function(
                             fs.name,
-                            self._create_mcp_handler(session, fs.name),
+                            self._with_hold_music(self._create_mcp_handler(session, fs.name)),
                             timeout_secs=session.call_timeout_secs,
                         )
                     logger.debug(
@@ -319,9 +428,52 @@ class CustomToolManager:
                 "timeout_ms", 5000
             )
             timeout_secs = float(timeout_ms) / 1000
-            handler = self._create_http_tool_handler(tool, function_name)
+            handler = self._with_hold_music(self._create_http_tool_handler(tool, function_name))
 
         return handler, timeout_secs
+
+    def _with_hold_music(self, handler):
+        """Phone tools "hold": a lookup still running after a moment plays hold music
+        to the caller until it returns, instead of dead air."""
+        from api.services.phone_tools.builtin import HOLD_AFTER_SECONDS
+
+        engine = self._engine
+
+        async def held(function_call_params: FunctionCallParams) -> None:
+            if not engine.hold_music_allowed():
+                await handler(function_call_params)
+                return
+            finished = asyncio.Event()
+            stop_music = asyncio.Event()
+
+            async def hold() -> None:
+                try:
+                    await asyncio.wait_for(finished.wait(), timeout=HOLD_AFTER_SECONDS)
+                    return
+                except asyncio.TimeoutError:
+                    pass
+                await engine.log_phone_tool_event("hold", outcome="started")
+                sample_rate = (
+                    engine._audio_config.transport_out_sample_rate if engine._audio_config else 8000
+                )
+                await play_audio_loop(
+                    stop_event=stop_music,
+                    sample_rate=sample_rate,
+                    queue_frame=engine._transport_output.queue_frame,
+                )
+
+            music = asyncio.create_task(hold())
+            try:
+                await handler(function_call_params)
+            finally:
+                finished.set()
+                stop_music.set()
+                try:
+                    await music
+                except Exception as e:  # noqa: BLE001 -- the music must never fail the lookup
+                    logger.warning(f"hold music failed: {e}")
+
+        return held
 
     def _register_calculator_handler(self) -> None:
         """Register the built-in calculator function with the LLM."""
@@ -355,9 +507,18 @@ class CustomToolManager:
             function_call_params: FunctionCallParams,
         ) -> None:
             logger.info(f"HTTP Tool EXECUTED: {function_name}")
-            logger.info(f"Arguments: {function_call_params.arguments}")
 
             try:
+                if await self._is_sandbox_test_run():
+                    await function_call_params.result_callback(
+                        await self._execute_sandbox_action(
+                            tool, function_call_params.arguments
+                        )
+                    )
+                    return
+
+                logger.info(f"Arguments: {function_call_params.arguments}")
+
                 # Queue custom message before executing the API call
                 # Queue custom message (text or audio) before executing the API call
                 config = tool.definition.get("config", {}) if tool.definition else {}
@@ -431,8 +592,13 @@ class CustomToolManager:
             function_call_params: FunctionCallParams,
         ) -> None:
             logger.info(f"MCP Tool EXECUTED: {function_name}")
-            logger.info(f"Arguments: {function_call_params.arguments}")
             try:
+                if await self._is_sandbox_test_run():
+                    await function_call_params.result_callback(
+                        self._sandbox_action_blocked(function_name)
+                    )
+                    return
+                logger.info(f"Arguments: {function_call_params.arguments}")
                 result = await session.call(
                     function_name, function_call_params.arguments or {}
                 )
@@ -541,6 +707,12 @@ class CustomToolManager:
                 workflow_run = await db_client.get_workflow_run_by_id(
                     self._engine._workflow_run_id
                 )
+                if is_sandbox_test_run(workflow_run):
+                    await function_call_params.result_callback(
+                        self._sandbox_action_blocked(function_name),
+                        properties=properties,
+                    )
+                    return
                 if workflow_run.mode == WorkflowRunMode.TEXTCHAT.value:
                     textchat_error_result = {
                         "status": "failed",
@@ -580,40 +752,26 @@ class CustomToolManager:
                     )
                     return
 
-                # Validate destination format based on workflow run mode
-                if workflow_run.mode == WorkflowRunMode.ARI.value:
-                    # For ARI provider, also accept SIP endpoints
-                    SIP_ENDPOINT_REGEX = r"^(PJSIP|SIP)\/[\w\-\.@]+$"
-                    E164_PHONE_REGEX = r"^\+[1-9]\d{1,14}$"
+                if not _valid_transfer_destination(destination, workflow_run.mode):
+                    validation_error_result = {
+                        "status": "failed",
+                        "message": "I'm sorry, but the transfer destination appears to be invalid. Please contact support to verify the transfer settings.",
+                        "action": "transfer_failed",
+                        "reason": "invalid_destination",
+                    }
+                    await self._handle_transfer_result(
+                        validation_error_result, function_call_params, properties
+                    )
+                    return
 
-                    is_valid_sip = re.match(SIP_ENDPOINT_REGEX, destination)
-                    is_valid_e164 = re.match(E164_PHONE_REGEX, destination)
-
-                    if not (is_valid_sip or is_valid_e164):
-                        validation_error_result = {
-                            "status": "failed",
-                            "message": "I'm sorry, but the transfer destination appears to be invalid. Please contact support to verify the transfer settings.",
-                            "action": "transfer_failed",
-                            "reason": "invalid_destination",
-                        }
-                        await self._handle_transfer_result(
-                            validation_error_result, function_call_params, properties
-                        )
-                        return
-                else:
-                    # For non-ARI providers (Twilio, etc), use E.164 validation
-                    E164_PHONE_REGEX = r"^\+[1-9]\d{1,14}$"
-                    if not re.match(E164_PHONE_REGEX, destination):
-                        validation_error_result = {
-                            "status": "failed",
-                            "message": "I'm sorry, but the transfer phone number appears to be invalid. Please contact support to verify the transfer settings.",
-                            "action": "transfer_failed",
-                            "reason": "invalid_destination",
-                        }
-                        await self._handle_transfer_result(
-                            validation_error_result, function_call_params, properties
-                        )
-                        return
+                # A backup number is tried when the first person does not take the call.
+                destinations = [destination]
+                fallback = str(config.get("fallback_destination") or "").strip()
+                if fallback and fallback != destination:
+                    if _valid_transfer_destination(fallback, workflow_run.mode):
+                        destinations.append(fallback)
+                    else:
+                        logger.warning(f"Ignoring invalid backup transfer number on tool {tool.tool_uuid}")
 
                 played = await self._play_config_message(config)
                 if played:
@@ -648,54 +806,48 @@ class CustomToolManager:
                     )
                     return
 
-                original_call_sid = workflow_run.gathered_context.get("call_id")
+                # Warm transfer: the colleague hears the agent's introduction and must
+                # press 1. Carriers that can't read it to them keep the cold transfer.
+                introduction = None
+                mode = config.get("transfer_mode")
+                # SIP lines join the colleague in the call's own bridge; stream carriers
+                # dial them as a second media stream that Dograh mixes in.
+                companion = (
+                    mode == "three_way"
+                    and not provider.supports_three_way()
+                    and provider.supports_companion()
+                    and self._engine.companion_available()
+                )
+                three_way = mode == "three_way" and (provider.supports_three_way() or companion)
+                if mode == "three_way" and not three_way:
+                    logger.info(
+                        f"{type(provider).__name__} cannot hold a three-way call; transferring warm"
+                    )
+                    mode = "warm"
+                if mode == "warm":
+                    if provider.supports_warm_transfer():
+                        introduction = clean_introduction(
+                            (function_call_params.arguments or {}).get("introduction")
+                        ) or "A caller is waiting to speak with you."
+                    else:
+                        logger.info(
+                            f"{type(provider).__name__} cannot introduce the caller; "
+                            "transferring without an introduction"
+                        )
 
-                # Generate a unique transfer ID for tracking this transfer
-                transfer_id = str(uuid.uuid4())
+                original_call_sid = workflow_run.gathered_context.get("call_id")
 
                 # Compute conference name from original call SID
                 conference_name = f"transfer-{original_call_sid}"
 
-                # Store initial transfer context in Redis before provider call to avoid race condition
-                call_transfer_manager = await get_call_transfer_manager()
-                transfer_context = TransferContext(
-                    transfer_id=transfer_id,
-                    call_sid=None,  # Will be updated after provider response
-                    target_number=destination,
-                    tool_uuid=tool.tool_uuid,
-                    original_call_sid=original_call_sid,
-                    conference_name=conference_name,
-                    initiated_at=time.time(),
-                    workflow_run_id=self._engine._workflow_run_id,
-                )
-                await call_transfer_manager.store_transfer_context(transfer_context)
-
                 # Mute the pipeline
                 self._engine.set_mute_pipeline(True)
 
-                # Initiate transfer via provider with inline TwiML
-                transfer_result = await provider.transfer_call(
-                    destination=destination,
-                    transfer_id=transfer_id,
-                    conference_name=conference_name,
-                    timeout=timeout_seconds,
-                )
-
-                call_sid = transfer_result.get("call_sid")
-                logger.info(f"Transfer call initiated successfully: {call_sid}")
-
-                # Update transfer context with actual call_sid from provider response
-                transfer_context.call_sid = call_sid
-                await call_transfer_manager.store_transfer_context(transfer_context)
-
-                # Wait for status callback completion using Redis pub/sub
-                logger.info(
-                    f"Transfer call initiated for {destination} (transfer_id={transfer_id}), waiting for completion..."
-                )
-
-                # Start hold music during transfer waiting period
+                # Start hold music for the whole transfer, backup number included
                 hold_music_stop_event = asyncio.Event()
                 hold_music_task = None
+                transfer_event = None
+                last_reason = "timeout"
 
                 try:
                     # Use audio config for sample rate (set during pipeline setup)
@@ -718,13 +870,39 @@ class CustomToolManager:
                         )
                     )
 
-                    # Wait for transfer completion using Redis pub/sub
-                    logger.info("Waiting for transfer completion via Redis pub/sub...")
-                    transfer_event = (
-                        await call_transfer_manager.wait_for_transfer_completion(
-                            transfer_id, timeout_seconds
+                    for target in destinations:
+                        transfer_event, reason = await self._dial_transfer_destination(
+                            provider=provider,
+                            tool=tool,
+                            destination=target,
+                            original_call_sid=original_call_sid,
+                            conference_name=conference_name,
+                            timeout_seconds=timeout_seconds,
+                            introduction=introduction,
+                            three_way=three_way,
+                            companion=companion,
                         )
-                    )
+                        if (
+                            companion
+                            and transfer_event
+                            and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
+                            and not await self._engine.start_companion(transfer_event.transfer_id)
+                        ):
+                            transfer_event, reason = None, "join_failed"
+                        connected = bool(
+                            transfer_event
+                            and transfer_event.type == TransferEventType.DESTINATION_ANSWERED
+                        )
+                        await self._engine.log_phone_tool_event(
+                            "conference" if three_way else "transfer",
+                            destination=masked_destination(target),
+                            warm=bool(introduction),
+                            outcome="connected" if connected else reason,
+                        )
+                        if connected:
+                            break
+                        last_reason = reason
+                        transfer_event = None
 
                 except Exception as e:
                     logger.error(f"Error during transfer wait: {e}")
@@ -742,23 +920,41 @@ class CustomToolManager:
                     self._engine.set_mute_pipeline(False)
 
                 # Handle result (after cleanup)
-                if transfer_event:
+                if transfer_event and three_way:
+                    # Nobody is handed off: the agent carries on with both of them.
+                    await function_call_params.result_callback(
+                        {
+                            "status": "colleague_joined",
+                            "note": (
+                                "Your colleague is now on the line with you and the caller. "
+                                "Introduce them to each other and carry on as a three-way "
+                                "conversation."
+                            ),
+                        }
+                    )
+                elif transfer_event:
                     final_result = transfer_event.to_result_dict()
                     await self._handle_transfer_result(
                         final_result, function_call_params, properties
                     )
                 else:
                     logger.error(
-                        f"Transfer call timed out or failed after {timeout_seconds} seconds"
+                        f"Transfer did not connect ({last_reason}) after trying "
+                        f"{len(destinations)} destination(s)"
                     )
-                    timeout_result = {
-                        "status": "failed",
-                        "message": "I'm sorry, but the call is taking longer than expected to connect. The person might not be available right now. Please try calling back later.",
-                        "action": "transfer_failed",
-                        "reason": "timeout",
-                    }
                     await self._handle_transfer_result(
-                        timeout_result, function_call_params, properties
+                        {
+                            "status": "failed",
+                            "message": "Nobody could take the call.",
+                            "action": "transfer_failed",
+                            "reason": last_reason,
+                            "next_step": (
+                                "Tell the caller nobody is free to take the call right "
+                                "now, and offer to take a message or arrange a callback."
+                            ),
+                        },
+                        function_call_params,
+                        properties,
                     )
 
             except Exception as e:
@@ -780,6 +976,80 @@ class CustomToolManager:
                 )
 
         return transfer_call_handler
+
+    async def _dial_transfer_destination(
+        self,
+        *,
+        provider: Any,
+        tool: Any,
+        destination: str,
+        original_call_sid: Optional[str],
+        conference_name: str,
+        timeout_seconds: int,
+        introduction: Optional[str],
+        three_way: bool = False,
+        companion: bool = False,
+    ) -> tuple[Optional[Any], str]:
+        """Ring one destination and wait for the outcome.
+
+        Returns (DESTINATION_ANSWERED event or None, failure reason).
+        """
+        transfer_id = str(uuid.uuid4())
+        call_transfer_manager = await get_call_transfer_manager()
+        # Store the context before the provider call to avoid a race with its webhooks
+        transfer_context = TransferContext(
+            transfer_id=transfer_id,
+            call_sid=None,  # Will be updated after provider response
+            target_number=destination,
+            tool_uuid=tool.tool_uuid,
+            original_call_sid=original_call_sid,
+            conference_name=conference_name,
+            initiated_at=time.time(),
+            workflow_run_id=self._engine._workflow_run_id,
+            warm=bool(introduction),
+            introduction=introduction,
+            three_way=three_way,
+        )
+        await call_transfer_manager.store_transfer_context(transfer_context)
+
+        try:
+            warm_kwargs = {"introduction": introduction} if introduction else {}
+            if companion:
+                warm_kwargs["three_way"] = True
+            transfer_result = await provider.transfer_call(
+                destination=destination,
+                transfer_id=transfer_id,
+                conference_name=conference_name,
+                timeout=timeout_seconds,
+                **warm_kwargs,
+            )
+        except Exception as e:
+            logger.error(f"Transfer dial failed (transfer_id={transfer_id}): {e}")
+            await call_transfer_manager.remove_transfer_context(transfer_id)
+            return None, "call_failed"
+
+        call_sid = transfer_result.get("call_sid")
+        logger.info(
+            f"Transfer call initiated: {call_sid} (transfer_id={transfer_id}), waiting for completion..."
+        )
+        # The webhooks may already have written to the context; only fill in the call id.
+        latest = await call_transfer_manager.get_transfer_context(transfer_id)
+        latest = latest or transfer_context
+        if not latest.call_sid:
+            latest.call_sid = call_sid
+            await call_transfer_manager.store_transfer_context(latest)
+
+        # Warm transfers wait a little longer: the colleague hears the introduction first.
+        wait_seconds = timeout_seconds + (20 if introduction else 0)
+        transfer_event = await call_transfer_manager.wait_for_transfer_completion(
+            transfer_id, wait_seconds
+        )
+        if transfer_event and transfer_event.type == TransferEventType.DESTINATION_ANSWERED:
+            return transfer_event, "connected"
+        reason = (transfer_event.reason if transfer_event else None) or "timeout"
+        # A failed attempt must not be found by the strategy that bridges the caller.
+        await call_transfer_manager.remove_transfer_context(transfer_id)
+        return None, reason
 
     async def _handle_transfer_result(
         self, result: dict, function_call_params, properties
@@ -831,13 +1101,14 @@ class CustomToolManager:
             reason = result.get("reason", "unknown")
             logger.info(f"Transfer failed ({reason}), informing user via LLM")
 
-            await function_call_params.result_callback(
-                {
-                    "status": "transfer_failed",
-                    "reason": reason,
-                    "message": "Transfer failed",
-                }
-            )
+            failure = {
+                "status": "transfer_failed",
+                "reason": reason,
+                "message": "Transfer failed",
+            }
+            if result.get("next_step"):
+                failure["next_step"] = result["next_step"]
+            await function_call_params.result_callback(failure)
         else:
             # Unknown action, treat as generic success
             logger.warning(f"Unknown transfer action: {action}, treating as success")

@@ -18,6 +18,9 @@ from typing import Any, Optional
 import httpx
 from loguru import logger
 
+from api.db import db_client
+from api.services.workflow.test_sandbox_mode import is_sandbox_test_run
+
 _TIMEOUT = 15.0
 
 
@@ -36,6 +39,20 @@ async def fire_call_live(
     start. No-ops if SYSEVO_CALL_LIVE_URL is unset, so an unwired
     deployment behaves exactly as before (rows reaped by the TTL sweeper).
     """
+    try:
+        workflow_run = await db_client.get_workflow_run_by_id(workflow_run_id)
+    except Exception as exc:
+        logger.error(f"[call-live] run lookup failed for {workflow_run_id}; event blocked: {exc}")
+        return
+    if not workflow_run:
+        logger.warning(f"[call-live] run {workflow_run_id} not found; event blocked")
+        return
+    if is_sandbox_test_run(workflow_run):
+        logger.info(
+            f"[call-live] sandbox run {workflow_run_id}; event={event} is disabled"
+        )
+        return
+
     call_live_url = os.getenv("SYSEVO_CALL_LIVE_URL")
     if not call_live_url:
         return

@@ -7,6 +7,8 @@ Twilio TwiML path needed xml.sax.saxutils to defend against.
 SCOPE: dialer only. Campaigns and agent calls do not use SWML.
 """
 
+from api.services.telephony.dialer import extra_answer
+
 
 def build_hangup_swml() -> dict:
     """Refuse the call politely. Used for bad signatures and bad input."""
@@ -39,6 +41,7 @@ def build_dialer_swml(
     call_state_webhook: str = "",
     connect_status_webhook: str = "",
     tap_websocket: str = "",
+    ring_timeout_seconds: int = 60,
 ) -> dict:
     """Record the call, then bridge the rep to the lead.
 
@@ -78,7 +81,7 @@ def build_dialer_swml(
         # RING timeout only. It bounds how long we wait for an answer and has no
         # bearing on how long the conversation may run -- worth stating, because it
         # was the first thing suspected when reps reported being cut off mid-call.
-        "timeout": 60,
+        "timeout": max(5, min(120, int(ring_timeout_seconds or 60))),
         # How long the CONVERSATION may run, stated rather than inherited.
         #
         # A rep on a good call can be on it for half an hour, and the requirement is
@@ -232,7 +235,7 @@ def build_no_agents_swml(
     }
 
 
-def build_conference_join_swml(*, conference_name: str) -> dict:
+def build_conference_join_swml(*, conference_name: str, status_callback_url: str | None = None) -> dict:
     """Put an accepting rep into the caller's conference.
 
     The rep IS the main participant: the conference starts when they arrive and
@@ -243,15 +246,78 @@ def build_conference_join_swml(*, conference_name: str) -> dict:
     recorder would bill twice for one conversation and produce two files that
     have to be reconciled later.
     """
+    conference = {
+        "name": conference_name, "start_on_enter": True, "end_on_exit": True,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
     return {
         "sections": {
             "main": [
                 {
-                    "join_conference": {
-                        "name": conference_name,
-                        "start_on_enter": True,
-                        "end_on_exit": True,
-                    }
+                    "join_conference": conference
+                }
+            ]
+        }
+    }
+
+
+def build_signalwire_parallel_rep_swml(
+    *, conference_name: str, status_callback_url: str | None = None
+) -> dict:
+    """Hold the browser rep in the private conference for a parallel batch."""
+    if not conference_name.startswith("sysevo-par-"):
+        raise ValueError("invalid parallel conference name")
+    join_conference = {
+        "name": conference_name,
+        "start_on_enter": True,
+        "end_on_exit": True,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        join_conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
+    return {
+        "sections": {
+            "main": [
+                {
+                    "join_conference": join_conference
+                }
+            ]
+        }
+    }
+
+
+def build_signalwire_parallel_overflow_swml(*, conference_name: str, status_callback_url: str | None = None) -> dict:
+    """Park a second answered prospect in a private room for a teammate offer."""
+    if not conference_name.startswith("sysevo-overflow-"):
+        raise ValueError("invalid SignalWire overflow conference name")
+    conference = {
+        "name": conference_name, "start_on_enter": False, "end_on_exit": False,
+    }
+    if status_callback_url:
+        if not status_callback_url.startswith("https://"):
+            raise ValueError("SignalWire conference callbacks must use HTTPS")
+        conference.update({
+            "status_callback": status_callback_url,
+            "status_callback_event": "join leave",
+            "status_callback_event_type": "relay",
+        })
+    return {
+        "sections": {
+            "main": [
+                {
+                    "join_conference": conference
                 }
             ]
         }
@@ -321,3 +387,94 @@ def build_agent_overflow_swml(
         }
     )
     return {"sections": {"main": steps}}
+
+
+# Classification tuning per account preset, in SignalWire's own units (seconds):
+# (machine_voice_threshold, end_silence_timeout, initial_timeout).
+#
+# These decide how fast a pickup is CLASSIFIED. They deliberately do not bound
+# the detector's total run time: with detect_message_end the detector keeps
+# running after a MACHINE verdict until the greeting's beep/end, and that wait is
+# what lets the drop land in the mailbox instead of over the greeting. "balanced"
+# is SignalWire's documented default set.
+SIGNALWIRE_AMD_PRESETS: dict[str, tuple[float, float, float]] = {
+    "fastest": (1.0, 0.6, 2.5),
+    "fast": (1.1, 0.8, 3.5),
+    "balanced": (1.25, 1.0, 4.5),
+    "accurate": (2.0, 1.2, 6.0),
+}
+
+# Upper bound on the whole detection, including the wait for the beep. A human
+# is classified within initial_timeout + end_silence_timeout regardless; only a
+# voicemail greeting runs this long. 30 s is SignalWire's default and covers
+# long greetings. The previous 1.2-3.2 s cap expired mid-greeting, so a
+# voicemail came back as `detecting`/`unknown` (and was bridged to the rep) or
+# as `machine` before the beep (and the drop played over the greeting).
+SIGNALWIRE_AMD_MAX_SECONDS = 30.0
+
+
+def build_signalwire_parallel_leg_swml(
+    *, decision_url: str, amd_preset: str = "balanced",
+    machine_detection_enabled: bool = True,
+) -> dict:
+    """Screen a server-originated prospect leg before it can reach the rep."""
+    if not decision_url.startswith("https://"):
+        raise ValueError("SignalWire parallel decision handler must use HTTPS")
+    voice_threshold, end_silence, initial = SIGNALWIRE_AMD_PRESETS.get(
+        amd_preset, SIGNALWIRE_AMD_PRESETS["balanced"]
+    )
+    steps: list[dict] = []
+    if machine_detection_enabled:
+        steps.append({"detect_machine": {
+            "detectors": "amd,fax", "detect_message_end": True,
+            "timeout": SIGNALWIRE_AMD_MAX_SECONDS, "wait": True,
+            "machine_voice_threshold": voice_threshold,
+            "end_silence_timeout": end_silence,
+            "initial_timeout": initial,
+        }})
+    steps.append({"execute": {"dest": decision_url, "params": {
+        "amd_result": "${detect_result}" if machine_detection_enabled else "human",
+        "amd_ms": "${detect_ms}" if machine_detection_enabled else "0",
+        "beep": "${detect_machine_beep}" if machine_detection_enabled else "false",
+    }}})
+    return {"sections": {"main": steps}}
+
+
+def build_signalwire_parallel_voicemail_swml(
+    *, recording_url: str, playback_status_url: str
+) -> dict:
+    """Play a private voicemail recording and report the playback result."""
+    if not recording_url.startswith("https://") or not playback_status_url.startswith("https://"):
+        raise ValueError("SignalWire voicemail playback URLs must use HTTPS")
+    return {"sections": {"main": [
+        {"play": {"url": recording_url, "status_url": playback_status_url}},
+        {"hangup": {}},
+    ]}}
+
+
+def build_say_and_hangup_swml(message: str) -> dict:
+    """Tell the rep why their call was refused, then hang up (e.g. the recording lock)."""
+    return {"sections": {"main": [
+        {"play": {"url": "say:" + message}},
+        {"hangup": {}},
+    ]}}
+
+
+def build_signalwire_ringback_wait_swml(*, conference_name: str) -> dict:
+    """Park a person who answered after a voicemail hand-off for their original rep.
+
+    The rep's accepted offer joins this room (build_conference_join_swml) and starts
+    it; the room ends when the person leaves. Never plays the rep's recording.
+    """
+    if not conference_name.startswith("sysevo-ringback-"):
+        raise ValueError("invalid SignalWire ring-back conference name")
+    notice = (
+        [{"play": {"url": "say:" + extra_answer.RECORDING_DISCLOSURE}}]
+        if extra_answer.AUTO_RECORDING_NOTICE else []
+    )
+    return {"sections": {"main": [
+        *notice,
+        {"join_conference": {
+            "name": conference_name, "start_on_enter": False, "end_on_exit": True,
+        }},
+    ]}}

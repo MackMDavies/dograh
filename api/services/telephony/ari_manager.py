@@ -402,11 +402,34 @@ class ARIConnection:
                 f"[ARI org={self.organization_id}] DTMF: "
                 f"channel={channel_id}, digit={digit}"
             )
+            # A warm-transfer colleague answering the introduction's "press 1".
+            transfer_id = await self._get_transfer_id_for_channel(channel_id)
+            if transfer_id and digit:
+                asyncio.create_task(self._warm_transfer_key(transfer_id, channel_id, digit))
+                return
+            # Hand the caller's key press to the pipeline running their call.
+            workflow_run_id = await self._get_channel_run(channel_id)
+            if workflow_run_id and digit:
+                asyncio.create_task(self._forward_caller_key(workflow_run_id, digit))
 
         else:
             logger.debug(
                 f"[ARI org={self.organization_id}] Event: {event_type} "
                 f"channel={channel_id}"
+            )
+
+    async def _forward_caller_key(self, workflow_run_id: str, digit: str) -> None:
+        from api.services.supervisor.live_control import (
+            caller_keypad_command,
+            publish_command,
+        )
+
+        try:
+            await publish_command(workflow_run_id, caller_keypad_command(digit))
+        except Exception as e:  # noqa: BLE001 -- a key press must never break the call
+            logger.warning(
+                f"[ARI org={self.organization_id}] could not forward key press "
+                f"for run {workflow_run_id}: {e}"
             )
 
     async def _ari_request(self, method: str, path: str, **kwargs) -> dict:
@@ -826,8 +849,9 @@ class ARIConnection:
             if bridge_id:
                 await self._delete_bridge(bridge_id)
 
-            # Destroy both channels, skipping the one that already ended
-            for cid in (call_id, ext_channel_id):
+            # Destroy both channels (and any colleague who joined a three-way call),
+            # skipping the one that already ended
+            for cid in (call_id, ext_channel_id, *ctx.get("three_way_channels", [])):
                 if cid and cid != channel_id:
                     await self._delete_channel(cid)
 
@@ -939,6 +963,14 @@ class ARIConnection:
                 )
                 return
 
+            if context.three_way and not context.resolved:
+                await self._join_three_way(context, destination_channel_id)
+                return
+
+            if context.warm and context.introduction and not context.resolved:
+                await self._play_warm_introduction(transfer_id, destination_channel_id)
+                return
+
             logger.info(
                 f"[ARI Transfer org={self.organization_id}] Transfer {transfer_id} success: "
                 f"caller={context.original_call_sid} -> destination={destination_channel_id}"
@@ -966,6 +998,117 @@ class ARIConnection:
                 transfer_id, destination_channel_id, f"Transfer processing error: {e}"
             )
 
+    async def _join_three_way(self, context, channel_id: str) -> None:
+        """Add the colleague to the bridge the caller and the agent are already in."""
+        transfer_manager = await self._get_transfer_manager()
+        run = await db_client.get_workflow_run_by_id(int(context.workflow_run_id or 0))
+        gathered = (run.gathered_context or {}) if run else {}
+        bridge_id = gathered.get("bridge_id")
+        joined = bool(bridge_id) and bool(
+            await self._ari_request(
+                "POST", f"/bridges/{bridge_id}/addChannel", params={"channel": channel_id}
+            )
+            is not None
+        )
+        if joined:
+            # _ari_request returns {} on failure and on an empty 204 alike, so check the bridge.
+            bridge = await self._ari_request("GET", f"/bridges/{bridge_id}")
+            joined = channel_id in (bridge.get("channels") or [])
+        context.resolved = True
+        context.accepted = joined
+        await transfer_manager.store_transfer_context(context)
+        if joined:
+            await db_client.update_workflow_run(
+                run_id=int(context.workflow_run_id),
+                gathered_context={
+                    "three_way_channels": [*gathered.get("three_way_channels", []), channel_id]
+                },
+            )
+        await transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.DESTINATION_ANSWERED if joined else TransferEventType.TRANSFER_FAILED,
+                transfer_id=context.transfer_id,
+                original_call_sid=context.original_call_sid,
+                transfer_call_sid=channel_id,
+                conference_name=context.conference_name,
+                message="The colleague joined the call." if joined else "The colleague could not be added.",
+                status="success" if joined else "failed",
+                action="colleague_joined" if joined else "transfer_failed",
+                reason=None if joined else "join_failed",
+            )
+        )
+        if not joined:
+            await self._delete_channel(channel_id)
+
+    async def _play_warm_introduction(self, transfer_id: str, channel_id: str) -> None:
+        """Warm transfer: the colleague hears the introduction and must press 1
+        (_warm_transfer_key). Silence for the whole window is a decline."""
+        from api.services.telephony.warm_transfer import ARI_ACCEPT_WINDOW_SECONDS
+        from api.utils.common import get_backend_endpoints
+
+        transfer_manager = await self._get_transfer_manager()
+        context = await transfer_manager.get_transfer_context(transfer_id)
+        if context is None:
+            return
+        context.answered = True
+        await transfer_manager.store_transfer_context(context)
+
+        backend, _ = await get_backend_endpoints()
+        media = f"sound:{backend}/api/v1/telephony/ari/transfer-intro/{transfer_id}.wav"
+        playback = await self._ari_request("POST", f"/channels/{channel_id}/play", params={"media": media})
+        if not playback:
+            # The introduction could not be played: connect them rather than lose the caller.
+            logger.warning(f"[ARI Transfer] introduction did not play for {transfer_id}; connecting cold")
+            context.warm = False
+            await transfer_manager.store_transfer_context(context)
+            await self._handle_destination_answered(transfer_id, channel_id)
+            return
+
+        async def decline_when_silent() -> None:
+            await asyncio.sleep(ARI_ACCEPT_WINDOW_SECONDS)
+            await self._warm_transfer_key(transfer_id, channel_id, "")
+
+        asyncio.create_task(decline_when_silent())
+
+    async def _warm_transfer_key(self, transfer_id: str, channel_id: str, digit: str) -> None:
+        from api.services.telephony.warm_transfer import ACCEPT_KEY
+
+        transfer_manager = await self._get_transfer_manager()
+        context = await transfer_manager.get_transfer_context(transfer_id)
+        if context is None or not context.warm or context.resolved:
+            return
+        context.resolved = True
+        context.accepted = digit == ACCEPT_KEY
+        await transfer_manager.store_transfer_context(context)
+        if context.accepted:
+            await self._ari_request("POST", f"/channels/{channel_id}/play", params={"media": "sound:beep"})
+            await transfer_manager.publish_transfer_event(
+                TransferEvent(
+                    type=TransferEventType.DESTINATION_ANSWERED,
+                    transfer_id=transfer_id,
+                    original_call_sid=context.original_call_sid,
+                    transfer_call_sid=channel_id,
+                    conference_name=context.conference_name,
+                    message="The person took the call.",
+                    status="success",
+                    action="destination_answered",
+                )
+            )
+            return
+        await transfer_manager.publish_transfer_event(
+            TransferEvent(
+                type=TransferEventType.TRANSFER_FAILED,
+                transfer_id=transfer_id,
+                original_call_sid=context.original_call_sid,
+                transfer_call_sid=channel_id,
+                message="The person answered but did not take the call.",
+                status="failed",
+                action="transfer_failed",
+                reason="declined",
+            )
+        )
+        await self._delete_channel(channel_id)
+
     async def _handle_transfer_failed(
         self, transfer_id: str, channel_id: str, reason: str
     ):
@@ -975,6 +1118,15 @@ class ARIConnection:
 
             transfer_manager = await self._get_transfer_manager()
             context = await transfer_manager.get_transfer_context(transfer_id)
+            if context is not None and context.three_way and context.resolved:
+                return  # a colleague leaving a three-way call is not a failed transfer
+            if context is not None and context.warm:
+                if context.resolved:
+                    return  # already reported (accepted and bridged, or declined)
+                context.resolved = True
+                await transfer_manager.store_transfer_context(context)
+                if context.answered:
+                    reason = "declined"  # hung up during the introduction
 
             # Publish failure event
             failure_event = TransferEvent(

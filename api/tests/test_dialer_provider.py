@@ -25,7 +25,7 @@ def test_get_dialer_provider_is_case_insensitive_and_trims():
 
 def test_get_dialer_provider_rejects_unknown():
     with pytest.raises(UnknownDialerProvider):
-        get_dialer_provider("vonage")
+        get_dialer_provider("plivo")  # vonage is a supported dialer provider now
 
 
 def test_get_dialer_provider_rejects_empty():

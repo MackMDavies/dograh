@@ -10,6 +10,11 @@ from api.constants import (
     LANGFUSE_PUBLIC_KEY,
     LANGFUSE_SECRET_KEY,
 )
+from api.services.telemetry.langfuse_config import (
+    LEGACY_OPTIONS,
+    decode_langfuse_config,
+)
+from api.services.telemetry.span_filter import filter_span
 from pipecat.utils.run_context import get_current_org_id
 from pipecat.utils.tracing.setup import setup_tracing
 
@@ -49,12 +54,15 @@ class _OrgRoutingExporter(SpanExporter):
         self._default_exporter = default_exporter
         self._org_exporters = {}
         self._org_hosts = {}
+        self._org_options = {}
 
     def get_org_host(self, org_id):
         return self._org_hosts.get(str(org_id))
 
-    def register_org(self, org_id, host, public_key, secret_key):
+    def register_org(self, org_id, host, public_key, secret_key, options=None):
         key = str(org_id)
+        # "What to send" (Developers → Telemetry); applied per span in export().
+        self._org_options[key] = dict(options or LEGACY_OPTIONS)
         normalized_host = host.rstrip("/")
         auth = base64.b64encode(f"{public_key}:{secret_key}".encode()).decode()
         endpoint = f"{normalized_host}/api/public/otel/v1/traces"
@@ -84,6 +92,7 @@ class _OrgRoutingExporter(SpanExporter):
         key = str(org_id)
         exporter = self._org_exporters.pop(key, None)
         self._org_hosts.pop(key, None)
+        self._org_options.pop(key, None)
         if exporter:
             exporter.shutdown()
             logger.info(f"Unregistered OTEL exporter for org {org_id}")
@@ -115,6 +124,9 @@ class _OrgRoutingExporter(SpanExporter):
                 result = r
 
         for oid, batch in org_buckets.items():
+            batch = _apply_send_options(batch, self._org_options.get(oid))
+            if not batch:
+                continue
             r = self._org_exporters[oid].export(batch)
             if r != SpanExportResult.SUCCESS:
                 result = r
@@ -134,6 +146,39 @@ class _OrgRoutingExporter(SpanExporter):
         for exp in self._org_exporters.values():
             ok = exp.force_flush(timeout_millis) and ok
         return ok
+
+
+def _apply_send_options(spans, options):
+    """Drop / strip / redact spans per the org's Langfuse send options."""
+    if not options:
+        return spans
+    from opentelemetry.sdk.trace import ReadableSpan
+
+    out = []
+    for span in spans:
+        try:
+            attrs = filter_span(span.name, dict(span.attributes or {}), options)
+            if attrs is None:
+                continue
+            out.append(
+                ReadableSpan(
+                    name=span.name,
+                    context=span.context,
+                    parent=span.parent,
+                    resource=span.resource,
+                    attributes=attrs,
+                    events=span.events,
+                    links=span.links,
+                    kind=span.kind,
+                    status=span.status,
+                    start_time=span.start_time,
+                    end_time=span.end_time,
+                    instrumentation_scope=span.instrumentation_scope,
+                )
+            )
+        except Exception as e:  # never lose the whole batch over one span
+            logger.debug(f"span option filter failed, dropping span: {e}")
+    return out
 
 
 def ensure_tracing() -> bool:
@@ -175,7 +220,7 @@ def ensure_tracing() -> bool:
     return True
 
 
-def register_org_langfuse_credentials(org_id, host, public_key, secret_key):
+def register_org_langfuse_credentials(org_id, host, public_key, secret_key, options=None):
     """Register or update org-specific Langfuse credentials for span routing.
 
     Safe to call multiple times — updates credentials if they changed.
@@ -187,7 +232,7 @@ def register_org_langfuse_credentials(org_id, host, public_key, secret_key):
             f"Incomplete Langfuse credentials for org {org_id}, skipping registration"
         )
         return
-    _org_routing_exporter.register_org(org_id, host, public_key, secret_key)
+    _org_routing_exporter.register_org(org_id, host, public_key, secret_key, options)
 
 
 def unregister_org_langfuse_credentials(org_id):
@@ -214,12 +259,15 @@ async def load_all_org_langfuse_credentials():
     )
     for config in configs:
         org_id = config["organization_id"]
-        value = config["value"]
+        value = decode_langfuse_config(config["value"])
+        if not value:
+            continue
         register_org_langfuse_credentials(
             org_id=org_id,
-            host=value.get("host"),
-            public_key=value.get("public_key"),
-            secret_key=value.get("secret_key"),
+            host=value["host"],
+            public_key=value["public_key"],
+            secret_key=value["secret_key"],
+            options=value["options"],
         )
     logger.info(f"Loaded Langfuse credentials for {len(configs)} org(s)")
 
@@ -242,12 +290,14 @@ async def handle_langfuse_sync(event):
     config = await db_client.get_configuration(
         org_id, OrganizationConfigurationKey.LANGFUSE_CREDENTIALS.value
     )
-    if config and config.value:
+    value = decode_langfuse_config(config.value) if config else None
+    if value:
         register_org_langfuse_credentials(
             org_id=org_id,
-            host=config.value.get("host"),
-            public_key=config.value.get("public_key"),
-            secret_key=config.value.get("secret_key"),
+            host=value["host"],
+            public_key=value["public_key"],
+            secret_key=value["secret_key"],
+            options=value["options"],
         )
     else:
         # Credentials were saved then deleted before we got the event
