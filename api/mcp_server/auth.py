@@ -31,7 +31,7 @@ async def authenticate_mcp_request() -> UserModel:
             status_code=401,
             detail="Missing API key — send X-API-Key or Authorization: Bearer <key>",
         )
-    user = await _handle_api_key_auth(api_key)
+    user = await _handle_api_key_auth(api_key, is_mcp=True)
 
     span = trace.get_current_span()
     if span.is_recording():

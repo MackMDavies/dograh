@@ -26,7 +26,7 @@ async def test_authenticate_mcp_request_accepts_bearer_authorization():
 
     assert authed is user
     get_headers.assert_called_once_with(include={"authorization"})
-    handle_auth.assert_awaited_once_with("secret-api-key")
+    handle_auth.assert_awaited_once_with("secret-api-key", is_mcp=True)
 
 
 @pytest.mark.asyncio
@@ -49,7 +49,7 @@ async def test_authenticate_mcp_request_accepts_x_api_key():
 
     assert authed is user
     get_headers.assert_called_once_with(include={"authorization"})
-    handle_auth.assert_awaited_once_with("secret-api-key")
+    handle_auth.assert_awaited_once_with("secret-api-key", is_mcp=True)
 
 
 @pytest.mark.asyncio
