@@ -66,14 +66,17 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
         "gpt-4.1": TokenPricingModel(
             prompt_token_price=Decimal("2.00") / 1000000,  # $2.00 per 1M tokens
             completion_token_price=Decimal("8.00") / 1000000,  # $8.00 per 1M tokens
+            cached_prompt_token_price=Decimal("0.50") / 1000000,  # $0.50 per 1M (OpenAI cached input)
         ),
         "gpt-4.1-mini": TokenPricingModel(
             prompt_token_price=Decimal("0.40") / 1000000,  # $0.40 per 1M tokens
             completion_token_price=Decimal("1.60") / 1000000,  # $1.60 per 1M tokens
+            cached_prompt_token_price=Decimal("0.10") / 1000000,  # $0.10 per 1M (OpenAI cached input)
         ),
         "gpt-4.1-nano": TokenPricingModel(
             prompt_token_price=Decimal("0.10") / 1000000,  # $0.10 per 1M tokens
             completion_token_price=Decimal("0.40") / 1000000,  # $0.40 per 1M tokens
+            cached_prompt_token_price=Decimal("0.025") / 1000000,  # $0.025 per 1M (OpenAI cached input)
         ),
         "gpt-4.5-preview": TokenPricingModel(
             prompt_token_price=Decimal("75.00") / 1000000,  # $75.00 per 1M tokens
@@ -83,6 +86,7 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
             prompt_token_price=Decimal("2.50") / 1000000,  # $2.50 per 1M tokens - FIXED
             completion_token_price=Decimal("10.00")
             / 1000000,  # $10.00 per 1M tokens - FIXED
+            cached_prompt_token_price=Decimal("1.25") / 1000000,  # $1.25 per 1M (OpenAI cached input)
         ),
         "gpt-4o-audio-preview": TokenPricingModel(
             prompt_token_price=Decimal("2.50") / 1000000,  # $2.50 per 1M tokens
@@ -110,6 +114,7 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
         "gpt-4o-mini": TokenPricingModel(
             prompt_token_price=Decimal("0.15") / 1000000,  # $0.15 per 1M tokens
             completion_token_price=Decimal("0.60") / 1000000,  # $0.60 per 1M tokens
+            cached_prompt_token_price=Decimal("0.075") / 1000000,  # $0.075 per 1M (OpenAI cached input)
         ),
         "gpt-4o-mini-audio-preview": TokenPricingModel(
             prompt_token_price=Decimal("0.15") / 1000000,  # $0.15 per 1M tokens
@@ -205,12 +210,11 @@ LLM_PRICING: Dict[str, Dict[str, TokenPricingModel]] = {
             cached_prompt_token_price=Decimal("0.50") / 1000000,
             cached_tokens_included_in_prompt=False,
         ),
-        # Introductory pricing, $2/$10, ENDS 2026-08-31 — reverts to $3/$15.
-        # Left at the introductory rate deliberately: it is correct today, and a
-        # future rate applied early would overstate every call until September.
+        # $2/$10 is now the standard price: Anthropic cancelled the planned rise
+        # to $3/$15 (platform.claude.com pricing, read 2026-10-10).
         "claude-sonnet-5": TokenPricingModel(
-            prompt_token_price=Decimal("2.00") / 1000000,  # $2 / MTok (intro)
-            completion_token_price=Decimal("10.00") / 1000000,  # $10 / MTok (intro)
+            prompt_token_price=Decimal("2.00") / 1000000,  # $2 / MTok
+            completion_token_price=Decimal("10.00") / 1000000,  # $10 / MTok
             cached_prompt_token_price=Decimal("0.20") / 1000000,  # $0.20 / MTok
             cached_tokens_included_in_prompt=False,
         ),

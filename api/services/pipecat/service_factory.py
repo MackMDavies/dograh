@@ -11,7 +11,10 @@ from api.services.configuration.registry import (
     OPENROUTER_DEFAULT_MAX_TOKENS,
     ServiceProviders,
 )
-from api.services.pipecat.elevenlabs_tts import DograhElevenLabsTTSService
+from api.services.pipecat.elevenlabs_tts import (
+    DograhElevenLabsHttpTTSService,
+    DograhElevenLabsTTSService,
+)
 from api.services.pipecat.minimax_llm import DograhMiniMaxLLMService
 from api.services.pipecat.minimax_tts import MiniMaxOwnedSessionTTSService
 from api.utils.url_security import validate_user_configured_service_url
@@ -41,7 +44,11 @@ from pipecat.services.deepgram.tts import DeepgramTTSService, DeepgramTTSSetting
 from pipecat.services.dograh.llm import DograhLLMService
 from pipecat.services.dograh.stt import DograhSTTService, DograhSTTSettings
 from pipecat.services.dograh.tts import DograhTTSService, DograhTTSSettings
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService, ElevenLabsTTSSettings
+from pipecat.services.elevenlabs.tts import (
+    ElevenLabsHttpTTSSettings,
+    ElevenLabsTTSService,
+    ElevenLabsTTSSettings,
+)
 from pipecat.services.fish.tts import FishAudioTTSService, FishAudioTTSSettings
 from pipecat.services.gladia.stt import GladiaSTTService, GladiaSTTSettings
 from pipecat.services.google.llm import GoogleLLMService, GoogleLLMSettings
@@ -538,6 +545,27 @@ def create_tts_service(user_config, audio_config: "AudioConfig"):
         # scheme (matching ElevenLabs documentation, e.g.
         # https://api.eu.residency.elevenlabs.io); rewrite it to the WS scheme.
         _validate_runtime_service_url(user_config.tts.base_url, "base_url")
+        if tts_model.startswith("eleven_v4"):
+            # ElevenLabs v4 is not supported by the multi-stream-input TTS socket.
+            # Use the HTTP streaming endpoint, which supports v4 model IDs.
+            return DograhElevenLabsHttpTTSService(
+                api_key=api_key,
+                aiohttp_session=aiohttp.ClientSession(),
+                base_url=user_config.tts.base_url.rstrip("/"),
+                sample_rate=max(audio_config.pipeline_sample_rate, 16000),
+                settings=ElevenLabsHttpTTSSettings(
+                    voice=voice_id,
+                    model=user_config.tts.model,
+                    stability=getattr(user_config.tts, "stability", 0.8),
+                    speed=user_config.tts.speed,
+                    similarity_boost=getattr(user_config.tts, "similarity_boost", 0.75),
+                    style=getattr(user_config.tts, "style", 0.0),
+                    use_speaker_boost=getattr(user_config.tts, "use_speaker_boost", False),
+                ),
+                text_filters=[xml_function_tag_filter],
+                skip_aggregator_types=["recording_router", "recording"],
+                silence_time_s=1.0,
+            )
         elevenlabs_url = (
             user_config.tts.base_url
             .rstrip("/")
@@ -958,7 +986,16 @@ def create_llm_service_from_provider(
         from api.services.pipecat.anthropic_llm import DograhAnthropicLLMService
         from pipecat.services.anthropic.llm import AnthropicLLMSettings
         _anthr_is_v4 = "-4" in model.split("/")[-1].lower()
-        _anthr_settings = AnthropicLLMSettings(model=model) if _anthr_is_v4 else AnthropicLLMSettings(model=model, temperature=0.1)
+        _anthr_kwargs = {"model": model} if _anthr_is_v4 else {"model": model, "temperature": 0.1}
+        # Prompt caching: every turn of a call re-sends the same system prompt, tools and
+        # conversation so far. Claude only caches when asked, and a cache read costs 10% of
+        # the input price (a write 125%), so this cuts the model cost of a Claude call-minute
+        # by about 70%. pipecat marks the cache points; prompts under Claude's minimum
+        # (4,096 tokens on Haiku 4.5 / Opus 4.5) are simply not cached, at no charge.
+        # Guarded so an older pipecat without the setting still builds the service.
+        if "enable_prompt_caching" in getattr(AnthropicLLMSettings, "__dataclass_fields__", {}):
+            _anthr_kwargs["enable_prompt_caching"] = True
+        _anthr_settings = AnthropicLLMSettings(**_anthr_kwargs)
         return DograhAnthropicLLMService(
             api_key=api_key,
             settings=_anthr_settings,

@@ -528,6 +528,10 @@ async def managed_number_billing(
 class OrgConcurrencyRequest(BaseModel):
     workflow_id: int
     max_concurrent: int
+    # Plan cap on cloned voices. Absent = leave the org's current setting alone;
+    # null (or negative) = no cap.
+    custom_voice_limit: Optional[int] = None
+    sync_custom_voice_limit: bool = False
 
 
 @router.post("/internal/org-concurrency")
@@ -561,8 +565,24 @@ async def set_org_concurrency(
         OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
         {"value": max_concurrent},
     )
+    custom_voice_limit = None
+    if body.sync_custom_voice_limit:
+        if body.custom_voice_limit is None or body.custom_voice_limit < 0:
+            await db_client.upsert_configuration(
+                workflow.organization_id,
+                OrganizationConfigurationKey.CUSTOM_VOICE_LIMIT.value,
+                {"value": None},
+            )
+        else:
+            custom_voice_limit = int(body.custom_voice_limit)
+            await db_client.upsert_configuration(
+                workflow.organization_id,
+                OrganizationConfigurationKey.CUSTOM_VOICE_LIMIT.value,
+                {"value": custom_voice_limit},
+            )
     return {
         "ok": True,
         "organization_id": workflow.organization_id,
         "max_concurrent": max_concurrent,
+        "custom_voice_limit": custom_voice_limit,
     }

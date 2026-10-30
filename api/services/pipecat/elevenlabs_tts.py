@@ -4,9 +4,10 @@ from __future__ import annotations
 import asyncio
 import time
 
+import aiohttp
 from loguru import logger
 
-from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
+from pipecat.services.elevenlabs.tts import ElevenLabsHttpTTSService, ElevenLabsTTSService
 
 _CONNECT_TIMEOUT_S = 8.0
 _START_TIMEOUT_S = 15.0
@@ -149,3 +150,16 @@ class DograhElevenLabsTTSService(ElevenLabsTTSService):
                 ),
                 fatal=True,
             )
+
+
+class DograhElevenLabsHttpTTSService(ElevenLabsHttpTTSService):
+    """ElevenLabs HTTP streaming service with an owned aiohttp session."""
+
+    def __init__(self, *args, aiohttp_session: aiohttp.ClientSession, **kwargs):
+        super().__init__(*args, aiohttp_session=aiohttp_session, **kwargs)
+        self._owned_session = aiohttp_session
+
+    async def cleanup(self):
+        await super().cleanup()
+        if not self._owned_session.closed:
+            await self._owned_session.close()

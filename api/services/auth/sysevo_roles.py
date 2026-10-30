@@ -78,3 +78,19 @@ async def require_sales_dialer_role(
         raise HTTPException(status_code=403, detail=_ACCESS_DENIED_DETAIL)
 
     return user
+
+
+async def require_sysevo_super_admin(
+    authorization: str | None = Header(None),
+    user: UserModel = Depends(get_user),
+) -> UserModel:
+    """Require a verified Sysevo super-admin for platform dialer management."""
+    if user.is_superuser:
+        return user
+    if AUTH_PROVIDER != "supabase" or not authorization:
+        raise HTTPException(status_code=403, detail="Super-admin privileges are required.")
+    token = authorization.removeprefix("Bearer ").strip()
+    roles = await get_sysevo_roles(user.provider_id, token)
+    if "super_admin" not in roles:
+        raise HTTPException(status_code=403, detail="Super-admin privileges are required.")
+    return user

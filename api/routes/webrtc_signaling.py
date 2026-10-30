@@ -329,21 +329,27 @@ class SignalingManager:
         if org_id:
             set_current_org_id(org_id)
 
-        # Check Dograh quota before initiating the call (apply per-workflow
-        # model_overrides so we evaluate the keys this workflow will use).
-        quota_result = await check_dograh_quota(user, workflow_id=workflow_id)
-        if not quota_result.has_quota:
-            # Send error response for quota issues
-            await ws.send_json(
-                {
-                    "type": "error",
-                    "payload": {
-                        "error_type": quota_result.error_code,
-                        "message": quota_result.error_message,
-                    },
-                }
-            )
-            return
+        # Syra's personal assistant calls are explicitly non-billable. The public
+        # embed-init route already bypasses quota and wallet checks for this workflow;
+        # the signaling route must apply the same rule or every call is rejected here.
+        from api.services.syra_voice import is_syra_voice_workflow
+
+        syra_voice = await is_syra_voice_workflow(workflow_id)
+
+        if not syra_voice:
+            # Apply per-workflow model_overrides so we evaluate the keys this workflow uses.
+            quota_result = await check_dograh_quota(user, workflow_id=workflow_id)
+            if not quota_result.has_quota:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "error_type": quota_result.error_code,
+                            "message": quota_result.error_message,
+                        },
+                    }
+                )
+                return
 
         # Agent activation gate — deactivated agents cannot place web test calls.
         from api.services.workflow_active_check import check_workflow_active
@@ -361,19 +367,21 @@ class SignalingManager:
             )
             return
 
-        # Check Sysevo wallet balance — blocks test calls when client has no minutes/dollars
-        wallet_allowed, wallet_reason = await check_wallet_before_call(workflow_id)
-        if not wallet_allowed:
-            await ws.send_json(
-                {
-                    "type": "error",
-                    "payload": {
-                        "error_type": "wallet_insufficient_balance",
-                        "message": "Insufficient balance. Please top up your wallet to continue.",
-                    },
-                }
-            )
-            return
+        # Check the Sysevo wallet for ordinary test calls. Syra voice is excluded from
+        # billing at embed initialization, so applying the check here would still reject it.
+        if not syra_voice:
+            wallet_allowed, wallet_reason = await check_wallet_before_call(workflow_id)
+            if not wallet_allowed:
+                await ws.send_json(
+                    {
+                        "type": "error",
+                        "payload": {
+                            "error_type": "wallet_insufficient_balance",
+                            "message": "Insufficient balance. Please top up your wallet to continue.",
+                        },
+                    }
+                )
+                return
 
         if pc_id and pc_id in self._peer_connections:
             # Reuse existing connection

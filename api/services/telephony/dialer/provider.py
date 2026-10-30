@@ -57,6 +57,10 @@ def get_dialer_provider(name: str) -> DialerProvider:
         from api.services.telephony.dialer.telnyx_dialer import TelnyxDialerProvider
 
         return TelnyxDialerProvider()
+    if normalized == "vonage":
+        from api.services.telephony.dialer.vonage_dialer import VonageDialerProvider
+
+        return VonageDialerProvider()
     raise UnknownDialerProvider(f"No dialer provider implementation for {name!r}")
 
 
@@ -69,4 +73,31 @@ def resolve_active_dialer_provider() -> str:
     """
     import os
 
+    return (os.environ.get("SYSEVO_DIALER_PROVIDER") or "twilio").strip().lower()
+
+
+async def resolve_configured_dialer_provider() -> str:
+    """Read the platform dialer default from Supabase; retain env rollback."""
+    import os
+
+    try:
+        import httpx
+        from api.constants import SUPABASE_SERVICE_ROLE_KEY, SUPABASE_URL
+
+        if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                response = await client.get(
+                    f"{SUPABASE_URL.rstrip('/')}/rest/v1/dialer_provider_settings",
+                    params={"id": "eq.1", "select": "main_provider"},
+                    headers={
+                        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+                        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+                    },
+                )
+            response.raise_for_status()
+            rows = response.json()
+            if rows and rows[0].get("main_provider"):
+                return str(rows[0]["main_provider"]).strip().lower()
+    except Exception:
+        pass
     return (os.environ.get("SYSEVO_DIALER_PROVIDER") or "twilio").strip().lower()

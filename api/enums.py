@@ -80,6 +80,8 @@ class OrganizationConfigurationKey(Enum):
     DISPOSITION_CODE_MAPPING = "DISPOSITION_CODE_MAPPING"
     DISPOSITION_MESSAGE_TEMPLATE = "DISPOSITION_MESSAGE_TEMPLATE"
     CONCURRENT_CALL_LIMIT = "CONCURRENT_CALL_LIMIT"
+    # Custom (cloned) voices this org may hold, synced from the Sysevo plan tier
+    CUSTOM_VOICE_LIMIT = "CUSTOM_VOICE_LIMIT"
     CALLS_PER_NUMBER = "CALLS_PER_NUMBER"  # Simultaneous calls allowed per caller ID
     TELEPHONY_CONFIGURATION = (
         "TELEPHONY_CONFIGURATION"  # Stores all providers + active one

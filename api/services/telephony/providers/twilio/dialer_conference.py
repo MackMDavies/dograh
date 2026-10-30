@@ -26,9 +26,24 @@ def parent_call_sid_from_conference_name(name: str) -> str | None:
     return name.removeprefix("call-")
 
 
-def _twilio_client() -> Client | None:
-    account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
-    auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
+async def _twilio_client() -> Client | None:
+    # Use the active platform dialer account saved by admins. The legacy
+    # environment account can differ from the account used for the SDK token.
+    account_sid = None
+    auth_token = None
+    try:
+        from api.db import db_client
+
+        credentials = await db_client.get_platform_dialer_credentials()
+        if credentials:
+            account_sid = credentials.get("account_sid")
+            auth_token = credentials.get("auth_token")
+    except Exception as exc:
+        logger.error(f"Platform Twilio dialer credential lookup failed: {exc}")
+        return None
+    if not account_sid or not auth_token:
+        account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
+        auth_token = os.environ.get("SYSEVO_TWILIO_AUTH_TOKEN")
     if not account_sid or not auth_token:
         return None
     # An explicit timeout is required, not tidiness: twilio-python's default
@@ -63,7 +78,7 @@ async def dial_lead_into_conference(
     blocking the FastAPI event loop (and every other concurrent request)
     for the time it takes Twilio to respond.
     """
-    client = _twilio_client()
+    client = await _twilio_client()
     if not client:
         logger.error("dial_lead_into_conference: Twilio credentials not configured")
         return None
@@ -122,7 +137,7 @@ async def cancel_call(*, call_sid: str) -> bool:
     Twilio's Python SDK is synchronous, so this is wrapped in
     asyncio.to_thread() for the same reason dial_lead_into_conference is.
     """
-    client = _twilio_client()
+    client = await _twilio_client()
     if not client:
         logger.error("cancel_call: Twilio credentials not configured")
         return False
