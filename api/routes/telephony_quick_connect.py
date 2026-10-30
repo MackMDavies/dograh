@@ -19,6 +19,9 @@ from api.db.models import UserModel
 from api.enums import OrganizationConfigurationKey
 from api.services.auth.depends import get_user
 from api.services.org_concurrency import clamp_to_system_max
+from api.services.subscription_managed_numbers import (
+    ManagedNumberPolicyError, managed_number_slot, release_subscription_number, cleanup_released_number,
+)
 from api.services.telephony.managed_provisioner import (
     ManagedProvisioner,
     RegulationNotAutomatable,
@@ -204,6 +207,14 @@ async def quick_connect(
     if body.mode == "forward" and not body.existing_number:
         raise HTTPException(status_code=422, detail="existing_number is required for mode=forward")
 
+    try:
+        async with managed_number_slot(user.selected_organization_id, db_client, body.country.upper()) as slot:
+            return await _provision_quick_connect(body, user, slot)
+    except ManagedNumberPolicyError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
+
+
+async def _provision_quick_connect(body: QuickConnectRequest, user: UserModel, number_slot):
     chosen_account_id = _resolve_platform_account_id(user, body.platform_account_id)
     provisioner = await get_managed_provisioner(chosen_account_id)
     if provisioner is None:
@@ -311,6 +322,7 @@ async def quick_connect(
             )
         raise HTTPException(status_code=502, detail=f"Twilio provisioning failed: {exc.msg}")
 
+    phone_row = None
     try:
         # Find or create a "Sysevo Managed" telephony config for this org,
         # scoped to the platform account actually used for THIS purchase —
@@ -360,13 +372,27 @@ async def quick_connect(
                 "forwarding_from": body.existing_number,
             },
         )
+        try:
+            await number_slot.register(phone_row)
+        except ManagedNumberPolicyError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
     except HTTPException:
         # Re-raise HTTP exceptions directly (e.g. workflow not found)
         # but first release the provisioned number to avoid a Twilio leak
-        await asyncio.to_thread(provisioner.release_number, provisioned.twilio_sid)
+        released = await asyncio.to_thread(provisioner.release_number, provisioned.twilio_sid)
+        if number_slot.scope is not None and phone_row is not None:
+            if not released:
+                raise HTTPException(status_code=502, detail="Number cleanup could not be confirmed. Contact support before retrying.")
+            await db_client.delete_phone_number(phone_row.id, organization_id=org_id)
+            await number_slot.release(phone_row.id)
         raise
     except Exception:
-        await asyncio.to_thread(provisioner.release_number, provisioned.twilio_sid)
+        released = await asyncio.to_thread(provisioner.release_number, provisioned.twilio_sid)
+        if number_slot.scope is not None and phone_row is not None:
+            if not released:
+                raise HTTPException(status_code=502, detail="Number cleanup could not be confirmed. Contact support before retrying.")
+            await db_client.delete_phone_number(phone_row.id, organization_id=org_id)
+            await number_slot.release(phone_row.id)
         raise HTTPException(status_code=500, detail="Failed to save provisioned number. The Twilio number has been released.")
 
     return QuickConnectResponse(
@@ -374,6 +400,7 @@ async def quick_connect(
         telephony_config_id=managed_config.id,
         phone_number_id=phone_row.id,
     )
+
 
 
 @router.get("/regulatory/requirements", response_model=RegulationResponse)
@@ -445,6 +472,11 @@ async def delete_managed_number(
     org_id = None if user.is_superuser else user.selected_organization_id
     row = await db_client.get_phone_number(phone_number_id, organization_id=org_id)
     if row is None:
+        try:
+            if await cleanup_released_number(user.selected_organization_id, phone_number_id, db_client):
+                return
+        except ManagedNumberPolicyError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
         raise HTTPException(status_code=404, detail="Phone number not found.")
 
     meta = row.extra_metadata or {}
@@ -456,6 +488,12 @@ async def delete_managed_number(
     # Resolved BEFORE the delete, from the row's own config — once the row is
     # gone we can no longer look up which account provisioned it.
     provisioner = await _provisioner_for_number(row) if twilio_sid else None
+
+    try:
+        if await release_subscription_number(row, provisioner, db_client):
+            return
+    except ManagedNumberPolicyError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
 
     # Delete the DB row first so the record is gone even if Twilio release fails.
     await db_client.delete_phone_number(phone_number_id, organization_id=org_id)
