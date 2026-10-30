@@ -6,11 +6,65 @@ import pytest
 from api.schemas.user_configuration import UserConfiguration
 from api.services.configuration import org_provider_resolver as resolver
 from api.services.configuration.pipeline import (
+    apply_agent_language_configuration,
     apply_pipeline_call_configuration,
+    build_agent_language_instruction,
     resolve_pipeline_configuration,
     resolve_pipeline_voice,
 )
 from api.tests.test_voice_test_providers import fixture, plan_fixture
+
+
+@pytest.mark.parametrize(
+    "language,expected",
+    [("Spanish", "es"), ("es-ES", "es"), ("en-GB", "en")],
+)
+def test_agent_language_is_applied_to_realtime_and_provider_settings(language, expected):
+    source, _, _ = plan_fixture()
+    source.is_realtime = True
+    source.realtime = fixture("realtime", "elevenlabs_realtime")[0]
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "flux-general-en"
+    before = source.model_dump()
+
+    result = apply_agent_language_configuration(source, {"language": language})
+
+    assert result is not source
+    assert result.realtime.language == expected
+    if "language" in result.tts.model_fields:
+        assert result.tts.language == (language if "-" in language else expected)
+    assert source.model_dump() == before
+    if expected != "en":
+        assert result.stt.model == "nova-3-general"
+        assert result.stt.language == expected
+
+
+def test_multilingual_agent_uses_nova_auto_detection_and_does_not_pin_realtime_language():
+    source, _, _ = plan_fixture()
+    source.is_realtime = True
+    source.realtime = fixture("realtime", "elevenlabs_realtime")[0]
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "flux-general-en"
+
+    result = apply_agent_language_configuration(
+        source,
+        {"language": "en-GB, es-ES", "multilingual_mode": True},
+    )
+
+    assert result.stt.model == "nova-3-general"
+    assert result.stt.language == "multi"
+    assert result.realtime.language is None
+    assert "Detect which of these languages" in build_agent_language_instruction(
+        {"language": "en-GB, es-ES", "multilingual_mode": True}
+    )
+
+
+def test_agent_without_language_keeps_provider_configuration_unchanged():
+    source, _, _ = plan_fixture()
+    before = source.model_dump()
+
+    assert apply_agent_language_configuration(source, {}) is source
+    assert source.model_dump() == before
 
 
 @pytest.mark.parametrize("provider", ["openai", "elevenlabs"])

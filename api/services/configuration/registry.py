@@ -800,6 +800,11 @@ class OpenAIRealtimeLLMConfiguration(BaseLLMConfiguration):
             "allow_custom_input": True,
         },
     )
+    language: str | None = Field(
+        default=None,
+        description="ISO 639-1 language code for realtime input transcription.",
+        json_schema_extra={"examples": ("en", "es", "fr")},
+    )
 
 
 @register_service(ServiceType.REALTIME)
@@ -820,6 +825,11 @@ class ElevenLabsRealtimeConfiguration(BaseLLMConfiguration):
         default="brian",
         description="ElevenLabs voice name or voice ID.",
         json_schema_extra={"allow_custom_input": True},
+    )
+    language: str | None = Field(
+        default=None,
+        description="ISO 639-1 language code for realtime input transcription.",
+        json_schema_extra={"examples": ("en", "es", "fr")},
     )
 
 
