@@ -1,0 +1,119 @@
+{
+  "running_image_id": "sha256:6feec492957e487893a54c8d13e2d1168c0a437082a8b72706d7f64a998180f6",
+  "canonical_commit": "92184b1",
+  "files": [
+    {
+      "path": "api/db/campaign_client.py",
+      "live_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971",
+      "candidate_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971",
+      "changed": false
+    },
+    {
+      "path": "api/db/voice_library_client.py",
+      "live_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719",
+      "candidate_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719",
+      "changed": false
+    },
+    {
+      "path": "api/db/workflow_run_client.py",
+      "live_sha256": "1fbd27b1a23fde06387f9a74e1b092123c5a0afda48addd27f8118a8a3208f77",
+      "candidate_sha256": "1fbd27b1a23fde06387f9a74e1b092123c5a0afda48addd27f8118a8a3208f77",
+      "changed": false
+    },
+    {
+      "path": "api/enums.py",
+      "live_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b",
+      "candidate_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b",
+      "changed": false
+    },
+    {
+      "path": "api/mcp_server/auth.py",
+      "live_sha256": "d3d0214b54807d18a19eb72b9857ad6c23d79cc61b79701be4680c17e0b90ec0",
+      "candidate_sha256": "2d1cf1d239004a59b228899b77fcf7017241a2747272ae1c98c9ca92dc8851db",
+      "changed": true
+    },
+    {
+      "path": "api/routes/campaign.py",
+      "live_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b",
+      "candidate_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b",
+      "changed": false
+    },
+    {
+      "path": "api/routes/telephony_quick_connect.py",
+      "live_sha256": "ad1b5bd07bf8756c5250595faa255563af7064e98d20b91039cb92aa1c6a0c5d",
+      "candidate_sha256": "ad1b5bd07bf8756c5250595faa255563af7064e98d20b91039cb92aa1c6a0c5d",
+      "changed": false
+    },
+    {
+      "path": "api/routes/voice_library.py",
+      "live_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201",
+      "candidate_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201",
+      "changed": false
+    },
+    {
+      "path": "api/services/auth/depends.py",
+      "live_sha256": "84b8a914a169d4e9db912929f6e87a1bbccd4ada6acdb11eff713b9b95289ccc",
+      "candidate_sha256": "960d35b1aa731d62a62d48daed7310f52f3433b9213df91f6c84f0f802acb026",
+      "changed": true
+    },
+    {
+      "path": "api/services/campaign/campaign_orchestrator.py",
+      "live_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26",
+      "candidate_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26",
+      "changed": false
+    },
+    {
+      "path": "api/services/campaign/limits.py",
+      "live_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765",
+      "candidate_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765",
+      "changed": false
+    },
+    {
+      "path": "api/services/campaign/runner.py",
+      "live_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078",
+      "candidate_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078",
+      "changed": false
+    },
+    {
+      "path": "api/services/pipecat/run_pipeline.py",
+      "live_sha256": "8fc3508b052edf89a0867e664321a6958ae632ead47e0396103d5801f85ae12b",
+      "candidate_sha256": "8fc3508b052edf89a0867e664321a6958ae632ead47e0396103d5801f85ae12b",
+      "changed": false
+    },
+    {
+      "path": "api/services/subscription_api_meter.py",
+      "live_sha256": null,
+      "candidate_sha256": "b9e86a93cf9011cb6fbd1724b7a4f9608724bd0065a6853d8889703b9284644e",
+      "changed": true
+    },
+    {
+      "path": "api/services/subscription_call_budget.py",
+      "live_sha256": "810f77fbfe26b1f5560ae2beafc3343a91824003275bd7219dd0164e7cfb272a",
+      "candidate_sha256": "810f77fbfe26b1f5560ae2beafc3343a91824003275bd7219dd0164e7cfb272a",
+      "changed": false
+    },
+    {
+      "path": "api/services/wallet_webhook.py",
+      "live_sha256": "b94557f26a274a08543d33091609eeab796ce198d9daba0e4fd58f5e94f7f1f6",
+      "candidate_sha256": "b94557f26a274a08543d33091609eeab796ce198d9daba0e4fd58f5e94f7f1f6",
+      "changed": false
+    },
+    {
+      "path": "api/services/workflow/test_sandbox_mode.py",
+      "live_sha256": "e1f22c061d58a10097bb3f805f6fb0ae0f37d2d4c777a168f7e3f8f435cc2ff4",
+      "candidate_sha256": "e1f22c061d58a10097bb3f805f6fb0ae0f37d2d4c777a168f7e3f8f435cc2ff4",
+      "changed": false
+    }
+  ],
+  "candidate_image": "dograh-local/native-api:candidate-20261030-92184b1",
+  "candidate_image_id": "sha256:ba0623ff661466c67e1f1ccd52c4535b502aef65932dcaca0d2e5709d068c782",
+  "base_layers_preserved": 211,
+  "checks_passed": {
+    "quota": 14,
+    "call_budget": 36,
+    "native_meter_and_auth": 18,
+    "mcp_auth": 3
+  },
+  "status": "candidate-tested-not-deployed",
+  "signup_opened": false
+}
