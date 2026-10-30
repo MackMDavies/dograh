@@ -87,6 +87,8 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
         session_properties = getattr(settings, "session_properties", None)
         audio = getattr(session_properties, "audio", None)
         input_audio = getattr(audio, "input", None)
+        transcription = getattr(input_audio, "transcription", None)
+        self._elevenlabs_language = getattr(transcription, "language", None)
         if input_audio is not None and hasattr(input_audio, "transcription"):
             # The upstream factory currently supplies OpenAI's private
             # transcription model by default. ElevenLabs Realtime owns ASR as
@@ -128,7 +130,16 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
             result=evt,
             finalized=True,
         )
-        await self._handle_user_transcription(evt.transcript, True, Language.EN)
+        transcript_language = getattr(evt, "language", None) or self._elevenlabs_language
+        language = Language.EN
+        if transcript_language:
+            for candidate in (transcript_language, transcript_language.split("-")[0]):
+                try:
+                    language = Language(candidate)
+                    break
+                except ValueError:
+                    continue
+        await self._handle_user_transcription(evt.transcript, True, language)
 
     async def _handle_evt_audio_transcript_delta(self, evt):
         if not evt.delta:
@@ -334,6 +345,13 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
                 },
             },
         }
+        # ElevenLabs accepts a language hint on realtime input transcription,
+        # but not OpenAI's transcription model. Keep the hint while deliberately
+        # omitting the foreign model identifier from the client-secret payload.
+        if self._elevenlabs_language:
+            session["audio"]["input"]["transcription"] = {
+                "language": self._elevenlabs_language,
+            }
         instructions = getattr(settings, "system_instruction", None)
         if instructions:
             session["instructions"] = instructions

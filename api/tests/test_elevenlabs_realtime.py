@@ -27,8 +27,6 @@ from api.services.pipecat.realtime.elevenlabs_realtime import (
 )
 from pipecat.services.openai.realtime.events import parse_server_event
 from api.services.pipecat.realtime.openai_realtime import DograhOpenAIRealtimeLLMService
-from api.services.pipecat.service_factory import create_realtime_llm_service
-from api.services.workflow.pipecat_engine import PipecatEngine
 
 
 @pytest.mark.parametrize("model", ELEVENLABS_REALTIME_MODELS)
@@ -52,6 +50,8 @@ def test_elevenlabs_realtime_configuration_is_registered(model):
 
 
 def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
+    from api.services.pipecat.service_factory import create_realtime_llm_service
+
     config = UserConfiguration.model_validate(
         {
             "llm": {"provider": "openai", "model": "gpt-4.1", "api_key": "llm-key"},
@@ -60,6 +60,7 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
                 "provider": "elevenlabs_realtime",
                 "model": "eleven_realtime_v1_max",
                 "voice": "voice-id-123",
+                "language": "es",
                 "api_key": "el-key",
             },
         }
@@ -77,6 +78,7 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
     assert kwargs["base_url"] == "wss://api.elevenlabs.io/v1/convai/realtime"
     assert kwargs["settings"].model == "eleven_realtime_v1_max"
     assert kwargs["settings"].session_properties.audio.output.voice == "voice-id-123"
+    assert kwargs["settings"].session_properties.audio.input.transcription.language == "es"
 
 
 @pytest.mark.parametrize("realtime_voice,expected_voice", [
@@ -84,6 +86,8 @@ def test_elevenlabs_realtime_factory_uses_compatible_endpoint_and_voice():
     ("selected-realtime-id", "selected-realtime-id"),
 ])
 def test_elevenlabs_realtime_voice_selection_preserves_legacy_fallback(realtime_voice, expected_voice):
+    from api.services.pipecat.service_factory import create_realtime_llm_service
+
     config = UserConfiguration.model_validate(
         {
             "llm": {"provider": "openai", "model": "gpt-4.1", "api_key": "llm-key"},
@@ -139,6 +143,26 @@ def test_client_secret_config_uses_pcm24k_model_and_selected_voice():
     assert service._settings.session_properties.audio.input.transcription is None
     assert session["audio"]["output"]["format"] == {"type": "audio/pcm"}
     assert session["audio"]["output"]["voice"] == "brian"
+
+
+def test_client_secret_keeps_selected_transcription_language_without_foreign_model():
+    service = DograhElevenLabsRealtimeLLMService(
+        api_key="synthetic-test-key",
+        settings=DograhElevenLabsRealtimeLLMService.Settings(
+            model="eleven_realtime_v1_mini",
+            session_properties=SessionProperties(
+                audio=AudioConfiguration(
+                    input=AudioInput(transcription=InputAudioTranscription(language="es")),
+                    output=AudioOutput(voice="brian"),
+                ),
+            ),
+        ),
+    )
+
+    session = service._client_secret_session()
+
+    assert session["audio"]["input"]["transcription"] == {"language": "es"}
+    assert service._settings.session_properties.audio.input.transcription is None
 
 
 @pytest.mark.asyncio
@@ -246,6 +270,8 @@ async def test_initial_context_only_adds_opening_input_when_no_caller_input_exis
 
 @pytest.mark.asyncio
 async def test_workflow_context_replaces_realtime_services_empty_context():
+    from api.services.workflow.pipecat_engine import PipecatEngine
+
     engine = object.__new__(PipecatEngine)
     live_context = LLMContext()
     engine.context = live_context
