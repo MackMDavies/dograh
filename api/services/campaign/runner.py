@@ -47,7 +47,9 @@ async def validate_campaign_startable(campaign: CampaignModel, user: UserModel) 
 class CampaignRunnerService:
     """Orchestrates campaign execution"""
 
-    async def start_campaign(self, campaign_id: int) -> None:
+    async def start_campaign(
+        self, campaign_id: int, active_campaign_limit: int | None = None
+    ) -> None:
         """Entry point - updates state to 'syncing' and enqueues sync task"""
         # Get campaign
         campaign = await db_client.get_campaign_by_id(campaign_id)
@@ -64,14 +66,18 @@ class CampaignRunnerService:
         is_redial = bool(
             (campaign.orchestrator_metadata or {}).get("parent_campaign_id")
         )
-        if is_redial:
-            now = datetime.now(UTC)
-            await db_client.update_campaign(
-                campaign_id=campaign_id,
-                state="running",
-                started_at=now,
-                source_last_synced_at=now,
+        claimed = await db_client.claim_campaign_start(
+            campaign_id,
+            active_campaign_limit=active_campaign_limit,
+            start_running=is_redial,
+        )
+        if not claimed:
+            current = await db_client.get_campaign_by_id(campaign_id)
+            state = current.state if current else "missing"
+            raise ValueError(
+                f"Campaign must be in 'created' state to start, current state: {state}"
             )
+        if is_redial:
             publisher = await get_campaign_event_publisher()
             await publisher.publish_sync_completed(
                 campaign_id=campaign_id,
@@ -82,20 +88,14 @@ class CampaignRunnerService:
             logger.info(f"Redial campaign {campaign_id} started, source sync skipped")
             return
 
-        # Update campaign state to syncing
-        await db_client.update_campaign(
-            campaign_id=campaign_id,
-            state="syncing",
-            started_at=datetime.now(UTC),
-            source_sync_status="in_progress",
-        )
-
         # Enqueue the sync task
         await enqueue_job(FunctionNames.SYNC_CAMPAIGN_SOURCE, campaign_id)
 
         logger.info(f"Campaign {campaign_id} started, syncing source data")
 
-    async def fire_scheduled_campaign(self, campaign_id: int) -> bool:
+    async def fire_scheduled_campaign(
+        self, campaign_id: int, active_campaign_limit: int | None = None
+    ) -> bool:
         """Called by the orchestrator when a scheduled campaign is due.
 
         Claims the campaign atomically (race-safe against a concurrent
@@ -106,7 +106,9 @@ class CampaignRunnerService:
         race — the caller should treat that as "nothing to do", not an
         error.
         """
-        claimed = await db_client.claim_scheduled_campaign(campaign_id)
+        claimed = await db_client.claim_scheduled_campaign(
+            campaign_id, active_campaign_limit=active_campaign_limit
+        )
         if not claimed:
             return False
 
@@ -130,7 +132,9 @@ class CampaignRunnerService:
 
         logger.info(f"Campaign {campaign_id} paused")
 
-    async def resume_campaign(self, campaign_id: int) -> None:
+    async def resume_campaign(
+        self, campaign_id: int, active_campaign_limit: int | None = None
+    ) -> None:
         """Resumes paused campaign"""
         campaign = await db_client.get_campaign_by_id(campaign_id)
         if not campaign:
@@ -143,7 +147,15 @@ class CampaignRunnerService:
 
         # Update state to running. Do not queue batch since campaign orchestrator's
         # stale campaign checker would do that if there are pending work.
-        await db_client.update_campaign(campaign_id=campaign_id, state="running")
+        claimed = await db_client.claim_campaign_resume(
+            campaign_id, active_campaign_limit=active_campaign_limit
+        )
+        if not claimed:
+            current = await db_client.get_campaign_by_id(campaign_id)
+            state = current.state if current else "missing"
+            raise ValueError(
+                f"Campaign must be in 'paused' state to resume, current state: {state}"
+            )
 
         # Reset circuit breaker so the resumed campaign starts with a clean slate
         await circuit_breaker.reset(campaign_id)

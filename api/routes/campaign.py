@@ -13,6 +13,7 @@ from api.constants import (
     MAX_SYSTEM_CONCURRENCY,
 )
 from api.db import db_client
+from api.db.campaign_client import ActiveCampaignLimitExceeded
 from api.db.models import UserModel
 from api.services.compliance_statements import (
     ACK_CALLING_HOURS_OFF,
@@ -29,6 +30,10 @@ from api.services.campaign.runner import (
     campaign_runner_service,
     validate_campaign_startable,
 )
+from api.services.campaign.limits import (
+    CampaignLimitConfigurationError,
+    get_active_campaign_limit,
+)
 from api.services.campaign.source_sync import CampaignSourceSyncService
 from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.campaign.source_sync_factory import get_sync_service
@@ -37,6 +42,20 @@ from api.services.reports import generate_campaign_report_csv
 from api.services.storage import storage_fs
 
 router = APIRouter(prefix="/campaign")
+
+
+async def _get_active_campaign_limit(user: UserModel, organization_id: int) -> Optional[int]:
+    """Read the plan cap synced from Sysevo; invalid/unreadable caps fail closed."""
+    try:
+        return await get_active_campaign_limit(
+            organization_id, bypass=user.is_superuser
+        )
+    except CampaignLimitConfigurationError as e:
+        logger.warning(f"[campaign-limit] lookup failed for org {organization_id}: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not verify your active campaign allowance. Please try again.",
+        ) from e
 
 
 async def _get_from_numbers_count(organization_id: int) -> int:
@@ -673,23 +692,35 @@ async def create_campaign(
     if request.scheduled_start_at is not None:
         _validate_schedule_lead_time(request.scheduled_start_at)
 
-    campaign = await db_client.create_campaign(
-        name=request.name,
-        workflow_id=request.workflow_id,
-        source_type=request.source_type,
-        source_id=request.source_id,
-        user_id=user.id,
-        organization_id=user.selected_organization_id,
-        retry_config=retry_config,
-        max_concurrency=request.max_concurrency,
-        schedule_config=schedule_config,
-        circuit_breaker=circuit_breaker_config,
-        calling_hours_config=calling_hours_config,
-        telephony_configuration_id=telephony_configuration_id,
-        from_phone_number_id=from_phone_number_id,
-        scheduled_start_at=request.scheduled_start_at,
-        scheduled_timezone=request.scheduled_timezone,
+    active_campaign_limit = (
+        await _get_active_campaign_limit(user, user.selected_organization_id)
+        if request.scheduled_start_at is not None
+        else None
     )
+    try:
+        campaign = await db_client.create_campaign(
+            name=request.name,
+            workflow_id=request.workflow_id,
+            source_type=request.source_type,
+            source_id=request.source_id,
+            user_id=user.id,
+            organization_id=user.selected_organization_id,
+            retry_config=retry_config,
+            max_concurrency=request.max_concurrency,
+            schedule_config=schedule_config,
+            circuit_breaker=circuit_breaker_config,
+            calling_hours_config=calling_hours_config,
+            telephony_configuration_id=telephony_configuration_id,
+            from_phone_number_id=from_phone_number_id,
+            scheduled_start_at=request.scheduled_start_at,
+            scheduled_timezone=request.scheduled_timezone,
+            active_campaign_limit=active_campaign_limit,
+        )
+    except ActiveCampaignLimitExceeded as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your plan allows {e.limit} active outbound campaign(s). Archive or finish one before adding another.",
+        ) from e
 
     # Evidence, kept separate from enforcement. The validator above already
     # refused mode='off' without an acknowledgement; this records WHO accepted
@@ -844,7 +875,17 @@ async def start_campaign(
 
     # Start the campaign using the runner service
     try:
-        await campaign_runner_service.start_campaign(campaign_id)
+        active_campaign_limit = await _get_active_campaign_limit(
+            user, campaign.organization_id
+        )
+        await campaign_runner_service.start_campaign(
+            campaign_id, active_campaign_limit=active_campaign_limit
+        )
+    except ActiveCampaignLimitExceeded as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your plan allows {e.limit} active outbound campaign(s). Finish or pause one before starting another.",
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1391,7 +1432,17 @@ async def resume_campaign(
 
     # Resume the campaign using the runner service
     try:
-        await campaign_runner_service.resume_campaign(campaign_id)
+        active_campaign_limit = await _get_active_campaign_limit(
+            user, campaign.organization_id
+        )
+        await campaign_runner_service.resume_campaign(
+            campaign_id, active_campaign_limit=active_campaign_limit
+        )
+    except ActiveCampaignLimitExceeded as e:
+        raise HTTPException(
+            status_code=403,
+            detail=f"Your plan allows {e.limit} active outbound campaign(s). Finish or pause one before resuming another.",
+        ) from e
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 

@@ -12,6 +12,70 @@ from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
 from api.db.workflow_run_visibility import customer_visible_workflow_run
 from api.schemas.workflow import WorkflowRunResponseSchema
 
+_ACTIVE_CAMPAIGN_LOCK_NAMESPACE = 1_397_736_276
+_ACTIVE_CAMPAIGN_STATES = ("scheduled", "syncing", "running")
+
+
+class ActiveCampaignLimitExceeded(Exception):
+    def __init__(self, limit: int, active: int):
+        self.limit = limit
+        self.active = active
+        super().__init__(f"Active campaign cap reached ({active}/{limit})")
+
+
+async def _lock_active_campaign_quota(session, organization_id: int, limit: int) -> int:
+    await session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "CAST(:lock_namespace AS integer), CAST(:organization_id AS integer))"
+        ),
+        {"lock_namespace": _ACTIVE_CAMPAIGN_LOCK_NAMESPACE, "organization_id": organization_id},
+    )
+    result = await session.execute(
+        select(func.count(CampaignModel.id)).where(
+            CampaignModel.organization_id == organization_id,
+            CampaignModel.state.in_(_ACTIVE_CAMPAIGN_STATES),
+            CampaignModel.is_standing.is_(False),
+        )
+    )
+    active = int(result.scalar() or 0)
+    if active >= limit:
+        raise ActiveCampaignLimitExceeded(limit, active)
+    return active
+
+
+async def _reserve_active_campaign_slot(
+    session,
+    organization_id: int,
+    limit: Optional[int],
+    exclude_campaign_id: Optional[int] = None,
+) -> None:
+    if limit is None:
+        return
+    if limit < 0:
+        raise ValueError("active_campaign_limit must be non-negative or None")
+    if exclude_campaign_id is None:
+        await _lock_active_campaign_quota(session, organization_id, limit)
+        return
+    await session.execute(
+        text(
+            "SELECT pg_advisory_xact_lock("
+            "CAST(:lock_namespace AS integer), CAST(:organization_id AS integer))"
+        ),
+        {"lock_namespace": _ACTIVE_CAMPAIGN_LOCK_NAMESPACE, "organization_id": organization_id},
+    )
+    result = await session.execute(
+        select(func.count(CampaignModel.id)).where(
+            CampaignModel.organization_id == organization_id,
+            CampaignModel.state.in_(_ACTIVE_CAMPAIGN_STATES),
+            CampaignModel.is_standing.is_(False),
+            CampaignModel.id != exclude_campaign_id,
+        )
+    )
+    active = int(result.scalar() or 0)
+    if active >= limit:
+        raise ActiveCampaignLimitExceeded(limit, active + 1)
+
 
 def unscheduled_queued_conditions(campaign_id: int) -> list:
     """The dispatcher's regular-queue claim branch, as reusable conditions.
@@ -54,9 +118,14 @@ class CampaignClient(BaseDBClient):
         from_phone_number_id: Optional[int] = None,
         scheduled_start_at: Optional[datetime] = None,
         scheduled_timezone: Optional[str] = None,
+        active_campaign_limit: Optional[int] = None,
     ) -> CampaignModel:
         """Create a new campaign"""
         async with self.async_session() as session:
+            if scheduled_start_at is not None:
+                await _reserve_active_campaign_slot(
+                    session, organization_id, active_campaign_limit
+                )
             # Build orchestrator_metadata with max_concurrency if provided
             orchestrator_metadata = {}
             if max_concurrency is not None:
@@ -101,6 +170,61 @@ class CampaignClient(BaseDBClient):
                 raise e
             await session.refresh(campaign)
             return campaign
+
+    async def claim_campaign_start(
+        self,
+        campaign_id: int,
+        active_campaign_limit: Optional[int] = None,
+        start_running: bool = False,
+    ) -> bool:
+        """Atomically reserve quota and move a created campaign into execution."""
+        async with self.async_session() as session:
+            organization_id = await session.scalar(
+                select(CampaignModel.organization_id).where(CampaignModel.id == campaign_id)
+            )
+            if organization_id is None:
+                return False
+            await _reserve_active_campaign_slot(
+                session, organization_id, active_campaign_limit
+            )
+            now = datetime.now(UTC)
+            values = {
+                "state": "running" if start_running else "syncing",
+                "started_at": now,
+                "updated_at": now,
+            }
+            if not start_running:
+                values["source_sync_status"] = "in_progress"
+            else:
+                values["source_last_synced_at"] = now
+            result = await session.execute(
+                update(CampaignModel)
+                .where(CampaignModel.id == campaign_id, CampaignModel.state == "created")
+                .values(**values)
+            )
+            await session.commit()
+            return result.rowcount == 1
+
+    async def claim_campaign_resume(
+        self, campaign_id: int, active_campaign_limit: Optional[int] = None
+    ) -> bool:
+        """Atomically reserve quota and resume a paused campaign."""
+        async with self.async_session() as session:
+            organization_id = await session.scalar(
+                select(CampaignModel.organization_id).where(CampaignModel.id == campaign_id)
+            )
+            if organization_id is None:
+                return False
+            await _reserve_active_campaign_slot(
+                session, organization_id, active_campaign_limit
+            )
+            result = await session.execute(
+                update(CampaignModel)
+                .where(CampaignModel.id == campaign_id, CampaignModel.state == "paused")
+                .values(state="running", updated_at=datetime.now(UTC))
+            )
+            await session.commit()
+            return result.rowcount == 1
 
     async def get_standing_campaign_for_workflow(self, workflow_id: int) -> Optional[CampaignModel]:
         """The workflow's callback queue (services/callbacks/standing.py), if it has one."""
@@ -518,7 +642,9 @@ class CampaignClient(BaseDBClient):
             result = await session.execute(query)
             return list(result.scalars().all())
 
-    async def claim_scheduled_campaign(self, campaign_id: int) -> bool:
+    async def claim_scheduled_campaign(
+        self, campaign_id: int, active_campaign_limit: Optional[int] = None
+    ) -> bool:
         """Atomically transition a due scheduled campaign to 'syncing'.
 
         Race-safe against a concurrent "Cancel schedule": the UPDATE only
@@ -528,6 +654,17 @@ class CampaignClient(BaseDBClient):
         Returns True only if THIS call performed the transition.
         """
         async with self.async_session() as session:
+            organization_id = await session.scalar(
+                select(CampaignModel.organization_id).where(CampaignModel.id == campaign_id)
+            )
+            if organization_id is None:
+                return False
+            await _reserve_active_campaign_slot(
+                session,
+                organization_id,
+                active_campaign_limit,
+                exclude_campaign_id=campaign_id,
+            )
             stmt = (
                 update(CampaignModel)
                 .where(

@@ -33,6 +33,10 @@ from api.services.campaign.campaign_event_protocol import (
 )
 from api.services.campaign.campaign_event_publisher import CampaignEventPublisher
 from api.services.campaign.circuit_breaker import circuit_breaker
+from api.services.campaign.limits import (
+    CampaignLimitConfigurationError,
+    get_active_campaign_limit,
+)
 from api.services.campaign.runner import (
     CampaignValidationError,
     campaign_runner_service,
@@ -592,7 +596,19 @@ class CampaignOrchestrator:
                     )
                     continue
 
-                fired = await campaign_runner_service.fire_scheduled_campaign(campaign.id)
+                try:
+                    active_campaign_limit = await get_active_campaign_limit(
+                        campaign.organization_id, bypass=user.is_superuser
+                    )
+                except CampaignLimitConfigurationError as e:
+                    logger.warning(
+                        f"Scheduled campaign {campaign.id} limit unavailable ({e}), will retry next tick"
+                    )
+                    continue
+
+                fired = await campaign_runner_service.fire_scheduled_campaign(
+                    campaign.id, active_campaign_limit=active_campaign_limit
+                )
                 if fired:
                     await notify_campaign_scheduled_started(campaign.id)
             except Exception:
