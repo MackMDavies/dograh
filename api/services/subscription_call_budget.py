@@ -73,7 +73,7 @@ class CallBudgetClient:
             # in caller-visible errors or later reconciliation logs.
             raise CallBudgetError('Call billing is unavailable') from None
 
-    async def reserve(self, account_id, run_id, workflow_id, max_seconds):
+    async def reserve(self, account_id, run_id, workflow_id, max_seconds, *, runtime_configuration=None):
         try:
             account_id = str(UUID(account_id))
         except (ValueError, TypeError, AttributeError):
@@ -81,8 +81,11 @@ class CallBudgetClient:
         if not all(_positive_int(v) for v in (run_id, workflow_id, max_seconds)):
             raise CallBudgetError('Invalid call identity or duration')
         sent_at = self.clock()
-        reply = await self._request({'operation': 'reserve', 'account_id': account_id,
-            'run_id': run_id, 'workflow_id': workflow_id, 'max_duration_seconds': max_seconds})
+        payload = {'operation': 'reserve', 'account_id': account_id,
+            'run_id': run_id, 'workflow_id': workflow_id, 'max_duration_seconds': max_seconds}
+        if runtime_configuration is not None:
+            payload['runtime_configuration'] = runtime_configuration
+        reply = await self._request(payload)
         return CallBudget.from_reply(reply, run_id=run_id, max_seconds=max_seconds,
             sent_at=sent_at, received_at=self.clock())
 
@@ -115,7 +118,7 @@ def configured_budget_client():
     return CallBudgetClient(endpoint, os.getenv('SYSEVO_MEMORY_SECRET', ''))
 
 
-async def prepare_pipeline_call_budget(workflow, workflow_run, max_seconds, db, *, client=None, skip=False):
+async def prepare_pipeline_call_budget(workflow, workflow_run, max_seconds, db, *, client=None, skip=False, resolved_models=None):
     """Bind the budget to the persisted workflow organization, never a user selection.
 
     The local plan marker is only an outage fallback for an explicitly known
@@ -154,7 +157,8 @@ async def prepare_pipeline_call_budget(workflow, workflow_run, max_seconds, db, 
         return None
     if route != 'subscription':
         raise CallBudgetError('Call billing route could not be verified')
-    budget = await billing.reserve(account, workflow_run.id, workflow.id, max_seconds)
+    budget = await billing.reserve(account, workflow_run.id, workflow.id, max_seconds,
+        runtime_configuration=resolved_models)
     await db.update_workflow_run(workflow_run.id, annotations={'subscription_call_budget': {
         'account_id': account, 'run_id': workflow_run.id, 'workflow_id': workflow.id,
     }})

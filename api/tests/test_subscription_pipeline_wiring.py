@@ -21,6 +21,7 @@ class SharedPipelineTests(unittest.IsolatedAsyncioTestCase):
         order = []
         async def prepare(*args, **kwargs):
             order.append(('reserve', kwargs['skip']))
+            self.assertEqual(kwargs['resolved_models'], {'is_realtime': True, 'realtime_model': 'eleven_realtime_v1_mini'})
             if fail: raise CallBudgetError('synthetic rejection')
             return budget
         async def run(params): order.append(('audio', None))
@@ -32,6 +33,7 @@ class SharedPipelineTests(unittest.IsolatedAsyncioTestCase):
         namespace = {'asyncio': asyncio, 'prepare_pipeline_call_budget': prepare,
             'run_with_call_budget': guarded, 'workflow': object(), 'workflow_run': object(),
             'max_call_duration_seconds': 300, 'db_client': object(), 'is_agent_test_sandbox': sandbox,
+            'is_realtime': True, 'runtime_configuration': {'realtime_model': 'eleven_realtime_v1_mini'},
             'run_configs': {}, 'PipelineTaskParams': lambda **kwargs: kwargs,
             'task': SimpleNamespace(run=run, cancel=cancel), 'supervisor': None, 'suppress': suppress,
             'engine': SimpleNamespace(stop_companion=cleanup),

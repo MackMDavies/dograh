@@ -1252,6 +1252,7 @@ async def _run_pipeline(
         budget = await prepare_pipeline_call_budget(
             workflow, workflow_run, max_call_duration_seconds, db_client,
             skip=is_agent_test_sandbox or run_configs.get('syra_voice') is True,
+            resolved_models={'is_realtime': is_realtime, **runtime_configuration},
         )
         if budget is None:
             await task.run(params)

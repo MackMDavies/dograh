@@ -26,6 +26,17 @@ class BudgetClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(requests, [{'operation': 'reserve', 'account_id': ACCOUNT, 'run_id': 101,
             'workflow_id': 123, 'max_duration_seconds': 300}])
 
+    async def test_reservation_sends_only_the_resolved_runtime_models(self):
+        requests = []
+        runtime = {'is_realtime': True, 'realtime_provider': 'elevenlabs_realtime',
+            'realtime_model': 'eleven_realtime_v1_mini', 'llm_model': 'gpt-4.1-mini'}
+        async def post(payload):
+            requests.append(payload)
+            return REPLY
+        await CallBudgetClient('https://example.invalid/budget', 'synthetic-secret',
+            post=post, clock=lambda: 10).reserve(ACCOUNT, 101, 123, 300, runtime_configuration=runtime)
+        self.assertEqual(requests[0]['runtime_configuration'], runtime)
+
     async def test_unavailable_billing_never_becomes_an_unlimited_budget(self):
         async def post(_):
             raise RuntimeError('synthetic-secret and private response')
@@ -187,7 +198,7 @@ class PipelineBindingTests(unittest.IsolatedAsyncioTestCase):
             requests.append(('classify', args))
             if isinstance(route, Exception): raise route
             return route
-        async def reserve(*args):
+        async def reserve(*args, **kwargs):
             requests.append(('reserve', args))
             return CallBudget(101, 5, time.monotonic()+299)
         return (SimpleNamespace(id=123, organization_id=42), SimpleNamespace(id=101, workflow_id=123),
