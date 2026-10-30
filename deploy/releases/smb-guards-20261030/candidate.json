@@ -1,0 +1,119 @@
+{
+  "files": [
+    {
+      "path": "api/db/campaign_client.py",
+      "live_sha256": "9bde75e70252bdce3f8455894b89935b93d7bab9f1dd11f4e4376e7aae7fbc80",
+      "candidate_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971"
+    },
+    {
+      "path": "api/db/voice_library_client.py",
+      "live_sha256": "230383d162cbdcdbd1e208bd25e219b8d5ef164d187ba9ba2926f1c7df9e58df",
+      "candidate_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719"
+    },
+    {
+      "path": "api/enums.py",
+      "live_sha256": "c66b6ec27d56f4793fc0a71cf4553209e16bec6725a8af82cd1eec257068f233",
+      "candidate_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b"
+    },
+    {
+      "path": "api/routes/campaign.py",
+      "live_sha256": "aaf4f35cbc3a3c18c014807054146ad3788afd47e3d395fab001ae15b2636653",
+      "candidate_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b"
+    },
+    {
+      "path": "api/routes/telephony_quick_connect.py",
+      "live_sha256": "9df34557c4e7ccb549beb62c6766dfd8d5c32596a75099b52bea1d38fad3a83f",
+      "candidate_sha256": "ad1b5bd07bf8756c5250595faa255563af7064e98d20b91039cb92aa1c6a0c5d"
+    },
+    {
+      "path": "api/routes/voice_library.py",
+      "live_sha256": "6532deb3c21b0256e9f84f132a2dfdff14f2d29e86e4bbdb11cf80f4a7985bb6",
+      "candidate_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201"
+    },
+    {
+      "path": "api/services/campaign/campaign_orchestrator.py",
+      "live_sha256": "294f1a2b4505345da8515a87816ff3ab20d512e07228792d92a944937b43cd49",
+      "candidate_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26"
+    },
+    {
+      "path": "api/services/campaign/runner.py",
+      "live_sha256": "7694e1f2c9162f2001b12561185903d1034e3d46904b908cd1c04a8cbb7559ee",
+      "candidate_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078"
+    },
+    {
+      "path": "api/services/campaign/limits.py",
+      "live_sha256": null,
+      "candidate_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765"
+    },
+    {
+      "path": "api/services/subscription_call_budget.py",
+      "live_sha256": null,
+      "candidate_sha256": "810f77fbfe26b1f5560ae2beafc3343a91824003275bd7219dd0164e7cfb272a"
+    },
+    {
+      "path": "api/db/workflow_run_client.py",
+      "live_sha256": "1e3f9757fefdf63fb245a986a66c8b4e78a74ffb0830cd57143bfbe83732fe60",
+      "candidate_sha256": "1fbd27b1a23fde06387f9a74e1b092123c5a0afda48addd27f8118a8a3208f77"
+    },
+    {
+      "path": "api/services/pipecat/run_pipeline.py",
+      "live_sha256": "2fa9247e7d01c74d45e1e6fe419ee7b0f4cbab3d16009fec53da1cb502152273",
+      "candidate_sha256": "8fc3508b052edf89a0867e664321a6958ae632ead47e0396103d5801f85ae12b"
+    },
+    {
+      "path": "api/services/wallet_webhook.py",
+      "live_sha256": "a3aca79ea2c63d828e986715b4bec6eeb3413077671ef1291a78eae7740f1c9f",
+      "candidate_sha256": "b94557f26a274a08543d33091609eeab796ce198d9daba0e4fd58f5e94f7f1f6"
+    },
+    {
+      "path": "api/services/workflow/test_sandbox_mode.py",
+      "live_sha256": "b657623f66555739a35278d95cc2830760ffe09e8da5ee4c22739f704cc28fe2",
+      "candidate_sha256": "e1f22c061d58a10097bb3f805f6fb0ae0f37d2d4c777a168f7e3f8f435cc2ff4"
+    }
+  ],
+  "runtime_commit": "178ccd9e65a32f60b4ae294392f266dfc1dcbc5d",
+  "quota_commit": "2a600fa2bff0e40ef0f67b20235a86d4b811a962",
+  "running_image_id": "sha256:691d4d66e71583042e5a21227b16ded150327076129d5a6f76dc387e2244571a",
+  "snapshot_source": "actual running filesystem collected 2026-10-30; must recheck before release",
+  "production_modified": false,
+  "conflicts": [],
+  "runtime_rehearsal": {
+    "passed": 36,
+    "scope": "Merged actual running pipeline, completion hook, sandbox marker stripping and budget module; synthetic HTTP and DB; no provider calls"
+  },
+  "quota_rehearsal": {
+    "prior_passed": 14,
+    "scope": "Quota files are byte-identical to previously verified candidate; not rerun in this local interpreter (pytest unavailable)"
+  },
+  "model_policy": "Resolved runtime model identifiers sent to authenticated reservation endpoint; no caller secrets or raw configuration",
+  "status": "candidate-tested-not-deployed",
+  "candidate_image": "dograh-local/smb-guards:candidate-20261030-178ccd9",
+  "candidate_image_id": "sha256:6feec492957e487893a54c8d13e2d1168c0a437082a8b72706d7f64a998180f6",
+  "base_layers_preserved": 210,
+  "unit_tests_inside_candidate": {
+    "quota": 14,
+    "budget": 36
+  },
+  "sdk_probe": {
+    "cancel_frame_processed": true,
+    "blocked_response": true,
+    "heartbeats": false,
+    "seconds": 0.402,
+    "provider_calls": 0
+  },
+  "compose_verification": {
+    "active_files": 38,
+    "environment_matches_running": true,
+    "changes": [
+      "services.api.image",
+      "services.worker.image"
+    ]
+  },
+  "owner_preflight": "Received 2026-10-30; f919ac3 with existing staged/unstaged changes; both images match base",
+  "enterprise_marker_repair": {
+    "inserted": 3,
+    "verified_after_commit": true,
+    "existing_replaced": 0,
+    "subscription_records_changed": false
+  }
+}
