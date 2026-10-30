@@ -68,6 +68,7 @@ def build_run_annotations(
     """Prevent caller annotations from forging the server-owned sandbox marker."""
     annotations = {**defaults, **(requested or {})}
     annotations.pop(SANDBOX_ANNOTATION, None)
+    annotations.pop('subscription_call_budget', None)
     if sandbox_authorized:
         requested_run_id = (requested or {}).get("agent_test_run_id")
         requested_scenario_id = (requested or {}).get("scenario_id")

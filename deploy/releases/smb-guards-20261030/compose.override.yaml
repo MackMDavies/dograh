@@ -1,0 +1,5 @@
+services:
+  api:
+    image: dograh-local/smb-guards:candidate-20261030-178ccd9
+  worker:
+    image: dograh-local/smb-guards:candidate-20261030-178ccd9

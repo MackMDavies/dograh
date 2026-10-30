@@ -29,6 +29,7 @@ from api.services.pipecat.memory_pre_call import (
     lead_number_for_call,
 )
 from api.services.call_live_webhook import fire_call_live
+from api.services.subscription_call_budget import prepare_pipeline_call_budget, run_with_call_budget
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -85,6 +86,7 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.extensions.voicemail.voicemail_detector import VoicemailDetector
 from pipecat.pipeline.task import PipelineTaskParams
+from pipecat.utils.enums import EndTaskReason
 from pipecat.processors.aggregators.llm_response_universal import (
     LLMAssistantAggregatorParams,
     LLMContextAggregatorPair,
@@ -1247,7 +1249,22 @@ async def _run_pipeline(
         # Run the pipeline
         loop = asyncio.get_running_loop()
         params = PipelineTaskParams(loop=loop)
-        await task.run(params)
+        budget = await prepare_pipeline_call_budget(
+            workflow, workflow_run, max_call_duration_seconds, db_client,
+            skip=is_agent_test_sandbox or run_configs.get('syra_voice') is True,
+            resolved_models={'is_realtime': is_realtime, **runtime_configuration},
+        )
+        if budget is None:
+            await task.run(params)
+        else:
+            async def stop_for_budget():
+                # Queue cancellation immediately; the normal engine end-call
+                # helper awaits final LLM extraction before sending its frame.
+                engine._mute_pipeline = True
+                engine._gathered_context['wallet_budget_exhausted'] = True
+                await task.cancel(reason=EndTaskReason.CALL_DURATION_EXCEEDED.value)
+
+            await run_with_call_budget(lambda: task.run(params), stop_for_budget, budget)
         logger.info(f"Task completed for run {workflow_run_id}")
     except asyncio.CancelledError:
         logger.warning("Received CancelledError in _run_pipeline")
