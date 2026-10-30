@@ -14,6 +14,7 @@ from loguru import logger
 
 from api.db import db_client
 from api.db.models import UserModel
+from api.db.voice_library_client import VoiceCloneLimitExceeded
 from api.enums import OrganizationConfigurationKey
 from api.schemas.voice_library import (
     ElevenLabsCatalogVoiceSchema,
@@ -1035,28 +1036,48 @@ async def clone_voice(
 
     org_id = user.selected_organization_id
 
-    # Plan cap on custom voices (5 / 15 / 35 on Launch / Growth / Command), synced from
-    # Sysevo into the org's CUSTOM_VOICE_LIMIT. No configured limit = no cap; superusers
-    # (Sysevo staff) are never capped.
+    # Plan cap on custom voices is synced from Sysevo into the org's CUSTOM_VOICE_LIMIT.
+    # The slot check and pending-row insert happen together under an org-scoped database
+    # lock below, so parallel requests across API workers cannot exceed the configured cap.
+    # No configured limit = no cap; superusers (Sysevo staff) are never capped.
+    custom_voice_limit = None
     if not getattr(user, "is_superuser", False):
         try:
+            plan_cfg = await db_client.get_configuration(
+                org_id, OrganizationConfigurationKey.SYSEVO_PLAN_KEY.value
+            )
             limit_cfg = await db_client.get_configuration(
                 org_id, OrganizationConfigurationKey.CUSTOM_VOICE_LIMIT.value
             )
-            limit = (limit_cfg.value or {}).get("value") if limit_cfg else None
         except Exception as e:
             logger.warning(f"[voice-clone] custom voice limit lookup failed for org {org_id}: {e}")
-            limit = None
-        if limit is not None:
-            used = await db_client.count_org_clones(org_id)
-            if used >= int(limit):
-                raise HTTPException(
-                    status_code=403,
-                    detail=(
-                        f"Your plan includes {int(limit)} custom voice{'s' if int(limit) != 1 else ''}. "
-                        "Delete one or upgrade your plan to add more."
-                    ),
-                )
+            raise HTTPException(
+                status_code=503,
+                detail="Could not verify your custom voice allowance. Please try again.",
+            ) from e
+        else:
+            plan_value = plan_cfg.value if plan_cfg else None
+            if plan_value is not None and not isinstance(plan_value, dict):
+                raise HTTPException(status_code=503, detail="Could not verify your custom voice allowance")
+            plan_key = plan_value.get("value") if plan_value else None
+            self_serve = isinstance(plan_key, str) and plan_key.startswith("subscription_")
+            limit_value = limit_cfg.value if limit_cfg else None
+            if limit_value is not None and not isinstance(limit_value, dict):
+                raise HTTPException(status_code=503, detail="Could not verify your custom voice allowance")
+            raw_limit = limit_value.get("value") if limit_value else None
+            if self_serve and raw_limit is None:
+                raise HTTPException(status_code=503, detail="Could not verify your custom voice allowance")
+            if raw_limit is not None:
+                try:
+                    if isinstance(raw_limit, bool):
+                        raise ValueError("boolean voice cap")
+                    custom_voice_limit = int(raw_limit)
+                except (TypeError, ValueError) as e:
+                    logger.error(f"[voice-clone] invalid custom voice limit for org {org_id}")
+                    raise HTTPException(status_code=503, detail="Could not verify your custom voice allowance") from e
+                if custom_voice_limit < 0:
+                    logger.error(f"[voice-clone] negative custom voice limit for org {org_id}")
+                    raise HTTPException(status_code=503, detail="Could not verify your custom voice allowance")
 
     # Auto-detect cloning provider. Prefer ElevenLabs — it's the reliable instant
     # voice-cloning path and is resolvable across the caller's config / org / (for
@@ -1073,21 +1094,31 @@ async def clone_voice(
     provider = "xai" if tts_provider == "xai" else "dograh_clone"
     content_type = file.content_type or "audio/webm"
     filename = file.filename or "recording.webm"
-    voice = await db_client.create_voice(
-        user_id=user.id,
-        organization_id=org_id,
-        name=name,
-        description=description or None,
-        provider=provider,
-        is_public=is_public,
-        language=language or None,
-        accent=accent or None,
-        gender=gender or None,
-        age=age or None,
-        use_case=use_case or None,
-        status="pending",
-        labels={"clone_audio_filename": filename, "clone_audio_content_type": content_type},
-    )
+    try:
+        voice = await db_client.create_clone_voice_with_limit(
+            user_id=user.id,
+            organization_id=org_id,
+            name=name,
+            description=description or None,
+            provider=provider,
+            is_public=is_public,
+            language=language or None,
+            accent=accent or None,
+            gender=gender or None,
+            age=age or None,
+            use_case=use_case or None,
+            status="pending",
+            labels={"clone_audio_filename": filename, "clone_audio_content_type": content_type},
+            clone_limit=custom_voice_limit,
+        )
+    except VoiceCloneLimitExceeded as e:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                f"Your plan includes {e.limit} custom voice{'s' if e.limit != 1 else ''}. "
+                "Delete one or upgrade your plan to add more."
+            ),
+        ) from e
     if tts_provider == "xai":
         background_tasks.add_task(
             _process_xai_clone_background,

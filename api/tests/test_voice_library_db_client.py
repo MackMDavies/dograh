@@ -5,7 +5,7 @@ from datetime import datetime, UTC
 
 import pytest
 
-from api.db.voice_library_client import VoiceLibraryClient
+from api.db.voice_library_client import VoiceCloneLimitExceeded, VoiceLibraryClient
 
 
 def _make_voice(uuid="v-1", is_public=True, status="ready", user_id=1, org_id=11):
@@ -29,6 +29,64 @@ def _make_voice(uuid="v-1", is_public=True, status="ready", user_id=1, org_id=11
     v.created_at = datetime.now(UTC)
     v.updated_at = datetime.now(UTC)
     return v
+
+
+def _clone_session(clone_count):
+    events = []
+    lock_result = MagicMock()
+    count_result = MagicMock()
+    count_result.scalar.return_value = clone_count
+    transaction = AsyncMock()
+    transaction.__aexit__ = AsyncMock(side_effect=lambda *_: events.append("transaction_end"))
+    session = AsyncMock()
+    session.begin = MagicMock(return_value=transaction)
+    async def execute(_statement, *_args, **_kwargs):
+        events.append("lock" if not events else "count")
+        return lock_result if events[-1] == "lock" else count_result
+    session.execute = AsyncMock(side_effect=execute)
+    session.refresh = AsyncMock()
+    session.add = MagicMock(side_effect=lambda _voice: events.append("insert"))
+    session.__aenter__ = AsyncMock(return_value=session)
+    session.__aexit__ = AsyncMock(return_value=None)
+    return session, events
+
+
+@pytest.mark.asyncio
+async def test_clone_slot_reservation_locks_org_and_inserts_before_releasing():
+    client = VoiceLibraryClient()
+    session, events = _clone_session(clone_count=2)
+
+    with patch.object(client, "async_session", return_value=session):
+        voice = await client.create_clone_voice_with_limit(
+            user_id=5, organization_id=11, name="My voice", provider="dograh_clone", clone_limit=3,
+        )
+
+    lock_statement = str(session.execute.await_args_list[0].args[0]).lower()
+    count_statement = str(session.execute.await_args_list[1].args[0]).lower()
+    assert "pg_advisory_xact_lock" in lock_statement
+    assert "voice_library.organization_id" in count_statement
+    assert "voice_library.provider in" in count_statement
+    assert events == ["lock", "count", "insert", "transaction_end"]
+    session.add.assert_called_once_with(voice)
+    assert voice.organization_id == 11
+    assert voice.status == "pending"
+
+
+@pytest.mark.asyncio
+async def test_clone_slot_reservation_denies_at_cap_without_inserting():
+    client = VoiceLibraryClient()
+    session, events = _clone_session(clone_count=3)
+
+    with patch.object(client, "async_session", return_value=session):
+        with pytest.raises(VoiceCloneLimitExceeded) as error:
+            await client.create_clone_voice_with_limit(
+                user_id=5, organization_id=11, name="My voice", provider="dograh_clone", clone_limit=3,
+            )
+
+    assert (error.value.limit, error.value.used) == (3, 3)
+    assert events == ["lock", "count", "transaction_end"]
+    session.add.assert_not_called()
+    session.refresh.assert_not_awaited()
 
 
 @pytest.mark.asyncio

@@ -547,10 +547,15 @@ async def managed_number_billing(
 class OrgConcurrencyRequest(BaseModel):
     workflow_id: int
     max_concurrent: int
+    plan_key: Optional[str] = None
     # Plan cap on cloned voices. Absent = leave the org's current setting alone;
     # null (or negative) = no cap.
     custom_voice_limit: Optional[int] = None
     sync_custom_voice_limit: bool = False
+    # Active outbound campaign cap. Absent = leave existing value unchanged;
+    # null = uncapped; zero disables active campaign starts.
+    max_active_campaigns: Optional[int] = None
+    sync_active_campaign_limit: bool = False
 
 
 @router.post("/internal/org-concurrency")
@@ -584,6 +589,12 @@ async def set_org_concurrency(
         OrganizationConfigurationKey.CONCURRENT_CALL_LIMIT.value,
         {"value": max_concurrent},
     )
+    if body.plan_key is not None:
+        await db_client.upsert_configuration(
+            workflow.organization_id,
+            OrganizationConfigurationKey.SYSEVO_PLAN_KEY.value,
+            {"value": body.plan_key},
+        )
     custom_voice_limit = None
     if body.sync_custom_voice_limit:
         if body.custom_voice_limit is None or body.custom_voice_limit < 0:
@@ -599,9 +610,20 @@ async def set_org_concurrency(
                 OrganizationConfigurationKey.CUSTOM_VOICE_LIMIT.value,
                 {"value": custom_voice_limit},
             )
+    max_active_campaigns = None
+    if body.sync_active_campaign_limit:
+        if body.max_active_campaigns is not None and body.max_active_campaigns < 0:
+            raise HTTPException(status_code=422, detail="max_active_campaigns must be non-negative or null")
+        max_active_campaigns = body.max_active_campaigns
+        await db_client.upsert_configuration(
+            workflow.organization_id,
+            OrganizationConfigurationKey.MAX_ACTIVE_CAMPAIGNS.value,
+            {"value": max_active_campaigns},
+        )
     return {
         "ok": True,
         "organization_id": workflow.organization_id,
         "max_concurrent": max_concurrent,
         "custom_voice_limit": custom_voice_limit,
+        "max_active_campaigns": max_active_campaigns,
     }

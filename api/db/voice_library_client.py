@@ -5,14 +5,94 @@ from datetime import UTC, datetime
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy import String, and_, cast, func, or_, select, text
 
 from api.db.base_client import BaseDBClient
 from api.db.models import VoiceLibraryModel
 from api.services.voice_library.dedupe import dedupe_voices
 
+_VOICE_CLONE_LIMIT_LOCK_NAMESPACE = 1_397_736_275
+
+
+class VoiceCloneLimitExceeded(Exception):
+    def __init__(self, limit: int, used: int):
+        self.limit = limit
+        self.used = used
+        super().__init__(f"Voice clone cap reached ({used}/{limit})")
+
 
 class VoiceLibraryClient(BaseDBClient):
+
+    async def create_clone_voice_with_limit(
+        self,
+        *,
+        user_id: int,
+        organization_id: int,
+        name: str,
+        provider: str,
+        clone_limit: Optional[int],
+        description: Optional[str] = None,
+        is_public: bool = False,
+        language: Optional[str] = None,
+        accent: Optional[str] = None,
+        gender: Optional[str] = None,
+        age: Optional[str] = None,
+        use_case: Optional[str] = None,
+        labels: Optional[dict] = None,
+        status: str = "pending",
+    ) -> VoiceLibraryModel:
+        """Atomically reserve a clone slot and create its pending voice row.
+
+        The transaction-scoped advisory lock serializes clone reservations for an
+        organization across API workers. The count includes pending and failed rows,
+        matching ``count_org_clones`` and the customer-facing delete-to-free-a-slot rule.
+        A ``None`` limit preserves the existing uncapped/staff behavior.
+        """
+        if clone_limit is not None and clone_limit < 0:
+            raise ValueError("clone_limit must be non-negative or None")
+
+        async with self.async_session() as session:
+            async with session.begin():
+                if clone_limit is not None:
+                    await session.execute(
+                        text(
+                            "SELECT pg_advisory_xact_lock("
+                            "CAST(:lock_namespace AS integer), CAST(:organization_id AS integer))"
+                        ),
+                        {"lock_namespace": _VOICE_CLONE_LIMIT_LOCK_NAMESPACE, "organization_id": organization_id},
+                    )
+                    result = await session.execute(
+                        select(func.count(VoiceLibraryModel.id)).where(
+                            and_(
+                                VoiceLibraryModel.organization_id == organization_id,
+                                VoiceLibraryModel.provider.in_(("dograh_clone", "xai")),
+                            )
+                        )
+                    )
+                    used = int(result.scalar() or 0)
+                    if used >= clone_limit:
+                        raise VoiceCloneLimitExceeded(clone_limit, used)
+
+                voice = VoiceLibraryModel(
+                    uuid=str(uuid_lib.uuid4()),
+                    user_id=user_id,
+                    organization_id=organization_id,
+                    name=name,
+                    description=description,
+                    provider=provider,
+                    language=language,
+                    accent=accent,
+                    gender=gender,
+                    age=age,
+                    use_case=use_case,
+                    is_public=is_public,
+                    status=status,
+                    labels=labels or {},
+                )
+                session.add(voice)
+            await session.refresh(voice)
+            logger.info(f"Reserved clone slot and created voice {voice.uuid} for org {organization_id}")
+            return voice
 
     async def create_voice(
         self,
