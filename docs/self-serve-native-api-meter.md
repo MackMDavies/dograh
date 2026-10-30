@@ -1,6 +1,6 @@
-# Native Self-Serve API/MCP meter — local component
+# Native Self-Serve API/MCP meter
 
-Native auth hook is not deployed yet. Its database/Edge prerequisites are now
+Native auth hook is deployed in API and worker as image ba0623ff6614. Its database/Edge prerequisites are
 live from Sysevo main 223fa55cfe: migrations 20270690000839 and 20270690000876,
 subscription-api-meter v1 and the Sysevo API (legacy slug xpand-api) v96.
 All deployed source files and database bodies match reviewed source. Live
@@ -40,12 +40,11 @@ Native MCP also checks mcp_enabled. The bridge passed 36 targeted PostgreSQL
 checks across all five tiers, plus a guard-disabled negative control. The
 unchanged paid setup passed 174 checks before source-matched fixture reuse.
 
-Next: inspect the actual running native auth/MCP source before layering these
-three runtime files onto the current voice image. Preserve the existing call
-budget/clone/campaign release: base must be the RUNNING image, currently
-sha256:6feec492957e487893a54c8d13e2d1168c0a437082a8b72706d7f64a998180f6.
-Use the full current Compose stack, normalize unordered bind comparisons and
-retain all settings checks. Verify no active audio and use the approved incoming
-artifact-only fast-forward path. After deploying, verify actual auth/helper
-behavior and source parity before accepting API enforcement evidence.
-The four new caps remain proposed; MFA and paid signup acceptance are not ready.
+The deployed image preserves all 211 prior filesystem layers and all fourteen
+existing voice guard files. Both services match the 17 expected runtime hashes.
+The switch preserved the full Compose settings and existing dirty server work.
+71 offline candidate checks passed, including the 3 existing MCP auth tests.
+Public backend health is verified. See deploy/releases/native-api-20261030/DEPLOYED.md.
+
+The four new caps remain proposed. Paid Self-Serve runtime acceptance and
+remaining catalog enforcement are not complete; MFA and real payment are not ready.

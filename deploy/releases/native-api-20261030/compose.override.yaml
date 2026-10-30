@@ -1,0 +1,5 @@
+services:
+  api:
+    image: dograh-local/native-api:candidate-20261030-92184b1
+  worker:
+    image: dograh-local/native-api:candidate-20261030-92184b1
