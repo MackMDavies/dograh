@@ -1,0 +1,80 @@
+{
+  "status": "candidate-tested-not-deployed",
+  "canonical_guard_commit": "2a600fa2bff0e40ef0f67b20235a86d4b811a962",
+  "base_image": "dograh-local/voice-redesign:candidate-124629ed",
+  "base_image_id": "sha256:691d4d66e71583042e5a21227b16ded150327076129d5a6f76dc387e2244571a",
+  "candidate_image": "dograh-local/smb-quotas:candidate-20261030-aba8eafc",
+  "candidate_image_id": "sha256:26094d9bf820aefe8b5b2fb136deebfb4815ae8507313455b4d26f6dfd1e9538",
+  "base_layers_preserved": 210,
+  "runtime_files": [
+    {
+      "path": "api/db/campaign_client.py",
+      "live_sha256": "9bde75e70252bdce3f8455894b89935b93d7bab9f1dd11f4e4376e7aae7fbc80",
+      "candidate_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971"
+    },
+    {
+      "path": "api/db/voice_library_client.py",
+      "live_sha256": "230383d162cbdcdbd1e208bd25e219b8d5ef164d187ba9ba2926f1c7df9e58df",
+      "candidate_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719"
+    },
+    {
+      "path": "api/enums.py",
+      "live_sha256": "c66b6ec27d56f4793fc0a71cf4553209e16bec6725a8af82cd1eec257068f233",
+      "candidate_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b"
+    },
+    {
+      "path": "api/routes/campaign.py",
+      "live_sha256": "aaf4f35cbc3a3c18c014807054146ad3788afd47e3d395fab001ae15b2636653",
+      "candidate_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b"
+    },
+    {
+      "path": "api/routes/telephony_quick_connect.py",
+      "live_sha256": "9df34557c4e7ccb549beb62c6766dfd8d5c32596a75099b52bea1d38fad3a83f",
+      "candidate_sha256": "ad1b5bd07bf8756c5250595faa255563af7064e98d20b91039cb92aa1c6a0c5d"
+    },
+    {
+      "path": "api/routes/voice_library.py",
+      "live_sha256": "6532deb3c21b0256e9f84f132a2dfdff14f2d29e86e4bbdb11cf80f4a7985bb6",
+      "candidate_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201"
+    },
+    {
+      "path": "api/services/campaign/campaign_orchestrator.py",
+      "live_sha256": "294f1a2b4505345da8515a87816ff3ab20d512e07228792d92a944937b43cd49",
+      "candidate_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26"
+    },
+    {
+      "path": "api/services/campaign/runner.py",
+      "live_sha256": "7694e1f2c9162f2001b12561185903d1034e3d46904b908cd1c04a8cbb7559ee",
+      "candidate_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078"
+    }
+  ],
+  "validation": {
+    "unit_tests_inside_candidate": 14,
+    "postgres_17_6_concurrency_checks": 18,
+    "negative_control": "Guard-disabled process failed at the zero-campaign-cap assertion as expected.",
+    "running_models_match_rehearsal_source": {
+      "CampaignModel": "8b5b7a416f7d9340fdb097e1493366c49a6d1a1c533fcc6aa087fe4c10756a24",
+      "VoiceLibraryModel": "452337d4b70773986e533852dbfdad0e550cb5ff20491b602851905569ce539d"
+    },
+    "compose_files_in_active_stack": 38,
+    "compose_fingerprints_match_running_services": true,
+    "only_compose_changes": [
+      "services.api.image",
+      "services.worker.image"
+    ]
+  },
+  "preserved_runtime_difference": "The campaign statistics query retains the running image behavior; no unrelated workflow visibility filter is added.",
+  "deployment_requirements": [
+    "Repeat immutable image IDs and all runtime source hashes immediately before applying.",
+    "Obtain the owner-run git status/log preflight required by repository instructions.",
+    "Preserve all staged and unstaged server work; use the required incoming-branch fast-forward release.",
+    "Obtain explicit live deployment approval and verify the no-call window.",
+    "Reconcile the paid tier limits after deployment; these tests do not accept provider costs or open purchases."
+  ],
+  "added_runtime_files": [
+    {
+      "path": "api/services/campaign/limits.py",
+      "candidate_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765"
+    }
+  ]
+}

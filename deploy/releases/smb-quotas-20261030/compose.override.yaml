@@ -1,0 +1,5 @@
+services:
+  api:
+    image: dograh-local/smb-quotas:candidate-20261030-aba8eafc
+  worker:
+    image: dograh-local/smb-quotas:candidate-20261030-aba8eafc
