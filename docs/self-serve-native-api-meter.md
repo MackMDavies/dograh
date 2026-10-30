@@ -1,8 +1,11 @@
 # Native Self-Serve API/MCP meter — local component
 
-Not deployed. This component depends on a new authenticated
-subscription-api-meter endpoint and shared-counter database bridge which are
-not implemented yet. Do not ship the auth hook before those dependencies.
+Native auth hook is not deployed yet. Its database/Edge prerequisites are now
+live from Sysevo main 223fa55cfe: migrations 20270690000839 and 20270690000876,
+subscription-api-meter v1 and the Sysevo API (legacy slug xpand-api) v96.
+All deployed source files and database bodies match reviewed source. Live
+internal probes verify authentication and existing Enterprise REST/MCP
+pass-through without consuming allowance or changing customer data.
 
 The normal native API-key authentication path still validates key expiry,
 revocation and owner existence. It then binds monthly usage to the persisted
@@ -29,16 +32,20 @@ synthetic Self-Serve request and admitted the rejected request; three regression
 failed. Existing pytest MCP auth expectations were updated for the new internal
 keyword, but that dependency-heavy suite has not been run in this local shell.
 
-Next, preserve and extend the existing atomic Supabase request journal rather
-than inventing platform key UUIDs for native integer key IDs. Current live
-consume_subscription_api_request body SHA256 is
-b08753047d3c35b32c152c48fc75d22ae8794dd8badd98c5636c550168647815;
-its exact definition is captured at
-/private/tmp/sysevo-live-api-meter-definition-20261030.sql. Snapshot and hash-guard
-existing source before replacing it. Keep current paid receipt, frozen terms,
-plan/feature approval, period expiry, account locking and replay checks; count
-both surfaces against the same account/period. Native MCP must also honor the
-mcp_enabled flag. Preserve the public REST RPC signature and legacy behavior.
-Prove concurrent final-request contention, replay binding, both key realms and
-all five tiers before accepting enforcement. The platform-side MCP fix and cap
-staging are in the Sysevo branch fix/subscription-api-shared-meter (de91964325).
+The shared journal now distinguishes platform UUID keys from native integer
+keys and records platform/voice_api/voice_mcp provenance. The public REST RPC
+signature is preserved; both wrappers call one private atomic core, retaining
+paid invoice, terms, current period, feature/capability and replay checks.
+Native MCP also checks mcp_enabled. The bridge passed 36 targeted PostgreSQL
+checks across all five tiers, plus a guard-disabled negative control. The
+unchanged paid setup passed 174 checks before source-matched fixture reuse.
+
+Next: inspect the actual running native auth/MCP source before layering these
+three runtime files onto the current voice image. Preserve the existing call
+budget/clone/campaign release: base must be the RUNNING image, currently
+sha256:6feec492957e487893a54c8d13e2d1168c0a437082a8b72706d7f64a998180f6.
+Use the full current Compose stack, normalize unordered bind comparisons and
+retain all settings checks. Verify no active audio and use the approved incoming
+artifact-only fast-forward path. After deploying, verify actual auth/helper
+behavior and source parity before accepting API enforcement evidence.
+The four new caps remain proposed; MFA and paid signup acceptance are not ready.
