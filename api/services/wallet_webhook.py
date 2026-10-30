@@ -11,6 +11,7 @@ flag signals that the Sysevo integration is active).
 """
 
 import os
+import math
 from typing import Any
 
 import httpx
@@ -78,13 +79,21 @@ async def fire_post_call_wallet_debit(
             return True
 
         usage: dict[str, Any] = workflow_run.usage_info or {}
-        duration_secs: float | None = (
-            usage.get("duration_seconds")
-            or usage.get("call_duration_seconds")
-            or None
-        )
+        annotations = workflow_run.annotations
+        marker = annotations.get('subscription_call_budget') if isinstance(annotations, dict) else None
+        reserved_call = (isinstance(marker, dict) and marker.get('run_id') == workflow_run_id
+            and marker.get('workflow_id') == workflow_run.workflow_id and isinstance(marker.get('account_id'), str))
+        duration_secs = usage.get('duration_seconds') or usage.get('call_duration_seconds') or None
+        if reserved_call and duration_secs is None and (
+            type(usage.get('duration_seconds')) in (int, float) and usage['duration_seconds'] == 0
+            or type(usage.get('call_duration_seconds')) in (int, float) and usage['call_duration_seconds'] == 0):
+            duration_secs = 0
+        if reserved_call and (type(duration_secs) not in (int, float)
+            or not math.isfinite(duration_secs) or duration_secs < 0
+            or (duration_secs == 0 and not workflow_run.is_completed)):
+            return False  # Missing/uncertain usage cannot release held minutes.
 
-        if not duration_secs or duration_secs < 1:
+        if not reserved_call and (not duration_secs or duration_secs < 1):
             logger.debug(f"[wallet-debit] run {workflow_run_id} — no duration, skipping")
             return True  # no billable duration — terminal, don't keep re-checking
 
@@ -110,6 +119,8 @@ async def fire_post_call_wallet_debit(
             "agent_id": workflow_run.workflow_id,
             "duration_secs": duration_secs,
         }
+        if reserved_call:
+            payload['subscription_call_budget'] = marker
         if llm_provider:
             payload["llm_provider"] = llm_provider
         if llm_model:

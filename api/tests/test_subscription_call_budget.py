@@ -2,8 +2,11 @@ import asyncio
 import time
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 
 from api.services.subscription_call_budget import CallBudget, CallBudgetClient, CallBudgetError, run_with_call_budget
+from api.services.subscription_call_budget import prepare_pipeline_call_budget
+from api.services.workflow.test_sandbox_mode import build_run_annotations
 
 ACCOUNT = '10000000-0000-4000-8000-000000000001'
 REPLY = {'allowed': True, 'kind': 'subscription', 'reserved_minutes': 5,
@@ -172,6 +175,69 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
             await parent
         self.assertTrue(cleaned.is_set())
         self.assertEqual(stopped, [])
+
+
+class PipelineBindingTests(unittest.IsolatedAsyncioTestCase):
+    def fixture(self, *, plan=None, route='subscription'):
+        saved, requests = [], []
+        async def owner(_): return SimpleNamespace(provider_id='supabase_org_acct_'+ACCOUNT)
+        async def config(*_): return SimpleNamespace(value={'value': plan}) if plan is not None else None
+        async def update(run_id, **kwargs): saved.append((run_id, kwargs))
+        async def classify(*args):
+            requests.append(('classify', args))
+            if isinstance(route, Exception): raise route
+            return route
+        async def reserve(*args):
+            requests.append(('reserve', args))
+            return CallBudget(101, 5, time.monotonic()+299)
+        return (SimpleNamespace(id=123, organization_id=42), SimpleNamespace(id=101, workflow_id=123),
+            SimpleNamespace(get_organization_by_id=owner, get_configuration=config, update_workflow_run=update),
+            SimpleNamespace(classify=classify, reserve=reserve), saved, requests)
+
+    async def test_missing_local_marker_does_not_bypass_authoritative_self_serve_route(self):
+        workflow, run, db, client, saved, requests = self.fixture()
+        budget = await prepare_pipeline_call_budget(workflow, run, 300, db, client=client)
+        self.assertEqual(budget.run_id, 101)
+        self.assertEqual(requests[1], ('reserve', (ACCOUNT, 101, 123, 300)))
+        self.assertEqual(saved, [(101, {'annotations': {'subscription_call_budget': {
+            'account_id': ACCOUNT, 'run_id': 101, 'workflow_id': 123}}})])
+
+    async def test_unknown_or_self_serve_outage_blocks_audio(self):
+        for plan in [None, 'subscription_voice']:
+            workflow, run, db, client, saved, requests = self.fixture(plan=plan, route=CallBudgetError('unavailable'))
+            with self.subTest(plan=plan), self.assertRaises(CallBudgetError):
+                await prepare_pipeline_call_budget(workflow, run, 300, db, client=client)
+            self.assertEqual(saved, [])
+            self.assertFalse(any(kind == 'reserve' for kind, _ in requests))
+
+    async def test_explicit_enterprise_outage_behavior_is_preserved(self):
+        workflow, run, db, client, saved, requests = self.fixture(plan='launch', route=CallBudgetError('unavailable'))
+        self.assertIsNone(await prepare_pipeline_call_budget(workflow, run, 300, db, client=client))
+        self.assertEqual(saved, [])
+
+    async def test_authoritative_legacy_calls_use_the_existing_path(self):
+        workflow, run, db, client, saved, requests = self.fixture(plan='launch', route='legacy')
+        self.assertIsNone(await prepare_pipeline_call_budget(workflow, run, 300, db, client=client))
+        self.assertEqual(len(requests), 1)
+
+    async def test_self_serve_marker_cannot_fall_back_to_an_inconsistent_legacy_route(self):
+        workflow, run, db, client, saved, requests = self.fixture(plan='subscription_voice', route='legacy')
+        with self.assertRaises(CallBudgetError):
+            await prepare_pipeline_call_budget(workflow, run, 300, db, client=client)
+
+    async def test_workflow_identity_is_validated_before_reservation(self):
+        workflow, run, db, client, saved, requests = self.fixture()
+        run.workflow_id = 999
+        with self.assertRaises(CallBudgetError):
+            await prepare_pipeline_call_budget(workflow, run, 300, db, client=client)
+        self.assertEqual(requests, [])
+
+    async def test_attested_sandbox_bypass_does_not_access_billing(self):
+        self.assertIsNone(await prepare_pipeline_call_budget(None, None, 300, None, skip=True))
+
+    def test_caller_cannot_forge_the_server_budget_annotation(self):
+        result = build_run_annotations({}, {'subscription_call_budget': {'account_id': ACCOUNT}}, sandbox_authorized=False)
+        self.assertNotIn('subscription_call_budget', result)
 
 
 if __name__ == '__main__':

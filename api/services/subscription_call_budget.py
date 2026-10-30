@@ -6,6 +6,7 @@ This module never treats an error as permission to start unrestricted audio.
 """
 import asyncio
 import math
+import os
 import time
 from dataclasses import dataclass
 from typing import Awaitable, Callable
@@ -85,6 +86,12 @@ class CallBudgetClient:
         return CallBudget.from_reply(reply, run_id=run_id, max_seconds=max_seconds,
             sent_at=sent_at, received_at=self.clock())
 
+    async def classify(self, account_id, run_id):
+        reply = await self._request({'operation': 'classify', 'account_id': account_id, 'run_id': run_id})
+        if not isinstance(reply, dict) or reply.get('kind') not in ('subscription', 'legacy'):
+            raise CallBudgetError('Call billing route could not be verified')
+        return reply['kind']
+
     async def settle(self, account_id, run_id, duration_seconds):
         try:
             account_id = str(UUID(account_id))
@@ -100,6 +107,58 @@ class CallBudgetClient:
                 or type(reply.get('unbilled_minutes')) is not int or reply['unbilled_minutes'] < 0):
             raise CallBudgetError('Call settlement is pending')
         return reply
+
+
+def configured_budget_client():
+    source = os.getenv('SYSEVO_PRE_CALL_CHECK_URL', '')
+    endpoint = source.rsplit('/', 1)[0] + '/subscription-call-budget' if source else ''
+    return CallBudgetClient(endpoint, os.getenv('SYSEVO_MEMORY_SECRET', ''))
+
+
+async def prepare_pipeline_call_budget(workflow, workflow_run, max_seconds, db, *, client=None, skip=False):
+    """Bind the budget to the persisted workflow organization, never a user selection.
+
+    The local plan marker is only an outage fallback for an explicitly known
+    legacy organization. A missing marker never proves that a workspace is legacy.
+    Normal admission always asks the authoritative platform billing route.
+    """
+    if skip:
+        return None
+    if workflow_run is None or workflow_run.workflow_id != workflow.id:
+        raise CallBudgetError('Call workflow binding changed')
+    owner = await db.get_organization_by_id(workflow.organization_id)
+    if owner is None:
+        raise CallBudgetError('Call organization could not be verified')
+    provider = getattr(owner, 'provider_id', None)
+    if not isinstance(provider, str) or not provider.startswith('supabase_org_acct_'):
+        return None  # Existing non-Sysevo/per-user OSS organizations.
+    try:
+        account = str(UUID(provider.removeprefix('supabase_org_acct_')))
+    except ValueError:
+        raise CallBudgetError('Call account binding is malformed') from None
+    config = await db.get_configuration(workflow.organization_id, 'SYSEVO_PLAN_KEY')
+    value = getattr(config, 'value', None)
+    if value is not None and (not isinstance(value, dict) or not isinstance(value.get('value'), str)):
+        raise CallBudgetError('Call plan configuration is malformed')
+    local_plan = value.get('value') if value else None
+    billing = client or configured_budget_client()
+    try:
+        route = await billing.classify(account, workflow_run.id)
+    except CallBudgetError:
+        if local_plan and not local_plan.startswith('subscription_'):
+            return None  # Preserve the existing explicit legacy outage behavior.
+        raise
+    if route == 'legacy':
+        if local_plan and local_plan.startswith('subscription_'):
+            raise CallBudgetError('Call billing route changed')
+        return None
+    if route != 'subscription':
+        raise CallBudgetError('Call billing route could not be verified')
+    budget = await billing.reserve(account, workflow_run.id, workflow.id, max_seconds)
+    await db.update_workflow_run(workflow_run.id, annotations={'subscription_call_budget': {
+        'account_id': account, 'run_id': workflow_run.id, 'workflow_id': workflow.id,
+    }})
+    return budget
 
 
 async def run_with_call_budget(

@@ -212,6 +212,11 @@ class WorkflowRunClient(BaseDBClient):
                 else workflow.template_context_variables
             )
 
+            # Every creation path passes here, including API/campaign paths
+            # which do not use build_run_annotations. Only the billing service
+            # may write this marker after a real reservation exists.
+            annotations = {key: value for key, value in (annotations or {}).items()
+                if key != 'subscription_call_budget'}
             new_run = WorkflowRunModel(
                 name=name,
                 workflow=workflow,
