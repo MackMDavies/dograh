@@ -1172,7 +1172,7 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
                 session_properties=SessionProperties(
                     audio=AudioConfiguration(
                         input=AudioInput(
-                            transcription=InputAudioTranscription(),
+                            transcription=InputAudioTranscription(language=language),
                         ),
                         output=AudioOutput(
                             voice=voice or "alloy",
@@ -1201,7 +1201,7 @@ def create_realtime_llm_service(user_config, audio_config: "AudioConfig"):
                 session_properties=SessionProperties(
                     audio=AudioConfiguration(
                         input=AudioInput(
-                            transcription=InputAudioTranscription(),
+                            transcription=InputAudioTranscription(language=language),
                         ),
                         output=AudioOutput(voice=voice or "brian"),
                     ),

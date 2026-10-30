@@ -549,11 +549,15 @@ async def _run_pipeline(
 
     # Syra's personal rate comes from the signed-in user's saved setting,
     # forwarded in the voice session's initial context. Apply it only to the
-    # Syra workflow and only for ElevenLabs; all other calls retain their saved
-    # workflow/provider configuration.
-    from api.services.configuration.pipeline import apply_pipeline_call_configuration
+    # Syra workflow and only for ElevenLabs. The agent language is a separate
+    # workflow setting applied to the provider configuration below.
+    from api.services.configuration.pipeline import (
+        apply_agent_language_configuration,
+        apply_pipeline_call_configuration,
+    )
 
     user_config = apply_pipeline_call_configuration(user_config, run_configs, merged_call_context_vars)
+    user_config = apply_agent_language_configuration(user_config, run_configs)
 
     # Resolve voice library UUID → provider_voice_id when a voice_uuid is set in tts overrides
     if user_config.tts is not None and not is_agent_test_sandbox:
@@ -810,8 +814,14 @@ async def _run_pipeline(
     # A callback run carries why the person asked and the earlier call's notes.
     from api.services.callbacks.standing import callback_instruction
 
+    from api.services.configuration.pipeline import build_agent_language_instruction
+
     voice_expression_instruction = "\n\n".join(
-        part for part in (voice_expression_instruction, callback_instruction(merged_call_context_vars)) if part
+        part for part in (
+            voice_expression_instruction,
+            build_agent_language_instruction(run_configs),
+            callback_instruction(merged_call_context_vars),
+        ) if part
     ) or None
     guardrail_config = run_configs.get("voice_guardrails")
     guardrail_instruction = build_guardrail_prompt_instruction(guardrail_config)
