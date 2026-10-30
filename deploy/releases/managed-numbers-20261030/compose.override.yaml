@@ -1,0 +1,5 @@
+services:
+  api:
+    image: dograh-local/managed-numbers:candidate-20261030-37f69215
+  worker:
+    image: dograh-local/managed-numbers:candidate-20261030-37f69215
