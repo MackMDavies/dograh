@@ -133,11 +133,18 @@ def apply_agent_language_configuration(config, workflow_configurations):
                     else "nova-3-general"
                 )
                 stt_updates["model"] = model
+                if model == "flux-general-multi":
+                    # Flux Multilingual uses language_hints to bias recognition;
+                    # preserve each configured language for service_factory.
+                    stt_updates["language"] = ",".join(
+                        dict.fromkeys(code.split("-")[0].lower() for code in languages)
+                    )
             elif model == "flux-general-multi" and not selected_bases.issubset(
                 _DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGES
             ):
                 model = "nova-3-general"
                 stt_updates["model"] = model
+                stt_updates["language"] = "multi" if multi else primary_base
             if model.startswith("nova-2") and multi:
                 # Nova-2's multi mode only covers a narrower pair. Nova-3
                 # handles the configured multilingual set used by the editor.
@@ -145,6 +152,10 @@ def apply_agent_language_configuration(config, workflow_configurations):
                 stt_updates["model"] = model
             if model.startswith("nova-3"):
                 stt_updates["language"] = "multi" if multi else primary_base
+            elif model == "flux-general-multi":
+                stt_updates["language"] = ",".join(
+                    dict.fromkeys(code.split("-")[0].lower() for code in languages)
+                )
             elif model not in {"flux-general-en", "flux-general-multi"} and not multi:
                 fields = getattr(type(effective.stt), "model_fields", {})
                 if "language" in fields:

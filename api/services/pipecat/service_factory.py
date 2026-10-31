@@ -123,6 +123,20 @@ def create_stt_service(
         # the Flux thresholds active for either model; Nova models use the
         # standard Deepgram service below.
         if user_config.stt.model in {"flux-general-en", "flux-general-multi"}:
+            language_hints = []
+            if user_config.stt.model == "flux-general-multi":
+                for language in (
+                    getattr(user_config.stt, "language", None) or ""
+                ).split(","):
+                    language = language.strip()
+                    if not language:
+                        continue
+                    try:
+                        language_hints.append(Language(language))
+                    except ValueError:
+                        logger.warning(
+                            "Ignoring unsupported Flux language hint %r", language
+                        )
             return DeepgramFluxSTTService(
                 api_key=user_config.stt.api_key,
                 settings=DeepgramFluxSTTSettings(
@@ -150,6 +164,7 @@ def create_stt_service(
                     eot_threshold=eot_threshold,
                     eager_eot_threshold=eager_eot_threshold,
                     keyterm=keyterms or [],
+                    language_hints=language_hints or None,
                 ),
                 should_interrupt=False,  # Let UserAggregator take care of sending InterruptionFrame
                 sample_rate=audio_config.transport_in_sample_rate,

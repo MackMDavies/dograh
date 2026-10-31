@@ -36,7 +36,7 @@ def test_agent_language_is_applied_to_realtime_and_provider_settings(language, e
     assert source.model_dump() == before
     if expected != "en":
         assert result.stt.model == "flux-general-multi"
-        assert result.stt.language == source.stt.language
+        assert result.stt.language == expected
 
 
 def test_multilingual_flux_languages_keep_flux_turn_detection():
@@ -52,7 +52,7 @@ def test_multilingual_flux_languages_keep_flux_turn_detection():
     )
 
     assert result.stt.model == "flux-general-multi"
-    assert result.stt.language == source.stt.language
+    assert result.stt.language == "en,es"
     assert result.realtime.language is None
     assert "Detect which of these languages" in build_agent_language_instruction(
         {"language": "en-GB, es-ES", "multilingual_mode": True}
