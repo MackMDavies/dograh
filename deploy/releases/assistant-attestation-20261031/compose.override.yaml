@@ -1,0 +1,5 @@
+services:
+  api:
+    image: dograh-local/assistant-attestation:candidate-20261030-4323f9a1
+  worker:
+    image: dograh-local/assistant-attestation:candidate-20261030-4323f9a1

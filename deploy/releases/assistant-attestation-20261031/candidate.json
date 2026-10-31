@@ -1,0 +1,127 @@
+{
+  "running_image_id": "sha256:511f5c3f66f941142deb68aa04a77f60d7d2b29d76c85e33502e22edb3f1a941",
+  "candidate_image": "dograh-local/assistant-attestation:candidate-20261030-4323f9a1",
+  "source_digest": "4323f9a1a7b67c0560a93f5000f0c1df7631c437c2b13e4a8070c826ba29d02e",
+  "files": [
+    {
+      "path": "api/db/campaign_client.py",
+      "live_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971",
+      "candidate_sha256": "23396c9efe06c9c20f862c8f8fa1da7ebaf9adb04e1d1219a9e95175756dd971",
+      "changed": false
+    },
+    {
+      "path": "api/db/voice_library_client.py",
+      "live_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719",
+      "candidate_sha256": "72509bdb3811170d15d370283f5685848d0cb3523c4fde2227858730256ea719",
+      "changed": false
+    },
+    {
+      "path": "api/db/workflow_run_client.py",
+      "live_sha256": "1fbd27b1a23fde06387f9a74e1b092123c5a0afda48addd27f8118a8a3208f77",
+      "candidate_sha256": "1fbd27b1a23fde06387f9a74e1b092123c5a0afda48addd27f8118a8a3208f77",
+      "changed": false
+    },
+    {
+      "path": "api/enums.py",
+      "live_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b",
+      "candidate_sha256": "869c2be2552a11c9f8b5e7c942d01152558ee811b4c9bf78b43083c5b81ce93b",
+      "changed": false
+    },
+    {
+      "path": "api/mcp_server/auth.py",
+      "live_sha256": "2d1cf1d239004a59b228899b77fcf7017241a2747272ae1c98c9ca92dc8851db",
+      "candidate_sha256": "2d1cf1d239004a59b228899b77fcf7017241a2747272ae1c98c9ca92dc8851db",
+      "changed": false
+    },
+    {
+      "path": "api/routes/campaign.py",
+      "live_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b",
+      "candidate_sha256": "29d5f3d70f6d37bedaf3dcad697aaba510f28288c5c4f8ea4358d637d479b63b",
+      "changed": false
+    },
+    {
+      "path": "api/routes/telephony_quick_connect.py",
+      "live_sha256": "94cbfdb745ba439e9ef3dcef17efb0c52b2e6edebee2b5b2c4be9f8854e11dde",
+      "candidate_sha256": "94cbfdb745ba439e9ef3dcef17efb0c52b2e6edebee2b5b2c4be9f8854e11dde",
+      "changed": false
+    },
+    {
+      "path": "api/routes/voice_library.py",
+      "live_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201",
+      "candidate_sha256": "5743baa9c16ec08b77c6f9d092e24e9e0d3fae9873df94770ef9888a8c4c6201",
+      "changed": false
+    },
+    {
+      "path": "api/services/auth/depends.py",
+      "live_sha256": "960d35b1aa731d62a62d48daed7310f52f3433b9213df91f6c84f0f802acb026",
+      "candidate_sha256": "960d35b1aa731d62a62d48daed7310f52f3433b9213df91f6c84f0f802acb026",
+      "changed": false
+    },
+    {
+      "path": "api/services/campaign/campaign_orchestrator.py",
+      "live_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26",
+      "candidate_sha256": "817c68282fabb31b30a3ca8d94f7549445b34acf3979d3f7660f627df2d16d26",
+      "changed": false
+    },
+    {
+      "path": "api/services/campaign/limits.py",
+      "live_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765",
+      "candidate_sha256": "984dfd9014d02b10209e06a2df7c5997a319d3930d5fb0049a50cdfd69ceb765",
+      "changed": false
+    },
+    {
+      "path": "api/services/campaign/runner.py",
+      "live_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078",
+      "candidate_sha256": "d2dd2a1d5acbfead33d79464bd771bf6b7a8d2a2a4314e771e48a2358bf6b078",
+      "changed": false
+    },
+    {
+      "path": "api/services/pipecat/run_pipeline.py",
+      "live_sha256": "8fc3508b052edf89a0867e664321a6958ae632ead47e0396103d5801f85ae12b",
+      "candidate_sha256": "211f87577c8b5fea9d572a4b3455a5e49b946ccdb669eab351243bb17e5f1aa3",
+      "changed": true
+    },
+    {
+      "path": "api/services/subscription_api_meter.py",
+      "live_sha256": "b9e86a93cf9011cb6fbd1724b7a4f9608724bd0065a6853d8889703b9284644e",
+      "candidate_sha256": "b9e86a93cf9011cb6fbd1724b7a4f9608724bd0065a6853d8889703b9284644e",
+      "changed": false
+    },
+    {
+      "path": "api/services/subscription_call_budget.py",
+      "live_sha256": "810f77fbfe26b1f5560ae2beafc3343a91824003275bd7219dd0164e7cfb272a",
+      "candidate_sha256": "9947ea19c3ed6ec10c349bd552f85fd24db96d1aa88d33f7a82a9fd85b8cf22d",
+      "changed": true
+    },
+    {
+      "path": "api/services/subscription_managed_numbers.py",
+      "live_sha256": "cb7bd2142057fcc7a63a4860c0312c6a510cb5797a69b1308358307d4b53a38f",
+      "candidate_sha256": "cb7bd2142057fcc7a63a4860c0312c6a510cb5797a69b1308358307d4b53a38f",
+      "changed": false
+    },
+    {
+      "path": "api/services/wallet_webhook.py",
+      "live_sha256": "b94557f26a274a08543d33091609eeab796ce198d9daba0e4fd58f5e94f7f1f6",
+      "candidate_sha256": "b94557f26a274a08543d33091609eeab796ce198d9daba0e4fd58f5e94f7f1f6",
+      "changed": false
+    },
+    {
+      "path": "api/services/workflow/test_sandbox_mode.py",
+      "live_sha256": "e1f22c061d58a10097bb3f805f6fb0ae0f37d2d4c777a168f7e3f8f435cc2ff4",
+      "candidate_sha256": "e1f22c061d58a10097bb3f805f6fb0ae0f37d2d4c777a168f7e3f8f435cc2ff4",
+      "changed": false
+    },
+    {
+      "path": "api/services/syra_voice.py",
+      "live_sha256": "b9a1721f8e8c7b00d200a90c4dcb39899acb5e029600e5653a22270bda44dc66",
+      "candidate_sha256": "3c1cfee5b35557e3c8857ca7582b6ba4c4de0d64c64fd20e8ef3bd77ef10c1da",
+      "changed": true
+    }
+  ],
+  "source_commit": "e1c2699c9a3cecc5ea5bac91c6a171f01903139a",
+  "candidate_image_id": "sha256:f9bfa14b521affba9885f0955eeb109b56f0c5a13a7182529728929f7107b251",
+  "status": "candidate-not-applied",
+  "required_edge": "subscription-call-budget assistant operation",
+  "pipeline_variant": "reviewed patch applied to captured running pipeline; preserves unrelated server changes",
+  "pipeline_live_base_patch": "--- a/api/services/pipecat/run_pipeline.py\n+++ b/api/services/pipecat/run_pipeline.py\n@@ -29,6 +29,7 @@\n )\n from api.services.call_live_webhook import fire_call_live\n from api.services.subscription_call_budget import prepare_pipeline_call_budget, run_with_call_budget\n+from api.services.syra_voice import is_syra_voice_workflow\n from api.services.pipecat.pipeline_builder import (\n     build_pipeline,\n     build_realtime_pipeline,\n@@ -488,6 +489,10 @@\n     memory_attr_map = build_memory_attr_map(template_vars)\n     run_workflow_json = run_definition.workflow_json\n     run_configs = run_definition.workflow_configurations or {}\n+    is_syra_voice = (\n+        await is_syra_voice_workflow(workflow.id if workflow else None)\n+        if run_configs.get('syra_voice') is True else False\n+    )\n \n     # Extract configurations from the version's workflow_configurations\n     max_call_duration_seconds = 300  # Default 5 minutes\n@@ -687,7 +692,7 @@\n     # Never for Syra's voice: the person is her user, not a caller to look up.\n     _sysevo_memory_url = (\n         None\n-        if run_configs.get(\"syra_voice\") or is_agent_test_sandbox\n+        if is_syra_voice or is_agent_test_sandbox\n         else os.getenv(\"SYSEVO_MEMORY_PRE_CALL_URL\")\n     )\n     _sysevo_memory_secret = os.getenv(\"SYSEVO_MEMORY_SECRET\", \"\")\n@@ -722,7 +727,7 @@\n     # Not for Syra's voice: a person talking to their own assistant is not a live call.\n     if (\n         os.getenv(\"SYSEVO_CALL_LIVE_URL\")\n-        and not run_configs.get(\"syra_voice\")\n+        and not is_syra_voice\n         and not is_agent_test_sandbox\n     ):\n         asyncio.create_task(\n@@ -1277,7 +1282,7 @@\n         params = PipelineTaskParams(loop=loop)\n         budget = await prepare_pipeline_call_budget(\n             workflow, workflow_run, max_call_duration_seconds, db_client,\n-            skip=is_agent_test_sandbox or run_configs.get('syra_voice') is True,\n+            skip=is_agent_test_sandbox or is_syra_voice,\n             resolved_models={'is_realtime': is_realtime, **runtime_configuration},\n         )\n         if budget is None:\n"
+}
