@@ -65,6 +65,10 @@ _LANGUAGE_LABELS = {
     "chinese": "zh", "mandarin": "zh", "cantonese": "yue",
 }
 
+_DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGES = {
+    "en", "es", "fr", "de", "hi", "ru", "pt", "ja", "it", "nl"
+}
+
 
 def _configured_languages(workflow_configurations):
     value = (workflow_configurations or {}).get("language")
@@ -116,13 +120,35 @@ def apply_agent_language_configuration(config, workflow_configurations):
         model = str(getattr(effective.stt, "model", ""))
         stt_updates = {}
         if provider == "deepgram":
-            if model == "flux-general-en" and (primary_base != "en" or multi):
-                # Flux General English cannot recognize other languages. Nova-3
-                # uses its standard endpointing/turn strategy instead of Flux knobs.
-                stt_updates["model"] = "nova-3-general"
+            selected_bases = {code.split("-")[0].lower() for code in languages}
+            if model in {"flux-general-en", "flux-general-multi"} and (
+                primary_base != "en" or multi
+            ):
+                # Prefer Flux Multilingual where possible so the agent keeps
+                # Flux turn detection. Its model supports ten languages; use
+                # Nova-3 for the rest of Nova-3's broader language set.
+                model = (
+                    "flux-general-multi"
+                    if selected_bases.issubset(_DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGES)
+                    else "nova-3-general"
+                )
+                stt_updates["model"] = model
+            elif model == "flux-general-multi" and not selected_bases.issubset(
+                _DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGES
+            ):
                 model = "nova-3-general"
+                stt_updates["model"] = model
+            if model.startswith("nova-2") and multi:
+                # Nova-2's multi mode only covers a narrower pair. Nova-3
+                # handles the configured multilingual set used by the editor.
+                model = "nova-3-general"
+                stt_updates["model"] = model
             if model.startswith("nova-3"):
                 stt_updates["language"] = "multi" if multi else primary_base
+            elif model not in {"flux-general-en", "flux-general-multi"} and not multi:
+                fields = getattr(type(effective.stt), "model_fields", {})
+                if "language" in fields:
+                    stt_updates["language"] = primary_base
         elif not multi and "language" in getattr(type(effective.stt), "model_fields", {}):
             stt_updates["language"] = primary
         if stt_updates:

@@ -119,8 +119,10 @@ def create_stt_service(
         logger.info(
             f"Deepgram STT: model={user_config.stt.model!r} api_key_set={bool(user_config.stt.api_key)}"
         )
-        # Check if using Flux model (English-only, no language selection)
-        if user_config.stt.model == "flux-general-en":
+        # Flux English and Multilingual share the v2 turn-aware service. Keep
+        # the Flux thresholds active for either model; Nova models use the
+        # standard Deepgram service below.
+        if user_config.stt.model in {"flux-general-en", "flux-general-multi"}:
             return DeepgramFluxSTTService(
                 api_key=user_config.stt.api_key,
                 settings=DeepgramFluxSTTSettings(

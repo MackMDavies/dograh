@@ -35,11 +35,11 @@ def test_agent_language_is_applied_to_realtime_and_provider_settings(language, e
         assert result.tts.language == (language if "-" in language else expected)
     assert source.model_dump() == before
     if expected != "en":
-        assert result.stt.model == "nova-3-general"
-        assert result.stt.language == expected
+        assert result.stt.model == "flux-general-multi"
+        assert result.stt.language == source.stt.language
 
 
-def test_multilingual_agent_uses_nova_auto_detection_and_does_not_pin_realtime_language():
+def test_multilingual_flux_languages_keep_flux_turn_detection():
     source, _, _ = plan_fixture()
     source.is_realtime = True
     source.realtime = fixture("realtime", "elevenlabs_realtime")[0]
@@ -51,12 +51,62 @@ def test_multilingual_agent_uses_nova_auto_detection_and_does_not_pin_realtime_l
         {"language": "en-GB, es-ES", "multilingual_mode": True},
     )
 
-    assert result.stt.model == "nova-3-general"
-    assert result.stt.language == "multi"
+    assert result.stt.model == "flux-general-multi"
+    assert result.stt.language == source.stt.language
     assert result.realtime.language is None
     assert "Detect which of these languages" in build_agent_language_instruction(
         {"language": "en-GB, es-ES", "multilingual_mode": True}
     )
+
+
+def test_language_outside_flux_multilingual_set_uses_nova3():
+    source, _, _ = plan_fixture()
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "flux-general-en"
+
+    result = apply_agent_language_configuration(source, {"language": "Arabic"})
+
+    assert result.stt.model == "nova-3-general"
+    assert result.stt.language == "ar"
+
+
+def test_multilingual_language_outside_flux_set_uses_nova3_auto_detection():
+    source, _, _ = plan_fixture()
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "flux-general-en"
+
+    result = apply_agent_language_configuration(
+        source,
+        {"language": "en-GB, ar-SA", "multilingual_mode": True},
+    )
+
+    assert result.stt.model == "nova-3-general"
+    assert result.stt.language == "multi"
+
+
+def test_non_realtime_deepgram_language_is_applied_to_nova2():
+    source, _, _ = plan_fixture()
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "nova-2-general"
+
+    result = apply_agent_language_configuration(source, {"language": "Spanish"})
+
+    assert result.stt.model == "nova-2-general"
+    assert result.stt.language == "es"
+
+
+def test_multilingual_nova2_selection_upgrades_to_nova3():
+    source, _, _ = plan_fixture()
+    source.stt = fixture("stt", "deepgram")[0]
+    source.stt.model = "nova-2-general"
+
+    result = apply_agent_language_configuration(
+        source,
+        {"language": "en-GB, es-ES", "multilingual_mode": True},
+    )
+
+    assert result.stt.model == "nova-3-general"
+    assert result.stt.language == "multi"
 
 
 def test_agent_without_language_keeps_provider_configuration_unchanged():
