@@ -75,7 +75,7 @@ def prepare():
   if new['Config'].get(key)!=old['Config'].get(key):raise RuntimeError('Candidate changed inherited image configuration: '+key)
  if sources(tag=candidate)!=MANIFEST['new_source_hashes']:raise RuntimeError('Candidate source hashes do not match reviewed main')
  logged(['docker','run','--rm','--network','none','--entrypoint','python',candidate,'-m','unittest','api.tests.test_subscription_imported_numbers','-v'],'candidate-tests.log')
- logged(['docker','run','--rm','--network','none','--entrypoint','python','-e','DATABASE_URL=postgresql+asyncpg://test:test@localhost:5432/test','-e','REDIS_URL=redis://localhost:6379/0',candidate,'-c','import api.app; print("PASS application import")'],'candidate-import.log')
+ logged(['docker','run','--rm','--network','none','--entrypoint','python','-e','ENVIRONMENT=test','-e','DATABASE_URL=postgresql+asyncpg://test:test@localhost:5432/test','-e','REDIS_URL=redis://localhost:6379/0',candidate,'-c','import api.app; print("PASS application import")'],'candidate-import.log')
  override=ROOT/'.runtime-compose.json';override.write_text(json.dumps({'services':{'api':{'image':candidate}}}));os.chmod(override,0o600)
  verify_configuration(api,override)
  if inspect(API)['Image']!=base or inspect(WORKER)['Image']!=worker['Image']:raise RuntimeError('Running image changed during preparation; rebuild from current image')
