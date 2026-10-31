@@ -1,0 +1,13 @@
+{
+  "canonical_commit": "53cc51efdcd8aea47b3af49c33dd8a93edb94b90",
+  "production_git_base": "84b9ea2d355a4e3bdbbf5204cc739297cc7bde8d",
+  "old_source_hashes": {
+    "api/routes/organization.py": "b0430c8b6e74037ebd30f69153b9ed043fc58fc002a4b7dee112b91707edcc5c",
+    "api/services/subscription_managed_numbers.py": "cb7bd2142057fcc7a63a4860c0312c6a510cb5797a69b1308358307d4b53a38f"
+  },
+  "new_source_hashes": {
+    "api/routes/organization.py": "d2eaf6e71dfbd08d5f43150da711b17c4b6ae69a366b22dddfd03948df7c559f",
+    "api/services/subscription_managed_numbers.py": "313f6b7a886d8c81ff8ba33920e8080dfc687650d3f767a751cf2ee54bc6eadd",
+    "api/tests/test_subscription_imported_numbers.py": "134807de1aa7a547bf1377d981cd0c1a9d79120c882463c97d38777aef26fa79"
+  }
+}
