@@ -49,6 +49,23 @@ def receiver_failure_message(exc: Exception) -> str:
     return "ElevenLabs Realtime stopped receiving responses. Please restart the call."
 
 
+def opening_input_text(greeting: str, language: str | None) -> str:
+    """Keep authored greetings exact in English; translate them for non-English agents."""
+    if language and language.split("-")[0].casefold() not in {"en", "eng"}:
+        return (
+            f"Begin the conversation in the agent's configured language ({language}). "
+            "Translate the greeting below naturally into that language, preserving its "
+            "meaning and details. Do not repeat the source-language wording or add any "
+            "other words.\n\n"
+            f"<greeting>{greeting}</greeting>"
+        )
+    return (
+        "Begin the conversation by saying exactly the greeting below. "
+        "Do not add an introduction or any other words.\n\n"
+        f"<greeting>{greeting}</greeting>"
+    )
+
+
 class _ElevenLabsProtocolSocket:
     """Normalize ElevenLabs' omitted nullable fields for Pipecat's event models."""
 
@@ -171,10 +188,8 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
             # ElevenLabs requires a conversation input before response.create.
             # The OpenAI wrapper only uses this frame as a trigger and discards
             # its text, leaving an empty first turn that never produces audio.
-            self._pending_opening_text = (
-                "Begin the conversation by saying exactly the greeting below. "
-                "Do not add an introduction or any other words.\n\n"
-                f"<greeting>{frame.text}</greeting>"
+            self._pending_opening_text = opening_input_text(
+                frame.text, self._elevenlabs_language
             )
             await self._handle_context(self._context or LLMContext())
             return
