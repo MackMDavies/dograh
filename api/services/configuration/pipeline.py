@@ -56,13 +56,40 @@ _LANGUAGE_NAMES = {
     "fil": "Filipino", "ta": "Tamil", "te": "Telugu", "th": "Thai",
     "tr": "Turkish", "uk": "Ukrainian", "ur": "Urdu", "vi": "Vietnamese",
     "cy": "Welsh", "eu": "Basque", "yo": "Yoruba", "zu": "Zulu",
+    "sq": "Albanian", "hy": "Armenian", "az": "Azerbaijani", "bs": "Bosnian",
+    "gl": "Galician", "ka": "Georgian", "ha": "Hausa", "jv": "Javanese",
+    "kk": "Kazakh", "km": "Khmer", "lo": "Lao", "lv": "Latvian",
+    "lt": "Lithuanian", "mk": "Macedonian", "mn": "Mongolian", "ne": "Nepali",
+    "uz": "Uzbek",
 }
 _LANGUAGE_LABELS = {
-    "english": "en", "english (uk)": "en-GB", "english (us)": "en-US",
-    "spanish": "es", "french": "fr", "polish": "pl", "urdu": "ur",
-    "german": "de", "italian": "it", "portuguese": "pt", "dutch": "nl",
-    "arabic": "ar", "hindi": "hi", "japanese": "ja", "korean": "ko",
-    "chinese": "zh", "mandarin": "zh", "cantonese": "yue",
+    # Keep names aligned with AgentSimpleView.ALL_LANGUAGES. The studio normally
+    # stores locale codes, but Syra and imported workflows may store labels.
+    "english": "en-US", "english (us)": "en-US", "english (uk)": "en-GB",
+    "spanish": "es-ES", "spanish (spain)": "es-ES", "spanish (mexico)": "es-MX",
+    "french": "fr-FR", "german": "de-DE", "italian": "it-IT",
+    "portuguese": "pt-BR", "portuguese (br)": "pt-BR", "dutch": "nl-NL",
+    "polish": "pl-PL", "arabic": "ar-SA", "japanese": "ja-JP",
+    "chinese": "zh-CN", "chinese (simplified)": "zh-CN", "korean": "ko-KR",
+    "hindi": "hi-IN", "turkish": "tr-TR", "russian": "ru-RU",
+    "swedish": "sv-SE", "danish": "da-DK", "finnish": "fi-FI",
+    "norwegian": "nb-NO", "czech": "cs-CZ", "hungarian": "hu-HU",
+    "romanian": "ro-RO", "ukrainian": "uk-UA", "greek": "el-GR",
+    "indonesian": "id-ID", "vietnamese": "vi-VN", "afrikaans": "af-ZA",
+    "albanian": "sq-AL", "armenian": "hy-AM", "azerbaijani": "az-AZ",
+    "bengali": "bn-BD", "bosnian": "bs-BA", "bulgarian": "bg-BG",
+    "catalan": "ca-ES", "cantonese": "yue-HK", "croatian": "hr-HR",
+    "estonian": "et-EE", "filipino": "fil-PH", "galician": "gl-ES",
+    "georgian": "ka-GE", "gujarati": "gu-IN", "hausa": "ha-NG",
+    "hebrew": "he-IL", "icelandic": "is-IS", "irish": "ga-IE",
+    "javanese": "jv-ID", "kannada": "kn-IN", "kazakh": "kk-KZ",
+    "khmer": "km-KH", "lao": "lo-LA", "latvian": "lv-LV",
+    "lithuanian": "lt-LT", "macedonian": "mk-MK", "malay": "ms-MY",
+    "malayalam": "ml-IN", "marathi": "mr-IN", "mongolian": "mn-MN",
+    "nepali": "ne-NP", "persian": "fa-IR", "punjabi": "pa-IN",
+    "serbian": "sr-RS", "swahili": "sw-KE", "tamil": "ta-IN",
+    "telugu": "te-IN", "thai": "th-TH", "urdu": "ur-PK",
+    "uzbek": "uz-UZ", "welsh": "cy-GB", "yoruba": "yo-NG",
 }
 
 _DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGES = {
@@ -94,6 +121,38 @@ def _configured_languages(workflow_configurations):
 def _provider_value(section):
     provider = getattr(section, "provider", None)
     return getattr(provider, "value", provider)
+
+
+_TTS_ISO_LANGUAGE_PROVIDERS = {"rime"}
+_DEFAULT_TTS_LOCALES = {
+    "af": "af-ZA", "ar": "ar-SA", "az": "az-AZ", "bg": "bg-BG",
+    "bn": "bn-BD", "bs": "bs-BA", "ca": "ca-ES", "cs": "cs-CZ",
+    "cy": "cy-GB", "da": "da-DK", "de": "de-DE", "el": "el-GR",
+    "en": "en-US", "es": "es-ES", "et": "et-EE", "fa": "fa-IR",
+    "fil": "fil-PH", "fi": "fi-FI", "fr": "fr-FR", "ga": "ga-IE",
+    "gl": "gl-ES", "gu": "gu-IN", "ha": "ha-NG", "he": "he-IL",
+    "hi": "hi-IN", "hr": "hr-HR", "hu": "hu-HU", "hy": "hy-AM",
+    "id": "id-ID", "is": "is-IS", "it": "it-IT", "ja": "ja-JP",
+    "jv": "jv-ID", "ka": "ka-GE", "kk": "kk-KZ", "km": "km-KH",
+    "kn": "kn-IN", "ko": "ko-KR", "lo": "lo-LA", "lt": "lt-LT",
+    "lv": "lv-LV", "mk": "mk-MK", "ml": "ml-IN", "mn": "mn-MN",
+    "mr": "mr-IN", "ms": "ms-MY", "nb": "nb-NO", "ne": "ne-NP",
+    "nl": "nl-NL", "pa": "pa-IN", "pl": "pl-PL", "pt": "pt-BR",
+    "ro": "ro-RO", "ru": "ru-RU", "sq": "sq-AL", "sr": "sr-RS",
+    "sv": "sv-SE", "sw": "sw-KE", "ta": "ta-IN", "te": "te-IN",
+    "th": "th-TH", "tr": "tr-TR", "uk": "uk-UA", "ur": "ur-PK",
+    "uz": "uz-UZ", "vi": "vi-VN", "yue": "yue-HK", "yo": "yo-NG",
+    "zh": "zh-CN",
+}
+
+
+def _tts_language(section, language):
+    """Convert the agent language to the code format expected by its TTS provider."""
+    provider = _provider_value(section)
+    base = language.split("-")[0].lower()
+    if provider in _TTS_ISO_LANGUAGE_PROVIDERS:
+        return base
+    return language if "-" in language else _DEFAULT_TTS_LOCALES.get(base, base)
 
 
 def apply_agent_language_configuration(config, workflow_configurations):
@@ -168,7 +227,9 @@ def apply_agent_language_configuration(config, workflow_configurations):
     if effective.tts is not None and not multi:
         fields = getattr(type(effective.tts), "model_fields", {})
         if "language" in fields:
-            effective.tts = effective.tts.model_copy(update={"language": primary})
+            effective.tts = effective.tts.model_copy(
+                update={"language": _tts_language(effective.tts, primary)}
+            )
 
     return effective
 

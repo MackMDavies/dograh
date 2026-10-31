@@ -6,6 +6,7 @@ import pytest
 from api.schemas.user_configuration import UserConfiguration
 from api.services.configuration import org_provider_resolver as resolver
 from api.services.configuration.pipeline import (
+    _configured_languages,
     apply_agent_language_configuration,
     apply_pipeline_call_configuration,
     build_agent_language_instruction,
@@ -57,6 +58,34 @@ def test_multilingual_flux_languages_keep_flux_turn_detection():
     assert "Detect which of these languages" in build_agent_language_instruction(
         {"language": "en-GB, es-ES", "multilingual_mode": True}
     )
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("English (UK)", "en-GB"),
+        ("Spanish (Mexico)", "es-MX"),
+        ("Cantonese", "yue-HK"),
+        ("Punjabi", "pa-IN"),
+        ("Welsh", "cy-GB"),
+        ("Uzbek", "uz-UZ"),
+    ],
+)
+def test_studio_language_labels_resolve_to_provider_codes(label, expected):
+    assert _configured_languages({"language": label}) == [expected]
+
+
+@pytest.mark.parametrize(
+    "provider,expected",
+    [("google", "es-ES"), ("rime", "es"), ("camb", "es-ES")],
+)
+def test_tts_language_uses_provider_code_format(provider, expected):
+    source, _, _ = plan_fixture()
+    source.tts = fixture("tts", provider)[0]
+
+    result = apply_agent_language_configuration(source, {"language": "Spanish"})
+
+    assert result.tts.language == expected
 
 
 def test_language_outside_flux_multilingual_set_uses_nova3():
