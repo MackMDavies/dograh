@@ -17,6 +17,7 @@ from api.constants import (
 from api.db import db_client
 from api.db.models import UserModel
 from api.db.telephony_configuration_client import TelephonyConfigurationInUseError
+from api.services.subscription_managed_numbers import imported_number_slot, ManagedNumberPolicyError
 from api.enums import OrganizationConfigurationKey, PostHogEvent
 from api.schemas.telephony_config import (
     TelephonyConfigRequest,
@@ -587,6 +588,18 @@ async def create_phone_number(
     if not user.selected_organization_id:
         raise HTTPException(status_code=400, detail="No organization selected")
     cfg = await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
+
+    try:
+        async with imported_number_slot(user.selected_organization_id, db_client, request.address, request.country_code) as country:
+            if country is not None:
+                request = request.model_copy(update={"country_code": country})
+            return await _create_phone_number(config_id, request, user, cfg)
+    except ManagedNumberPolicyError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
+
+
+async def _create_phone_number(config_id, request, user, cfg):
+    """Existing provider claim and persistence, within the account capacity lock."""
 
     if request.inbound_workflow_id is not None and not user.is_superuser:
         await _ensure_workflow_belongs_to_org(

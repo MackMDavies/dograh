@@ -6,7 +6,9 @@ from uuid import UUID
 
 LOCK_NAMESPACE = 1397736277
 LOCK_SQL = "SELECT pg_advisory_xact_lock(CAST(:namespace AS integer), CAST(:organization AS integer))"
-COUNT_SQL = "SELECT count(*) FROM telephony_phone_numbers WHERE organization_id=:organization AND extra_metadata->>'is_managed'='true'"
+# A provider import and a Sysevo purchase consume the same account allowance.
+# Counting every row also prevents a browser-editable metadata flag bypass.
+COUNT_SQL = "SELECT count(*) FROM telephony_phone_numbers WHERE organization_id=:organization"
 
 
 class ManagedNumberPolicyError(RuntimeError):
@@ -133,6 +135,36 @@ async def managed_number_slot(organization_id, db, country, *, post=None):
             if used >= limit:
                 raise ManagedNumberPolicyError(403, 'Your paid phone-number capacity is full. Purchase another number add-on or release a number first')
             yield ManagedNumberSlot(scope, country, used+1, post)
+
+
+@asynccontextmanager
+async def imported_number_slot(organization_id, db, address, country_hint=None, *, post=None):
+    """Apply the same paid capacity lock to direct provider-number imports.
+
+    Legacy organizations retain their PSTN/SIP behavior. Self-Serve imports
+    must be real US PSTN addresses; caller-provided country labels cannot
+    turn a Canadian +1 number or a SIP extension into a US line.
+    """
+    scope = await number_scope(organization_id, db)
+    if scope is None:
+        yield None
+        return
+    context = await request_number_policy(scope, {'operation': 'context', 'country': 'US'}, post=post)
+    if admitted_limit(context) is None:
+        yield None
+        return
+    try:
+        import phonenumbers
+        hint = country_hint.upper() if isinstance(country_hint, str) else None
+        number = phonenumbers.parse(address, hint)
+        us_number = phonenumbers.region_code_for_number(number) == 'US'
+        shared_toll_free = number.country_code == 1 and phonenumbers.number_type(number) == phonenumbers.PhoneNumberType.TOLL_FREE
+        if hint not in (None, 'US') or not phonenumbers.is_valid_number(number) or not (us_number or shared_toll_free):
+            raise ValueError('Unsupported number')
+    except Exception:
+        raise ManagedNumberPolicyError(403, 'Self-Serve provider imports currently require a valid United States phone number') from None
+    async with managed_number_slot(organization_id, db, 'US', post=post):
+        yield 'US'
 
 
 async def cleanup_released_number(organization_id, phone_id, db, *, post=None):
