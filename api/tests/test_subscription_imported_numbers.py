@@ -127,4 +127,28 @@ class Tests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result,'created');self.assertEqual(events[-1],('persist','US'))
         self.assertIn('session-exit',db.events)
 
+    async def test_legacy_configuration_route_cannot_import_beyond_the_same_cap(self):
+        db=self.db();created=[]
+        row=SimpleNamespace(id=7,provider='twilio',credentials={})
+        async def default(*_):return row
+        async def update(**_):return row
+        async def existing(*_):return []
+        async def create(**values):
+            created.append(values);db.connection.execute('INSERT INTO telephony_phone_numbers VALUES(?,?)',(42,'{}'))
+        db.get_default_telephony_configuration=default;db.update_telephony_configuration=update
+        db.list_phone_numbers_for_config=existing;db.create_phone_number=create
+        def slot(org,client,address):return imported_number_slot(org,client,address,post=self.policy())
+        class HTTPError(Exception):
+            def __init__(self,status_code,detail):self.status_code=status_code;self.detail=detail
+        path=Path(__file__).parents[1]/'routes/organization.py'
+        fn=next(node for node in ast.parse(path.read_text()).body if isinstance(node,ast.AsyncFunctionDef) and node.name=='save_telephony_configuration');fn.decorator_list=[]
+        namespace={'TelephonyConfigRequest':object,'UserModel':object,'Depends':lambda *_:None,'get_user':lambda:None,
+          'db_client':db,'imported_number_slot':slot,'ManagedNumberPolicyError':ManagedNumberPolicyError,'HTTPException':HTTPError,
+          'preserve_masked_fields':lambda *_:None,'IntegrityError':type('IntegrityError',(Exception,),{}),'capture_event':lambda **_:None,
+          'PostHogEvent':SimpleNamespace(TELEPHONY_CONFIGURED='configured')}
+        exec(compile(ast.Module(body=[fn],type_ignores=[]),str(path),'exec'),namespace)
+        request=SimpleNamespace(provider='twilio',model_dump=lambda:{'provider':'twilio','from_numbers':['+12015550123','+12015550124']})
+        with self.assertRaises(HTTPError) as error:await namespace['save_telephony_configuration'](request,SimpleNamespace(selected_organization_id=42,provider_id='synthetic'))
+        self.assertEqual(error.exception.status_code,403);self.assertEqual(len(created),1);self.assertEqual(created[0]['country_code'],'US')
+
 if __name__=='__main__':unittest.main()

@@ -997,11 +997,14 @@ async def save_telephony_configuration(
         if addr in existing_by_address:
             continue
         try:
-            await db_client.create_phone_number(
-                organization_id=user.selected_organization_id,
-                telephony_configuration_id=row.id,
-                address=addr,
-            )
+            async with imported_number_slot(user.selected_organization_id, db_client, addr) as country:
+                values = {"organization_id": user.selected_organization_id,
+                    "telephony_configuration_id": row.id, "address": addr}
+                if country is not None:
+                    values["country_code"] = country
+                await db_client.create_phone_number(**values)
+        except ManagedNumberPolicyError as error:
+            raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
         except IntegrityError:
             logger.warning(
                 f"Skipping duplicate phone number {addr!r} for config {row.id}"
