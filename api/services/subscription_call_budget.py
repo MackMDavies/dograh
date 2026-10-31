@@ -89,6 +89,14 @@ class CallBudgetClient:
         return CallBudget.from_reply(reply, run_id=run_id, max_seconds=max_seconds,
             sent_at=sent_at, received_at=self.clock())
 
+    async def attest_assistant(self, workflow_id):
+        if not _positive_int(workflow_id):
+            raise CallBudgetError('Invalid assistant workflow')
+        reply = await self._request({'operation': 'assistant', 'workflow_id': workflow_id})
+        if not isinstance(reply, dict) or type(reply.get('assistant')) is not bool:
+            raise CallBudgetError('Assistant exemption could not be verified')
+        return reply['assistant']
+
     async def classify(self, account_id, run_id):
         reply = await self._request({'operation': 'classify', 'account_id': account_id, 'run_id': run_id})
         if not isinstance(reply, dict) or reply.get('kind') not in ('subscription', 'legacy'):

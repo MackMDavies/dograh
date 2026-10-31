@@ -13,7 +13,7 @@ PIPELINE_SOURCE = Path(__file__).parents[1]/'services/pipecat/run_pipeline.py'
 
 
 class SharedPipelineTests(unittest.IsolatedAsyncioTestCase):
-    async def exercise(self, *, budget=None, fail=False, sandbox=False):
+    async def exercise(self, *, budget=None, fail=False, sandbox=False, assistant_flag=False, attested_assistant=False):
         path = PIPELINE_SOURCE
         function = next(n for n in ast.parse(path.read_text()).body if isinstance(n, ast.AsyncFunctionDef) and n.name=='_run_pipeline')
         block = function.body[-1]
@@ -34,7 +34,7 @@ class SharedPipelineTests(unittest.IsolatedAsyncioTestCase):
             'run_with_call_budget': guarded, 'workflow': object(), 'workflow_run': object(),
             'max_call_duration_seconds': 300, 'db_client': object(), 'is_agent_test_sandbox': sandbox,
             'is_realtime': True, 'runtime_configuration': {'realtime_model': 'eleven_realtime_v1_mini'},
-            'run_configs': {}, 'PipelineTaskParams': lambda **kwargs: kwargs,
+            'run_configs': {'syra_voice': assistant_flag}, 'is_syra_voice': attested_assistant, 'PipelineTaskParams': lambda **kwargs: kwargs,
             'task': SimpleNamespace(run=run, cancel=cancel), 'supervisor': None, 'suppress': suppress,
             'engine': SimpleNamespace(stop_companion=cleanup),
             'feedback_observer': SimpleNamespace(cleanup=cleanup), 'workflow_run_id': 101,
@@ -61,6 +61,14 @@ class SharedPipelineTests(unittest.IsolatedAsyncioTestCase):
         order = await self.exercise()
         self.assertEqual(order[:2], [('reserve', False), ('audio', None)])
         self.assertNotIn(('guard', None), order)
+
+    async def test_customer_workflow_cannot_claim_an_assistant_budget_exemption(self):
+        order = await self.exercise(assistant_flag=True)
+        self.assertEqual(order[0], ('reserve', False))
+
+    async def test_registered_assistant_keeps_its_separate_nonbillable_path(self):
+        order = await self.exercise(assistant_flag=True, attested_assistant=True)
+        self.assertEqual(order[0], ('reserve', True))
 
     async def test_attested_sandbox_bypass_is_passed_to_the_service(self):
         order = await self.exercise(sandbox=True)

@@ -30,6 +30,7 @@ from api.services.pipecat.memory_pre_call import (
 )
 from api.services.call_live_webhook import fire_call_live
 from api.services.subscription_call_budget import prepare_pipeline_call_budget, run_with_call_budget
+from api.services.syra_voice import is_syra_voice_workflow
 from api.services.pipecat.pipeline_builder import (
     build_pipeline,
     build_realtime_pipeline,
@@ -486,6 +487,10 @@ async def _run_pipeline(
     memory_attr_map = build_memory_attr_map(template_vars)
     run_workflow_json = run_definition.workflow_json
     run_configs = run_definition.workflow_configurations or {}
+    is_syra_voice = (
+        await is_syra_voice_workflow(workflow.id if workflow else None)
+        if run_configs.get('syra_voice') is True else False
+    )
 
     # Extract configurations from the version's workflow_configurations
     max_call_duration_seconds = 300  # Default 5 minutes
@@ -689,7 +694,7 @@ async def _run_pipeline(
     # Never for Syra's voice: the person is her user, not a caller to look up.
     _sysevo_memory_url = (
         None
-        if is_agent_test_sandbox or run_configs.get("syra_voice")
+        if is_agent_test_sandbox or is_syra_voice
         else os.getenv("SYSEVO_MEMORY_PRE_CALL_URL")
     )
     _sysevo_memory_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
@@ -724,7 +729,7 @@ async def _run_pipeline(
     # Not for Syra's voice: a person talking to their own assistant is not a live call.
     if (
         os.getenv("SYSEVO_CALL_LIVE_URL")
-        and not run_configs.get("syra_voice")
+        and not is_syra_voice
         and not is_agent_test_sandbox
     ):
         asyncio.create_task(
@@ -1251,7 +1256,7 @@ async def _run_pipeline(
         params = PipelineTaskParams(loop=loop)
         budget = await prepare_pipeline_call_budget(
             workflow, workflow_run, max_call_duration_seconds, db_client,
-            skip=is_agent_test_sandbox or run_configs.get('syra_voice') is True,
+            skip=is_agent_test_sandbox or is_syra_voice,
             resolved_models={'is_realtime': is_realtime, **runtime_configuration},
         )
         if budget is None:
