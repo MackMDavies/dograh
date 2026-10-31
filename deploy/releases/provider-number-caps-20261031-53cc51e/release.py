@@ -73,7 +73,10 @@ print(json.dumps({'call_slots':slots,'api_connections':connections}))"""
  return json.loads(run(['docker','exec',API,'python','-c',code]))
 
 def fingerprint(api):
- return digest({key:api[key] for key in ['Config','HostConfig','Mounts']})
+ config={**api['Config'],'Env':sorted(api['Config']['Env'])}
+ # Docker may emit the same mounts in either order across inspect calls.
+ mounts=sorted(api['Mounts'],key=lambda mount:mount['Destination'])
+ return digest({'Config':config,'HostConfig':api['HostConfig'],'Mounts':mounts})
 
 def prepare():
  api=inspect(API);worker=inspect(WORKER);current=sources(container=API)
@@ -119,7 +122,8 @@ def apply():
  else:raise RuntimeError('API did not become healthy; retain prepared state for controlled rollback')
  now=inspect(API);worker_after=inspect(WORKER)
  if now['Image']!=state['candidate_image'] or sources(container=API)!=MANIFEST['new_source_hashes']:raise RuntimeError('Running API source verification failed')
- for key in ['Env','Cmd','Entrypoint','WorkingDir','User']:
+ if sorted(now['Config']['Env'])!=sorted(api['Config']['Env']):raise RuntimeError('Runtime environment changed')
+ for key in ['Cmd','Entrypoint','WorkingDir','User']:
   if now['Config'].get(key)!=api['Config'].get(key):raise RuntimeError('Runtime configuration changed: '+key)
  for key in ['RestartPolicy','Memory','NanoCpus','PortBindings']:
   if now['HostConfig'].get(key)!=api['HostConfig'].get(key):raise RuntimeError('Runtime service settings changed: '+key)
