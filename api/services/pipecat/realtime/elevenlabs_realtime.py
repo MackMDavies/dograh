@@ -38,6 +38,17 @@ CLIENT_SECRET_URL = "https://api.elevenlabs.io/v1/convai/realtime/client_secrets
 REALTIME_WEBSOCKET_URL = "wss://api.elevenlabs.io/v1/convai/realtime"
 
 
+def receiver_failure_message(exc: Exception) -> str:
+    """Return a safe, actionable message for a closed ElevenLabs session."""
+    details = str(exc).casefold()
+    if "quota limit" in details or "quota exceeded" in details:
+        return (
+            "ElevenLabs quota limit reached. Check the connected account's plan or "
+            "available quota, then try again."
+        )
+    return "ElevenLabs Realtime stopped receiving responses. Please restart the call."
+
+
 class _ElevenLabsProtocolSocket:
     """Normalize ElevenLabs' omitted nullable fields for Pipecat's event models."""
 
@@ -266,7 +277,7 @@ class DograhElevenLabsRealtimeLLMService(DograhOpenAIRealtimeLLMService):
                 # silently listening. Never include raw provider payloads here.
                 logger.error("ElevenLabs Realtime receiver failed ({})", type(exc).__name__)
                 await self.push_error(
-                    error_msg="ElevenLabs Realtime stopped receiving responses. Please restart the call.",
+                    error_msg=receiver_failure_message(exc),
                     fatal=True,
                 )
 
