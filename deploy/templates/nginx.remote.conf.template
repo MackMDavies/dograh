@@ -1,8 +1,13 @@
 __DOGRAH_UPSTREAM_BLOCK__
 
+# Browser WebSocket auth currently travels in a query parameter. Log only the
+# path, never the full request target or Referer, which can contain credentials.
+log_format dograh_redacted '$remote_addr [$time_local] "$request_method $uri $server_protocol" $status $body_bytes_sent "$http_user_agent"';
+
 server {
     listen 80;
     server_name __DOGRAH_PUBLIC_HOST__;
+    access_log /var/log/nginx/access.log dograh_redacted;
 
     # Redirect all HTTP to HTTPS
     return 301 https://$host$request_uri;
@@ -11,6 +16,7 @@ server {
 server {
     listen 443 ssl;
     server_name __DOGRAH_PUBLIC_HOST__;
+    access_log /var/log/nginx/access.log dograh_redacted;
 
     ssl_certificate     /etc/nginx/certs/local.crt;
     ssl_certificate_key /etc/nginx/certs/local.key;
