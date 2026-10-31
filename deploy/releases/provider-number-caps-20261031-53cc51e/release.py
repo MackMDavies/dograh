@@ -52,9 +52,25 @@ def verify_configuration(api,extra):
  if differing:raise RuntimeError('Compose environment differs from running container; key names only: '+','.join(sorted(differing)))
 
 def active_calls():
- sql="SELECT count(*) FROM workflow_runs WHERE is_completed IS NOT TRUE AND (state='running' OR (state='initialized' AND created_at>now()-interval '2 minutes'))"
+ # Same live modes as call_concurrency.LIVE_CALL_MODES. Persistent textchat
+ # conversations intentionally retain running state; they are not live audio.
+ sql="SELECT count(*) FROM workflow_runs WHERE mode IN ('ari','plivo','twilio','vonage','vobiz','cloudonix','telnyx','webrtc','smallwebrtc') AND is_completed IS NOT TRUE AND (state='running' OR (state='initialized' AND created_at>now()-interval '2 minutes'))"
  result=run(['docker','exec','dograh-postgres-1','sh','-c','psql -U "$POSTGRES_USER" -d "${POSTGRES_DB:-$POSTGRES_USER}" -Atc "$1"','sh',sql])
  return int(result.strip())
+
+def runtime_activity():
+ code="""import os,json,redis
+from pathlib import Path
+r=redis.Redis.from_url(os.environ['REDIS_URL'])
+slots=sum(r.zcard(key) for key in r.scan_iter('concurrent_calls:*'))
+ports=range(int(os.getenv('UVICORN_BASE_PORT','8000')),int(os.getenv('UVICORN_BASE_PORT','8000'))+int(os.getenv('FASTAPI_WORKERS','1')))
+connections=0
+for name in ['tcp','tcp6']:
+ for line in Path('/proc/net/'+name).read_text().splitlines()[1:]:
+  fields=line.split()
+  if fields[3]=='01' and int(fields[1].split(':')[-1],16) in ports:connections+=1
+print(json.dumps({'call_slots':slots,'api_connections':connections}))"""
+ return json.loads(run(['docker','exec',API,'python','-c',code]))
 
 def fingerprint(api):
  return digest({key:api[key] for key in ['Config','HostConfig','Mounts']})
@@ -83,7 +99,7 @@ def prepare():
   'worker_id':worker['Id'],'worker_image':worker['Image'],'candidate':candidate,'candidate_image':new['Id'],
   'override':str(override),'compose_digest':digest(configuration(api)),'source_commit':MANIFEST['canonical_commit']}
  STATE.write_text(json.dumps(state,indent=2)+'\n');os.chmod(STATE,0o600)
- print(json.dumps({'prepared':True,'candidate':candidate,'retained_base_layers':len(old['RootFS']['Layers']),'offline_tests':8,'application_import':True,'worker_changes':False,'active_calls':active_calls()}))
+ print(json.dumps({'prepared':True,'candidate':candidate,'retained_base_layers':len(old['RootFS']['Layers']),'offline_tests':8,'application_import':True,'worker_changes':False,'active_calls':active_calls(),'runtime_activity':runtime_activity()}))
 
 def apply():
  state=json.loads(STATE.read_text());api=inspect(API);worker=inspect(WORKER)
@@ -93,7 +109,7 @@ def apply():
  if digest(configuration(api))!=state['compose_digest']:raise RuntimeError('Compose changed during review')
  current=sources(container=API)
  if any(current.get(key)!=value for key,value in MANIFEST['old_source_hashes'].items()):raise RuntimeError('Running source changed')
- if active_calls()!=0:raise RuntimeError('Active calls present; no service was changed')
+ if active_calls()!=0 or any(runtime_activity().values()):raise RuntimeError('Live audio activity present; no service was changed')
  dirty_before=run(['git','-C','/root/SYSEVO/dograh','status','--porcelain'])
  logged(compose(api,override)+['up','-d','--no-deps','--no-build','api'],'apply.log',180)
  for _ in range(24):
@@ -116,7 +132,7 @@ def apply():
 def rollback():
  state=json.loads(STATE.read_text());api=inspect(API);worker=inspect(WORKER)
  if api['Image']!=state['candidate_image'] or worker['Id']!=state['worker_id']:raise RuntimeError('Concurrent service change prevents automatic rollback')
- if active_calls()!=0:raise RuntimeError('Active calls prevent automatic rollback')
+ if active_calls()!=0 or any(runtime_activity().values()):raise RuntimeError('Live audio activity prevents automatic rollback')
  override=ROOT/'.runtime-rollback.json';override.write_text(json.dumps({'services':{'api':{'image':state['api_base_tag']}}}));os.chmod(override,0o600)
  verify_configuration(api,override)
  logged(compose(api,override)+['up','-d','--no-deps','--no-build','api'],'rollback.log',180)
