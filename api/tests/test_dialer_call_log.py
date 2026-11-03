@@ -526,11 +526,11 @@ async def test_update_dialer_call_recording_by_conference_sid_patches_by_confere
     fake_client.patch.assert_awaited_once()
     call = fake_client.patch.await_args
     assert call.args[0] == "https://example.supabase.co/rest/v1/dialer_calls"
-    assert call.kwargs["params"] == {"conference_sid": "eq.CF999"}
+    assert call.kwargs["params"] == {"conference_sid": "eq.CF999", "select": "id"}
     assert call.kwargs["json"] == {"recording_sid": "RE999"}
     # Without count=exact PostgREST answers a zero-row PATCH with a bare 204
     # and the miss is invisible.
-    assert call.kwargs["headers"]["Prefer"] == "count=exact"
+    assert call.kwargs["headers"]["Prefer"] == "count=exact,return=representation"
     # The Prefer header is an ADDITION to the module's auth headers, not a
     # replacement - dropping these would 401 rather than update anything.
     assert call.kwargs["headers"]["Authorization"] == "Bearer test-service-role-key"
@@ -985,3 +985,15 @@ async def test_get_dialer_call_child_leg_returns_none_for_array_of_non_objects(
         return_value=fake_client,
     ):
         assert await get_dialer_call_child_leg(parent_call_sid="CA111") is None
+
+
+async def test_twilio_completed_recording_immediately_starts_transcription(monkeypatch):
+    from api.services.telephony.providers.twilio import dialer_call_log as log
+    _configure_supabase(monkeypatch)
+    call_id = '00000000-0000-4000-8000-000000000001'
+    response = MagicMock(); response.headers={'Content-Range':'0-0/1'}; response.json.return_value=[{'id':call_id}]
+    client = _fake_client(response)
+    with patch.object(log.httpx,'AsyncClient',return_value=client), patch.object(log,'_kick_transcription',new_callable=AsyncMock) as kick:
+        assert await log.update_dialer_call_recording_by_conference_sid(conference_sid='CFtest',recording_sid='REtest')
+        kick.assert_awaited_once_with(call_id)
+        assert client.patch.await_args.kwargs['params']['select']=='id'

@@ -182,3 +182,16 @@ def test_stream_with_bad_auth_is_closed_and_publishes_nothing(bad):
     _run(socket, published)
     assert socket.closed == 4401
     assert published == [] and FakeTranscriber.instances == []
+
+
+def test_final_captions_are_persisted_without_waiting_in_the_audio_feed():
+    from unittest.mock import AsyncMock
+    token = tlt.issue_stream_token(secret=SECRET, channel_key=KEY, leg_call_sid=LEG)
+    socket = FakeSocket([_start(token), _media('inbound'), _media('outbound'), {'event':'stop'}])
+    persisted = AsyncMock(return_value=True)
+    async def secret(): return SECRET
+    async def publish(*_): pass
+    asyncio.run(tlt.serve_twilio_transcription(socket, secret, publish=publish, persist=persisted, transcriber_factory=FakeTranscriber))
+    assert persisted.await_count == 2
+    assert [call.args[1]['speaker'] for call in persisted.await_args_list] == ['rep','prospect']
+    assert all(call.args[1]['is_final'] is True for call in persisted.await_args_list)

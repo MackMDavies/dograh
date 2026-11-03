@@ -154,9 +154,12 @@ class LiveTranscriber:
         socket, self._socket = self._socket, None
         if socket is not None:
             with suppress(Exception):
-                # Tells Deepgram to flush and close rather than dropping the connection,
-                # so the last thing said is not lost.
                 await socket.send(json.dumps({"type": "CloseStream"}))
+            # CloseStream asks the provider to flush its final words. Closing the
+            # websocket and cancelling its reader immediately used to lose them.
+            if self._reader is not None:
+                with suppress(Exception, asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(self._reader), timeout=2.0)
             with suppress(Exception):
                 await socket.close()
         if self._reader is not None:

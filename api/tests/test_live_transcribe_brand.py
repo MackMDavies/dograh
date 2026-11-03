@@ -25,3 +25,29 @@ def test_ordinary_words_are_untouched():
 def test_nova3_is_told_to_expect_the_name():
     assert "model=nova-3" in _DEEPGRAM_URL and "keyterm=Sysevo" in _DEEPGRAM_URL
     assert "keywords=" not in _DEEPGRAM_URL  # nova-3 ignores keywords
+
+
+def test_closing_stream_waits_for_the_last_final_words():
+    import asyncio
+    import json
+    from api.services.telephony.dialer.live_transcribe import LiveTranscriber
+
+    async def run():
+        flushed = asyncio.Event()
+        captions = []
+        class Socket:
+            async def send(self, message):
+                assert json.loads(message)['type'] == 'CloseStream'
+                flushed.set()
+            async def close(self):
+                assert captions == ['Final sentence.']
+        transcriber = LiveTranscriber('test-call', lambda _payload: None)
+        transcriber._socket = Socket()
+        async def read_final():
+            await flushed.wait()
+            await asyncio.sleep(0)
+            captions.append('Final sentence.')
+        transcriber._reader = asyncio.create_task(read_final())
+        await transcriber.__aexit__()
+        assert captions == ['Final sentence.']
+    asyncio.run(run())

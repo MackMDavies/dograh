@@ -973,9 +973,9 @@ async def _kick_transcription(dialer_call_id: str) -> None:
     """
     try:
         async with httpx.AsyncClient() as client:
-            await client.post(
+            response = await client.post(
                 f"{SUPABASE_URL}/functions/v1/dialer-call-transcribe",
-                json={"dialer_call_id": dialer_call_id},
+                json={"dialer_call_id": dialer_call_id, "background": True},
                 headers={
                     "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
                     "apikey": SUPABASE_SERVICE_ROLE_KEY,
@@ -983,6 +983,7 @@ async def _kick_transcription(dialer_call_id: str) -> None:
                 },
                 timeout=10.0,
             )
+            response.raise_for_status()
     except Exception as exc:  # noqa: BLE001
         logger.warning(
             f"Could not start transcription for {dialer_call_id} ({exc}); "
@@ -1001,6 +1002,19 @@ def _affected_row_count(content_range: str) -> int | None:
     """
     total = content_range.rsplit("/", 1)[-1].strip()
     return int(total) if total.isdigit() else None
+
+
+async def _kick_returned_recordings(response: httpx.Response) -> None:
+    try:
+        rows = response.json()
+        if not isinstance(rows, list):
+            return
+        for row in rows[:3]:
+            row_id = row.get("id") if isinstance(row, dict) else None
+            if isinstance(row_id, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", row_id):
+                await _kick_transcription(row_id)
+    except Exception as exc:  # noqa: BLE001 - callback writes already succeeded
+        logger.warning(f"Could not start recording transcription: {type(exc).__name__}")
 
 
 async def update_dialer_call_recording_by_conference_sid(
@@ -1022,7 +1036,7 @@ async def update_dialer_call_recording_by_conference_sid(
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"conference_sid": f"eq.{conference_sid}"},
+                params={"conference_sid": f"eq.{conference_sid}", "select": "id"},
                 json={"recording_sid": recording_sid},
                 # count=exact is asked for HERE and nowhere else in this
                 # module, deliberately. A PATCH that matches no row is a
@@ -1034,7 +1048,7 @@ async def update_dialer_call_recording_by_conference_sid(
                 # nothing. The symptom would be a call that looks completely
                 # fine with no play button, and no error in Dograh, Twilio or
                 # Supabase to explain it. The count is what makes it say so.
-                headers={**_headers(), "Prefer": "count=exact"},
+                headers={**_headers(), "Prefer": "count=exact,return=representation"},
                 timeout=5.0,
             )
             response.raise_for_status()
@@ -1046,6 +1060,7 @@ async def update_dialer_call_recording_by_conference_sid(
                     "conference_sid (did dialer-conference-events miss conference-start?)"
                 )
                 return False
+            await _kick_returned_recordings(response)
             return True if affected else None
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to update dialer_calls recording for conference {conference_sid}: {exc}")
@@ -1064,12 +1079,13 @@ async def update_dialer_call_recording_by_child_call_sid(
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"child_call_sid": f"eq.{child_call_sid}", "recording_sid": "is.null"},
+                params={"child_call_sid": f"eq.{child_call_sid}", "recording_sid": "is.null", "select": "id"},
                 json={"recording_sid": recording_sid},
-                headers={**_headers(), "Prefer": "count=exact"},
+                headers={**_headers(), "Prefer": "count=exact,return=representation"},
                 timeout=5.0,
             )
             response.raise_for_status()
+            await _kick_returned_recordings(response)
             return bool(_affected_row_count(response.headers.get("Content-Range", "")))
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to attach leg recording {recording_sid} to {child_call_sid}: {exc}")
@@ -1089,12 +1105,13 @@ async def update_dialer_call_recording_by_parent_call_sid(
         async with httpx.AsyncClient() as client:
             response = await client.patch(
                 f"{SUPABASE_URL}{_DIALER_CALLS_URL_SUFFIX}",
-                params={"parent_call_sid": f"eq.{parent_call_sid}", "recording_sid": "is.null"},
+                params={"parent_call_sid": f"eq.{parent_call_sid}", "recording_sid": "is.null", "select": "id"},
                 json={"recording_sid": recording_sid, "conference_sid": conference_sid},
-                headers={**_headers(), "Prefer": "count=exact"},
+                headers={**_headers(), "Prefer": "count=exact,return=representation"},
                 timeout=5.0,
             )
             response.raise_for_status()
+            await _kick_returned_recordings(response)
             return bool(_affected_row_count(response.headers.get("Content-Range", "")))
     except Exception as exc:  # noqa: BLE001 - deliberate: this module's whole contract is "never raise"
         logger.error(f"Failed to attach orphaned recording {recording_sid} to {parent_call_sid}: {exc}")

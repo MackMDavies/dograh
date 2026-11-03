@@ -44,6 +44,7 @@ from loguru import logger
 
 from api.services.telephony.dialer.live_transcribe import LiveTranscriber
 from api.services.telephony.dialer.tap_relay import publish_text
+from api.services.telephony.dialer.transcript_store import persist_live_caption
 
 STREAM_PATH = "/api/v1/telephony/dialer-twilio-transcribe"
 SOURCE = "twilio_stream"
@@ -171,6 +172,7 @@ async def serve_twilio_transcription(
     *,
     publish: Callable[[str, dict], Awaitable[None]] = publish_text,
     transcriber_factory=LiveTranscriber,
+    persist: Callable[[str, dict], Awaitable[bool]] = persist_live_caption,
 ) -> None:
     """Run one Twilio Media Stream: authenticate, then caption both tracks.
 
@@ -205,7 +207,22 @@ async def serve_twilio_transcription(
 
     logger.info(f"twilio live transcription attached for {channel_key}")
 
+    pending: set[asyncio.Task] = set()
+    stream_id = str(start.get("streamSid") or leg_call_sid)
+
+    async def save_caption(payload: dict) -> None:
+        try:
+            saved = await persist(channel_key, {**payload, "stream_id": stream_id})
+            if not saved:
+                logger.warning(f"Final caption was not persisted for {channel_key}")
+        except Exception as exc:  # noqa: BLE001 - no persistence failure enters the audio path
+            logger.warning(f"Final caption persistence failed for {channel_key}: {type(exc).__name__}")
+
     async def on_caption(payload: dict) -> None:
+        if payload.get("is_final") is True and payload.get("text", "").strip():
+            task = asyncio.create_task(save_caption(payload))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
         await publish(channel_key, payload)
 
     try:
@@ -242,6 +259,13 @@ async def serve_twilio_transcription(
                     await transcriber.feed(audio)
     except Exception as exc:  # noqa: BLE001 - disconnects land here; a live call is never affected
         logger.info(f"twilio live transcription ended for {channel_key}: {type(exc).__name__}")
+    if pending:
+        done, unfinished = await asyncio.wait(pending, timeout=3.0)
+        for task in unfinished:
+            task.cancel()
+        if unfinished:
+            await asyncio.gather(*unfinished, return_exceptions=True)
+            logger.warning(f"Final caption persistence timed out for {channel_key}: {len(unfinished)} segment(s)")
     logger.info(f"twilio live transcription closed for {channel_key}")
 
 
