@@ -7,8 +7,8 @@ managed_provisioner.py resolves for provisioning), not the per-org
 TelephonyConfigurationModel — this is intentionally internal-only for now.
 
 Resolution order: DB-stored dialer credentials on the active platform
-account first, then the SYSEVO_TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID /
-TWILIO_API_KEY_SECRET / TWILIO_TWIML_APP_SID env vars as a fallback. An
+account first, then the TWILIO_DIALER_ACCOUNT_SID / TWILIO_DIALER_API_KEY_SID /
+TWILIO_DIALER_API_KEY_SECRET / TWILIO_DIALER_TWIML_APP_SID env vars as a fallback. An
 account can have valid account_sid/auth_token (enough for provisioning)
 without dialer fields set — those three (API Key pair + TwiML App) must be
 created in that Twilio account's own console first; there's no API-only way
@@ -38,10 +38,10 @@ async def _resolve_dialer_credentials() -> dict | None:
     except Exception:  # noqa: BLE001 — never block token issuance on a DB hiccup
         pass
 
-    account_sid = os.environ.get("SYSEVO_TWILIO_ACCOUNT_SID")
-    api_key_sid = os.environ.get("TWILIO_API_KEY_SID")
-    api_key_secret = os.environ.get("TWILIO_API_KEY_SECRET")
-    twiml_app_sid = os.environ.get("TWILIO_TWIML_APP_SID")
+    account_sid = os.environ.get("TWILIO_DIALER_ACCOUNT_SID")
+    api_key_sid = os.environ.get("TWILIO_DIALER_API_KEY_SID")
+    api_key_secret = os.environ.get("TWILIO_DIALER_API_KEY_SECRET")
+    twiml_app_sid = os.environ.get("TWILIO_DIALER_TWIML_APP_SID")
     if all([account_sid, api_key_sid, api_key_secret, twiml_app_sid]):
         return {
             "account_sid": account_sid,
@@ -57,8 +57,8 @@ async def generate_voice_access_token(identity: str) -> str:
     if not creds:
         raise VoiceSdkNotConfigured(
             "No Twilio account has dialer credentials configured (API Key pair + "
-            "TwiML App SID), and the SYSEVO_TWILIO_ACCOUNT_SID / TWILIO_API_KEY_SID / "
-            "TWILIO_API_KEY_SECRET / TWILIO_TWIML_APP_SID env vars are not fully set."
+            "TwiML App SID), and the TWILIO_DIALER_ACCOUNT_SID / TWILIO_DIALER_API_KEY_SID / "
+            "TWILIO_DIALER_API_KEY_SECRET / TWILIO_DIALER_TWIML_APP_SID env vars are not fully set."
         )
 
     token = AccessToken(

@@ -5,6 +5,7 @@ from pgvector.sqlalchemy import Vector
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     Column,
     DateTime,
     Enum,
@@ -310,7 +311,7 @@ class TelephonyPhoneNumberModel(Base):
 class PlatformTwilioCredentialsModel(Base):
     """
     Store of platform-level (Sysevo-managed) Twilio accounts. Quick Connect
-    provisioning and the internal sales-rep dialer both use whichever row has
+    provisioning uses whichever row has
     ``is_active=True`` (at most one at a time — enforced in
     ``PlatformSettingsClient``, not the DB). Multiple rows may exist so an
     admin can hold several accounts and switch which one is live without
@@ -330,17 +331,6 @@ class PlatformTwilioCredentialsModel(Base):
     label = Column(String(120), nullable=True)
     account_sid = Column(String(64), nullable=False)
     auth_token_encrypted = Column(String, nullable=False)
-    # Optional — only needed if this account also powers the internal browser
-    # softphone dialer (Twilio Voice SDK). Account SID/auth token alone are
-    # not enough for that: the Voice SDK signs its own short-lived tokens with
-    # a separate API Key pair, and routes outbound calls through a TwiML
-    # Application configured in that Twilio account's console. All three must
-    # be created in the Twilio console for this specific account before the
-    # dialer can use it — there's no way to provision them via the API alone.
-    dialer_api_key_sid = Column(String(64), nullable=True)
-    dialer_api_key_secret_encrypted = Column(String, nullable=True)
-    dialer_twiml_app_sid = Column(String(64), nullable=True)
-    dialer_default_caller_id = Column(String(32), nullable=True)
     is_active = Column(
         Boolean, nullable=False, default=True, server_default=text("true")
     )
@@ -351,6 +341,28 @@ class PlatformTwilioCredentialsModel(Base):
         default=lambda: datetime.now(UTC),
         onupdate=lambda: datetime.now(UTC),
     )
+
+
+class PlatformTwilioDialerCredentialsModel(Base):
+    """Standalone Twilio credentials for the Sysevo sales dialer.
+
+    Intentionally independent from AI Voice managed telephony accounts so
+    number provisioning or managed-account changes cannot silently change
+    the browser dialer's credentials.
+    """
+
+    __tablename__ = "platform_twilio_dialer_credentials"
+    __table_args__ = (CheckConstraint("id = 1", name="ck_platform_twilio_dialer_credentials_singleton"),)
+
+    id = Column(Integer, primary_key=True, default=1)
+    account_sid = Column(String(64), nullable=False)
+    auth_token_encrypted = Column(String, nullable=False)
+    api_key_sid = Column(String(64), nullable=False)
+    api_key_secret_encrypted = Column(String, nullable=False)
+    twiml_app_sid = Column(String(64), nullable=False)
+    default_caller_id = Column(String(32), nullable=True)
+    last_validated_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(DateTime(timezone=True), default=lambda: datetime.now(UTC), onupdate=lambda: datetime.now(UTC))
 
 
 class PlatformTelnyxDialerCredentialsModel(Base):

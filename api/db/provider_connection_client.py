@@ -111,7 +111,7 @@ PROVIDER_MODELS: dict[str, dict[str, list[str]]] = {
     },
     "tts": {
         "elevenlabs": [
-            "eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2",
+            "eleven_v4", "eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_multilingual_v2",
             "eleven_turbo_v2", "eleven_monolingual_v1", "eleven_multilingual_v1",
             "eleven_multilingual_sts_v2", "eleven_english_sts_v2",
         ],
@@ -517,6 +517,9 @@ class ProviderConnectionClient(BaseDBClient):
         model_ids = await _fetch_live_models(conn.provider, conn.service_type, conn.api_key)
         if not model_ids:
             model_ids = PROVIDER_MODELS.get(conn.service_type, {}).get(conn.provider, [])
+        elif conn.provider == "elevenlabs" and conn.service_type == "tts":
+            # Eleven v4 can be missing from account-scoped lists immediately after release.
+            model_ids = list(dict.fromkeys([*model_ids, "eleven_v4"]))
 
         if not model_ids:
             return 0

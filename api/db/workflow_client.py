@@ -1,4 +1,6 @@
 from datetime import UTC, datetime
+import hashlib
+import json
 from typing import Optional
 
 from loguru import logger
@@ -15,6 +17,11 @@ from api.services.workflow.disposition_shape import (
 
 
 class WorkflowClient(BaseDBClient):
+    @staticmethod
+    def _test_repair_hash(workflow_json: dict) -> str:
+        payload = json.dumps(workflow_json, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
     async def _next_version_number(self, session, workflow_id: int) -> int:
         """Get the next version number for a workflow."""
         result = await session.execute(
@@ -157,6 +164,63 @@ class WorkflowClient(BaseDBClient):
             await session.refresh(draft)
         return draft
 
+    async def create_test_repair_draft(
+        self,
+        workflow_id: int,
+        expected_published_version_number: int,
+        workflow_definition: dict,
+    ) -> WorkflowDefinitionModel:
+        """Atomically create a test repair draft without replacing an editor draft."""
+        async with self.async_session() as session:
+            try:
+                workflow_result = await session.execute(
+                    select(WorkflowModel)
+                    .where(WorkflowModel.id == workflow_id)
+                    .with_for_update()
+                )
+                workflow = workflow_result.scalars().first()
+                if not workflow:
+                    raise ValueError("Workflow not found")
+
+                published_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "published",
+                    )
+                )
+                published = published_result.scalars().first()
+                if not published or published.version_number != expected_published_version_number:
+                    raise ValueError("Published workflow changed; rerun tests")
+
+                draft_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "draft",
+                    )
+                )
+                if draft_result.scalars().first():
+                    raise ValueError("An existing draft must be resolved before repair")
+
+                draft = WorkflowDefinitionModel(
+                    workflow_id=workflow_id,
+                    workflow_json=workflow_definition,
+                    workflow_configurations=published.workflow_configurations or {},
+                    template_context_variables=published.template_context_variables or {},
+                    status="draft",
+                    version_number=await self._next_version_number(session, workflow_id),
+                    is_current=False,
+                )
+                session.add(draft)
+                workflow.workflow_definition = draft.workflow_json
+                workflow.workflow_configurations = draft.workflow_configurations
+                workflow.template_context_variables = draft.template_context_variables
+                await session.commit()
+                await session.refresh(draft)
+                return draft
+            except Exception:
+                await session.rollback()
+                raise
+
     async def publish_workflow_draft(
         self,
         workflow_id: int,
@@ -213,6 +277,67 @@ class WorkflowClient(BaseDBClient):
             await session.refresh(draft)
         return draft
 
+    async def promote_test_repair_draft(
+        self,
+        workflow_id: int,
+        expected_published_version_number: int,
+        expected_draft_version_number: int,
+        expected_workflow_hash: str,
+    ) -> WorkflowDefinitionModel:
+        """Compare and promote a test candidate under a workflow row lock."""
+        async with self.async_session() as session:
+            try:
+                workflow_result = await session.execute(
+                    select(WorkflowModel)
+                    .where(WorkflowModel.id == workflow_id)
+                    .with_for_update()
+                )
+                workflow = workflow_result.scalars().first()
+                if not workflow:
+                    raise ValueError("Workflow not found")
+                published_result = await session.execute(
+                    select(WorkflowDefinitionModel)
+                    .where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "published",
+                    )
+                    .with_for_update()
+                )
+                published = published_result.scalars().first()
+                draft_result = await session.execute(
+                    select(WorkflowDefinitionModel)
+                    .where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "draft",
+                    )
+                    .with_for_update()
+                )
+                draft = draft_result.scalars().first()
+                if not published or published.version_number != expected_published_version_number:
+                    raise ValueError("Published workflow changed; refusing to promote candidate")
+                if (
+                    not draft
+                    or draft.version_number != expected_draft_version_number
+                    or self._test_repair_hash(draft.workflow_json) != expected_workflow_hash
+                ):
+                    raise ValueError("Candidate changed; refusing to promote it")
+
+                published.status = "archived"
+                published.is_current = False
+                draft.status = "published"
+                draft.published_at = datetime.now(UTC)
+                draft.is_current = True
+                workflow.released_definition_id = draft.id
+                workflow.workflow_definition = draft.workflow_json
+                workflow.workflow_configurations = draft.workflow_configurations
+                workflow.template_context_variables = draft.template_context_variables
+                await session.commit()
+                await session.refresh(draft)
+                return draft
+            except Exception:
+                await session.rollback()
+                raise
+
     async def discard_workflow_draft(
         self,
         workflow_id: int,
@@ -236,6 +361,61 @@ class WorkflowClient(BaseDBClient):
             except Exception as e:
                 await session.rollback()
                 raise e
+
+    async def discard_test_repair_draft(
+        self,
+        workflow_id: int,
+        expected_version_number: int,
+        expected_workflow_hash: str,
+    ) -> int:
+        """Compare and discard only the exact repair candidate under a row lock."""
+        async with self.async_session() as session:
+            try:
+                workflow_result = await session.execute(
+                    select(WorkflowModel)
+                    .where(WorkflowModel.id == workflow_id)
+                    .with_for_update()
+                )
+                if not workflow_result.scalars().first():
+                    raise ValueError("Workflow not found")
+                draft_result = await session.execute(
+                    select(WorkflowDefinitionModel)
+                    .where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "draft",
+                    )
+                    .with_for_update()
+                )
+                draft = draft_result.scalars().first()
+                if not draft:
+                    raise ValueError("Draft not found")
+                if (
+                    draft.version_number != expected_version_number
+                    or self._test_repair_hash(draft.workflow_json) != expected_workflow_hash
+                ):
+                    raise ValueError("Draft changed; refusing to discard it")
+                version_number = draft.version_number
+                await session.delete(draft)
+                workflow_result = await session.execute(
+                    select(WorkflowModel).where(WorkflowModel.id == workflow_id)
+                )
+                workflow = workflow_result.scalars().first()
+                published_result = await session.execute(
+                    select(WorkflowDefinitionModel).where(
+                        WorkflowDefinitionModel.workflow_id == workflow_id,
+                        WorkflowDefinitionModel.status == "published",
+                    )
+                )
+                published = published_result.scalars().first()
+                if workflow and published:
+                    workflow.workflow_definition = published.workflow_json
+                    workflow.workflow_configurations = published.workflow_configurations
+                    workflow.template_context_variables = published.template_context_variables
+                await session.commit()
+                return version_number
+            except Exception:
+                await session.rollback()
+                raise
 
     async def revert_to_version(
         self,

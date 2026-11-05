@@ -1,8 +1,10 @@
 """Custom tool execution for user-defined HTTP API tools."""
 
 import json
+import os
 import re
 from typing import Any, Dict, Optional
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 from loguru import logger
@@ -17,6 +19,24 @@ TYPE_MAP = {
     "number": "number",
     "boolean": "boolean",
 }
+
+
+def sysevo_sandbox_action(tool: Any) -> str | None:
+    """Return the only supported Sysevo sandbox action for a known adapter URL."""
+    config = ((tool.definition or {}).get("config") or {})
+    method = str(config.get("method", "POST")).upper()
+    parsed = urlparse(str(config.get("url", "")))
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return None
+    if parsed.hostname == "api.resend.com" and parsed.path == "/emails" and method == "POST":
+        return "send_test_email"
+    if parsed.hostname == "api.twilio.com" and re.fullmatch(r"/2010-04-01/Accounts/AC[0-9a-fA-F]{32}/Messages\.json", parsed.path) and method == "POST":
+        return "send_test_sms"
+    if parsed.hostname == "rdiwzxtibglitvtextzs.supabase.co" and parsed.path == "/functions/v1/agent-memory-lookup" and method == "POST":
+        action = parse_qs(parsed.query).get("action", [""])[0]
+        if action in {"check_availability", "book_appointment"}:
+            return action
+    return None
 
 
 def tool_to_function_schema(tool: Any) -> Dict[str, Any]:
@@ -177,6 +197,8 @@ async def execute_http_tool(
     call_context_vars: Optional[Dict[str, Any]] = None,
     gathered_context_vars: Optional[Dict[str, Any]] = None,
     organization_id: Optional[int] = None,
+    sysevo_test_sandbox: Optional[dict] = None,
+    workflow_id: Optional[int] = None,
 ) -> Dict[str, Any]:
     """Execute an HTTP API tool.
 
@@ -202,7 +224,7 @@ async def execute_http_tool(
 
     # Add auth header if credential is configured
     credential_uuid = config.get("credential_uuid")
-    if credential_uuid and organization_id:
+    if credential_uuid and organization_id and sysevo_test_sandbox is None:
         try:
             credential = await db_client.get_credential_by_uuid(
                 credential_uuid, organization_id
@@ -231,6 +253,35 @@ async def execute_http_tool(
         return {"status": "error", "error": str(e)}
 
     resolved_arguments = {**(arguments or {}), **preset_arguments}
+
+    if sysevo_test_sandbox is not None:
+        action = sysevo_sandbox_action(tool)
+        sandbox_secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
+        supabase_url = os.getenv("SUPABASE_URL", "").rstrip("/")
+        if not action or not sandbox_secret or not supabase_url or not workflow_id:
+            return {"status": "blocked", "error": "This action has no verified Sysevo sandbox adapter."}
+        payload = {
+            "test_run_id": sysevo_test_sandbox.get("run_id"),
+            "workflow_id": workflow_id,
+            "workflow_run_id": sysevo_test_sandbox.get("workflow_run_id"),
+            "scenario_id": sysevo_test_sandbox.get("scenario_id"),
+            "action": action,
+            "arguments": resolved_arguments,
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    f"{supabase_url}/functions/v1/agent-test-sandbox-execute",
+                    headers={"x-sysevo-secret": sandbox_secret},
+                    json=payload,
+                )
+                data = response.json()
+                if not response.is_success or data.get("status") != "success":
+                    return {"status": "error", "error": data.get("message") or data.get("code") or "Sandbox action was blocked."}
+                return data
+        except Exception as e:
+            logger.error("Sysevo sandbox action proxy failed: {}", e)
+            return {"status": "error", "error": "Sysevo sandbox action could not be completed."}
 
     # Build request: JSON body for POST/PUT/PATCH, query params for GET/DELETE
     body = None

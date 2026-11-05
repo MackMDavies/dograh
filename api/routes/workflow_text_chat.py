@@ -1,8 +1,11 @@
 from datetime import datetime
+import hmac
+import os
+import re
 from typing import Any, Dict
 from uuid import uuid4
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from pipecat.utils.run_context import set_current_run_id
 from pydantic import BaseModel, Field
 
@@ -29,10 +32,29 @@ from api.services.workflow.text_chat_session_service import (
 router = APIRouter(prefix="/workflow", tags=["workflow-text-chat"])
 
 
+@router.get("/test-sandbox/capabilities")
+async def get_test_sandbox_capabilities(
+    x_sysevo_secret: str | None = Header(default=None, alias="x-sysevo-secret"),
+) -> dict[str, Any]:
+    expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+    if not expected or not x_sysevo_secret or not hmac.compare_digest(x_sysevo_secret, expected):
+        raise HTTPException(status_code=401, detail="Internal sandbox authentication required")
+    return {
+        "sandbox_mode": True,
+        "exact_workflow_version_pinning": True,
+        "isolated_action_proxy": True,
+        "unsupported_tools_blocked": True,
+        "sandbox_protocol_version": 1,
+    }
+
+
 class CreateTextChatSessionRequest(BaseModel):
     name: str | None = None
     initial_context: Dict[str, Any] | None = None
     annotations: Dict[str, Any] | None = None
+    sandbox_mode: bool = False
+    published_version_number: int | None = Field(default=None, ge=1)
+    candidate_draft_version_number: int | None = Field(default=None, ge=1)
 
 
 class AppendTextChatMessageRequest(BaseModel):
@@ -159,9 +181,45 @@ async def create_text_chat_session(
     workflow_id: int,
     request: CreateTextChatSessionRequest,
     user: UserModel = Depends(get_user),
+    x_sysevo_secret: str | None = Header(default=None, alias="x-sysevo-secret"),
 ) -> WorkflowRunTextSessionResponse:
     organization_id = _require_selected_organization_id(user)
     await _ensure_text_chat_quota(user, workflow_id)
+
+    pinned_definition_id = None
+    if request.sandbox_mode:
+        expected = os.getenv("SYSEVO_MEMORY_SECRET", "")
+        if not expected or not x_sysevo_secret or not hmac.compare_digest(x_sysevo_secret, expected):
+            raise HTTPException(status_code=401, detail="Internal sandbox authentication required")
+        published_pin = request.published_version_number
+        draft_pin = request.candidate_draft_version_number
+        if (published_pin is None) == (draft_pin is None):
+            raise HTTPException(status_code=400, detail="Sandbox sessions must pin exactly one published or candidate version")
+        annotations = request.annotations or {}
+        run_id = annotations.get("agent_test_run_id")
+        scenario_id = annotations.get("scenario_id")
+        if not isinstance(run_id, str) or not re.fullmatch(
+            r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[1-8][0-9a-fA-F]{3}-[89abAB][0-9a-fA-F]{3}-[0-9a-fA-F]{12}",
+            run_id,
+        ) or not isinstance(scenario_id, str) or not re.fullmatch(
+            r"[a-zA-Z0-9_-]{1,100}", scenario_id
+        ):
+            raise HTTPException(status_code=400, detail="Sandbox run and scenario identifiers are required")
+        versions = await db_client.get_workflow_versions(workflow_id)
+        desired_status = "draft" if draft_pin is not None else "published"
+        desired_number = draft_pin if draft_pin is not None else published_pin
+        pinned = next(
+            (
+                version
+                for version in versions
+                if version.status == desired_status
+                and version.version_number == desired_number
+            ),
+            None,
+        )
+        if pinned is None:
+            raise HTTPException(status_code=409, detail="Requested workflow version is no longer available")
+        pinned_definition_id = pinned.id
 
     session_name = request.name or f"WR-TEXT-{uuid4().hex[:6].upper()}"
     try:
@@ -172,6 +230,7 @@ async def create_text_chat_session(
             user_id=user.id,
             initial_context=request.initial_context,
             use_draft=True,
+            definition_id=pinned_definition_id,
             organization_id=organization_id,
         )
     except ValueError as e:
@@ -186,7 +245,17 @@ async def create_text_chat_session(
         }
     }
     if request.annotations:
-        annotations = {**annotations, **request.annotations}
+        annotations = {**annotations, **{key: value for key, value in request.annotations.items() if key != "sysevo_test_sandbox"}}
+    if request.sandbox_mode:
+        # This marker is server-authenticated and stored on the run. Client
+        # supplied annotations alone can never enable sandbox restrictions.
+        annotations["sysevo_test_sandbox"] = {
+            "run_id": request.annotations["agent_test_run_id"],
+            "scenario_id": request.annotations["scenario_id"],
+            "workflow_id": workflow_id,
+            "workflow_version_number": request.candidate_draft_version_number or request.published_version_number,
+            "workflow_run_id": workflow_run.id,
+        }
     workflow_run = await db_client.update_workflow_run(
         workflow_run.id,
         annotations=annotations,

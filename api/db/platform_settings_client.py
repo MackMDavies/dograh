@@ -21,6 +21,7 @@ from api.db.models import (
     PlatformTelnyxUserCredentialModel,
     PlatformSignalWireDialerCredentialsModel,
     PlatformTwilioCredentialsModel,
+    PlatformTwilioDialerCredentialsModel,
     PlatformVonageDialerCredentialsModel,
 )
 from api.services.crypto import decrypt_secret, encrypt_secret
@@ -187,25 +188,54 @@ class PlatformSettingsClient(BaseDBClient):
         env vars on ``None`` (see ``voice_sdk.py``).
         """
         async with self.async_session() as session:
-            result = await session.execute(
-                select(PlatformTwilioCredentialsModel)
-                .where(PlatformTwilioCredentialsModel.is_active.is_(True))
-                .order_by(PlatformTwilioCredentialsModel.id.desc())
-                .limit(1)
-            )
-            row = result.scalars().first()
-        if not row or not row.dialer_api_key_sid or not row.dialer_api_key_secret_encrypted:
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
+        if not row:
             return None
         try:
-            api_key_secret = decrypt_secret(row.dialer_api_key_secret_encrypted)
+            api_key_secret = decrypt_secret(row.api_key_secret_encrypted)
+            auth_token = decrypt_secret(row.auth_token_encrypted)
         except Exception:
             return None
         return {
             "account_sid": row.account_sid,
-            "api_key_sid": row.dialer_api_key_sid,
+            "auth_token": auth_token,
+            "api_key_sid": row.api_key_sid,
             "api_key_secret": api_key_secret,
-            "twiml_app_sid": row.dialer_twiml_app_sid,
-            "default_caller_id": row.dialer_default_caller_id,
+            "twiml_app_sid": row.twiml_app_sid,
+            "default_caller_id": row.default_caller_id,
+            "last_validated_at": row.last_validated_at,
+        }
+
+    async def save_platform_dialer_credentials(
+        self, *, account_sid: str, auth_token: str, api_key_sid: str,
+        api_key_secret: str, twiml_app_sid: str, default_caller_id: str | None,
+    ) -> None:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
+            if row is None:
+                row = PlatformTwilioDialerCredentialsModel(id=1)
+                session.add(row)
+            row.account_sid = account_sid
+            row.auth_token_encrypted = encrypt_secret(auth_token)
+            row.api_key_sid = api_key_sid
+            row.api_key_secret_encrypted = encrypt_secret(api_key_secret)
+            row.twiml_app_sid = twiml_app_sid
+            row.default_caller_id = default_caller_id
+            row.last_validated_at = datetime.now(UTC)
+            await session.commit()
+
+    async def get_platform_dialer_connection_status(self) -> dict:
+        async with self.async_session() as session:
+            row = await session.get(PlatformTwilioDialerCredentialsModel, 1)
+        if not row:
+            return {"configured": False, "account_sid": None, "api_key_sid": None, "twiml_app_sid": None, "default_caller_id": None, "last_validated_at": None}
+        return {
+            "configured": bool(row.account_sid and row.auth_token_encrypted and row.api_key_sid and row.api_key_secret_encrypted and row.twiml_app_sid),
+            "account_sid": row.account_sid,
+            "api_key_sid": row.api_key_sid,
+            "twiml_app_sid": row.twiml_app_sid,
+            "default_caller_id": row.default_caller_id,
+            "last_validated_at": row.last_validated_at,
         }
 
     async def get_platform_dialer_auth_token(self) -> Optional[str]:
@@ -213,7 +243,7 @@ class PlatformSettingsClient(BaseDBClient):
         Return the active account's decrypted auth token, for verifying
         inbound Twilio webhook signatures on the dialer's voice-connect route.
         """
-        creds = await self.get_platform_twilio_credentials()
+        creds = await self.get_platform_dialer_credentials()
         return creds["auth_token"] if creds else None
 
     async def list_platform_twilio_accounts(self) -> list[dict]:
@@ -233,15 +263,6 @@ class PlatformSettingsClient(BaseDBClient):
                 "is_active": r.is_active,
                 "last_validated_at": r.last_validated_at,
                 "created_at": r.created_at,
-                "dialer_configured": bool(
-                    r.dialer_api_key_sid and r.dialer_api_key_secret_encrypted
-                ),
-                # Identifiers, not secrets — safe to show in full so the edit
-                # form can pre-fill them. Only auth_token / dialer_api_key_secret
-                # are ever masked/withheld.
-                "dialer_api_key_sid": r.dialer_api_key_sid,
-                "dialer_twiml_app_sid": r.dialer_twiml_app_sid,
-                "dialer_default_caller_id": r.dialer_default_caller_id,
             }
             for r in rows
         ]
@@ -255,12 +276,7 @@ class PlatformSettingsClient(BaseDBClient):
         pass only fields the client actually submitted, e.g. via
         ``BaseModel.model_dump(exclude_unset=True)``).
 
-        Recognised keys: label, account_sid, auth_token, dialer_api_key_sid,
-        dialer_api_key_secret, dialer_twiml_app_sid, dialer_default_caller_id.
-        Empty string clears a nullable field; ``auth_token``/
-        ``dialer_api_key_secret`` are re-encrypted when present and non-empty,
-        left alone when absent, and only cleared (along with the paired SID)
-        by explicitly clearing ``dialer_api_key_sid`` to "".
+        Recognised keys: label, account_sid, auth_token.
 
         Returns None on success, or an error string if the account doesn't exist.
         """
@@ -275,22 +291,6 @@ class PlatformSettingsClient(BaseDBClient):
                 row.account_sid = updates["account_sid"]
             if "auth_token" in updates and updates["auth_token"]:
                 row.auth_token_encrypted = encrypt_secret(updates["auth_token"])
-            if "dialer_api_key_sid" in updates:
-                new_sid = updates["dialer_api_key_sid"] or None
-                row.dialer_api_key_sid = new_sid
-                if new_sid is None:
-                    row.dialer_api_key_secret_encrypted = None
-            if updates.get("dialer_api_key_secret"):
-                row.dialer_api_key_secret_encrypted = encrypt_secret(
-                    updates["dialer_api_key_secret"]
-                )
-            if "dialer_twiml_app_sid" in updates:
-                row.dialer_twiml_app_sid = updates["dialer_twiml_app_sid"] or None
-            if "dialer_default_caller_id" in updates:
-                row.dialer_default_caller_id = (
-                    updates["dialer_default_caller_id"] or None
-                )
-
             await session.commit()
             return None
 
@@ -300,10 +300,6 @@ class PlatformSettingsClient(BaseDBClient):
         auth_token: str,
         label: Optional[str] = None,
         make_active: bool = False,
-        dialer_api_key_sid: Optional[str] = None,
-        dialer_api_key_secret: Optional[str] = None,
-        dialer_twiml_app_sid: Optional[str] = None,
-        dialer_default_caller_id: Optional[str] = None,
     ) -> int:
         """
         Insert a new platform Twilio account. Existing accounts (and their
@@ -312,9 +308,6 @@ class PlatformSettingsClient(BaseDBClient):
         remains active. Returns the new row's id.
         """
         encrypted = encrypt_secret(auth_token)
-        dialer_secret_encrypted = (
-            encrypt_secret(dialer_api_key_secret) if dialer_api_key_secret else None
-        )
         now = datetime.now(UTC)
         async with self.async_session() as session:
             if make_active:
@@ -329,10 +322,6 @@ class PlatformSettingsClient(BaseDBClient):
                 label=label,
                 account_sid=account_sid,
                 auth_token_encrypted=encrypted,
-                dialer_api_key_sid=dialer_api_key_sid,
-                dialer_api_key_secret_encrypted=dialer_secret_encrypted,
-                dialer_twiml_app_sid=dialer_twiml_app_sid,
-                dialer_default_caller_id=dialer_default_caller_id,
                 is_active=make_active,
                 last_validated_at=now,
             )

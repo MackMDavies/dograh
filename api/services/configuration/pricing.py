@@ -135,6 +135,7 @@ _PRICING: dict[str, tuple[float, str]] = {
     "sal":                          (0.0030,  "xAI TTS — est. $0.006/min"),
     "leo":                          (0.0030,  "xAI TTS — est. $0.006/min"),
     # ── ElevenLabs TTS ──────────────────────────────────────────────────────
+    "eleven_v4":                    (0.000045, "$0.09/M characters"),
     "eleven_flash_v2_5":            (0.000040, "$0.08/M characters"),
     "eleven_flash_v2":              (0.000040, "$0.08/M characters"),
     "eleven_turbo_v2_5":            (0.000040, "$0.08/M characters"),
