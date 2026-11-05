@@ -105,6 +105,7 @@ class ManagedProvisioner:
         contains: Optional[str] = None,
         in_locality: Optional[str] = None,
         limit: int = 6,
+        in_region: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         """Purchasable numbers with place and capabilities (Voice AI "Buy a number")."""
         try:
@@ -115,6 +116,8 @@ class ManagedProvisioner:
                 kwargs["contains"] = contains
             if in_locality:
                 kwargs["in_locality"] = in_locality
+            if in_region:
+                kwargs["in_region"] = in_region
             listing = self._client.available_phone_numbers(country)
             source = {"toll_free": listing.toll_free, "mobile": listing.mobile}.get(number_type, listing.local)
             out = []
@@ -128,10 +131,28 @@ class ManagedProvisioner:
                 })
             return out
         except TwilioRestException as exc:
-            logger.error(f"[managed_provisioner] Detailed number search failed: {exc}")
-            return []
+            logger.warning("[managed_provisioner] Detailed number search failed (status={})", exc.status)
+            raise
 
     # ── Provisioning ──────────────────────────────────────────────────────────
+
+    def has_inbound_call_since(self, number, since) -> bool:
+        """Only disclose whether this destination received a fresh inbound call."""
+        for call in self._client.calls.list(to=number, start_time_after=since.date(), limit=20):
+            created = getattr(call, "date_created", None) or getattr(call, "start_time", None)
+            if created and created >= since and getattr(call, "direction", None) == "inbound" and call.to == number:
+                return True
+        return False
+
+    def available_number_types(self, country):
+        try:
+            resource = self._client.available_phone_numbers(country).fetch()
+        except TwilioRestException as error:
+            if error.status == 404:
+                return []
+            raise
+        sources = getattr(resource, "subresource_uris", None) or {}
+        return [kind for kind in ("local", "mobile", "toll_free") if kind in sources]
 
     def provision_number(
         self,

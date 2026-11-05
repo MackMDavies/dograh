@@ -78,6 +78,20 @@ def test_available_numbers_503_when_not_configured():
     assert resp.status_code == 503
 
 
+def test_available_numbers_passes_the_selected_state_to_live_inventory():
+    client = TestClient(_make_test_app())
+    with patch("api.routes.telephony_quick_connect.get_managed_provisioner", new_callable=AsyncMock) as factory:
+        provisioner = MagicMock()
+        provisioner.search_available_numbers_detailed.return_value = [
+            {"phone_number": "+14155550123", "locality": "San Francisco", "region": "CA", "capabilities": ["Voice"]}
+        ]
+        factory.return_value = provisioner
+        response = client.get("/telephony/available-numbers?country=US&in_region=ca&number_type=local&detailed=true")
+    assert response.status_code == 200
+    assert response.json()["items"][0]["region"] == "CA"
+    provisioner.search_available_numbers_detailed.assert_called_once_with("US", "local", None, None, None, in_region="CA")
+
+
 # ── quick-connect ─────────────────────────────────────────────────────────────
 
 def test_quick_connect_forward_mode_requires_existing_number():
@@ -298,3 +312,48 @@ def test_create_bundle_names_missing_kyc_fields():
     assert resp.status_code == 422
     assert resp.json()["detail"]["code"] == "kyc_incomplete"
     assert "business_registration_number" in resp.json()["detail"]["message"]
+
+
+def test_forwarding_check_is_scoped_to_the_owners_organization():
+    from datetime import datetime, timezone
+    client = TestClient(_make_test_app())
+    with patch("api.routes.telephony_quick_connect.db_client.get_phone_number", new_callable=AsyncMock, return_value=None) as get_number:
+        response = client.get("/telephony/forwarding-check", params={"phone_number_id": 42, "since": datetime.now(timezone.utc).isoformat()})
+    assert response.status_code == 404
+    get_number.assert_awaited_once_with(42, organization_id=11)
+
+
+def test_forwarding_check_reports_only_a_fresh_inbound_call():
+    from datetime import datetime, timezone
+    client = TestClient(_make_test_app())
+    row = SimpleNamespace(address="+12125550101", extra_metadata={"is_managed": True})
+    provisioner = MagicMock()
+    provisioner.has_inbound_call_since.return_value = True
+    since = datetime.now(timezone.utc)
+    with patch("api.routes.telephony_quick_connect.db_client.get_phone_number", new_callable=AsyncMock, return_value=row), patch("api.routes.telephony_quick_connect._provisioner_for_number", new_callable=AsyncMock, return_value=provisioner):
+        response = client.get("/telephony/forwarding-check", params={"phone_number_id": 42, "since": since.isoformat()})
+    assert response.status_code == 200
+    assert response.json() == {"observed": True}
+    provisioner.has_inbound_call_since.assert_called_once_with(row.address, since)
+
+
+def test_forwarding_check_rejects_a_stale_test_before_reading_a_number():
+    from datetime import datetime, timedelta, timezone
+    client = TestClient(_make_test_app())
+    with patch("api.routes.telephony_quick_connect.db_client.get_phone_number", new_callable=AsyncMock) as get_number:
+        response = client.get("/telephony/forwarding-check", params={"phone_number_id": 42, "since": (datetime.now(timezone.utc)-timedelta(minutes=10)).isoformat()})
+    assert response.status_code == 422
+    get_number.assert_not_called()
+
+
+def test_available_countries_respect_paid_workspace_policy_and_live_types():
+    client = TestClient(_make_test_app())
+    provisioner = MagicMock()
+    provisioner.available_number_types.return_value = ["local", "toll_free"]
+    async def policy(scope, request):
+        return {"allowed": request["country"] == "US"}
+    with patch("api.routes.telephony_quick_connect.get_managed_provisioner", new_callable=AsyncMock, return_value=provisioner), patch("api.routes.telephony_quick_connect.number_scope", new_callable=AsyncMock, return_value={"account_id": "owner-account"}), patch("api.routes.telephony_quick_connect.request_number_policy", side_effect=policy):
+        response = client.get("/telephony/available-number-countries")
+    assert response.status_code == 200
+    assert response.json() == {"countries": [{"code": "US", "name": "United States", "types": ["local", "toll_free"]}]}
+    provisioner.available_number_types.assert_called_once_with("US")

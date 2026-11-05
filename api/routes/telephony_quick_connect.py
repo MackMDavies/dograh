@@ -7,6 +7,7 @@ Users never supply credentials — Sysevo handles Twilio internally.
 """
 import asyncio
 import os
+from datetime import datetime, timezone, timedelta
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query
@@ -21,6 +22,7 @@ from api.services.auth.depends import get_user
 from api.services.org_concurrency import clamp_to_system_max
 from api.services.subscription_managed_numbers import (
     ManagedNumberPolicyError, managed_number_slot, release_subscription_number, cleanup_released_number,
+    number_scope, request_number_policy,
 )
 from api.services.telephony.managed_provisioner import (
     ManagedProvisioner,
@@ -173,23 +175,52 @@ async def available_numbers(
     number_type: Optional[Literal["local", "toll_free", "mobile"]] = Query(None),
     contains: Optional[str] = Query(None, max_length=16),
     in_locality: Optional[str] = Query(None, max_length=64),
+    in_region: Optional[str] = Query(None, min_length=2, max_length=3, pattern="^[A-Za-z]{2,3}$"),
     detailed: bool = Query(False),
     user: UserModel = Depends(get_user),
 ):
     """List purchasable numbers from the platform Twilio account."""
+    if in_region and country.upper() not in ("US", "CA"):
+        raise HTTPException(status_code=422, detail="State/province filtering is available for US and Canadian numbers. Use city search for this country.")
     provisioner = await get_managed_provisioner(
         _resolve_platform_account_id(user, platform_account_id)
     )
     if provisioner is None:
         raise HTTPException(status_code=503, detail="Managed telephony not configured.")
-    if detailed or number_type or contains or in_locality:
-        items = await asyncio.to_thread(
-            provisioner.search_available_numbers_detailed,
-            country, number_type or "local", area_code, contains, in_locality,
-        )
-        return AvailableNumbersResponse(numbers=[i["phone_number"] for i in items], items=items)
+    if detailed or number_type or contains or in_locality or in_region:
+        try:
+            items = await asyncio.to_thread(
+                provisioner.search_available_numbers_detailed,
+                country, number_type or "local", area_code, contains, in_locality,
+                in_region=in_region.upper() if in_region else None,
+            )
+            return AvailableNumbersResponse(numbers=[i["phone_number"] for i in items], items=items)
+        except TwilioRestException:
+            raise HTTPException(status_code=502, detail="Live number inventory could not be checked. Try again.") from None
     numbers = await asyncio.to_thread(provisioner.search_available_numbers, country, area_code)
     return AvailableNumbersResponse(numbers=numbers)
+
+
+@router.get("/available-number-countries")
+async def available_number_countries(user: UserModel = Depends(get_user)):
+    """Only offer countries admitted by this workspace's paid number policy."""
+    provisioner = await get_managed_provisioner()
+    if provisioner is None:
+        raise HTTPException(status_code=503, detail="Managed telephony not configured.")
+    try:
+        scope = await number_scope(user.selected_organization_id, db_client)
+        async def option(code, name):
+            policy = await request_number_policy(scope, {"operation": "context", "country": code}) if scope else {"allowed": True}
+            if not policy["allowed"]:
+                return None
+            types = await asyncio.to_thread(provisioner.available_number_types, code)
+            return {"code": code, "name": name, "types": types} if types else None
+        rows = await asyncio.gather(*(option(code, name) for code, name in (("US", "United States"), ("GB", "United Kingdom"), ("CA", "Canada"), ("AU", "Australia"))))
+        return {"countries": [row for row in rows if row]}
+    except ManagedNumberPolicyError as error:
+        raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
+    except TwilioRestException:
+        raise HTTPException(status_code=502, detail="Available number countries could not be checked.") from None
 
 
 @router.post("/quick-connect", response_model=QuickConnectResponse)
@@ -212,6 +243,31 @@ async def quick_connect(
             return await _provision_quick_connect(body, user, slot)
     except ManagedNumberPolicyError as error:
         raise HTTPException(status_code=error.status_code, detail=error.public_message) from None
+
+
+@router.get("/forwarding-check")
+async def forwarding_check(
+    phone_number_id: int = Query(..., gt=0),
+    since: datetime = Query(...),
+    user: UserModel = Depends(get_user),
+):
+    """Observe a fresh inbound test on the caller's own managed destination; never places a call."""
+    if since.tzinfo is None:
+        raise HTTPException(status_code=422, detail="Use a timezone-aware test start time.")
+    now = datetime.now(timezone.utc)
+    if not now - timedelta(minutes=5) <= since <= now + timedelta(seconds=30):
+        raise HTTPException(status_code=422, detail="Start a new forwarding test.")
+    row = await db_client.get_phone_number(phone_number_id, organization_id=user.selected_organization_id)
+    if row is None or not (row.extra_metadata or {}).get("is_managed"):
+        raise HTTPException(status_code=404, detail="Managed destination not found.")
+    provisioner = await _provisioner_for_number(row)
+    if provisioner is None:
+        raise HTTPException(status_code=503, detail="Forwarding verification is unavailable.")
+    try:
+        observed = await asyncio.to_thread(provisioner.has_inbound_call_since, row.address, since)
+    except TwilioRestException:
+        raise HTTPException(status_code=502, detail="The carrier could not check this test. Try again.") from None
+    return {"observed": observed}
 
 
 async def _provision_quick_connect(body: QuickConnectRequest, user: UserModel, number_slot):
