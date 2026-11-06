@@ -305,8 +305,11 @@ async def save_dialer_twilio_connection(
 
     def validate() -> None:
         Client(account_sid, auth_token).api.accounts(account_sid).fetch()
+        # Standard API keys cannot read the /Accounts resource, so fetching the account
+        # with the key rejected valid Standard keys. A one-row Voice API read proves the
+        # key and secret belong to this account without needing a Main key.
         key_client = Client(api_key_sid, api_key_secret, account_sid=account_sid)
-        key_client.api.accounts(account_sid).fetch()
+        key_client.calls.list(limit=1)
         app = Client(account_sid, auth_token).applications(twiml_app_sid).fetch()
         voice_url = (getattr(app, "voice_url", "") or "").split("?")[0].rstrip("/")
         method = (getattr(app, "voice_method", "") or "").upper()
