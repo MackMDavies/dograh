@@ -1,4 +1,7 @@
 from datetime import datetime
+import hmac
+import json
+from uuid import UUID
 from typing import List, Optional
 
 import httpx
@@ -45,7 +48,7 @@ from api.services.org_concurrency import get_org_concurrency_limit
 from api.services.configuration.masking import is_mask_of, mask_key
 from api.services.posthog_client import capture_event
 from api.services.telephony import registry as telephony_registry
-from api.services.telephony.factory import get_telephony_provider_by_id
+from api.services.telephony.factory import get_telephony_provider_by_id, discover_provider_numbers
 from api.services.worker_sync.manager import get_worker_sync_manager
 from api.services.worker_sync.protocol import WorkerSyncEventType
 from api.utils.common import get_backend_endpoints
@@ -184,6 +187,76 @@ class TelephonyConfigWarningsResponse(BaseModel):
     telnyx_missing_webhook_public_key_count: int
 
 
+class TelephonyProviderDiscoveryRequest(BaseModel):
+    config: TelephonyConfigRequest
+
+
+class TelephonyProviderConnectionRequest(BaseModel):
+    config: TelephonyConfigRequest
+    connection_key: UUID
+
+
+@router.post('/telephony-providers/connect')
+async def connect_telephony_provider(request: TelephonyProviderConnectionRequest, user: UserModel = Depends(get_user)):
+    """Persist a pending SIP registration, then report its actual status.
+
+    The owner can retry the same key without creating another encrypted account.
+    Importing the resulting E.164 number still uses the normal capacity guard.
+    No workflow or caller routing is attached by this endpoint.
+    """
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail='No organization selected')
+    if request.config.provider != 'sip':
+        raise HTTPException(status_code=422, detail='Use number discovery for this provider.')
+    import os
+    if os.getenv('SYSEVO_SIP_GATEWAY_ENABLED', 'false').lower() != 'true':
+        raise HTTPException(status_code=503, detail='SIP connections are not enabled on this server.')
+    name = 'SIP · ' + str(request.connection_key)
+    credentials = _credentials_from_payload(request.config)
+    rows = await db_client.list_telephony_configurations_by_provider(user.selected_organization_id, 'sip')
+    row = next((item for item in rows if item.name == name), None)
+    if row:
+        saved = {key: (row.credentials or {}).get(key) for key in credentials}
+        if not hmac.compare_digest(json.dumps(saved, sort_keys=True).encode(), json.dumps(credentials, sort_keys=True).encode()):
+            numbers = await db_client.list_phone_numbers_for_config(row.id)
+            if numbers:
+                raise HTTPException(status_code=409, detail='This connection already has a number. Edit it in Phone Numbers.')
+            prepared = await _run_preprocess_hook('sip', credentials)
+            row = await db_client.update_telephony_configuration(row.id, user.selected_organization_id, credentials=prepared)
+            if not row:
+                raise HTTPException(status_code=409, detail='Connection changed. Start a new connection.')
+    else:
+        prepared = await _run_preprocess_hook('sip', credentials)
+        try:
+            row = await db_client.create_telephony_configuration(organization_id=user.selected_organization_id, name=name, provider='sip', credentials=prepared, is_default_outbound=False)
+        except IntegrityError:
+            # A simultaneous retry may have won the unique org/name insert.
+            raise HTTPException(status_code=409, detail='Connection is being saved. Retry with the same details.') from None
+    provider = await get_telephony_provider_by_id(row.id, user.selected_organization_id)
+    try:
+        numbers = await provider.get_available_phone_numbers()
+    except HTTPException as error:
+        if error.status_code != 409:
+            raise
+        return {'config_id': row.id, 'status': 'pending', 'numbers': []}
+    return {'config_id': row.id, 'status': 'registered', 'numbers': [{'e164': number, 'label': '', 'caps': ['Voice']} for number in numbers]}
+
+
+@router.post('/telephony-providers/discover')
+async def discover_telephony_provider_numbers(request: TelephonyProviderDiscoveryRequest, user: UserModel = Depends(get_user)):
+    """Verify a supplied provider account without persisting credentials or routing."""
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=400, detail='No organization selected')
+    credentials = request.config.model_dump(exclude={'provider'})
+    try:
+        numbers = await discover_provider_numbers(request.config.provider, credentials)
+    except HTTPException:
+        raise
+    except Exception:
+        raise HTTPException(status_code=502, detail='The provider could not be reached. Check the connection details and try again.') from None
+    return {'numbers': [{'e164': number, 'label': '', 'caps': ['Voice']} for number in numbers]}
+
+
 @router.get(
     "/telephony-providers/metadata",
     response_model=TelephonyProvidersMetadataResponse,
@@ -200,6 +273,10 @@ async def get_telephony_providers_metadata(user: UserModel = Depends(get_user)):
 
     providers = []
     for spec in telephony_registry.all_specs():
+        if spec.name == 'sip':
+            import os
+            if os.getenv('SYSEVO_SIP_GATEWAY_ENABLED', 'false').lower() != 'true':
+                continue
         if spec.ui_metadata is None:
             continue
         providers.append(

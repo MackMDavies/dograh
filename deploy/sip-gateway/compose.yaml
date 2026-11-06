@@ -1,0 +1,48 @@
+# Append to the actual running Compose file chain. Do not replace that chain.
+# Activate only after the isolated probe passes and no live calls are active.
+services:
+  sysevo-sip-gateway:
+    image: ${SYSEVO_SIP_GATEWAY_IMAGE:?set the verified gateway image}
+    profiles: [subscription-sip]
+    restart: unless-stopped
+    init: true
+    cpus: 1
+    mem_limit: 1g
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    environment:
+      ENVIRONMENT: ${ENVIRONMENT:-remote}
+      LOG_LEVEL: INFO
+      LOG_TO_FILE: "false"
+      DATABASE_URL: postgresql+asyncpg://dograh_app:${DOGRAH_APP_DB_PASSWORD:?required}@postgres:5432/postgres
+      REDIS_URL: redis://:${REDIS_PASSWORD:?required}@redis:6379
+      OSS_JWT_SECRET: ${OSS_JWT_SECRET:?required}
+      BACKEND_API_ENDPOINT: ${BACKEND_API_ENDPOINT:?required}
+      AUTH_PROVIDER: ${AUTH_PROVIDER:-supabase}
+      DEPLOYMENT_MODE: ${DEPLOYMENT_MODE:-oss}
+      SUPABASE_URL: ${SUPABASE_URL:?required}
+      SUPABASE_ANON_KEY: ${SUPABASE_ANON_KEY:-}
+      SUPABASE_SERVICE_ROLE_KEY: ${SUPABASE_SERVICE_ROLE_KEY:?required}
+      SYSEVO_PRE_CALL_CHECK_URL: ${SYSEVO_PRE_CALL_CHECK_URL:?required}
+      SYSEVO_MEMORY_SECRET: ${SYSEVO_MEMORY_SECRET:?required}
+      SYSEVO_SIP_GATEWAY_ENABLED: ${SYSEVO_SIP_GATEWAY_ENABLED:-false}
+      SYSEVO_SIP_PUBLIC_IP: ${SYSEVO_SIP_PUBLIC_IP:?required}
+    # ARI 8088 and status 8089 stay private on app-network.
+    ports:
+      - 5060:5060/udp
+      - 30000-30199:30000-30199/udp
+    tmpfs:
+      - /etc/asterisk:rw,noexec,nosuid,size=4m,mode=0700
+      - /var/run/asterisk:rw,noexec,nosuid,size=2m
+      - /var/log/asterisk:rw,noexec,nosuid,size=2m
+      - /var/spool/asterisk:rw,noexec,nosuid,size=8m
+      - /var/lib/asterisk/db:rw,noexec,nosuid,size=2m
+      - /tmp:rw,noexec,nosuid,size=16m
+    healthcheck:
+      test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+    networks: [app-network]

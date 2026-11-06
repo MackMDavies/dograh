@@ -191,6 +191,7 @@ services:
       # SYSEVO_MEMORY_SECRET must match the SYSEVO_MEMORY_SECRET set in Supabase secrets.
       SYSEVO_MEMORY_PRE_CALL_URL: "${SYSEVO_MEMORY_PRE_CALL_URL:-}"
       SYSEVO_PRE_CALL_CHECK_URL: "${SYSEVO_PRE_CALL_CHECK_URL:-}"
+      SYSEVO_SIP_GATEWAY_ENABLED: "${SYSEVO_SIP_GATEWAY_ENABLED:-false}"
       SYSEVO_POST_CALL_MEMORY_URL: "${SYSEVO_POST_CALL_MEMORY_URL:-}"
       SYSEVO_MEMORY_SECRET: "${SYSEVO_MEMORY_SECRET:-}"
       # Direct wallet debit URL — set this to enable per-client minute billing.

@@ -55,7 +55,9 @@ class ARIConnection:
         app_name: str,
         app_password: str,
         ws_client_name: str = "",
+        provider_name: str = "ari",
     ):
+        self.provider_name = provider_name
         self.organization_id = organization_id
         self.telephony_configuration_id = telephony_configuration_id
         self.ari_endpoint = ari_endpoint.rstrip("/")
@@ -549,7 +551,7 @@ class ARIConnection:
             # 1. Resolve the workflow from the called extension via the
             #    telephony_phone_numbers row scoped to this connection's config.
             phone_row = await db_client.find_active_phone_number_for_inbound(
-                self.organization_id, called_number, "ari"
+                self.organization_id, called_number, self.provider_name
             )
             if (
                 not phone_row
@@ -637,14 +639,14 @@ class ARIConnection:
             workflow_run = await db_client.create_workflow_run(
                 name=f"ARI Inbound {caller_number}",
                 workflow_id=inbound_workflow_id,
-                mode=WorkflowRunMode.ARI.value,
+                mode=self.provider_name,
                 user_id=user_id,
                 call_type=CallType.INBOUND,
                 initial_context={
                     "caller_number": caller_number,
                     "called_number": called_number,
                     "direction": "inbound",
-                    "provider": "ari",
+                    "provider": self.provider_name,
                     "telephony_configuration_id": self.telephony_configuration_id,
                 },
                 gathered_context={
@@ -1171,10 +1173,11 @@ class ARIConnection:
 class ARIManager:
     """Manages ARI WebSocket connections for all organizations."""
 
-    def __init__(self):
+    def __init__(self, *, provider_name="ari", refresh_interval=60):
+        self._provider_name = provider_name
         self._connections: Dict[str, ARIConnection] = {}  # key -> connection
         self._running = False
-        self._config_refresh_interval = 60  # Check for config changes every 60 seconds
+        self._config_refresh_interval = refresh_interval
 
     async def start(self):
         """Start the ARI manager."""
@@ -1232,6 +1235,7 @@ class ARIManager:
                 app_name,
                 app_password,
                 ws_client_name,
+                provider_name=config.get("provider", "ari"),
             )
             key = conn.connection_key
 
@@ -1284,11 +1288,14 @@ class ARIManager:
 
     async def _load_ari_configs(self) -> list:
         """Load all ARI telephony configurations from the multi-config tables."""
-        rows = await db_client.list_all_telephony_configurations_by_provider("ari")
+        rows = await db_client.list_all_telephony_configurations_by_provider(self._provider_name)
 
         configs = []
         for row in rows:
             credentials = row.credentials or {}
+            if row.provider == "sip":
+                from api.services.telephony.sip_gateway_config import asterisk_config
+                credentials = asterisk_config(credentials)
             ari_endpoint = credentials.get("ari_endpoint")
             app_name = credentials.get("app_name")
             app_password = credentials.get("app_password")
@@ -1309,6 +1316,7 @@ class ARIManager:
 
             configs.append(
                 {
+                    "provider": row.provider,
                     "organization_id": row.organization_id,
                     "telephony_configuration_id": row.id,
                     "ari_endpoint": ari_endpoint,

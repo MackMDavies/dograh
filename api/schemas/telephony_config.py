@@ -12,6 +12,8 @@ from typing import Annotated, List, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from api.services.telephony.providers.sip.config import SIPConfigurationRequest, SIPConfigurationResponse
+from api.services.telephony.providers.signalwire.config import SignalWireConfigurationRequest, SignalWireConfigurationResponse
 from api.services.telephony.providers.ari.config import (
     ARIConfigurationRequest,
     ARIConfigurationResponse,
@@ -47,6 +49,8 @@ from api.services.telephony.providers.vonage.config import (
 TelephonyConfigRequest = Annotated[
     Union[
         ARIConfigurationRequest,
+        SignalWireConfigurationRequest,
+        SIPConfigurationRequest,
         CloudonixConfigurationRequest,
         PlivoConfigurationRequest,
         TelnyxConfigurationRequest,
@@ -66,6 +70,8 @@ class TelephonyConfigurationResponse(BaseModel):
     flat discriminated union.
     """
 
+    sip: Optional[SIPConfigurationResponse] = None
+    signalwire: Optional[SignalWireConfigurationResponse] = None
     twilio: Optional[TwilioConfigurationResponse] = None
     plivo: Optional[PlivoConfigurationResponse] = None
     vonage: Optional[VonageConfigurationResponse] = None
@@ -132,6 +138,8 @@ class TelephonyConfigurationListResponse(BaseModel):
 
 
 __all__ = [
+    "SignalWireConfigurationRequest",
+    "SignalWireConfigurationResponse",
     "ARIConfigurationRequest",
     "ARIConfigurationResponse",
     "CloudonixConfigurationRequest",

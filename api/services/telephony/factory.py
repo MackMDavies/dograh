@@ -231,3 +231,19 @@ def _instantiate(config: Dict[str, Any]) -> TelephonyProvider:
     spec = registry.get(config["provider"])
     logger.info(f"Creating {spec.name} telephony provider")
     return spec.provider_cls(config)
+
+
+async def discover_provider_numbers(provider_name: str, credentials: Dict[str, Any]) -> List[str]:
+    """Validate an unsaved account using the same registered adapter as saved calls."""
+    from fastapi import HTTPException
+    if provider_name == "sip":
+        raise HTTPException(status_code=409, detail="Complete SIP registration before discovering its number.")
+    if provider_name == "ari":
+        raise HTTPException(status_code=422, detail="Use the saved PBX connection to verify its extensions.")
+    spec = registry.get(provider_name)
+    normalized = spec.config_loader(credentials)
+    normalized["provider"] = provider_name
+    provider = _instantiate(normalized)
+    if not provider.validate_config():
+        raise HTTPException(status_code=422, detail="Complete the provider connection details.")
+    return await provider.get_available_phone_numbers()
