@@ -39,6 +39,7 @@ services:
       - /var/spool/asterisk:rw,noexec,nosuid,size=8m
       - /var/lib/asterisk/db:rw,noexec,nosuid,size=2m
       - /tmp:rw,noexec,nosuid,size=16m
+      - /app/dograh_pcm_cache:rw,noexec,nosuid,size=8m,mode=1777
     healthcheck:
       test: [CMD, python, -c, "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8089/health', timeout=3)"]
       interval: 10s

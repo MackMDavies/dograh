@@ -8,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 from xml.etree import ElementTree
 from twilio.request_validator import RequestValidator
 
@@ -29,6 +29,15 @@ provider=module(PACKAGE+'.provider','services/telephony/providers/signalwire/pro
 CREDS={'space_url':'customer.signalwire.com','project_id':'12345678-1234-1234-1234-123456789012','api_token':'fixture-api-token','signing_key':'fixture-signing-key','from_numbers':['+12125550101']}
 
 class ConfigTests(unittest.TestCase):
+ def test_registered_providers_obey_the_live_call_concurrency_gate(self):
+  import ast
+  source=ast.parse((ROOT/'services/telephony/call_concurrency.py').read_text())
+  nodes=[node for node in source.body if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=='LIVE_CALL_MODES' for target in node.targets) or isinstance(node,ast.FunctionDef) and node.name=='is_live_call_mode']
+  namespace={};exec(compile(ast.Module(body=nodes,type_ignores=[]),'actual-concurrency-gate','exec'),namespace)
+  fake=SimpleNamespace(get_optional=lambda name:object() if name in ('signalwire','sip') else None)
+  with patch.object(sys.modules['api.services.telephony'],'registry',fake,create=True):
+   for name in ('twilio','ari','webrtc','signalwire','sip'):self.assertTrue(namespace['is_live_call_mode'](name),name)
+   for name in ('textchat','STASIS','VOICE','CHAT','unknown'):self.assertFalse(namespace['is_live_call_mode'](name),name)
  def test_space_normalization_and_secret_fields(self):
   result=config.SignalWireConfigurationRequest(**{**CREDS,'space_url':'https://Customer.signalwire.com/'})
   self.assertEqual(result.space_url,'customer.signalwire.com')

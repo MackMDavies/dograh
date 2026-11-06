@@ -20,6 +20,8 @@ RUN curl --fail --show-error --location --proto '=https' --tlsv1.2 \
     && make install DESTDIR=/out
 
 FROM ${BASE_IMAGE}
+ARG SOURCE_REVISION
+LABEL io.sysevo.subscription-providers.revision=${SOURCE_REVISION}
 USER root
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libedit2 libjansson4 libsqlite3-0 libssl3t64 libxml2 libuuid1 libcurl4t64 libncurses6 \
@@ -30,7 +32,7 @@ COPY --from=asterisk-builder /out/var/lib/asterisk/ /var/lib/asterisk/
 COPY api/services/telephony/providers/sip /app/api/services/telephony/providers/sip
 COPY api/services/telephony/providers/signalwire /app/api/services/telephony/providers/signalwire
 COPY api/services/telephony/providers/__init__.py /app/api/services/telephony/providers/__init__.py
-COPY api/services/telephony/asterisk_media.py api/services/telephony/asterisk_strategies.py api/services/telephony/ari_manager.py api/services/telephony/sip_gateway.py api/services/telephony/sip_gateway_config.py api/services/telephony/factory.py /app/api/services/telephony/
+COPY api/services/telephony/asterisk_media.py api/services/telephony/asterisk_strategies.py api/services/telephony/ari_manager.py api/services/telephony/call_concurrency.py api/services/telephony/sip_gateway.py api/services/telephony/sip_gateway_config.py api/services/telephony/factory.py /app/api/services/telephony/
 COPY api/schemas/telephony_config.py /app/api/schemas/telephony_config.py
 WORKDIR /app
 CMD ["python", "-m", "uvicorn", "api.services.telephony.sip_gateway:app", "--host", "0.0.0.0", "--port", "8089", "--no-access-log"]

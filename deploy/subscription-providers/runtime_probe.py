@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock
 from pydantic import TypeAdapter
 from api.schemas.telephony_config import TelephonyConfigRequest
 from api.services.telephony import registry
+from api.services.telephony.call_concurrency import is_live_call_mode
 from api.services.pipecat.audio_config import create_audio_config
 from api.services.telephony.providers.signalwire import transport as signalwire
 from api.services.telephony.providers.sip import transport as sip
@@ -21,6 +22,7 @@ async def main():
     for config in (signalwire_config, sip_config):
         assert TypeAdapter(TelephonyConfigRequest).validate_python(config).provider == config['provider']
         assert registry.get(config['provider']).transport_sample_rate == 8000
+        assert is_live_call_mode(config['provider'])
     signalwire.load_credentials_for_transport = AsyncMock(return_value=signalwire_config)
     sip.load_credentials_for_transport = AsyncMock(return_value=asterisk_config({**sip_config, 'gateway_id': 'a' * 32}))
     socket = SimpleNamespace()
@@ -45,6 +47,10 @@ async def main():
         os.environ['SYSEVO_SIP_GATEWAY_ENABLED'] = 'true'
         metadata = await get_telephony_providers_metadata(user)
         assert {'sip', 'signalwire'} <= {item.provider for item in metadata.providers}
+        from api.routes.telephony import router
+        paths = {route.path for route in router.routes}
+        assert '/signalwire-xml' in paths and '/signalwire/status/{workflow_run_id}' in paths
+        assert '/ws/ari' in paths
     print(json.dumps({'schema_union': True, 'native_registry': True, 'native_serializers': True, 'run_scoped_credentials': True, 'tts_and_realtime_transports': True, 'signalwire_hangup': True, 'api_metadata': '--api' in sys.argv}))
 
 

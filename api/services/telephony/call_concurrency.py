@@ -31,7 +31,13 @@ LIVE_CALL_MODES = frozenset(
 
 def is_live_call_mode(mode) -> bool:
     """True if a run mode string represents a live audio call (counts against concurrency)."""
-    return str(mode).lower() in LIVE_CALL_MODES
+    normalized = str(mode).lower()
+    if normalized in LIVE_CALL_MODES:
+        return True
+    # New registered telephony adapters must share the same plan/system cap.
+    # Import lazily so provider registration does not create an import cycle.
+    from api.services.telephony import registry
+    return registry.get_optional(normalized) is not None
 
 
 async def _org_limit(organization_id: int) -> int:
