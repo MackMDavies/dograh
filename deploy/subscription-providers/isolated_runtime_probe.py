@@ -36,6 +36,7 @@ runtime = request('GET', '/containers/dograh-api-1/json')
 environment = dict(item.split('=', 1) for item in runtime['Config']['Env'])
 keys = ('DATABASE_URL', 'REDIS_URL', 'OSS_JWT_SECRET')
 assert all(environment.get(key) for key in keys), 'Required runtime settings are missing'
+keys += tuple(key for key in ('MINIO_PUBLIC_ENDPOINT', 'MINIO_ENDPOINT', 'BACKEND_API_ENDPOINT') if environment.get(key))
 name = 'sysevo-provider-runtime-probe-' + mode
 created = request('POST', '/containers/create?name=' + quote(name), {
     'Image': image, 'Entrypoint': ['python'], 'Cmd': ['/probe.py'] + (['--api'] if mode == 'api' else []),

@@ -4,6 +4,9 @@ No database, environment credentials, public ports or external calls are used.
 Tests digest SIP registration and bidirectional PCMU external-media streaming.
 """
 import asyncio
+import ast
+import ipaddress
+import os
 import hashlib
 import importlib.util
 import json
@@ -63,19 +66,17 @@ async def main():
         # Only this network-none test substitutes the pinned destination with
         # its local registrar. Production always uses validated public IPv4.
         (directory / name).write_text(content.replace('8.8.8.8:5099', '127.0.0.1:5099'))
-    settings = {
-        'asterisk.conf': '[directories]\nastetcdir => /etc/asterisk\nastmoddir => /usr/lib/asterisk/modules\nastvarlibdir => /var/lib/asterisk\nastspooldir => /var/spool/asterisk\nastrundir => /var/run/asterisk\nastlogdir => /var/log/asterisk\n[options]\nverbose=0\ndebug=0\n',
-        'modules.conf': '[modules]\nautoload=yes\nnoload=res_pjsip_endpoint_identifier_anonymous.so\n',
-        'http.conf': '[general]\nenabled=yes\nbindaddr=127.0.0.1\nbindport=8088\n',
-        'ari.conf': '[general]\nenabled=yes\n[fixture]\ntype=user\nread_only=no\npassword=fixture-secret\n#include ari_connections.conf\n',
-        'extensions.conf': '#include extensions_connections.conf\n',
-        'pjsip.conf': '[global]\ntype=global\nendpoint_identifier_order=line,username,auth_username\n[transport-udp]\ntype=transport\nprotocol=udp\nbind=127.0.0.1:5060\n#include pjsip_connections.conf\n',
-        'websocket_client.conf': '[sysevo_media]\ntype=websocket_client\nuri=ws://127.0.0.1:9099/media\nprotocols=media\nconnection_type=per_call_config\n',
-        'logger.conf': '[general]\n[logfiles]\n',
-        'rtp.conf': '[general]\nrtpstart=30000\nrtpend=30020\n',
-    }
-    for name, content in settings.items():
-        (directory / name).write_text(content)
+    # Exercise the real production bootstrap rather than a parallel test copy.
+    tree = ast.parse(Path('/app/api/services/telephony/sip_gateway.py').read_text())
+    write = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == 'write_base_configuration')
+    namespace = {'Path': Path, 'ipaddress': ipaddress, 'os': os}
+    exec(compile(ast.Module(body=[write], type_ignores=[]), 'actual-gateway-bootstrap', 'exec'), namespace)
+    os.environ['SYSEVO_SIP_PUBLIC_IP'] = '8.8.8.8'
+    namespace['write_base_configuration'](directory)
+    with (directory / 'ari.conf').open('a') as output:
+        output.write('[fixture]\ntype=user\nread_only=no\npassword=fixture-secret\n')
+    websocket = directory / 'websocket_client.conf'
+    websocket.write_text(websocket.read_text().replace('wss://api.sysevo.io/api/v1/telephony/ws/ari', 'ws://127.0.0.1:9099/media').replace('tls_enabled=yes', 'tls_enabled=no'))
     for name in ('/var/run/asterisk', '/var/log/asterisk', '/var/spool/asterisk/recording', '/var/lib/asterisk'):
         Path(name).mkdir(parents=True, exist_ok=True)
     with wave.open('/tmp/fixture-tone.wav', 'wb') as output:
