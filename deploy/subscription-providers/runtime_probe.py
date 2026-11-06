@@ -49,8 +49,8 @@ async def main():
         assert {'sip', 'signalwire'} <= {item.provider for item in metadata.providers}
         from api.routes.telephony import router
         paths = {route.path for route in router.routes}
-        assert '/signalwire-xml' in paths and '/signalwire/status/{workflow_run_id}' in paths
-        assert '/ws/ari' in paths
+        assert '/telephony/signalwire-xml' in paths and '/telephony/signalwire/status/{workflow_run_id}' in paths
+        assert '/telephony/ws/ari' in paths
     print(json.dumps({'schema_union': True, 'native_registry': True, 'native_serializers': True, 'run_scoped_credentials': True, 'tts_and_realtime_transports': True, 'signalwire_hangup': True, 'api_metadata': '--api' in sys.argv}))
 
 
