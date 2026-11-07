@@ -2,6 +2,7 @@ import json
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Literal, Optional
 from zoneinfo import ZoneInfo
+from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from loguru import logger
@@ -13,7 +14,7 @@ from api.constants import (
     MAX_SYSTEM_CONCURRENCY,
 )
 from api.db import db_client
-from api.db.campaign_client import ActiveCampaignLimitExceeded
+from api.db.campaign_client import ActiveCampaignLimitExceeded, CallerHandoffConflict
 from api.db.models import UserModel
 from api.services.compliance_statements import (
     ACK_CALLING_HOURS_OFF,
@@ -276,6 +277,7 @@ class CreateCampaignRequest(BaseModel):
     workflow_id: int
     source_type: str = Field(..., pattern="^csv$")
     source_id: str  # CSV file key
+    verified_caller_handoff_id: Optional[UUID] = None
     # Optional during the legacy → multi-config migration window. Required in
     # a follow-up. When omitted, the dispatcher falls back to the org's
     # default config.
@@ -309,6 +311,12 @@ class CreateCampaignRequest(BaseModel):
     def validate_schedule_fields_together(self) -> "CreateCampaignRequest":
         if (self.scheduled_start_at is None) != (self.scheduled_timezone is None):
             raise ValueError("scheduled_start_at and scheduled_timezone must be set together")
+        if self.verified_caller_handoff_id is not None and self.scheduled_start_at is not None:
+            raise ValueError("Confirm the verified caller handoff before scheduling this campaign")
+        if self.verified_caller_handoff_id is not None and (
+            self.retry_config is None or self.retry_config.enabled or self.retry_config.max_retries != 0
+        ):
+            raise ValueError("Verified caller campaigns require provider retries disabled; CRM rules control attempts")
         return self
 
 
@@ -364,12 +372,14 @@ class CampaignLogEntryResponse(BaseModel):
 
 class CampaignResponse(BaseModel):
     id: int
+    organization_id: int
     name: str
     workflow_id: int
     workflow_name: str
     state: str
     source_type: str
     source_id: str
+    verified_caller_handoff_id: Optional[str] = None
     total_rows: Optional[int]
     processed_rows: int
     failed_rows: int
@@ -486,12 +496,14 @@ def _build_campaign_response(
 
     return CampaignResponse(
         id=campaign.id,
+        organization_id=campaign.organization_id,
         name=campaign.name,
         workflow_id=campaign.workflow_id,
         workflow_name=workflow_name,
         state=campaign.state,
         source_type=campaign.source_type,
         source_id=campaign.source_id,
+        verified_caller_handoff_id=(campaign.orchestrator_metadata or {}).get("verified_caller_handoff_id"),
         total_rows=campaign.total_rows,
         processed_rows=campaign.processed_rows,
         failed_rows=campaign.failed_rows,
@@ -715,7 +727,10 @@ async def create_campaign(
             scheduled_start_at=request.scheduled_start_at,
             scheduled_timezone=request.scheduled_timezone,
             active_campaign_limit=active_campaign_limit,
+            verified_caller_handoff_id=str(request.verified_caller_handoff_id) if request.verified_caller_handoff_id is not None else None,
         )
+    except CallerHandoffConflict as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except ActiveCampaignLimitExceeded as e:
         raise HTTPException(
             status_code=403,
@@ -1027,6 +1042,13 @@ async def update_campaign(
     campaign = await db_client.get_campaign(campaign_id, org_id)
     if not campaign:
         raise HTTPException(status_code=404, detail="Campaign not found")
+
+    if (campaign.orchestrator_metadata or {}).get("verified_caller_handoff_id") and request.retry_config is not None and (
+        request.retry_config.enabled or request.retry_config.max_retries != 0
+    ):
+        raise HTTPException(status_code=409, detail="Verified caller campaigns use CRM attempt rules; provider retries must remain disabled")
+    if (campaign.orchestrator_metadata or {}).get("verified_caller_handoff_id") and request.workflow_id is not None and request.workflow_id != campaign.workflow_id:
+        raise HTTPException(status_code=409, detail="Choose a different agent by creating a new attempt from the verified caller pool")
 
     # Running/paused campaigns cannot have concurrency or schedule changed mid-flight.
     # Failed campaigns must remain fully editable so the agent/telephony/concurrency
@@ -1341,6 +1363,8 @@ async def redial_campaign(
         )
 
     parent_meta = parent.orchestrator_metadata or {}
+    if parent_meta.get("verified_caller_handoff_id"):
+        raise HTTPException(status_code=409, detail="Create another attempt from the verified caller pool so the current rules and ownership are checked")
     if parent_meta.get("redialed_campaign_id"):
         raise HTTPException(
             status_code=400,

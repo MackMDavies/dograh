@@ -205,12 +205,20 @@ class CampaignCallDispatcher:
                             else None
                         )
 
-                    dial_allowed, dial_block_reason, retry_at = await check_dial_permitted(
-                        campaign.workflow_id, phone_number, campaign_calling_hours
-                    )
+                    handoff_id = (campaign.orchestrator_metadata or {}).get("verified_caller_handoff_id")
+                    if handoff_id is not None:
+                        dial_allowed, dial_block_reason, retry_at = await check_dial_permitted(
+                            campaign.workflow_id, phone_number, campaign_calling_hours,
+                            campaign_id=campaign.id, queued_run_id=queued_run.id,
+                            verified_caller_handoff_id=handoff_id,
+                        )
+                    else:
+                        dial_allowed, dial_block_reason, retry_at = await check_dial_permitted(
+                            campaign.workflow_id, phone_number, campaign_calling_hours
+                        )
 
                     if not dial_allowed:
-                        if dial_block_reason == "suppressed":
+                        if dial_block_reason in ("suppressed", "verified_caller_unavailable"):
                             # Route through the same skipped_suppressed/
                             # suppressed_rows path dispatch_call's own
                             # suppression check uses (see the "except

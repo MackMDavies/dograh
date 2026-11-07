@@ -16,6 +16,10 @@ _ACTIVE_CAMPAIGN_LOCK_NAMESPACE = 1_397_736_276
 _ACTIVE_CAMPAIGN_STATES = ("scheduled", "syncing", "running")
 
 
+class CallerHandoffConflict(Exception):
+    """An immutable CRM handoff already has a different campaign draft."""
+
+
 class ActiveCampaignLimitExceeded(Exception):
     def __init__(self, limit: int, active: int):
         self.limit = limit
@@ -119,6 +123,7 @@ class CampaignClient(BaseDBClient):
         scheduled_start_at: Optional[datetime] = None,
         scheduled_timezone: Optional[str] = None,
         active_campaign_limit: Optional[int] = None,
+        verified_caller_handoff_id: Optional[str] = None,
     ) -> CampaignModel:
         """Create a new campaign"""
         async with self.async_session() as session:
@@ -128,6 +133,8 @@ class CampaignClient(BaseDBClient):
                 )
             # Build orchestrator_metadata with max_concurrency if provided
             orchestrator_metadata = {}
+            if verified_caller_handoff_id is not None:
+                orchestrator_metadata["verified_caller_handoff_id"] = verified_caller_handoff_id
             if max_concurrency is not None:
                 orchestrator_metadata["max_concurrency"] = max_concurrency
             if schedule_config is not None:
@@ -144,6 +151,42 @@ class CampaignClient(BaseDBClient):
                     orchestrator_metadata["calling_hours_off_acknowledged_at"] = (
                         calling_hours_config["off_acknowledged_at"].isoformat()
                     )
+
+            if verified_caller_handoff_id is not None:
+                # Serialize only marked creates. A lost HTTP response must not
+                # leave a second independently launchable campaign for a handoff.
+                # PostgreSQL transaction lock covers lookup and insert, including
+                # concurrent requests across API processes. No schema/global
+                # campaign behavior change is needed.
+                await session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtextextended(:handoff_lock, 0))"),
+                    {"handoff_lock": f"crm-caller:{organization_id}:{verified_caller_handoff_id}"},
+                )
+                existing_result = await session.execute(
+                    select(CampaignModel).where(
+                        CampaignModel.organization_id == organization_id,
+                        text("orchestrator_metadata->>'verified_caller_handoff_id' = :handoff_id"),
+                    ).params(handoff_id=verified_caller_handoff_id)
+                )
+                existing = existing_result.scalar_one_or_none()
+                if existing is not None:
+                    unchanged = (
+                        existing.created_by == user_id
+                        and existing.name == name
+                        and existing.workflow_id == workflow_id
+                        and existing.source_type == source_type
+                        and existing.source_id == source_id
+                        and existing.retry_config == retry_config
+                        and existing.telephony_configuration_id == telephony_configuration_id
+                        and existing.from_phone_number_id == from_phone_number_id
+                        and all((existing.orchestrator_metadata or {}).get(key) == orchestrator_metadata.get(key)
+                                for key in ('verified_caller_handoff_id', 'max_concurrency', 'schedule_config',
+                                            'circuit_breaker', 'calling_hours_mode', 'calling_hours_start',
+                                            'calling_hours_end', 'calling_hours_off_acknowledged_at'))
+                    )
+                    if not unchanged:
+                        raise CallerHandoffConflict("This caller handoff already has a saved campaign. Open the original draft before continuing.")
+                    return existing
 
             campaign = CampaignModel(
                 name=name,

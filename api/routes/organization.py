@@ -56,6 +56,21 @@ from api.utils.common import get_backend_endpoints
 router = APIRouter(prefix="/organizations", tags=["organizations"])
 
 
+@router.get("/identity")
+async def get_organization_identity(user: UserModel = Depends(get_user)):
+    """Identity of the org resolved by get_user's canonical account/key binding.
+
+    Server bridges compare provider_id to the verified Supabase account, even
+    for a support user whose other resource routes may permit cross-org reads.
+    """
+    if not user.selected_organization_id:
+        raise HTTPException(status_code=409, detail="No voice organization is bound")
+    org = await db_client.get_organization_by_id(user.selected_organization_id)
+    if not org:
+        raise HTTPException(status_code=404, detail="Voice organization not found")
+    return {"organization_id": org.id, "provider_id": org.provider_id}
+
+
 async def _twilio_claim_account_sid(config_id: int) -> Optional[str]:
     """Return the account SID only when this is the shared Sysevo Twilio account."""
     config = await db_client.get_telephony_configuration(config_id)

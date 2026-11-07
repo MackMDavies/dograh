@@ -53,7 +53,7 @@ _UNAVAILABLE_DEFER_SECONDS = 300
 REASON_CHECK_UNAVAILABLE = "check_unavailable"
 
 
-def _defer_response() -> tuple[bool, str, Optional[str]]:
+def _defer_response(*, force_closed: bool = False) -> tuple[bool, str, Optional[str]]:
     """Fail closed: don't dial, come back shortly.
 
     Set SYSEVO_DIAL_CHECK_FAIL_OPEN=true to restore the old behaviour of
@@ -62,7 +62,7 @@ def _defer_response() -> tuple[bool, str, Optional[str]]:
     gate was unreachable) for dial throughput during an outage — a deliberate
     choice, so it has to be made explicitly.
     """
-    if os.getenv("SYSEVO_DIAL_CHECK_FAIL_OPEN", "").strip().lower() == "true":
+    if not force_closed and os.getenv("SYSEVO_DIAL_CHECK_FAIL_OPEN", "").strip().lower() == "true":
         return True, "", None
     retry_at = (
         datetime.now(UTC) + timedelta(seconds=_UNAVAILABLE_DEFER_SECONDS)
@@ -74,6 +74,10 @@ async def check_dial_permitted(
     workflow_id: int,
     to_number: str,
     campaign_calling_hours: Optional[dict] = None,
+    *,
+    campaign_id: Optional[int] = None,
+    queued_run_id: Optional[int] = None,
+    verified_caller_handoff_id: Optional[str] = None,
 ) -> tuple[bool, str, Optional[str]]:
     """Return (allowed, reason, retry_at).
 
@@ -81,9 +85,10 @@ async def check_dial_permitted(
     allowed=False → skip this number; reason is "suppressed", "needs_enrichment",
                      or "outside_calling_hours" (only this last one sets retry_at)
     """
+    marked = verified_caller_handoff_id is not None
     check_url = os.getenv("SYSEVO_PRE_CALL_CHECK_URL")
     if not check_url:
-        return True, "", None
+        return _defer_response(force_closed=True) if marked else (True, "", None)
 
     secret = os.getenv("SYSEVO_MEMORY_SECRET", "")
 
@@ -93,6 +98,10 @@ async def check_dial_permitted(
     }
     if campaign_calling_hours is not None:
         call_inbound["calling_hours"] = campaign_calling_hours
+    if verified_caller_handoff_id is not None:
+        call_inbound["campaign_id"] = campaign_id
+        call_inbound["queued_run_id"] = queued_run_id
+        call_inbound["verified_caller_handoff_id"] = verified_caller_handoff_id
 
     payload = {"call_inbound": call_inbound}
     headers: dict[str, str] = {"Content-Type": "application/json"}
@@ -107,7 +116,7 @@ async def check_dial_permitted(
             logger.warning(
                 f"[dial-permission] HTTP {response.status_code} for workflow {workflow_id} — deferring call"
             )
-            return _defer_response()
+            return _defer_response(force_closed=marked)
 
         data = response.json()
         dynamic_vars = data.get("call_inbound", {}).get("dynamic_variables", {})
@@ -121,11 +130,15 @@ async def check_dial_permitted(
             )
             return False, reason, retry_at
 
+        # A legacy, unknown-agent or fail-open Edge response is insufficient
+        # for CRM pool campaigns: an explicit tenant claim permit is required.
+        if marked and dynamic_vars.get("verified_caller_allowed") != "true":
+            return _defer_response(force_closed=True)
         return True, "", None
 
     except httpx.TimeoutException:
         logger.warning(f"[dial-permission] timed out for workflow {workflow_id} — deferring call")
-        return _defer_response()
+        return _defer_response(force_closed=marked)
     except Exception as e:
         logger.error(f"[dial-permission] error for workflow {workflow_id}: {e} — deferring call")
-        return _defer_response()
+        return _defer_response(force_closed=marked)
