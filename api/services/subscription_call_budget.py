@@ -60,14 +60,27 @@ class CallBudgetClient:
         if not self.endpoint or not self.secret:
             raise CallBudgetError('Call billing is not configured')
         try:
-            if self.post is not None:
-                return await self.post(payload)
             import httpx
             async with httpx.AsyncClient(timeout=8.0) as client:
-                response = await client.post(self.endpoint, json=payload,
-                    headers={'X-Sysevo-Secret': self.secret, 'Content-Type': 'application/json'})
-            response.raise_for_status()
-            return response.json()
+                for attempt in range(2):
+                    try:
+                        if self.post is not None:
+                            return await self.post(payload)
+                        response = await client.post(self.endpoint, json=payload,
+                            headers={'X-Sysevo-Secret': self.secret, 'Content-Type': 'application/json'})
+                        response.raise_for_status()
+                        return response.json()
+                    except (httpx.TransportError, httpx.HTTPStatusError) as error:
+                        transient = (isinstance(error, httpx.TransportError)
+                            or error.response.status_code in (429, 500, 502, 503, 504))
+                        if attempt or not transient:
+                            raise
+                        # Every operation is read-only or idempotent by run ID.
+                        # Reuse the exact identity after a lost response: the DB
+                        # never reserves twice or moves an existing deadline.
+                        # reserve() keeps its original monotonic sent_at, so
+                        # retry latency cannot grant extra audio time.
+                        await asyncio.sleep(0.2)
         except Exception:
             # Do not include hook credentials, response bodies or HTTP internals
             # in caller-visible errors or later reconciliation logs.

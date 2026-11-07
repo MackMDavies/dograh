@@ -1,6 +1,7 @@
 import asyncio
 import time
 import unittest
+import httpx
 from unittest.mock import patch
 from types import SimpleNamespace
 
@@ -14,6 +15,80 @@ REPLY = {'allowed': True, 'kind': 'subscription', 'reserved_minutes': 5,
 
 
 class BudgetClientTests(unittest.IsolatedAsyncioTestCase):
+    async def test_transient_timeout_retries_same_reservation_without_resetting_deadline(self):
+        requests = []
+        async def post(payload):
+            requests.append(dict(payload))
+            if len(requests) == 1:
+                raise httpx.ReadTimeout('synthetic-secret must not leak')
+            return REPLY
+        ticks = iter([10.0, 19.0])
+        with patch('api.services.subscription_call_budget.asyncio.sleep'):
+            budget = await CallBudgetClient('https://example.invalid', 'synthetic-secret',
+                post=post, clock=lambda: next(ticks)).reserve(ACCOUNT, 101, 123, 300)
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0], requests[1])
+        self.assertEqual(budget.expires_at, 308.0)
+
+    async def test_persistent_timeout_is_bounded_and_redacted(self):
+        attempts = []
+        async def post(payload):
+            attempts.append(payload)
+            raise httpx.ReadTimeout('synthetic-secret')
+        with patch('api.services.subscription_call_budget.asyncio.sleep'):
+            with self.assertRaises(CallBudgetError) as error:
+                await CallBudgetClient('https://example.invalid', 'synthetic-secret', post=post).classify(ACCOUNT, 101)
+        self.assertEqual(len(attempts), 2)
+        self.assertNotIn('synthetic-secret', str(error.exception))
+
+    async def test_http_transport_retries_identical_authenticated_request(self):
+        requests = []
+        def handler(request):
+            requests.append(request)
+            if len(requests) == 1:
+                raise httpx.ReadTimeout('lost response', request=request)
+            return httpx.Response(200, json={'kind': 'subscription'})
+        client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        with patch('httpx.AsyncClient', return_value=client), patch('api.services.subscription_call_budget.asyncio.sleep'):
+            result = await CallBudgetClient('https://example.invalid', 'synthetic-secret').classify(ACCOUNT, 101)
+        self.assertEqual(result, 'subscription')
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].content, requests[1].content)
+        self.assertTrue(all(r.headers['X-Sysevo-Secret'] == 'synthetic-secret' for r in requests))
+
+    async def test_retry_does_not_revive_expired_reservation(self):
+        attempts = []
+        async def post(payload):
+            attempts.append(payload)
+            if len(attempts) == 1:
+                raise httpx.ReadTimeout('lost response')
+            return {**REPLY, 'remaining_seconds': 5}
+        ticks = iter([10.0, 19.0])
+        with patch('api.services.subscription_call_budget.asyncio.sleep'), self.assertRaises(CallBudgetError):
+            await CallBudgetClient('https://example.invalid', 'synthetic-secret',
+                post=post, clock=lambda: next(ticks)).reserve(ACCOUNT, 101, 123, 300)
+
+    async def test_http_failures_retry_only_transient_statuses(self):
+        for status in [401, 403, 404, 422, 429, 500, 502, 503, 504]:
+            attempts = []
+            async def post(payload):
+                attempts.append(payload)
+                response = httpx.Response(status, request=httpx.Request('POST', 'https://example.invalid'))
+                response.raise_for_status()
+            with self.subTest(status=status), patch('api.services.subscription_call_budget.asyncio.sleep'):
+                with self.assertRaises(CallBudgetError):
+                    await CallBudgetClient('https://example.invalid', 'synthetic-secret', post=post).classify(ACCOUNT, 101)
+                self.assertEqual(len(attempts), 2 if status in [429, 500, 502, 503, 504] else 1)
+
+    async def test_explicit_denial_is_never_retried_or_allowed(self):
+        attempts = []
+        async def post(payload):
+            attempts.append(payload)
+            return {'allowed': False, 'reason': 'insufficient_balance'}
+        with self.assertRaises(CallBudgetError):
+            await CallBudgetClient('https://example.invalid', 'synthetic-secret', post=post).reserve(ACCOUNT, 101, 123, 300)
+        self.assertEqual(len(attempts), 1)
+
     async def test_reservation_binds_identity_and_subtracts_roundtrip_and_shutdown_margin(self):
         requests = []
         async def post(payload):
